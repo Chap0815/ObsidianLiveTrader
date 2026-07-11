@@ -1,0 +1,1140 @@
+"""Order preview → confirm → cancel orchestration.
+
+No place without unused, unexpired preview token AND TRADING_ENABLED=true.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from app.config import Settings
+from app.hyperliquid.errors import HyperliquidError
+from app.mexc.client import MexcClient, map_position, usdt_balances
+from app.mexc.errors import MexcError
+from app.models import ContractMeta, OrderTicket
+from app.orders.tokens import PreviewStore, TokenError
+from app.risk.gates import GateResult, validate_order
+from app.risk.sizing import round_down_to_unit
+
+ExchangeError = (MexcError, HyperliquidError)
+
+# MEXC futures order enums (official create docs / common practice):
+# side: 1 open long, 2 close short, 3 open short, 4 close long
+# type: 1 limit (price+vol), 2 post-only, 3 IOC, 4 FOK, 5 market
+# openType: 1 isolated, 2 cross
+MEXC_SIDE_OPEN_LONG = 1
+MEXC_SIDE_OPEN_SHORT = 3
+MEXC_TYPE_LIMIT = 1
+MEXC_TYPE_MARKET = 5
+
+
+class OrderError(Exception):
+    """Business-level order flow error (gates, arming, token, policy)."""
+
+    def __init__(self, message: str, *, errors: list[str] | None = None):
+        super().__init__(message)
+        self.errors = errors or [message]
+
+
+def ticket_to_mexc_body(
+    ticket: OrderTicket,
+    *,
+    rounded_vol: float,
+    rounded_price: float | None,
+    external_oid: str,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    attach_triggers: bool = True,
+) -> dict[str, Any]:
+    """Map internal ticket → MEXC POST /api/v1/private/order/create body.
+
+    attach_triggers=False (manual mode): send NO stopLossPrice/takeProfitPrice —
+    the trader manages the exit; the SL value is still used for risk gates only.
+    """
+    side = (ticket.side or "").lower()
+    mexc_side = MEXC_SIDE_OPEN_LONG if side == "long" else MEXC_SIDE_OPEN_SHORT
+    order_type = (ticket.order_type or "").lower()
+    mexc_type = MEXC_TYPE_MARKET if order_type == "market" else MEXC_TYPE_LIMIT
+
+    body: dict[str, Any] = {
+        "symbol": ticket.symbol.upper().strip(),
+        "vol": rounded_vol,
+        "side": mexc_side,
+        "type": mexc_type,
+        "openType": int(ticket.open_type or 1),
+        "leverage": int(ticket.leverage),
+        "externalOid": external_oid,
+    }
+
+    if mexc_type == MEXC_TYPE_LIMIT:
+        if rounded_price is None or rounded_price <= 0:
+            raise OrderError("limit order missing rounded price")
+        body["price"] = rounded_price
+    else:
+        body["price"] = 0
+
+    if attach_triggers:
+        sl = stop_loss if stop_loss is not None else ticket.stop_loss
+        tp = take_profit if take_profit is not None else ticket.take_profit
+        if sl is not None and float(sl) > 0:
+            body["stopLossPrice"] = float(sl)
+        if tp is not None and float(tp) > 0:
+            body["takeProfitPrice"] = float(tp)
+
+    return body
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _utc_now_iso_from_ts(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+    )
+
+
+def estimate_same_side_risk_usdt(
+    positions: list[dict[str, Any]],
+    *,
+    symbol: str,
+    side: str,
+    contract_size: float,
+) -> float:
+    """Rough open same-side risk using entry vs liquidate_price if present.
+
+    Fail-closed: an open same-side position without a usable liquidate_price
+    raises ValueError — treating unknown exposure as 0 would understate MAX_RISK_PCT.
+    """
+    total = 0.0
+    for raw in positions:
+        p = raw if "hold_vol" in raw else map_position(raw)
+        if str(p.get("symbol") or "").upper() != symbol.upper():
+            continue
+        if str(p.get("side") or "").lower() != side.lower():
+            continue
+        vol = float(p.get("hold_vol") or 0)
+        entry = float(p.get("entry_price") or 0)
+        liq = p.get("liquidate_price")
+        if vol <= 0 or entry <= 0 or contract_size <= 0:
+            continue
+        if liq is not None and float(liq) > 0:
+            total += abs(entry - float(liq)) * contract_size * vol
+        else:
+            raise ValueError(
+                f"open {side} position on {symbol} has no liquidate_price — "
+                "cannot enforce aggregate MAX_RISK_PCT (close or wait for liq data)"
+            )
+    return total
+
+
+def _coerce_float(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_filled_vol(resp: Any) -> float | None:
+    """Filled quantity of THIS order from the exchange place response.
+
+    Returns the exchange-reported fill (contracts/coins) for our order, or None
+    when the response does not carry it. Used to bound auto-flatten to our OWN
+    fill so a concurrent external bot that adds same-side volume in the same
+    window is never partially closed by us.
+
+    A key that is present but 0 is trusted as "reported unfilled" (returns 0.0)
+    — that is the fail-closed choice: we would rather cancel a resting entry
+    than market-close volume that may not be ours.
+    """
+    if not isinstance(resp, dict):
+        return None
+    # Flat quantity keys seen across MEXC revisions / internal adapters.
+    for key in (
+        "dealVol",
+        "deal_vol",
+        "dealVolume",
+        "filledVol",
+        "filled_vol",
+        "filledQty",
+        "filled_qty",
+        "filled",
+        "cumQty",
+        "filledSz",
+    ):
+        if key in resp:
+            f = _coerce_float(resp.get(key))
+            if f is not None:
+                return max(0.0, f)
+    # Hyperliquid nested SDK shape: response.data.statuses[].filled.totalSz
+    for container in (resp.get("response"), resp):
+        if not isinstance(container, dict):
+            continue
+        try:
+            statuses = (
+                container.get("response", {}).get("data", {}).get("statuses", [])
+            )
+        except AttributeError:
+            statuses = []
+        total = 0.0
+        found = False
+        for st in statuses or []:
+            if isinstance(st, dict) and isinstance(st.get("filled"), dict):
+                fv = _coerce_float(st["filled"].get("totalSz"))
+                if fv is not None:
+                    total += fv
+                    found = True
+        if found:
+            return max(0.0, total)
+    return None
+
+
+def _sl_matches(expected: float, candidate: float | None, tol_pct: float = 0.15) -> bool:
+    if candidate is None or expected <= 0:
+        return False
+    c = float(candidate)
+    if c <= 0:
+        return False
+    return abs(c - expected) / expected * 100.0 <= tol_pct
+
+
+class OrderService:
+    def __init__(
+        self,
+        client: MexcClient,
+        settings: Settings,
+        store: PreviewStore,
+        db: Any | None = None,
+        trade_lock: "asyncio.Lock | None" = None,
+    ):
+        self.client = client
+        self.settings = settings
+        self.store = store
+        self.db = db
+        # Serialize confirm/close so parallel places cannot both see risk=0.
+        # MUST be shared across requests: a new OrderService is built per
+        # request, so a per-instance lock would serialize nothing. The caller
+        # passes an app-global lock; the fallback only helps single-instance
+        # unit tests.
+        self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
+
+    async def _balances(self) -> tuple[float, float]:
+        """Return (equity, available). Fail-closed on API/mapping errors."""
+        try:
+            assets = await self.client.assets()
+            equity, available = usdt_balances(assets)
+        except ExchangeError as e:
+            raise OrderError(f"equity unavailable: {e}") from e
+        if equity is None or float(equity) <= 0:
+            raise OrderError(
+                "equity unknown/zero — fail-closed (cannot enforce MAX_RISK_PCT)"
+            )
+        return float(equity), float(available)
+
+    async def _existing_risk(self, symbol: str, side: str, contract_size: float) -> float:
+        """Same-side open risk. Positions API failure is fail-closed (not 0)."""
+        try:
+            positions = await self.client.positions(symbol)
+        except ExchangeError as e:
+            # Fail-closed: treating unknown exposure as 0 would understate MAX_RISK_PCT
+            raise OrderError(
+                f"positions unavailable — cannot enforce aggregate same-side risk: {e}"
+            ) from e
+        try:
+            return estimate_same_side_risk_usdt(
+                positions, symbol=symbol, side=side, contract_size=contract_size
+            )
+        except ValueError as e:
+            raise OrderError(str(e)) from e
+
+    async def preview(self, ticket: OrderTicket) -> dict[str, Any]:
+        """Run gates, optionally issue one-time token + persist preview hash."""
+        symbol = ticket.symbol.upper().strip()
+        ticket = ticket.model_copy(update={"symbol": symbol})
+
+        try:
+            contract = await self.client.contract_meta(symbol)
+        except ExchangeError as e:
+            raise OrderError(f"contract meta failed: {e}") from e
+
+        last_price: float | None = None
+        try:
+            ticker = await self.client.ticker(symbol)
+            last_price = float(ticker.last_price) if ticker.last_price else None
+        except ExchangeError as e:
+            raise OrderError(f"ticker failed: {e}") from e
+
+        try:
+            equity, available = await self._balances()
+        except OrderError as e:
+            # Preview: still return gate errors instead of 500
+            return {
+                "ok": False,
+                "token": None,
+                "errors": list(e.errors),
+                "warnings": [],
+                "gate": {"ok": False, "errors": list(e.errors)},
+                "summary": {},
+            }
+
+        try:
+            existing = await self._existing_risk(
+                symbol, ticket.side, contract.contract_size
+            )
+        except OrderError as e:
+            return {
+                "ok": False,
+                "token": None,
+                "errors": list(e.errors),
+                "warnings": [],
+                "gate": {"ok": False, "errors": list(e.errors)},
+                "summary": {},
+            }
+        gate = validate_order(
+            ticket,
+            contract,
+            equity,
+            self.settings,
+            last_price=last_price,
+            for_confirm=False,
+            existing_same_side_risk_usdt=existing,
+            available_usdt=available,
+        )
+
+        summary = _confirm_summary(ticket, gate, contract, equity, last_price)
+        summary["available_usdt"] = available
+        summary["existing_same_side_risk_usdt"] = existing
+
+        if not gate.ok:
+            return {
+                "ok": False,
+                "token": None,
+                "errors": gate.errors,
+                "warnings": gate.warnings,
+                "gate": gate.to_dict(),
+                "summary": summary,
+            }
+
+        # Fix externalOid at preview for idempotent confirm retries
+        external_oid = f"mlt-{uuid.uuid4().hex[:20]}"
+        payload = {
+            "ticket": ticket.model_dump(),
+            "gate": gate.to_dict(),
+            "contract": {
+                "symbol": contract.symbol,
+                "contract_size": contract.contract_size,
+                "price_unit": contract.price_unit,
+                "vol_unit": contract.vol_unit,
+                "min_vol": contract.min_vol,
+                "max_vol": contract.max_vol,
+                "max_leverage": contract.max_leverage,
+                "api_allowed": contract.api_allowed,
+            },
+            "equity_usdt": equity,
+            "available_usdt": available,
+            "last_price": last_price,
+            "external_oid": external_oid,
+            "created_at": _utc_now_iso(),
+        }
+        ttl = self.settings.preview_token_ttl_seconds
+        token = self.store.create(payload, ttl)
+        token_hash = PreviewStore.hash_token(token)
+
+        if self.db is not None:
+            expires = datetime.now(timezone.utc).timestamp() + ttl
+            await self.db.insert_preview(
+                token_hash=token_hash,
+                payload_json=payload,
+                expires_at=_utc_now_iso_from_ts(expires),
+            )
+
+        return {
+            "ok": True,
+            "token": token,
+            "errors": [],
+            "warnings": gate.warnings,
+            "gate": gate.to_dict(),
+            "summary": summary,
+            "expires_in_seconds": ttl,
+            "external_oid": external_oid,
+        }
+
+    async def _verify_sl_attached(
+        self,
+        *,
+        symbol: str,
+        expected_sl: float,
+        side: str,
+    ) -> tuple[bool, str, bool]:
+        """Best-effort check that exchange has SL protection near expected_sl.
+
+        Returns (verified, detail, checked).
+
+        `checked` is True ONLY if the reliable SL source — the stop/plan-order
+        lookup — succeeded at least once. A position row that lacks an SL field
+        is NOT proof the SL is missing (MEXC usually does not surface a planned
+        SL on the position), so it never sets `checked`. This prevents a broken
+        stop-order endpoint from producing a false "MISSING" and auto-flattening
+        a genuinely protected trade.
+
+        Retries a few times because exchanges reflect a freshly placed trigger
+        with a short delay — an immediate single lookup can miss a real SL.
+        """
+        sl_keys = (
+            "stopLossPrice",
+            "stop_loss_price",
+            "stopLoss",
+            "stop_loss",
+            "slPrice",
+            "sl_price",
+        )
+        stops_ever_ok = False
+        last_detail = ""
+        attempts = max(1, int(getattr(self.settings, "sl_verify_attempts", 3)))
+        delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
+        for attempt in range(attempts):
+            # 1) Stop / plan orders — the authoritative SL source.
+            try:
+                stops = await self.client.open_stop_orders(symbol)
+                stops_ever_ok = True
+                for s in stops:
+                    if not isinstance(s, dict):
+                        continue
+                    kind = str(
+                        s.get("orderType") or s.get("tpsl") or s.get("type") or ""
+                    ).lower()
+                    if "take" in kind or kind in ("tp", "take_profit", "take-profit"):
+                        continue
+                    for key in (
+                        "stopLossPrice",
+                        "stop_loss_price",
+                        "stopPrice",
+                        "stop_price",
+                        "triggerPrice",
+                        "trigger_price",
+                    ):
+                        if key not in s:
+                            continue
+                        # A bare triggerPrice can be a TP; only accept it as SL
+                        # proof when the order kind is SL-ish (or unmarked/plan).
+                        if key.startswith("trigger") and not (
+                            "stop" in kind or "sl" in kind or kind in ("", "plan")
+                        ):
+                            continue
+                        if _sl_matches(expected_sl, s.get(key)):
+                            return True, f"stop order field {key} matched", True
+            except ExchangeError as e:
+                last_detail = str(e)
+
+            # 2) Position row fields — ADDITIONAL positive evidence only. Their
+            # absence never proves the SL is missing, so it must not set checked.
+            try:
+                positions = await self.client.positions(symbol)
+                for raw in positions:
+                    p = map_position(raw) if "hold_vol" not in raw else raw
+                    if str(p.get("symbol") or "").upper() != symbol.upper():
+                        continue
+                    if str(p.get("side") or "").lower() != side.lower():
+                        continue
+                    for key in sl_keys:
+                        val = None
+                        if key in raw:
+                            val = raw.get(key)
+                        elif key in p:
+                            val = p.get(key)
+                        if _sl_matches(expected_sl, val):
+                            return True, f"position field {key} matched", True
+            except ExchangeError as e:
+                last_detail = last_detail or str(e)
+
+            # Not found yet — the trigger may simply not be reflected. Wait & retry.
+            if attempt < attempts - 1 and delay_s > 0:
+                await asyncio.sleep(delay_s)
+
+        return (
+            False,
+            last_detail or "no matching stop found on exchange",
+            stops_ever_ok,
+        )
+
+    async def _same_side_hold_vol(self, symbol: str, side: str) -> tuple[float, int]:
+        """Return (hold_vol, open_type 1|2) for same-side position; (0, 1) if none."""
+        try:
+            positions = await self.client.positions(symbol)
+        except ExchangeError:
+            return 0.0, 1
+        for raw in positions or []:
+            p = map_position(raw) if "hold_vol" not in raw else raw
+            if str(p.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if str(p.get("side") or "").lower() != side.lower():
+                continue
+            hv = float(p.get("hold_vol") or 0)
+            ot_raw = p.get("open_type")
+            if ot_raw in (2, "2", "cross"):
+                ot = 2
+            else:
+                ot = 1
+            return max(hv, 0.0), ot
+        return 0.0, 1
+
+    async def confirm(self, token: str) -> dict[str, Any]:
+        """Consume token, re-check arming + gates, set leverage, place order."""
+        async with self._trade_lock:
+            return await self._confirm_locked(token)
+
+    async def _confirm_locked(self, token: str) -> dict[str, Any]:
+        if not self.settings.trading_enabled:
+            # Consume token so it cannot be reused after arming without re-preview
+            try:
+                self.store.consume(token)
+            except TokenError:
+                pass
+            raise OrderError(
+                "DISARMED: TRADING_ENABLED=false — confirm blocked. "
+                "Set TRADING_ENABLED=true in .env to arm live trading."
+            )
+
+        try:
+            payload = self.store.consume(token)
+        except TokenError as e:
+            raise OrderError(str(e)) from e
+
+        token_hash = PreviewStore.hash_token(token)
+        if self.db is not None:
+            await self.db.mark_preview_used(token_hash)
+
+        ticket = OrderTicket.model_validate(payload["ticket"])
+        symbol = ticket.symbol.upper().strip()
+        external_oid = str(payload.get("external_oid") or f"mlt-{uuid.uuid4().hex[:20]}")
+        preview_last = payload.get("last_price")
+        if preview_last is not None:
+            preview_last = float(preview_last)
+
+        try:
+            contract = await self.client.contract_meta(symbol)
+        except ExchangeError as e:
+            raise OrderError(f"contract meta failed: {e}") from e
+
+        last_price: float | None = None
+        try:
+            ticker = await self.client.ticker(symbol)
+            if ticker.last_price:
+                last_price = float(ticker.last_price)
+        except ExchangeError as e:
+            raise OrderError(f"ticker failed on confirm: {e}") from e
+
+        equity, available = await self._balances()
+        existing = await self._existing_risk(
+            symbol, ticket.side, contract.contract_size
+        )
+
+        gate = validate_order(
+            ticket,
+            contract,
+            equity,
+            self.settings,
+            last_price=last_price,
+            for_confirm=True,
+            existing_same_side_risk_usdt=existing,
+            available_usdt=available,
+            preview_last_price=preview_last,
+        )
+        if not gate.ok:
+            raise OrderError(
+                "order failed risk gates on confirm",
+                errors=gate.errors,
+            )
+
+        # Manual mode: the trader manages the exit; NO exchange SL/TP trigger is
+        # attached. The SL value is still required (risk gates), but it is not
+        # sent to the exchange, and the SL-verify / auto-flatten paths below are
+        # deliberately skipped for this order only.
+        manual_sltp = getattr(ticket, "trigger_mode", "auto") == "manual"
+
+        # Fail-closed option: manual mode places NO exchange stop, so it bypasses
+        # the exchange-side protection even when ALLOW_UNPROTECTED_ENTRY=false.
+        # When ALLOW_MANUAL_TRIGGER=false, refuse manual orders entirely.
+        if manual_sltp and not getattr(self.settings, "allow_manual_trigger", True):
+            raise OrderError(
+                "manual trigger_mode blocked (ALLOW_MANUAL_TRIGGER=false) — "
+                "manual mode places no exchange SL/TP; use auto mode or enable "
+                "ALLOW_MANUAL_TRIGGER to permit it."
+            )
+
+        sl = gate.rounded_stop if gate.rounded_stop is not None else ticket.stop_loss
+        tp = gate.rounded_tp if gate.rounded_tp is not None else ticket.take_profit
+        # SL value is mandatory for the risk gate in BOTH modes (it sizes risk),
+        # unless unprotected entries are explicitly allowed.
+        if (sl is None or float(sl) <= 0) and not self.settings.allow_unprotected_entry:
+            raise OrderError(
+                "stop_loss required (ALLOW_UNPROTECTED_ENTRY=false); "
+                "cannot size risk without a stop"
+            )
+
+        try:
+            body = ticket_to_mexc_body(
+                ticket,
+                rounded_vol=gate.rounded_vol,
+                rounded_price=gate.rounded_price,
+                external_oid=external_oid,
+                stop_loss=sl,
+                take_profit=tp,
+                attach_triggers=not manual_sltp,
+            )
+        except OrderError:
+            raise
+
+        # Auto mode still requires the SL to be attachable on the body.
+        if (
+            not manual_sltp
+            and not self.settings.allow_unprotected_entry
+            and "stopLossPrice" not in body
+        ):
+            raise OrderError(
+                "SL not attachable on create body — blocked "
+                "(ALLOW_UNPROTECTED_ENTRY=false)"
+            )
+
+        # Set leverage — HARD fail (do not place with unknown leverage)
+        open_type = int(ticket.open_type or 1)
+        position_type = 1 if ticket.side == "long" else 2
+        try:
+            await self.client.set_leverage(
+                symbol,
+                int(ticket.leverage),
+                open_type,
+                position_type=position_type,
+            )
+        except ExchangeError as e:
+            raise OrderError(f"set_leverage failed — order blocked: {e}") from e
+
+        # Hold before place — used so auto-flatten never closes pre-existing size
+        pre_hold, _ = await self._same_side_hold_vol(symbol, ticket.side)
+
+        recovered_from_timeout = False
+        transport_err: str | None = None
+        try:
+            resp = await self.client.place_order(body)
+        except ExchangeError as e:
+            # Timeout / network: try recover by externalOid before declaring failure
+            recovered = None
+            err_l = str(e).lower()
+            if any(x in err_l for x in ("timeout", "timed out", "connect", "network")):
+                try:
+                    recovered = await self.client.order_by_external_oid(
+                        symbol, external_oid
+                    )
+                except ExchangeError:
+                    recovered = None
+                # Only count as recovered if OUR oid actually appears in the data
+                if recovered and external_oid not in str(recovered):
+                    recovered = None
+            if not recovered:
+                if self.db is not None:
+                    await self.db.insert_order(
+                        symbol=symbol,
+                        side=ticket.side,
+                        request_json=body,
+                        response_json={
+                            "error": getattr(e, "raw", None),
+                            "recovery": None,
+                        },
+                        status="error",
+                        error=str(e),
+                    )
+                raise OrderError(
+                    f"place_order failed: {e}. "
+                    f"If timeout, check the exchange for externalOid={external_oid} "
+                    "before retry (do not blind re-preview)."
+                ) from e
+            # Order is (likely) live — fall through to SL verify/flatten (not early-return)
+            recovered_from_timeout = True
+            transport_err = str(e)
+            resp = (
+                recovered
+                if isinstance(recovered, dict)
+                else {"data": recovered, "recovery": recovered}
+            )
+
+        # ── Post-placement: the order IS live from here on. ────────────
+        # Nothing below may raise out of confirm() — a crash here would
+        # report an error for an order that already exists on the exchange
+        # (and could bait the user into placing it again).
+        warnings: list[str] = list(gate.warnings)
+        if recovered_from_timeout:
+            warnings.append(
+                "place_order transport error but order recovered "
+                f"(externalOid={external_oid}). DO NOT re-preview — "
+                f"verify on the exchange. Detail: {transport_err}"
+            )
+        sl_verified: bool = True
+        sl_checked: bool = True
+        sl_detail = "no SL required"
+        flatten_result: dict[str, Any] | None = None
+        post_errors: list[str] = []
+
+        if manual_sltp:
+            # Manual mode: no exchange trigger by design → do not verify or
+            # auto-flatten. The trader was warned and confirmed they manage it.
+            sl_detail = "manual mode — no exchange SL/TP (trader manages exit)"
+            warnings.append(
+                "MANUELL: Kein Börsen-SL/TP platziert — du musst die Position "
+                "selbst schließen. Bei geschlossenem Browser ist sie ungeschützt."
+            )
+
+        try:
+            if (
+                not manual_sltp
+                and sl is not None
+                and float(sl) > 0
+                and not self.settings.allow_unprotected_entry
+            ):
+                # Trust only explicit exchange evidence: a real trigger-order id
+                # from the adapter (HL) or a stop order found on the exchange.
+                # Request echoes are never proof.
+                sl_trigger_oid = (
+                    resp.get("slTriggerOid") if isinstance(resp, dict) else None
+                )
+                trigger_errors = (
+                    resp.get("triggerErrors") if isinstance(resp, dict) else None
+                ) or []
+                if sl_trigger_oid is not None:
+                    sl_verified = True
+                    sl_detail = f"exchange accepted SL trigger (oid={sl_trigger_oid})"
+                else:
+                    sl_verified, sl_detail, sl_checked = await self._verify_sl_attached(
+                        symbol=symbol, expected_sl=float(sl), side=ticket.side
+                    )
+                    if trigger_errors:
+                        sl_detail += (
+                            f"; trigger errors: {'; '.join(map(str, trigger_errors))}"
+                        )
+
+                if not sl_verified and not sl_checked:
+                    # UNKNOWN is not the same as MISSING: never flatten blind,
+                    # or a broken lookup endpoint closes every protected trade.
+                    warnings.append(
+                        f"SL-Status UNBEKANNT ({sl_detail}) — Verifikation nicht "
+                        "möglich. Position auf der Börse manuell prüfen!"
+                    )
+                elif not sl_verified:
+                    warnings.append(
+                        f"CRITICAL: SL not verified after place ({sl_detail}). "
+                        "Position may be unprotected."
+                    )
+        except Exception as e:  # noqa: BLE001 — order is live, must not bubble
+            post_errors.append(f"post-place SL verify failed: {e}")
+            sl_verified = False
+            sl_checked = False
+            warnings.append(
+                "Post-Place-SL-Prüfung abgestürzt — Order IST platziert. "
+                "SL/Position jetzt manuell auf der Börse kontrollieren!"
+            )
+
+        # Flatten/cancel is separate so its failures never wipe SL flags.
+        # Never auto-flatten a manual-mode order — that IS the point of manual.
+        if (
+            not manual_sltp
+            and sl is not None
+            and float(sl) > 0
+            and not self.settings.allow_unprotected_entry
+            and not sl_verified
+            and sl_checked
+            and self.settings.auto_flatten_if_sl_unverified
+        ):
+            try:
+                hold_now, pos_open_type = await self._same_side_hold_vol(
+                    symbol, ticket.side
+                )
+                # Determine OUR fill. Prefer the exchange's reported fill from
+                # the order response — that is bot-safe: it counts only this
+                # order's volume, so a concurrent external bot adding same-side
+                # size in this window cannot inflate what we close.
+                reported_fill = _extract_filled_vol(resp)
+                if reported_fill is not None:
+                    new_fill = min(float(gate.rounded_vol), reported_fill)
+                    fill_source = "order response"
+                else:
+                    # FALLBACK ONLY (response carried no fill field): the hold
+                    # difference. This can include an external bot's same-side
+                    # fills from the same window; the min(rounded_vol, …) cap
+                    # below still guarantees we never close MORE than our own
+                    # order volume, but it may over-attribute a partial fill.
+                    new_fill = max(0.0, hold_now - pre_hold)
+                    fill_source = "hold difference (fallback)"
+                if new_fill <= 1e-12:
+                    # Unfilled resting entry: cancel it, do not close old pos
+                    cancel_ids: list[Any] = []
+                    if isinstance(resp, dict):
+                        for k in ("orderId", "order_id", "oid"):
+                            if resp.get(k) is not None:
+                                cancel_ids.append(resp.get(k))
+                                break
+                    is_hl = (
+                        getattr(self.client, "exchange_id", "") == "hyperliquid"
+                    )
+                    cancelled: list[Any] = []
+                    for coid in cancel_ids:
+                        try:
+                            if is_hl:
+                                await self.client.cancel_order(
+                                    [{"orderId": coid, "symbol": symbol}]
+                                )
+                            else:
+                                await self.client.cancel_order([coid])
+                            cancelled.append(coid)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    flatten_result = {
+                        "action": "cancel_resting",
+                        "cancelled": cancelled,
+                        "new_fill": 0.0,
+                        "pre_hold": pre_hold,
+                    }
+                    if cancelled:
+                        warnings.append(
+                            "AUTO_FLATTEN: no fill yet — cancelled resting "
+                            f"entry order(s) {cancelled} (pre-existing "
+                            f"hold {pre_hold} left untouched)"
+                        )
+                    else:
+                        warnings.append(
+                            "AUTO_FLATTEN: no fill and no orderId to cancel "
+                            "— check exchange for resting entry"
+                        )
+                else:
+                    vol = min(float(gate.rounded_vol), new_fill)
+                    flatten_result = await self.client.close_position_market(
+                        symbol,
+                        side=ticket.side,
+                        vol=vol,
+                        open_type=pos_open_type or open_type,
+                    )
+                    warnings.append(
+                        f"AUTO_FLATTEN: market close vol={vol} "
+                        f"(new_fill={new_fill} via {fill_source}, "
+                        f"pre_hold={pre_hold}) after unverified SL"
+                    )
+            except Exception as fe:  # noqa: BLE001
+                warnings.append(
+                    f"AUTO_FLATTEN failed: {fe} — close manually on the exchange"
+                )
+                flatten_result = {"error": str(fe)}
+
+        status = "recovered_placed" if recovered_from_timeout else "placed"
+        if manual_sltp:
+            status = "placed_manual"
+        elif sl is not None and float(sl) > 0 and not sl_verified:
+            if not sl_checked:
+                status = (
+                    "recovered_placed_sl_unknown"
+                    if recovered_from_timeout
+                    else "placed_sl_unknown"
+                )
+            else:
+                status = (
+                    "recovered_placed_sl_unverified"
+                    if recovered_from_timeout
+                    else "placed_sl_unverified"
+                )
+                if flatten_result and not (
+                    isinstance(flatten_result, dict) and flatten_result.get("error")
+                ):
+                    status = status + "_flatten_sent"
+
+        # Audit log must survive its own failures too
+        try:
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol,
+                    side=ticket.side,
+                    request_json=body,
+                    response_json={
+                        "place": resp if isinstance(resp, dict) else {"data": resp},
+                        "sl_verified": sl_verified,
+                        "sl_checked": sl_checked,
+                        "sl_detail": sl_detail,
+                        "flatten": flatten_result,
+                        "post_errors": post_errors,
+                    },
+                    status=status,
+                    error=None if sl_verified else status,
+                )
+        except Exception as e:  # noqa: BLE001
+            post_errors.append(f"audit log failed: {e}")
+
+        return {
+            "ok": True,
+            "external_oid": external_oid,
+            "request": body,
+            "response": resp,
+            "gate": gate.to_dict(),
+            "sl_verified": sl_verified,
+            "sl_checked": sl_checked,
+            "sl_detail": sl_detail,
+            "flatten": flatten_result,
+            "status": status,
+            "warnings": warnings,
+            "post_errors": post_errors,
+        }
+
+    async def close_position(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        vol: float | None = None,
+        fraction: float | None = None,
+    ) -> dict[str, Any]:
+        """Market-close an open position (full or partial). Hard-gated on arming.
+
+        fraction (0<f<=1): close that share of the CURRENT hold (server-side, so
+        the amount is never based on a stale UI value). vol still supported.
+        """
+        async with self._trade_lock:
+            return await self._close_position_locked(
+                symbol=symbol, side=side, vol=vol, fraction=fraction
+            )
+
+    async def _close_position_locked(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        vol: float | None = None,
+        fraction: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.settings.trading_enabled:
+            raise OrderError(
+                "DISARMED: TRADING_ENABLED=false — close blocked. "
+                "Set TRADING_ENABLED=true in .env to arm live trading."
+            )
+        symbol = symbol.upper().strip()
+        side = (side or "").lower()
+        if side not in ("long", "short"):
+            raise OrderError("side must be 'long' or 'short'")
+
+        try:
+            positions = await self.client.positions(symbol)
+        except ExchangeError as e:
+            raise OrderError(f"positions lookup failed: {e}") from e
+
+        # Exact symbol match; base-coin fallback ONLY on Hyperliquid (bare
+        # coins) — on MEXC BTC_USDT and BTC_USDC must never match each other.
+        is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
+        hold = 0.0
+        open_type = 1
+        for raw in positions:
+            p = map_position(raw) if "hold_vol" not in raw else raw
+            psym = str(p.get("symbol") or "").upper()
+            sym_match = psym == symbol or (
+                is_hl and psym.split("_")[0] == symbol.split("_")[0]
+            )
+            if sym_match and str(p.get("side") or "").lower() == side:
+                hold = float(p.get("hold_vol") or 0)
+                ot = p.get("open_type")
+                if ot in (2, "2", "cross"):
+                    open_type = 2
+                break
+        if hold <= 0:
+            raise OrderError(f"no open {side} position on {symbol}")
+
+        # Fraction is applied to the CURRENT hold; vol is capped at hold.
+        if fraction is not None and float(fraction) > 0:
+            f = min(1.0, float(fraction))
+            close_vol = hold * f
+        elif vol and float(vol) > 0:
+            close_vol = min(float(vol), hold)
+        else:
+            close_vol = hold
+
+        # Round to the exchange lot step so a partial close is not rejected.
+        try:
+            contract = await self.client.contract_meta(symbol)
+            vol_unit = float(contract.vol_unit or 0)
+            min_vol = float(contract.min_vol or 0)
+        except ExchangeError:
+            vol_unit = 0.0
+            min_vol = 0.0
+        # Never round a full close down (would leave dust); only partials.
+        is_full = close_vol >= hold - 1e-12
+        if not is_full and vol_unit > 0:
+            close_vol = round_down_to_unit(close_vol, vol_unit)
+        if close_vol <= 0 or (not is_full and min_vol > 0 and close_vol < min_vol):
+            raise OrderError(
+                f"close amount {close_vol} below exchange minimum {min_vol} — "
+                "choose a larger share or close the full position"
+            )
+
+        try:
+            resp = await self.client.close_position_market(
+                symbol, side=side, vol=close_vol, open_type=open_type
+            )
+        except ExchangeError as e:
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol,
+                    side=side,
+                    request_json={"action": "manual_close", "vol": close_vol},
+                    response_json=getattr(e, "raw", None),
+                    status="close_error",
+                    error=str(e),
+                )
+            raise OrderError(f"close failed: {e}") from e
+
+        if self.db is not None:
+            await self.db.insert_order(
+                symbol=symbol,
+                side=side,
+                request_json={"action": "manual_close", "vol": close_vol},
+                response_json=resp if isinstance(resp, dict) else {"data": resp},
+                status="closed",
+                error=None,
+            )
+        return {"ok": True, "closed_vol": close_vol, "hold_vol": hold, "response": resp}
+
+    async def cancel(
+        self,
+        *,
+        order_id: str | int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """Cancel via official POST /api/v1/private/order/cancel.
+
+        Fail-closed: require the id to appear in open orders (and symbol match
+        when provided) so a stale/wrong id is not blindly sent to the exchange.
+        """
+        if order_id is None:
+            raise OrderError("order_id required")
+
+        is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
+        if is_hl and not symbol:
+            raise OrderError("symbol required for Hyperliquid cancel")
+
+        oid: Any = int(order_id) if str(order_id).isdigit() else order_id
+
+        try:
+            open_rows = await self.client.open_orders(symbol)
+        except ExchangeError as e:
+            raise OrderError(
+                f"open orders lookup failed — cancel blocked: {e}"
+            ) from e
+
+        matched = False
+        for r in open_rows or []:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("orderId")
+            if rid is None:
+                rid = r.get("order_id")
+            if rid is None:
+                rid = r.get("oid")
+            if rid is None:
+                continue
+            if str(rid) != str(oid):
+                continue
+            if symbol:
+                rsym = str(r.get("symbol") or "").upper()
+                want = symbol.upper()
+                if rsym and rsym != want:
+                    if not (
+                        is_hl
+                        and rsym.split("_")[0] == want.split("_")[0]
+                    ):
+                        continue
+            matched = True
+            break
+        if not matched:
+            raise OrderError(
+                f"order {order_id} not found in open orders"
+                + (f" for {symbol}" if symbol else "")
+                + " — cancel blocked"
+            )
+
+        try:
+            if is_hl:
+                resp = await self.client.cancel_order(
+                    [{"orderId": oid, "symbol": symbol}]
+                )
+            else:
+                resp = await self.client.cancel_order([oid])
+        except ExchangeError as e:
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol or "",
+                    side=None,
+                    request_json={"orderId": order_id, "symbol": symbol},
+                    response_json=getattr(e, "raw", None),
+                    status="cancel_error",
+                    error=str(e),
+                )
+            raise OrderError(f"cancel failed: {e}") from e
+
+        # Batch cancel may return per-id errors
+        cancel_ok = True
+        detail = resp
+        if isinstance(resp, list):
+            for item in resp:
+                if isinstance(item, dict) and item.get("errorCode") not in (None, 0, "0"):
+                    cancel_ok = False
+        elif isinstance(resp, dict) and resp.get("success") is False:
+            cancel_ok = False
+
+        if self.db is not None:
+            await self.db.insert_order(
+                symbol=symbol or "",
+                side=None,
+                request_json={"orderId": order_id, "symbol": symbol},
+                response_json=resp if isinstance(resp, (dict, list)) else {"data": resp},
+                status="cancelled" if cancel_ok else "cancel_partial_error",
+                error=None if cancel_ok else "per-id cancel error in response",
+            )
+        return {"ok": cancel_ok, "response": detail}
+
+
+def _confirm_summary(
+    ticket: OrderTicket,
+    gate: GateResult,
+    contract: ContractMeta,
+    equity: float,
+    last_price: float | None,
+) -> dict[str, Any]:
+    return {
+        "symbol": ticket.symbol,
+        "side": ticket.side,
+        "order_type": ticket.order_type,
+        "vol": gate.rounded_vol,
+        "price": gate.rounded_price,
+        "leverage": ticket.leverage,
+        "entry_for_risk": gate.entry_for_risk,
+        "stop_loss": gate.rounded_stop if gate.rounded_stop is not None else ticket.stop_loss,
+        "take_profit": gate.rounded_tp if gate.rounded_tp is not None else ticket.take_profit,
+        "risk_usdt": gate.risk_usdt,
+        "risk_pct": gate.risk_pct,
+        "rrr": gate.rrr,
+        "notional_usdt": gate.notional_usdt,
+        "equity_usdt": equity,
+        "last_price": last_price,
+        "contract_size": contract.contract_size,
+        "api_allowed": contract.api_allowed,
+        "open_type": ticket.open_type,
+        # Bind the SL/TP mode to the preview so the confirm modal shows the
+        # warning for what the token ACTUALLY does, not the live UI toggle.
+        "trigger_mode": getattr(ticket, "trigger_mode", "auto"),
+        "irreversible": True,
+        "live": True,
+    }
+
+

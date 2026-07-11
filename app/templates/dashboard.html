@@ -1,0 +1,310 @@
+{% extends "base.html" %}
+{% block title %}Obsidian — {{ default_symbol }}{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="brand" aria-hidden="true">
+      <img class="brand-logo" src="/static/obsidian.ico" alt="" width="26" height="26" />
+      <span class="brand-name">Obsidian<br />Live Trader</span>
+    </div>
+    <label class="field-inline symbol-picker" id="symbol-picker">
+      <span>Symbol</span>
+      <input
+        id="symbol-input"
+        type="text"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="symbol-dropdown"
+        aria-autocomplete="list"
+        title="Coin tippen zum Filtern (z.B. „b" für BTC), ↑/↓ + Enter"
+        placeholder="Coin…"
+        autocomplete="off"
+        spellcheck="false"
+        value="{{ default_symbol }}"
+      />
+      <div id="symbol-dropdown" class="symbol-dropdown hidden" role="listbox" aria-label="Coin-Ergebnisse"></div>
+    </label>
+    <div class="tf-group" role="group" aria-label="Timeframe">
+      <button type="button" class="tf-btn" data-tf="5m">5m</button>
+      <button type="button" class="tf-btn active" data-tf="15m">15m</button>
+      <button type="button" class="tf-btn" data-tf="1H">1H</button>
+      <button type="button" class="tf-btn" data-tf="4H">4H</button>
+      <button type="button" class="tf-btn" data-tf="1D">1D</button>
+    </div>
+    <button type="button" id="btn-load" class="btn btn-secondary">Laden</button>
+  </div>
+  <div class="topbar-right">
+    {# Arming status: dezenter Chip statt Balken. JS toggelt .armed. #}
+    <span id="arm-status" class="arm-status{% if trading_enabled %} armed{% endif %}"
+          data-tip="Ob echte Orders möglich sind. DISARMED = gesperrt (Sicherheitsschalter TRADING_ENABLED in der .env).">
+      <span class="arm-dot" aria-hidden="true"></span>
+      <span class="arm-text">{% if trading_enabled %}LIVE{% else %}DISARMED{% endif %}</span>
+    </span>
+    <div class="health" title="API-Status">
+      <span class="health-item">
+        <span id="dot-exchange" class="status-dot unknown"></span>
+        <span id="exchange-label">{{ exchange|default('EXCHANGE')|upper }}</span>
+      </span>
+      <span class="health-item">
+        <span id="dot-xai" class="status-dot unknown"></span>
+        <span id="llm-label">Claude</span>
+      </span>
+    </div>
+    <div class="equity" title="Equity">
+      <span class="equity-label">Equity</span>
+      <strong id="equity-value">—</strong>
+      <span class="equity-label" id="equity-ccy">{{ 'USDC' if exchange == 'hyperliquid' else 'USDT' }}</span>
+    </div>
+  </div>
+</header>
+
+<div class="symbol-tabs" id="symbol-tabs" role="tablist" aria-label="Beobachtete Coins">
+  <button type="button" class="tab-add" id="tab-add-btn" title="Coin beobachten" aria-label="Coin hinzufügen">+</button>
+</div>
+
+<main class="layout">
+  <section class="panel chart-panel">
+    <div class="panel-head">
+      <h2>Chart</h2>
+      <div class="panel-head-right">
+        <span id="chart-meta" class="muted"></span>
+        <button type="button" id="btn-toggle-zones" class="btn-ai-lines active" title="Trade-Zonen (SL/TP-Felder) ein-/ausblenden">Zonen</button>
+        <button type="button" id="btn-toggle-ai-lines" class="btn-ai-lines active" title="KI-Linien im Chart ein-/ausblenden">KI-Linien</button>
+        <span id="rt-badge" class="rt-badge" title="Realtime WebSocket">RT</span>
+      </div>
+    </div>
+    <div id="chart-wrap" class="chart-wrap">
+      <div id="chart" class="chart"></div>
+      <canvas id="trade-overlay" class="trade-overlay"></canvas>
+    </div>
+  </section>
+
+  <section class="statbar" aria-label="Marktkontext">
+    <div class="stat stat-price">
+      <span class="stat-label">Preis</span>
+      <span class="stat-value" id="ctx-price">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Funding</span>
+      <span class="stat-value" id="ctx-funding">—<span class="funding-cd" id="ctx-funding-cd"></span></span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">RSI 14</span>
+      <span class="stat-value" id="ctx-rsi">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">EMA 20 / 50</span>
+      <span class="stat-value" id="ctx-ema">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Support</span>
+      <span class="stat-value" id="ctx-support">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Resistance</span>
+      <span class="stat-value" id="ctx-resistance">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Range</span>
+      <span class="stat-value" id="ctx-range">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Contract</span>
+      <span class="stat-value" id="ctx-contract">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">API-Orders</span>
+      <span class="stat-value" id="ctx-api-allowed">—</span>
+    </div>
+  </section>
+
+  <section class="panel positions-panel">
+    <div class="panel-head"><h2>Positionen</h2></div>
+    <div id="positions-body" class="positions-body muted">—</div>
+  </section>
+
+  <section class="panel orders-panel">
+    <div class="panel-head">
+      <h2>Offene Orders</h2>
+      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
+    </div>
+    <div id="open-orders-body" class="orders-body muted">—</div>
+  </section>
+
+  <section class="panel proposal-panel">
+    <div class="panel-head">
+      <h2>KI-Analyse</h2>
+      <div class="proposal-actions">
+        <button type="button" id="btn-scan" class="btn btn-scan" title="Top-Coins nach Setups screenen (günstiges Modell, 1 Abfrage)">
+          ◎ Markt scannen
+        </button>
+        <select id="llm-select" class="llm-select" title="KI-Anbieter wechseln (sofort aktiv)">
+          <option value="claude">Claude Opus</option>
+          <option value="xai">Grok</option>
+          <option value="openai">Codex</option>
+          <option value="ollama">Ollama (lokal)</option>
+        </select>
+        <button type="button" id="btn-analyze" class="btn btn-secondary" title="Analyse anfordern">
+          Analysieren
+        </button>
+        <button type="button" id="btn-apply-proposal" class="btn btn-secondary" disabled title="Vorschlag ins Order-Ticket übernehmen">
+          In Ticket übernehmen
+        </button>
+      </div>
+    </div>
+    <div id="scan-strip" class="scan-strip hidden"></div>
+    <div id="proposal-body" class="placeholder">
+      Noch keine Analyse. „Analysieren" bewertet den aktuellen Coin, „Markt scannen" durchsucht die Top-Coins nach Setups. Der Vorschlag füllt nur das Ticket — jede Order läuft durch die Risk-Gates.
+    </div>
+  </section>
+
+  <aside class="panel ticket-panel" id="ticket-panel" data-side="long">
+    <div class="panel-head"><h2>Order</h2></div>
+    <form id="order-form" class="ticket-form" autocomplete="off">
+
+      <div class="side-seg" role="group" aria-label="Seite">
+        <button type="button" class="side-btn side-btn-long active" data-side="long">Long</button>
+        <button type="button" class="side-btn side-btn-short" data-side="short">Short</button>
+      </div>
+      <select id="ticket-side" name="side" class="visually-hidden" tabindex="-1" aria-hidden="true">
+        <option value="long" selected>Long</option>
+        <option value="short">Short</option>
+      </select>
+
+      <div class="type-seg" role="group" aria-label="Ordertyp">
+        <button type="button" class="type-btn active" data-type="market">Market</button>
+        <button type="button" class="type-btn" data-type="limit">Limit</button>
+      </div>
+      <select id="ticket-type" name="order_type" class="visually-hidden" tabindex="-1" aria-hidden="true">
+        <option value="market" selected>Market</option>
+        <option value="limit">Limit</option>
+      </select>
+
+      <div class="row">
+        <label>
+          <span class="field-name" data-tip="Position = Gegenwert der Position in {{ 'USDC' if exchange == 'hyperliquid' else 'USDT' }} (Notional). Margin = eingesetztes Kapital; Position = Margin × Hebel. Coin-Menge = Notional ÷ Kurs.">
+            <span id="size-mode-label">Größe ({{ 'USDC' if exchange == 'hyperliquid' else 'USDT' }})</span><i class="tip-cue">i</i>
+            <span class="size-mode-seg" role="group" aria-label="Größen-Modus">
+              <button type="button" class="size-mode-btn active" data-size-mode="position">Position</button>
+              <button type="button" class="size-mode-btn" data-size-mode="margin">Margin</button>
+            </span>
+          </span>
+          <input id="ticket-usdt" name="usdt" type="number" min="0" step="any" placeholder="z.B. 100" />
+        </label>
+        <label>
+          <span class="field-name tip-left" data-tip="Multipliziert die Positionsgröße. Höherer Hebel = weniger Margin nötig, aber die Liquidation rückt näher. Das Maximum setzt die Börse pro Coin.">Hebel<i class="tip-cue">i</i><span id="lev-max-hint" class="lev-max-hint"></span></span>
+          <input id="ticket-leverage" name="leverage" type="number" min="1" max="{{ max_leverage|default(20) }}" step="1" value="5" />
+        </label>
+      </div>
+      <div class="liq-readout" id="liq-readout"></div>
+      <p id="liq-warn" class="ticket-danger hidden" role="alert"></p>
+      <!-- internal contract volume derived from the USDT amount -->
+      <input id="ticket-size" name="size" type="hidden" />
+
+      <div class="size-readout">
+        <span id="ticket-size-hint">≈ — · Margin —</span>
+        <button type="button" id="btn-suggest-vol" class="btn btn-ghost" data-tip="Berechnet die Größe so, dass der Stop-Loss genau MAX_RISK_PCT deines Equity riskiert (Stop-Loss vorher eintragen).">1 % Risiko</button>
+      </div>
+
+      <div class="row" id="row-prices">
+        <label id="field-limit-price">
+          <span class="field-name" data-tip="Nur bei Limit-Orders: dein Wunsch-Ausführungskurs. Die Order wird erst gefüllt, wenn der Markt diesen Kurs erreicht.">Limit-Preis<i class="tip-cue">i</i></span>
+          <input id="ticket-price" name="price" type="number" min="0" step="any" placeholder="—" />
+        </label>
+        <label>
+          <span class="field-name tip-left" data-tip="Referenzkurs für die Risikoberechnung. Bei Market-Orders ≈ der letzte gehandelte Preis.">Entry-Referenz<i class="tip-cue">i</i></span>
+          <input id="ticket-entry" name="entry" type="number" min="0" step="any" placeholder="Market = letzter" />
+        </label>
+      </div>
+
+      <div class="sltp-mode-row">
+        <span class="sltp-mode-label">SL / TP als</span>
+        <div class="sltp-mode-seg" role="group" aria-label="SL/TP-Eingabemodus">
+          <button type="button" class="sltp-mode-btn active" data-mode="price">Kurs</button>
+          <button type="button" class="sltp-mode-btn" data-mode="pct">%</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label class="field-sl">
+          <span class="field-name" data-tip="Stop-Loss: schließt die Position automatisch mit Verlust — deine Absicherung. Pflicht. Umschaltbar zwischen absolutem Kurs und Abstand in % vom Entry.">Stop-Loss<i class="tip-cue">i</i></span>
+          <input id="ticket-sl" name="sl" type="number" min="0" step="any" placeholder="Kurs, z.B. 61000" />
+        </label>
+        <label class="field-tp">
+          <span class="field-name tip-left" data-tip="Take-Profit: Kursziel für die Gewinnmitnahme. Optional. Umschaltbar zwischen absolutem Kurs und Abstand in % vom Entry.">Take-Profit<i class="tip-cue">i</i></span>
+          <input id="ticket-tp1" name="tp1" type="number" min="0" step="any" placeholder="Kurs, z.B. 64000" />
+        </label>
+      </div>
+
+      <div class="risk-readout" id="risk-readout">
+        <div class="risk-cell risk-sl">
+          <span class="risk-label">Stop-Loss</span>
+          <span class="risk-val" id="rr-sl">—</span>
+        </div>
+        <div class="risk-cell risk-tp">
+          <span class="risk-label">Take-Profit</span>
+          <span class="risk-val" id="rr-tp">—</span>
+        </div>
+        <div class="risk-cell">
+          <span class="risk-label">Chance/Risiko</span>
+          <span class="risk-val" id="rr-rrr">—</span>
+        </div>
+        <div class="risk-cell risk-liq">
+          <span class="risk-label">Liquidation</span>
+          <span class="risk-val" id="rr-liq">—</span>
+        </div>
+      </div>
+
+      <div class="sltp-mode-row">
+        <span class="sltp-mode-label" data-tip="Börse: SL/TP werden als Trigger-Orders auf der Börse platziert und automatisch ausgeführt (empfohlen). Manuell: KEIN Börsen-SL/TP — du schließt selbst. Bei geschlossenem Browser ist die Position ungeschützt.">SL/TP-Ausführung<i class="tip-cue">i</i></span>
+        <div class="sltp-mode-seg" role="group" aria-label="SL/TP-Ausführung">
+          <button type="button" class="trigger-mode-btn active" data-trigger="auto">Börse</button>
+          <button type="button" class="trigger-mode-btn" data-trigger="manual">Manuell</button>
+        </div>
+      </div>
+      <p id="trigger-mode-warn" class="ticket-danger hidden" role="alert">
+        ⚠ KEIN Börsen-Stop — du musst selbst schließen. Bei geschlossenem Browser ungeschützt.
+      </p>
+
+      <button type="submit" id="btn-send-order" class="btn-submit">
+        Order prüfen (Preview)
+      </button>
+
+      <p class="hint muted">Preview prüft die Risk-Gates. Live geht die Order erst nach dem Confirm im nächsten Schritt.</p>
+      <p id="ticket-error" class="error-text hidden" role="alert"></p>
+    </form>
+  </aside>
+
+  <section class="panel history-panel">
+    <div class="panel-head">
+      <h2>Historie</h2>
+      <button type="button" id="btn-history-refresh" class="btn btn-ghost" title="Historie neu laden">
+        Aktualisieren
+      </button>
+    </div>
+    <div id="history-body" class="placeholder">
+      Lade Historie…
+    </div>
+  </section>
+</main>
+
+<!-- Confirm modal -->
+<div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal-backdrop" data-close-modal></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="confirm-title">Order bestätigen — LIVE</h2>
+      <button type="button" class="btn btn-ghost modal-close" data-close-modal aria-label="Schließen">×</button>
+    </div>
+    <div id="confirm-body" class="modal-body"></div>
+    <div class="modal-actions">
+      <button type="button" id="btn-confirm-cancel" class="btn btn-secondary" data-close-modal>Abbrechen</button>
+      <button type="button" id="btn-confirm-live" class="btn btn-confirm">Confirm LIVE</button>
+    </div>
+    <p id="confirm-error" class="error-text hidden" role="alert"></p>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+{% endblock %}

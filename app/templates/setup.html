@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ersteinrichtung — Obsidian Live Trader</title>
+  <link rel="icon" href="/static/obsidian.ico" sizes="any" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="live-banner" role="note">
+    <span class="live-dot" aria-hidden="true"></span>
+    <span class="live-text">ERSTEINRICHTUNG</span>
+    <span class="banner-chip chip-disarmed">DISARMED</span>
+  </div>
+
+  <main class="setup-wrap">
+    <header class="setup-head">
+      <span class="brand-mark" aria-hidden="true">◮</span>
+      <div>
+        <h1>Obsidian Live Trader einrichten</h1>
+        <p class="muted">
+          Drei Schritte, dann läuft alles. Deine Keys landen nur in der lokalen
+          <code>.env</code> auf diesem Rechner — nirgendwo sonst.
+        </p>
+      </div>
+    </header>
+
+    <form id="setup-form" autocomplete="off">
+
+      <!-- Schritt 1: Börse -->
+      <section class="panel setup-section">
+        <div class="panel-head"><h2>1 · Börse</h2></div>
+        <div class="setup-body">
+          <div class="choice-grid" role="radiogroup" aria-label="Börse">
+            <label class="choice-card">
+              <input type="radio" name="exchange" value="hl-testnet" checked />
+              <span class="choice-title">Hyperliquid Testnet</span>
+              <span class="choice-desc">Empfohlen zum Start — Spielgeld, kein Risiko. Faucet auf app.hyperliquid-testnet.xyz.</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="exchange" value="hl-mainnet" />
+              <span class="choice-title">Hyperliquid Mainnet</span>
+              <span class="choice-desc">Echtes Geld. Nur wenn du den Flow schon kennst.</span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="exchange" value="mexc" />
+              <span class="choice-title">MEXC Futures</span>
+              <span class="choice-desc">USDT-M Perpetuals. API-Key nur mit Trade-Recht, ohne Withdraw.</span>
+            </label>
+          </div>
+
+          <div id="fields-hl" class="setup-fields">
+            <label>
+              <span>Private Key (API/Agent-Wallet, beginnt mit 0x)</span>
+              <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" />
+            </label>
+            <label>
+              <span>Haupt-Wallet-Adresse <em class="label-note">nur bei Agent-Key nötig</em></span>
+              <input type="text" id="hl-account-address" placeholder="0x… (optional)" spellcheck="false" />
+            </label>
+            <p class="hint muted">Tipp: Lege in der Hyperliquid-UI unter „API" einen Agent-Key an — der kann handeln, aber nie abheben.</p>
+          </div>
+
+          <div id="fields-mexc" class="setup-fields hidden">
+            <label>
+              <span>MEXC API Key</span>
+              <input type="password" id="mexc-api-key" spellcheck="false" />
+            </label>
+            <label>
+              <span>MEXC API Secret</span>
+              <input type="password" id="mexc-api-secret" spellcheck="false" />
+            </label>
+            <p class="hint muted">Im MEXC-Account: Trade erlauben, Withdraw/Transfer deaktivieren.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Schritt 2: KI -->
+      <section class="panel setup-section">
+        <div class="panel-head"><h2>2 · KI-Analyse</h2></div>
+        <div class="setup-body">
+          <label>
+            <span>Anbieter <em class="label-note">später im UI per Dropdown wechselbar</em></span>
+            <select id="llm-provider">
+              <option value="claude" selected>Claude Opus (Anthropic)</option>
+              <option value="xai">Grok (xAI)</option>
+              <option value="openai">Codex (OpenAI)</option>
+              <option value="ollama">Ollama — lokal, kein Key</option>
+              <option value="none">Ohne KI starten</option>
+            </select>
+          </label>
+          <label id="field-llm-key">
+            <span id="llm-key-label">Anthropic API Key</span>
+            <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" />
+          </label>
+          <div id="fields-ollama" class="setup-fields hidden">
+            <label>
+              <span>Ollama-Modell</span>
+              <input type="text" id="ollama-model" value="llama3.1" spellcheck="false" />
+            </label>
+            <p class="hint muted">Voraussetzung: <code>ollama serve</code> läuft lokal (Port 11434).</p>
+          </div>
+          <label class="setup-check" id="field-include-account">
+            <input type="checkbox" id="include-account" checked />
+            <span>Kontostand &amp; Positionen an die KI senden <em class="label-note">bessere Sizing-Vorschläge; bei Cloud-Anbietern verlassen diese Daten deinen Rechner</em></span>
+          </label>
+          <p class="hint muted">Die KI schlägt nur vor — jede Order läuft durch die Risk-Gates und braucht dein Confirm.</p>
+        </div>
+      </section>
+
+      <!-- Schritt 3: Risiko -->
+      <section class="panel setup-section">
+        <div class="panel-head"><h2>3 · Risiko-Limits</h2></div>
+        <div class="setup-body">
+          <div class="setup-grid">
+            <label>
+              <span>Max. Risiko pro Trade (% Equity)</span>
+              <input type="number" id="risk-pct" value="1.0" min="0.1" max="10" step="0.1" />
+            </label>
+            <label>
+              <span>Max. Hebel</span>
+              <input type="number" id="max-leverage" value="20" min="1" max="125" step="1" />
+            </label>
+            <label>
+              <span>Min. Chance/Risiko (RRR)</span>
+              <input type="number" id="min-rrr" value="2.0" min="1" max="10" step="0.1" />
+            </label>
+            <label>
+              <span>Max. Ordergröße (USD Notional)</span>
+              <input type="number" id="max-notional" value="500" min="10" step="10" />
+            </label>
+          </div>
+          <p class="hint muted">
+            Bewährte Defaults — im Zweifel so lassen. Alle Limits werden serverseitig
+            bei jeder Order erzwungen und sind später in der <code>.env</code> änderbar.
+          </p>
+        </div>
+      </section>
+
+      <div class="setup-note">
+        <strong>Sicherheit:</strong> Trading startet <strong>DISARMED</strong> — es kann
+        keine Order rausgehen, bis du bewusst <code>TRADING_ENABLED=true</code> in die
+        <code>.env</code> schreibst. Ein lokales API-Token wird automatisch generiert.
+      </div>
+
+      <button type="submit" id="btn-save" class="btn-submit">Konfiguration speichern &amp; starten</button>
+      <p id="setup-error" class="error-text hidden" role="alert"></p>
+      <p id="setup-ok" class="hint hidden">Gespeichert — Terminal startet…</p>
+    </form>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+      function $(id) { return document.getElementById(id); }
+
+      function syncExchange() {
+        var ex = document.querySelector('input[name="exchange"]:checked').value;
+        $("fields-hl").classList.toggle("hidden", ex === "mexc");
+        $("fields-mexc").classList.toggle("hidden", ex !== "mexc");
+        document.querySelectorAll(".choice-card").forEach(function (c) {
+          c.classList.toggle("active", c.querySelector("input").checked);
+        });
+      }
+
+      var keyLabels = {
+        claude: "Anthropic API Key",
+        xai: "xAI API Key",
+        openai: "OpenAI API Key",
+      };
+
+      function syncLlm() {
+        var p = $("llm-provider").value;
+        var needsKey = p === "claude" || p === "xai" || p === "openai";
+        $("field-llm-key").classList.toggle("hidden", !needsKey);
+        if (needsKey) $("llm-key-label").textContent = keyLabels[p];
+        $("fields-ollama").classList.toggle("hidden", p !== "ollama");
+      }
+
+      document.querySelectorAll('input[name="exchange"]').forEach(function (r) {
+        r.addEventListener("change", syncExchange);
+      });
+      $("llm-provider").addEventListener("change", syncLlm);
+      syncExchange();
+      syncLlm();
+
+      function fail(msg) {
+        var el = $("setup-error");
+        el.textContent = msg;
+        el.classList.remove("hidden");
+      }
+
+      $("setup-form").addEventListener("submit", async function (e) {
+        e.preventDefault();
+        $("setup-error").classList.add("hidden");
+
+        var ex = document.querySelector('input[name="exchange"]:checked').value;
+        var llm = $("llm-provider").value;
+        var payload = {
+          exchange: ex,
+          hl_private_key: $("hl-private-key").value.trim(),
+          hl_account_address: $("hl-account-address").value.trim(),
+          mexc_api_key: $("mexc-api-key").value.trim(),
+          mexc_api_secret: $("mexc-api-secret").value.trim(),
+          llm_provider: llm,
+          llm_api_key: $("llm-api-key").value.trim(),
+          ollama_model: $("ollama-model").value.trim(),
+          include_account_in_llm: $("include-account").checked,
+          max_risk_pct: Number($("risk-pct").value),
+          max_leverage: Number($("max-leverage").value),
+          min_rrr: Number($("min-rrr").value),
+          max_notional_usdt: Number($("max-notional").value),
+        };
+
+        if (ex !== "mexc" && !payload.hl_private_key) {
+          return fail("Hyperliquid Private Key fehlt.");
+        }
+        if (ex === "mexc" && (!payload.mexc_api_key || !payload.mexc_api_secret)) {
+          return fail("MEXC API Key und Secret werden benötigt.");
+        }
+        if ((llm === "claude" || llm === "xai" || llm === "openai") && !payload.llm_api_key) {
+          return fail("API Key für den gewählten KI-Anbieter fehlt (oder wähle Ollama / Ohne KI).");
+        }
+
+        var btn = $("btn-save");
+        btn.disabled = true;
+        btn.textContent = "Speichere…";
+        try {
+          var res = await fetch("/api/setup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          var data = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            var d = data && data.detail;
+            fail(typeof d === "string" ? d : JSON.stringify(d || "Speichern fehlgeschlagen"));
+            btn.disabled = false;
+            btn.textContent = "Konfiguration speichern & starten";
+            return;
+          }
+          $("setup-ok").classList.remove("hidden");
+          setTimeout(function () { window.location.href = "/"; }, 900);
+        } catch (err) {
+          fail("Netzwerkfehler: " + (err && err.message ? err.message : err));
+          btn.disabled = false;
+          btn.textContent = "Konfiguration speichern & starten";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

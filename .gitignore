@@ -1,0 +1,26 @@
+# Secrets & local config — NEVER commit real keys
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_rsa*
+*.secret
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data / runtime
+data/
+*.db
+
+# Editors
+.idea/
+.vscode/
+
+# Development-internal (superpowers SDD artifacts)
+.superpowers/
