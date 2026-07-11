@@ -1986,12 +1986,19 @@
     if (!state.symbol) return null;
     // Only HL has a fill-history API today; skip the request entirely on MEXC.
     if (!(state.health && state.health.exchange === "hyperliquid")) return null;
+    // Sequence guard: a fast coin switch can leave an in-flight request from
+    // the previous symbol resolving AFTER the new symbol's own request,
+    // silently overwriting state.fills with stale data (markers flicker).
+    // Stamp each call and drop any response that isn't the most recent one.
+    const reqSeq = (state._fillsSeq || 0) + 1;
+    state._fillsSeq = reqSeq;
     try {
       const res = await apiFetch(
         "/api/fills?symbol=" + encodeURIComponent(state.symbol) + "&limit=100"
       );
       if (!res.ok) return null;
       const data = await res.json();
+      if (reqSeq !== state._fillsSeq) return null; // superseded by a newer call
       state.fills = Array.isArray(data.fills) ? data.fills : [];
       applyTradeMarkers();
       return data;
@@ -3081,11 +3088,11 @@
     opts = opts || {};
     sym = String(sym || "").toUpperCase().trim();
     if (!sym) return;
-    const newTab = !!opts.newTab || state._pendingNewTab === true;
+    const fromOverview = state.activeView === "overview"; // coming from overview → open a tab
+    const newTab = !!opts.newTab || state._pendingNewTab === true || fromOverview;
     state._pendingNewTab = false;
     ensureSymbolOption(sym);
 
-    if (state.activeView === "overview") state._pendingNewTab = true; // coming from overview → open a tab
     showChart();
 
     const existing = state.openTabs.indexOf(sym);
@@ -3288,6 +3295,7 @@
     ensureSymbolOption(sym);
     if (state.watchlist.indexOf(sym) === -1) state.watchlist.push(sym);
     saveWatchlist();
+    state._miniLast = 0; // bypass the 10s throttle so the new symbol's candles load immediately
     refreshOverview();
   }
   function removeWatch(sym) {
@@ -4548,6 +4556,7 @@
     let pollTick = 0;
     setInterval(function () {
       if (!state.symbol) return;
+      if (state.activeView !== "chart") return; // chart hidden (overview active) → skip background loads
       if (!state._chartKey) return; // overview start: no chart loaded yet → no market polling
       pollTick += 1;
       if (state.wsStatus === "live" && pollTick % 3 !== 0) return;
