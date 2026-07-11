@@ -446,6 +446,33 @@ async def account(request: Request, _: None = Depends(require_local_token)):
         return empty_account(error=str(e))
 
 
+@app.get("/api/fills")
+async def fills(
+    request: Request,
+    symbol: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    _: None = Depends(require_local_token),
+):
+    """Recent account executions for the chart trade markers. Read-only.
+
+    Only exchanges with a fill-history API are supported (Hyperliquid
+    userFills); others report supported=False and the UI hides the markers.
+    Soft errors (rate limit etc.) return 200 with an error string.
+    """
+    client = getattr(request.app.state, "mexc", None) or getattr(
+        request.app.state, "exchange", None
+    )
+    if client is None or not hasattr(client, "user_fills"):
+        return {"fills": [], "supported": False, "error": None}
+    if symbol:
+        symbol = normalize_symbol(symbol)
+    try:
+        rows = await client.user_fills(symbol=symbol, limit=limit)
+    except ExchangeError as e:
+        return {"fills": [], "supported": True, "error": str(e)}
+    return {"fills": rows, "supported": True, "error": None}
+
+
 @app.post("/api/analyze")
 async def analyze(
     request: Request,

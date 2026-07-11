@@ -50,6 +50,7 @@
     allSymbols: [], // full coin pool for the search dropdown
     openTabs: [], // watched coins in the chart tab bar (localStorage-backed)
     _pendingNewTab: false, // set by "+" tab / scanner so the next switch opens a new tab
+    fills: [], // account executions of the active symbol (chart markers)
   };
 
   function $(id) {
@@ -1257,6 +1258,7 @@
     drawProposalLines();
     drawPositionLines();
     drawOrderLines();
+    applyTradeMarkers(); // fills already loaded; time axis/TF may have changed
     drawTradeZones();
     updateNotionalHint();
     setChartMeta(data.symbol || symbol, tf, htf, candles.length);
@@ -1835,6 +1837,56 @@
       console.error("account draw", e);
     }
     return data;
+  }
+
+  /* ── Trade markers (E7): real executions on the time axis ───────────── */
+  async function loadFills() {
+    if (!state.symbol) return null;
+    // Only HL has a fill-history API today; skip the request entirely on MEXC.
+    if (!(state.health && state.health.exchange === "hyperliquid")) return null;
+    try {
+      const res = await apiFetch(
+        "/api/fills?symbol=" + encodeURIComponent(state.symbol) + "&limit=100"
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      state.fills = Array.isArray(data.fills) ? data.fills : [];
+      applyTradeMarkers();
+      return data;
+    } catch (e) {
+      console.error("loadFills", e);
+      return null;
+    }
+  }
+
+  function applyTradeMarkers() {
+    if (
+      !state.candleSeries ||
+      typeof state.candleSeries.setMarkers !== "function"
+    )
+      return;
+    const markers = (state.fills || [])
+      .filter(function (f) {
+        return symMatch(f.symbol, state.symbol) && Number(f.time) > 0;
+      })
+      .map(function (f) {
+        const buy = f.side === "buy";
+        return {
+          time: barOpenTimeSec(f.time, state.tf || "15m"),
+          position: buy ? "belowBar" : "aboveBar",
+          color: buy ? "#4fbe8e" : "#e35349",
+          shape: buy ? "arrowUp" : "arrowDown",
+          text: (buy ? "▲ " : "▼ ") + fmt(f.sz, 4) + " @ " + fmt(f.px, 4),
+        };
+      });
+    markers.sort(function (a, b) {
+      return a.time - b.time;
+    });
+    try {
+      state.candleSeries.setMarkers(markers);
+    } catch (e) {
+      console.error("setMarkers", e);
+    }
   }
 
   /** Reference entry price for size/risk math: limit price, else entry ref,
@@ -2915,6 +2967,7 @@
     loadMarket(sym, tf, state.htf || "1H");
     loadOpenOrders();
     loadAccount();
+    loadFills();
     renderSymbolTabs();
   }
 
@@ -4060,6 +4113,7 @@
     loadSymbols();
     loadLlm();
     setInterval(loadAccount, 30000);
+    setInterval(loadFills, 30000); // same cadence as the account poll
     setInterval(loadOpenOrders, 30000);
     // Live chart poll, adaptive:
     //  - WS live: ticks stream in real time already; full refresh
@@ -4087,6 +4141,7 @@
     addOpenTab(state.symbol);
     sizeTradeOverlay();
     drawTradeZones();
+    loadFills(); // initial markers for the boot symbol (reload case)
   });
 })();
 

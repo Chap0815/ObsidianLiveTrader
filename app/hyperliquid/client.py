@@ -437,6 +437,61 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"positions failed: {e}") from e
 
+    async def user_fills(
+        self, symbol: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Recent executions of the account (userFills), newest first.
+
+        Read-only /info call — also shows fills placed outside this app.
+        Normalized shape for the UI: symbol, px, sz, side, time(ms), dir,
+        closed_pnl, oid, fee.
+        """
+
+        def _f():
+            if not self.account_address and not self.private_key:
+                return []
+            addr = self.account_address
+            if not addr and self.private_key:
+                from eth_account import Account
+
+                addr = Account.from_key(self.private_key).address
+                self.account_address = addr
+            info = self._get_info()
+            fills = info.user_fills(addr) or []
+            coin_f = to_hl_coin(symbol) if symbol else None
+            out: list[dict[str, Any]] = []
+            for f in fills:
+                coin = str(f.get("coin") or "").upper()
+                if coin_f and coin != coin_f:
+                    continue
+                try:
+                    out.append(
+                        {
+                            "symbol": coin,
+                            "px": float(f.get("px") or 0),
+                            "sz": float(f.get("sz") or 0),
+                            "side": "buy" if str(f.get("side")) == "B" else "sell",
+                            "time": int(f.get("time") or 0),
+                            "dir": str(f.get("dir") or ""),
+                            "closed_pnl": float(f["closedPnl"])
+                            if f.get("closedPnl") not in (None, "")
+                            else None,
+                            "oid": f.get("oid"),
+                            "fee": float(f.get("fee") or 0),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+            out.sort(key=lambda r: r["time"], reverse=True)
+            return out[: max(1, int(limit))]
+
+        try:
+            return await self._to_thread(_f)
+        except HyperliquidError:
+            raise
+        except Exception as e:
+            raise HyperliquidError(f"user_fills failed: {e}") from e
+
     async def account_snapshot(self) -> dict[str, Any]:
         from app.mexc.client import map_account_snapshot
 
