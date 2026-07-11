@@ -771,9 +771,18 @@ async def sizing_suggest(
     if equity <= 0:
         raise HTTPException(status_code=400, detail="equity unavailable for sizing")
 
+    # Honor the client-requested risk %, but never let it exceed the gate's
+    # max_risk_pct — the suggestion must never label a size as "X% risk"
+    # while actually sizing for more than X% (or more than the hard cap).
+    requested_risk = ticket.risk_pct
+    if requested_risk is None or requested_risk <= 0:
+        effective_risk = s.max_risk_pct
+    else:
+        effective_risk = min(float(requested_risk), s.max_risk_pct)
+
     vol = suggest_vol(
         equity,
-        s.max_risk_pct,
+        effective_risk,
         contract.contract_size,
         entry,
         stop,
@@ -790,6 +799,7 @@ async def sizing_suggest(
         "entry": entry,
         "stop_loss": stop,
         "equity_usdt": equity,
+        "risk_pct": effective_risk,
         "max_risk_pct": s.max_risk_pct,
     }
 

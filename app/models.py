@@ -191,6 +191,13 @@ class OrderTicket(BaseModel):
         "auto",
         description="auto = exchange SL/TP triggers; manual = none, trader exits",
     )
+    risk_pct: float | None = Field(
+        None,
+        description=(
+            "Requested risk percent for /api/sizing/suggest; server caps it at "
+            "settings.max_risk_pct and falls back to that cap if omitted/invalid."
+        ),
+    )
 
 
 class ConfirmRequest(BaseModel):
