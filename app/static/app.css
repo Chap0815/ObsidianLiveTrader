@@ -994,9 +994,26 @@ select:focus {
 .pos-cockpit {
   padding: 12px;
   border-top: 2px solid var(--long);
+  cursor: pointer;
+  transition: background 0.12s ease;
 }
 
 .pos-cockpit.cp-short { border-top-color: var(--short); }
+
+.pos-cockpit:hover { background: var(--bg-elevated); }
+
+/* Multiple account-wide cards stack in the same panel; separate them (without
+   losing each card's own long/short top-border accent) and highlight the one
+   matching the currently active chart symbol. */
+.pos-cockpit { border-bottom: 1px solid var(--hairline); }
+.pos-cockpit:last-child { border-bottom: none; }
+
+.pos-cockpit.cp-active {
+  background: var(--accent-dim);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.pos-cockpit.cp-active:hover { background: var(--accent-dim); }
 
 .cp-head {
   display: flex;

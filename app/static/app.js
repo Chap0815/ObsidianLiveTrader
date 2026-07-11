@@ -888,55 +888,32 @@
     const el = $("positions-body");
     if (!el) return;
 
-    // Big cockpit PnL (active-symbol position)
-    const cp = el.querySelector(".pos-cockpit[data-entry]");
-    if (cp) {
+    // Cockpit PnL, live per tick. All open positions now render as cockpit
+    // cards (account-wide), but the streamed px is only valid for the
+    // currently active symbol — each card still gates on its own data-sym.
+    const cockpits = el.querySelectorAll(".pos-cockpit[data-entry]");
+    cockpits.forEach(function (cp) {
       const entry = Number(cp.getAttribute("data-entry"));
       const vol = Number(cp.getAttribute("data-vol"));
       const cs = Number(cp.getAttribute("data-cs")) || 1;
       const im = Number(cp.getAttribute("data-im"));
       const short = cp.getAttribute("data-side") === "short";
       const sym = cp.getAttribute("data-sym");
-      if (symMatch(sym, state.symbol) && Number.isFinite(entry) && Number.isFinite(vol)) {
-        const pnl = (px - entry) * vol * cs * (short ? -1 : 1);
-        const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
-        const cls = "cp-pnl js-upnl-big " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
-        const big = cp.querySelector(".js-upnl-big");
-        if (big) {
-          big.className = cls;
-          big.firstChild &&
-            (big.firstChild.nodeValue =
-              (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + " " + ccy() + " ");
-        }
-        const sub = cp.querySelector(".js-roe-big");
-        if (sub && roe != null) {
-          sub.textContent = (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE";
-        }
-      }
-    }
-
-    const rows = el.querySelectorAll(".pos-row[data-entry]");
-    rows.forEach(function (row) {
-      const entry = Number(row.getAttribute("data-entry"));
-      const vol = Number(row.getAttribute("data-vol"));
-      const cs = Number(row.getAttribute("data-cs")) || 1;
-      const short = row.getAttribute("data-side") === "short";
-      const sym = row.getAttribute("data-sym");
-      if (!symMatch(sym, state.symbol)) return; // px is for the active symbol
+      if (!symMatch(sym, state.symbol)) return; // px is for the active symbol only
       if (!Number.isFinite(entry) || !Number.isFinite(vol)) return;
-      const dir = short ? -1 : 1;
-      const pnl = (px - entry) * vol * cs * dir;
-      const im = Number(row.getAttribute("data-im"));
+      const pnl = (px - entry) * vol * cs * (short ? -1 : 1);
       const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
-      const pnlEl = row.querySelector(".js-upnl");
-      if (pnlEl) {
-        pnlEl.textContent = fmt(pnl, 2);
-        pnlEl.className = "js-upnl " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
+      const cls = "cp-pnl js-upnl-big " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
+      const big = cp.querySelector(".js-upnl-big");
+      if (big) {
+        big.className = cls;
+        big.firstChild &&
+          (big.firstChild.nodeValue =
+            (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + " " + ccy() + " ");
       }
-      const roeEl = row.querySelector(".js-roe");
-      if (roeEl && roe != null) {
-        roeEl.textContent = fmt(roe, 1) + "%";
-        roeEl.className = "js-roe " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
+      const sub = cp.querySelector(".js-roe-big");
+      if (sub && roe != null) {
+        sub.textContent = (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE";
       }
     });
     drawTradeZones(); // keep zones aligned as price moves
@@ -1500,20 +1477,26 @@
     const el = $("positions-body");
     if (!el) return;
     const positions = (data && data.positions) || [];
-    if (!positions.length) {
+    const open = positions.filter(function (p) {
+      return Math.abs(Number(p.hold_vol) || 0) > 0;
+    });
+    if (!open.length) {
       el.className = "positions-body muted";
       el.textContent = data && data.error ? String(data.error) : "Keine offenen Positionen.";
       return;
     }
 
-    // The position in the ACTIVE symbol becomes a full cockpit; others stay
-    // as compact rows below.
-    const active = positions.filter(function (p) {
+    // ALL open positions render as full cockpit cards, account-wide — not
+    // just the active symbol. The active symbol's card is visually
+    // highlighted (cp-active) but every other coin is equally full/clickable,
+    // no more "hidden + ansehen" compact rows.
+    const active = open.filter(function (p) {
       return symMatch(p.symbol, state.symbol);
     });
-    const others = positions.filter(function (p) {
+    const others = open.filter(function (p) {
       return !symMatch(p.symbol, state.symbol);
     });
+    const ordered = active.concat(others);
 
     const cs =
       (state.market && state.market.contract && state.market.contract.contractSize) || 1;
@@ -1524,10 +1507,12 @@
       const im = Number(p.im);
       const roe = Number.isFinite(pnl) && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
       const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
+      const isActive = symMatch(p.symbol, state.symbol);
       const notional =
         Number(p.hold_vol) * cs * Number(p.entry_price || 0);
       return (
-        '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") + '"' +
+        '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
+        (isActive ? " cp-active" : "") + '"' +
         _posDataAttrs(p, sideVal, cs) + ">" +
         '<div class="cp-head">' +
         sideTag(p.side) +
@@ -1557,32 +1542,14 @@
       );
     }
 
-    function compactRow(p) {
-      const pnl = Number(p.unrealized_pnl);
-      const pnlCls = Number.isFinite(pnl) && pnl !== 0 ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
-      const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
-      return (
-        '<div class="pos-row"' + _posDataAttrs(p, sideVal, cs) + ">" +
-        '<span class="pos-sym">' + escapeHtml(p.symbol || "—") + "</span>" +
-        sideTag(p.side) +
-        posKv("Entry", fmt(p.entry_price, 4)) +
-        '<span class="pos-kv"><b>uPnL</b><span class="js-upnl ' + pnlCls + '">' +
-        fmt(p.unrealized_pnl, 2) + "</span></span>" +
-        '<button type="button" class="btn-cancel-order btn-close-pos"' +
-        ' data-symbol="' + escapeHtml(String(p.symbol || "")) + '"' +
-        ' data-side="' + sideVal + '" data-frac="1">Schließen</button>' +
-        "</div>"
-      );
-    }
-
     el.className = "positions-body";
-    el.innerHTML =
-      active.map(cockpit).join("") + others.map(compactRow).join("");
+    el.innerHTML = ordered.map(cockpit).join("");
 
     // Partial-close buttons (cockpit) send a fraction; the server closes that
     // share of the CURRENT hold with lot rounding.
     el.querySelectorAll(".cp-close-btn").forEach(function (btn) {
-      btn.addEventListener("click", function () {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation(); // never let this bubble into the card's click-to-open-chart
         const box = btn.closest(".cp-close");
         if (!box) return;
         closePositionFrac(
@@ -1592,13 +1559,16 @@
         );
       });
     });
-    el.querySelectorAll(".btn-close-pos").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        closePositionFrac(
-          btn.getAttribute("data-symbol"),
-          btn.getAttribute("data-side"),
-          Number(btn.getAttribute("data-frac")) || 1
-        );
+
+    // K4: clicking a position card opens that coin's chart (goToSymbol).
+    // Event delegation on the panel so it survives re-renders; ignore clicks
+    // that land on a button or other interactive element inside the card
+    // (e.g. the partial-close buttons) so those keep their own behavior.
+    el.querySelectorAll(".pos-cockpit").forEach(function (card) {
+      card.addEventListener("click", function (e) {
+        if (e.target.closest("button, a, input, select, textarea")) return;
+        const sym = card.getAttribute("data-sym");
+        if (sym) goToSymbol(sym);
       });
     });
   }
@@ -2297,7 +2267,7 @@
       const res = await apiFetch("/api/sizing/suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(ticket),
+        body: JSON.stringify(Object.assign({}, ticket, { risk_pct: 2.0 })),
       });
       const data = await res.json().catch(function () {
         return {};
@@ -2325,7 +2295,7 @@
       }
       updateRiskReadout();
       showToast(
-        "Größe für 1 % Risiko: " +
+        "Größe für 2 % Risiko: " +
           fmt(data.notional_usdt, 2) + " " + ccy() +
           " ≈ " + fmt(data.base_amount, 6) + " " + (state.symbol || ""),
         "ok"
