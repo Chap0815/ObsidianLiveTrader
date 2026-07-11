@@ -53,7 +53,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 15.6px;
   line-height: 1.45;
 }
 
@@ -100,7 +100,7 @@ body {
   border: 1px solid var(--border);
   background: var(--bg-inset);
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--muted);
@@ -135,7 +135,7 @@ body {
 .banner-chip,
 .disarmed-badge {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   padding: 2px 8px;
   border-radius: 3px;
@@ -164,7 +164,7 @@ body {
   background: var(--bg-elevated);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 11.5px;
+  font-size: 13.8px;
   font-weight: 400;
   line-height: 1.45;
   letter-spacing: normal;
@@ -226,7 +226,7 @@ body {
   border-radius: 50%;
   border: 1px solid var(--faint);
   color: var(--faint);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 700;
   font-family: var(--sans);
   cursor: help;
@@ -269,7 +269,7 @@ body {
 
 .brand-mark {
   color: var(--accent);
-  font-size: 18px;
+  font-size: 21.6px;
   line-height: 1;
 }
 
@@ -283,7 +283,7 @@ body {
 
 .brand-name {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   line-height: 1.25;
   letter-spacing: 0.22em;
@@ -300,7 +300,7 @@ body {
 .field-inline > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -315,7 +315,7 @@ select {
   border-radius: var(--radius);
   padding: 6px 9px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   font-variant-numeric: tabular-nums;
   transition: border-color 0.12s ease;
 }
@@ -352,7 +352,7 @@ select:focus {
   padding: 6px 11px;
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 14.4px;
   transition: background 0.12s ease, color 0.12s ease;
 }
 
@@ -378,7 +378,7 @@ select:focus {
   padding: 6px 12px;
   cursor: pointer;
   font-family: var(--sans);
-  font-size: 12.5px;
+  font-size: 15px;
   font-weight: 500;
   background: var(--bg-elevated);
   color: var(--text);
@@ -428,7 +428,7 @@ select:focus {
   align-items: center;
   gap: 6px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   letter-spacing: 0.05em;
   color: var(--muted);
 }
@@ -465,7 +465,7 @@ select:focus {
 
 .equity-label {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -474,7 +474,7 @@ select:focus {
 
 .equity strong {
   font-family: var(--mono);
-  font-size: 16px;
+  font-size: 19.2px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--text);
@@ -483,7 +483,7 @@ select:focus {
 /* ── Layout grid ────────────────────────────────────────── */
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.9fr) minmax(380px, 1fr);
+  grid-template-columns: minmax(0, 2.2fr) minmax(400px, 0.85fr);
   grid-template-rows: auto;
   grid-template-areas:
     "chart     ticket"
@@ -525,7 +525,7 @@ select:focus {
 .panel-head h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.16em;
@@ -543,12 +543,12 @@ select:focus {
   align-items: center;
   gap: 8px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
 }
 
 .btn-ai-lines {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -577,7 +577,7 @@ select:focus {
 
 .llm-select {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 4px 6px;
 }
 
@@ -592,7 +592,7 @@ select:focus {
 
 #ticket-size-hint {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
@@ -621,7 +621,7 @@ select:focus {
 
 .risk-label {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -630,19 +630,19 @@ select:focus {
 
 .risk-val {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 14.4px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
 
 .risk-sl .risk-label { color: var(--short); }
 .risk-tp .risk-label { color: var(--long); }
-.rr-money { font-size: 10px; color: var(--muted); }
-.rr-dim { color: var(--faint); font-size: 11px; }
+.rr-money { font-size: 12px; color: var(--muted); }
+.rr-dim { color: var(--faint); font-size: 13.2px; }
 .rr-good { color: var(--long); }
 .rr-warn { color: var(--warn); }
 .rr-error { color: var(--short); }
-.rr-bad { color: var(--short); font-size: 10px; }
+.rr-bad { color: var(--short); font-size: 12px; }
 
 /* ── Confirm modal: blockers + summary card ─────────────── */
 .blocker-box {
@@ -660,7 +660,7 @@ select:focus {
 
 .blocker-title {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 15.6px;
   color: #ffc9c4;
   margin-bottom: 6px;
 }
@@ -672,19 +672,19 @@ select:focus {
 .blocker-list {
   margin: 0;
   padding-left: 18px;
-  font-size: 12.5px;
+  font-size: 15px;
   line-height: 1.55;
 }
 
 .blocker-box p {
   margin: 4px 0 0;
-  font-size: 12px;
+  font-size: 14.4px;
   line-height: 1.5;
 }
 
 .blocker-box code {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   background: rgba(0, 0, 0, 0.3);
   border-radius: 3px;
   padding: 1px 5px;
@@ -712,7 +712,7 @@ select:focus {
 .sum-side {
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 13px;
+  font-size: 15.6px;
   letter-spacing: 0.08em;
 }
 
@@ -722,12 +722,12 @@ select:focus {
 .sum-sym {
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 14px;
+  font-size: 16.8px;
 }
 
 .sum-type {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--muted);
   margin-left: auto;
 }
@@ -749,7 +749,7 @@ select:focus {
 
 .sum-label {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -758,14 +758,14 @@ select:focus {
 
 .sum-value {
   font-family: var(--mono);
-  font-size: 14px;
+  font-size: 16.8px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
 
 .sum-sub {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -781,7 +781,7 @@ select:focus {
 }
 
 .warn-title {
-  font-size: 11px;
+  font-size: 13.2px;
   font-weight: 600;
   color: var(--warn);
   margin-bottom: 4px;
@@ -825,7 +825,7 @@ select:focus {
 
 .scan-rank {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--faint);
   width: 16px;
@@ -834,7 +834,7 @@ select:focus {
 
 .scan-score {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   font-weight: 600;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
@@ -842,14 +842,14 @@ select:focus {
 
 .scan-score::after {
   content: "/10";
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 400;
   color: var(--faint);
 }
 
 .scan-setup {
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11.4px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -860,7 +860,7 @@ select:focus {
 }
 
 .scan-reason {
-  font-size: 12px;
+  font-size: 14.4px;
   color: var(--text);
   flex: 1 1 240px;
   min-width: 180px;
@@ -868,14 +868,14 @@ select:focus {
 
 .btn-scan-open {
   margin-left: auto;
-  font-size: 11.5px;
+  font-size: 13.8px;
   padding: 4px 12px;
 }
 
 .rt-badge,
 #rt-badge {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.1em;
   padding: 2px 6px;
@@ -918,7 +918,7 @@ select:focus {
 .placeholder {
   padding: 14px 12px;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 15px;
 }
 
 /* ── Statbar: instrument tiles under the chart ──────────── */
@@ -946,7 +946,7 @@ select:focus {
 
 .stat-label {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -956,7 +956,7 @@ select:focus {
 
 .stat-value {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
@@ -969,7 +969,7 @@ select:focus {
 }
 
 .stat-price .stat-value {
-  font-size: 21px;
+  font-size: 25.2px;
   font-weight: 600;
   line-height: 1.1;
 }
@@ -979,7 +979,7 @@ select:focus {
 }
 
 .funding-cd {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--faint);
   font-weight: 400;
 }
@@ -1002,20 +1002,20 @@ select:focus {
 
 .cp-sym {
   font-family: var(--mono);
-  font-size: 14px;
+  font-size: 16.8px;
   font-weight: 600;
 }
 
 .cp-lev {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--muted);
 }
 
 .cp-pnl {
   font-family: var(--mono);
-  font-size: 26px;
+  font-size: 31.2px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
@@ -1030,7 +1030,7 @@ select:focus {
 .cp-pnl.pnl-neg { color: var(--short); }
 
 .cp-pnl-sub {
-  font-size: 12px;
+  font-size: 14.4px;
   font-weight: 500;
   opacity: 0.85;
 }
@@ -1056,7 +1056,7 @@ select:focus {
 
 .cp-cell-label {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1065,7 +1065,7 @@ select:focus {
 
 .cp-cell-val {
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 15px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1079,7 +1079,7 @@ select:focus {
 
 .cp-close-label {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1094,7 +1094,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 5px 0;
   cursor: pointer;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
@@ -1114,7 +1114,7 @@ select:focus {
 .positions-body,
 .orders-body {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 13.8px;
   max-height: 200px;
   overflow-y: auto;
   overflow-x: hidden;
@@ -1143,11 +1143,11 @@ select:focus {
 
 .pos-sym {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 15.6px;
 }
 
 .side-tag {
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.1em;
   padding: 2px 7px;
@@ -1180,7 +1180,7 @@ select:focus {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px solid var(--border, #2a2438);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted, #8a86a0);
@@ -1206,12 +1206,12 @@ select:focus {
 }
 .other-coin-detail {
   color: var(--muted, #8a86a0);
-  font-size: 11px;
+  font-size: 13.2px;
 }
 .other-coin-go {
   margin-left: auto;
   color: var(--accent, #9a86e8);
-  font-size: 11px;
+  font-size: 13.2px;
 }
 
 /* SL-status banner in the position cockpit — the key safety nudge */
@@ -1219,7 +1219,7 @@ select:focus {
   margin: 6px 0;
   padding: 5px 9px;
   border-radius: 5px;
-  font-size: 11px;
+  font-size: 13.2px;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -1271,13 +1271,13 @@ select:focus {
 .symbol-dropdown::-webkit-scrollbar-track { background: transparent; }
 .symbol-option {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 6px 9px; border-radius: 3px; font-family: var(--mono); font-size: 12px;
+  padding: 6px 9px; border-radius: 3px; font-family: var(--mono); font-size: 14.4px;
   font-weight: 600; letter-spacing: 0.02em; color: var(--text); cursor: pointer;
 }
 .symbol-option:hover, .symbol-option.hl { background: var(--accent-dim); color: var(--accent); }
 .symbol-option.current { color: var(--accent); }
-.symbol-option.current::after { content: "●"; font-size: 8px; color: var(--accent); }
-.symbol-empty { padding: 10px 9px; color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+.symbol-option.current::after { content: "●"; font-size: 9.6px; color: var(--accent); }
+.symbol-empty { padding: 10px 9px; color: var(--faint); font-family: var(--mono); font-size: 13.8px; }
 
 /* ── Chart-Tab-Leiste ─────────────────────────────────────── */
 .symbol-tabs {
@@ -1290,7 +1290,7 @@ select:focus {
 .symbol-tab {
   display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
   padding: 5px 8px 5px 10px; border: 1px solid transparent; border-radius: var(--radius);
-  background: transparent; color: var(--muted); font-family: var(--mono); font-size: 11.5px;
+  background: transparent; color: var(--muted); font-family: var(--mono); font-size: 13.8px;
   font-weight: 600; letter-spacing: 0.02em; cursor: pointer; white-space: nowrap;
   transition: background .12s ease, color .12s ease, border-color .12s ease;
 }
@@ -1300,14 +1300,14 @@ select:focus {
 .tab-dot.long { background: var(--long); opacity: 1; }
 .tab-dot.short { background: var(--short); opacity: 1; }
 .tab-close {
-  border: none; background: transparent; color: inherit; opacity: .45; font-size: 13px;
+  border: none; background: transparent; color: inherit; opacity: .45; font-size: 15.6px;
   line-height: 1; padding: 0 2px; border-radius: 2px; cursor: pointer;
 }
 .tab-close:hover { opacity: 1; color: var(--short); background: var(--bg-inset); }
 .tab-add {
   flex: 0 0 auto; width: 24px; height: 24px; border: 1px dashed var(--border);
   border-radius: var(--radius); background: transparent; color: var(--muted);
-  font-size: 14px; line-height: 1; cursor: pointer;
+  font-size: 16.8px; line-height: 1; cursor: pointer;
 }
 .tab-add:hover { color: var(--accent); border-color: var(--accent); }
 
@@ -1316,7 +1316,7 @@ select:focus {
   display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
 }
 .setup-conf-label {
-  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--muted);
 }
 
@@ -1329,7 +1329,7 @@ select:focus {
 
 .pos-kv b {
   font-weight: 400;
-  font-size: 9px;
+  font-size: 10.8px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--faint);
@@ -1344,13 +1344,13 @@ select:focus {
 
 .order-oid {
   color: var(--faint);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .order-row .btn-cancel-order,
 .pos-row .btn-cancel-order {
   margin-left: auto;
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 3px 10px;
   background: transparent;
   border: 1px solid var(--border);
@@ -1384,7 +1384,7 @@ select:focus {
 }
 
 .proposal-actions .btn {
-  font-size: 11.5px;
+  font-size: 13.8px;
   padding: 4px 10px;
 }
 
@@ -1404,7 +1404,7 @@ select:focus {
 
 .scan-strip-head {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1422,7 +1422,7 @@ select:focus {
 
 .scan-empty {
   font-family: var(--sans);
-  font-size: 12.5px;
+  font-size: 15px;
   padding: 4px 0;
 }
 
@@ -1456,14 +1456,14 @@ select:focus {
 }
 
 .chip-score {
-  font-size: 13px;
+  font-size: 15.6px;
   font-weight: 600;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
 
 .chip-sym {
-  font-size: 12.5px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--text);
 }
@@ -1472,7 +1472,7 @@ select:focus {
 .chip-short .chip-bias { color: var(--short); }
 
 .chip-setup {
-  font-size: 9px;
+  font-size: 10.8px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
@@ -1492,13 +1492,13 @@ select:focus {
 
 .an-sym {
   font-family: var(--mono);
-  font-size: 16px;
+  font-size: 19.2px;
   font-weight: 600;
 }
 
 .an-lev {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--muted);
   margin-left: auto;
 }
@@ -1523,16 +1523,16 @@ select:focus {
 
 .mtf-tf {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--faint);
 }
 
-.mtf-arrow { font-size: 14px; }
+.mtf-arrow { font-size: 16.8px; }
 .mtf-trend {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   margin-left: auto;
 }
 
@@ -1568,7 +1568,7 @@ select:focus {
 
 .tile-label {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1577,7 +1577,7 @@ select:focus {
 
 .tile-value {
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -1588,12 +1588,12 @@ select:focus {
 
 .tile-sub {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--muted);
 }
 
 .an-zone {
-  font-size: 12px;
+  font-size: 14.4px;
   color: var(--text);
   padding: 8px 10px;
   background: var(--bg-inset);
@@ -1618,7 +1618,7 @@ select:focus {
 
 .an-lvl-label {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1627,12 +1627,12 @@ select:focus {
 
 .an-lvl-val {
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 15px;
   font-variant-numeric: tabular-nums;
 }
 
 .an-reason {
-  font-size: 13px;
+  font-size: 15.6px;
   line-height: 1.65;
   color: var(--text);
   margin-bottom: 12px;
@@ -1643,7 +1643,7 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 12px;
+  font-size: 14.4px;
   color: var(--muted);
   padding: 9px 11px;
   background: var(--bg-inset);
@@ -1655,7 +1655,7 @@ select:focus {
 .an-mgmt b { color: var(--text); font-weight: 600; }
 
 .an-foot {
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--faint);
 }
 
@@ -1669,7 +1669,7 @@ select:focus {
   display: inline-block;
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 13px;
+  font-size: 15.6px;
   letter-spacing: 0.08em;
   padding: 4px 12px;
   border-radius: 3px;
@@ -1699,7 +1699,7 @@ select:focus {
 
 .proposal-rationale {
   margin: 10px 0 0;
-  font-size: 12.5px;
+  font-size: 15px;
   line-height: 1.55;
   white-space: pre-wrap;
   color: var(--text);
@@ -1707,7 +1707,7 @@ select:focus {
 
 .proposal-meta {
   margin: 10px 0 0;
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--faint);
 }
 
@@ -1723,7 +1723,7 @@ select:focus {
 .kv dt {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1734,7 +1734,7 @@ select:focus {
 .kv dd {
   margin: 0;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 15px;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
 }
@@ -1777,7 +1777,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1810,7 +1810,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 6px 0;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -1840,7 +1840,7 @@ select:focus {
 .ticket-form label > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 9.5px;
+  font-size: 11.4px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1878,7 +1878,7 @@ select:focus {
 
 .sltp-mode-label {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1903,7 +1903,7 @@ select:focus {
 }
 .size-mode-btn {
   padding: 1px 8px;
-  font-size: 10px;
+  font-size: 12px;
   background: transparent;
   color: var(--muted, #8a86a0);
   border: none;
@@ -1918,7 +1918,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 4px 14px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -1945,7 +1945,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   padding: 4px 14px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -1967,7 +1967,7 @@ select:focus {
   align-items: flex-start;
   gap: 8px;
   margin-top: 8px;
-  font-size: 12px;
+  font-size: 14.4px;
   color: var(--text);
   cursor: pointer;
 }
@@ -1985,7 +1985,7 @@ select:focus {
   display: block;
   color: var(--short);
   font-weight: 600;
-  font-size: 12px;
+  font-size: 14.4px;
   line-height: 1.45;
   margin: 6px 0 0;
   padding: 7px 10px;
@@ -1996,7 +1996,7 @@ select:focus {
 
 .liq-readout {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   color: var(--muted);
   margin: 5px 0 0;
 }
@@ -2020,12 +2020,12 @@ select:focus {
 
 .pattern-icon {
   color: var(--violet);
-  font-size: 13px;
+  font-size: 15.6px;
 }
 
 .pattern-name {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15.6px;
   font-weight: 600;
   color: var(--text);
 }
@@ -2033,7 +2033,7 @@ select:focus {
 .pattern-conf {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10.8px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2081,7 +2081,7 @@ select:focus {
 
 #ticket-notional-hint {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
@@ -2093,7 +2093,7 @@ select:focus {
   background: var(--long-dim);
   color: var(--long);
   font-family: var(--sans);
-  font-size: 13.5px;
+  font-size: 16.2px;
   font-weight: 600;
   padding: 11px 0;
   cursor: pointer;
@@ -2123,13 +2123,13 @@ select:focus {
 
 .hint {
   margin: 0;
-  font-size: 11px;
+  font-size: 13.2px;
   line-height: 1.5;
 }
 
 .error-text {
   color: var(--short);
-  font-size: 12px;
+  font-size: 14.4px;
   margin: 0;
 }
 
@@ -2164,7 +2164,7 @@ select:focus {
 .history-section h3 {
   margin: 0 0 8px;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11.4px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.14em;
@@ -2176,7 +2176,7 @@ select:focus {
   min-width: max-content;
   border-collapse: collapse;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 12.6px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2191,7 +2191,7 @@ select:focus {
 .history-table th {
   color: var(--faint);
   font-weight: 600;
-  font-size: 8.5px;
+  font-size: 10.2px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -2202,7 +2202,7 @@ select:focus {
 
 .history-empty {
   margin: 0;
-  font-size: 12px;
+  font-size: 14.4px;
 }
 
 .hist-ok { color: var(--long); }
@@ -2271,7 +2271,7 @@ select:focus {
 .modal-head h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 14.4px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2279,7 +2279,7 @@ select:focus {
 }
 
 .modal-close {
-  font-size: 18px;
+  font-size: 21.6px;
   line-height: 1;
 }
 
@@ -2295,7 +2295,7 @@ select:focus {
 .modal-body .err-list {
   margin: 12px 0 0;
   padding-left: 18px;
-  font-size: 11.5px;
+  font-size: 13.8px;
   line-height: 1.55;
 }
 
@@ -2310,7 +2310,7 @@ select:focus {
   background: var(--short-dim);
   color: #ffb9c2;
   font-weight: 600;
-  font-size: 12px;
+  font-size: 14.4px;
 }
 
 .modal-actions {
@@ -2327,7 +2327,7 @@ select:focus {
   background: var(--short);
   color: #fff;
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 15.6px;
   font-weight: 600;
   padding: 8px 18px;
   cursor: pointer;
@@ -2360,7 +2360,7 @@ select:focus {
   border: 1px solid var(--border);
   border-left-width: 3px;
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 15px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
   animation: toast-in 0.16s ease-out;
 }
@@ -2400,21 +2400,21 @@ select:focus {
 }
 
 .setup-head .brand-mark {
-  font-size: 28px;
+  font-size: 33.6px;
   line-height: 1.2;
 }
 
 .setup-head h1 {
   margin: 0 0 4px;
   font-family: var(--mono);
-  font-size: 17px;
+  font-size: 20.4px;
   font-weight: 600;
   letter-spacing: 0.04em;
 }
 
 .setup-head p {
   margin: 0;
-  font-size: 12.5px;
+  font-size: 15px;
   line-height: 1.5;
 }
 
@@ -2422,7 +2422,7 @@ select:focus {
 .setup-note code,
 .setup-body code {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 13.2px;
   background: var(--bg-inset);
   border: 1px solid var(--hairline);
   border-radius: 3px;
@@ -2475,14 +2475,14 @@ select:focus {
 .choice-title {
   display: block;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 15px;
   font-weight: 600;
   margin-bottom: 2px;
 }
 
 .choice-desc {
   display: block;
-  font-size: 11.5px;
+  font-size: 13.8px;
   color: var(--muted);
   line-height: 1.45;
 }
@@ -2502,7 +2502,7 @@ select:focus {
 .setup-body label > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 9.5px;
+  font-size: 11.4px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2534,7 +2534,7 @@ select:focus {
   text-transform: none !important;
   letter-spacing: normal !important;
   font-family: var(--sans) !important;
-  font-size: 12px !important;
+  font-size: 14.4px !important;
   color: var(--text) !important;
   font-weight: 400 !important;
 }
@@ -2544,7 +2544,7 @@ select:focus {
   border: 1px solid rgba(224, 162, 61, 0.5);
   border-radius: var(--radius);
   background: rgba(227, 179, 65, 0.07);
-  font-size: 12px;
+  font-size: 14.4px;
   line-height: 1.55;
   color: var(--text);
 }
