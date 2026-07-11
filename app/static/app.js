@@ -1160,11 +1160,15 @@
     const chartKey = symbol + "|" + tf;
     const keyChanged = state._chartKey !== chartKey;
 
-    // Capture the viewport BEFORE setData so silent refreshes never move it.
+    // Capture the viewport BEFORE setData so ANY refresh of the same coin/TF
+    // never moves it — silent polls AND explicit reloads alike (Load button,
+    // re-clicking the already-active tab/TF, WS-triggered refreshes). Only an
+    // actual coin/TF switch (keyChanged) is allowed to reset the view; the
+    // user's manual zoom/scroll must otherwise survive every tick/refresh.
     // Exception: user parked at the live edge → keep following new candles.
     let savedRange = null;
     let stickRight = true;
-    if (silent && !keyChanged && state.chart) {
+    if (!keyChanged && state.chart) {
       try {
         const ts = state.chart.timeScale();
         stickRight = ts.scrollPosition() > -2; // ~at the right edge
@@ -1189,7 +1193,7 @@
 
     if (state.chart) {
       const ts = state.chart.timeScale();
-      if (!silent || keyChanged) {
+      if (keyChanged) {
         // Fresh view: show a wide history by default (~260 candles) so the
         // past price action is visible without zooming out manually.
         const n = candles.length;
@@ -1618,6 +1622,15 @@
 
   async function loadOpenOrders() {
     const el = $("open-orders-body");
+    // Sequence guard: loadOpenOrders() is called from many places (30s poll,
+    // cancelOrder, symbol switch, WS fill handler, manual refresh). Two calls
+    // can overlap and resolve out of order — e.g. the periodic poll fires
+    // right before the user cancels an order, and its (now-stale) response
+    // lands AFTER cancelOrder's own refresh, silently resurrecting the
+    // just-cancelled order (and its chart line) until the next poll. Stamp
+    // each call and drop any response that isn't the most recent one.
+    const reqSeq = (state._ordersSeq || 0) + 1;
+    state._ordersSeq = reqSeq;
     try {
       const sym =
         ($("symbol-input") && $("symbol-input").value) || state.symbol || "";
@@ -1626,6 +1639,7 @@
       // resting order/stop on another coin while looking at this chart.
       const res = await apiFetch("/api/orders/open");
       const data = await res.json();
+      if (reqSeq !== state._ordersSeq) return null; // superseded by a newer call
       state.openOrders = data && !data.error ? data : null;
       drawOrderLines(); // these already filter to the active symbol internally
       drawTradeZones();
