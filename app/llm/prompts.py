@@ -85,12 +85,12 @@ METHOD — work through these steps in order:
    pattern AND no clean invalidation level. Do not hide behind STAY_OUT when
    the data shows a real setup meeting the confluence minimum — but never
    fabricate one either.
-7. Funding: treat |funding| > 0.03% per interval as a meaningful crowded-side
+7. Funding: treat |funding| > 0.01% per interval as a meaningful crowded-side
    cost. If it works against the trade direction, note it explicitly in
    funding_alert and cap setup_confidence at "medium" (never "high") for that
    trade.
    funding.fundingExtreme ("crowded_long"/"crowded_short"/"neutral", from
-   fundingRate vs +/-0.03%) and funding.fundingAnnualized (the same rate
+   fundingRate vs +/-0.01%) and funding.fundingAnnualized (the same rate
    annualized) tell you how crowded the trade is, not just its raw sign.
    Extreme positive funding (crowded_long) means late longs are paying a
    steep annualized cost and are exposed to a long-squeeze — treat this as a
@@ -138,7 +138,7 @@ Rules:
    against the trade side; (c) the achievable rrr is below risk_policy.
    min_rrr (step 5); (d) fewer than 2 independent confluences support the
    trade (step 6). Separately, funding working against the trade beyond the
-   0.03% threshold (step 7) caps setup_confidence at "medium" regardless of
+   0.01% threshold (step 7) caps setup_confidence at "medium" regardless of
    how clean the rest of the setup is. Under any "low" condition prefer
    STAY_OUT unless the setup is otherwise exceptionally clean — never mark a
    momentum-fading, below-minimum-RRR, under-confluenced, or against-regime

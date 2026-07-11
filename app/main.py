@@ -441,13 +441,20 @@ async def mini(
     """
     raw = [s for s in (symbols or "").split(",") if s.strip()]
     syms: list[str] = []
+    invalid_errors: list[str] = []
     for s in raw:
-        n = normalize_symbol(s)
+        try:
+            n = normalize_symbol(s)
+        except HTTPException as e:
+            # Skip an invalid symbol instead of failing the whole overview
+            # request — other requested symbols may still be valid.
+            invalid_errors.append(f"{s}: {e.detail}")
+            continue
         if n and n not in syms:
             syms.append(n)
     syms = syms[:24]  # hard cap: overview never fans out unbounded
     if not syms:
-        return {"results": [], "errors": []}
+        return {"results": [], "errors": invalid_errors}
 
     client = getattr(request.app.state, "mexc", None) or getattr(
         request.app.state, "exchange", None
@@ -481,7 +488,7 @@ async def mini(
         *(one(s) for s in syms), return_exceptions=True
     )
     results: list[dict] = []
-    errors: list[str] = []
+    errors: list[str] = list(invalid_errors)
     for sym, r in zip(syms, gathered):
         if isinstance(r, Exception):
             errors.append(f"{sym}: {r}")

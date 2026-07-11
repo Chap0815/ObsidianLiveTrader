@@ -6,6 +6,7 @@ Never places orders. User must apply → preview → confirm; gates re-validate.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -20,6 +21,8 @@ from app.llm.prompts import (
     build_user_prompt,
 )
 from app.models import ReevaluateProposal, TradeProposal
+
+log = logging.getLogger("app.llm.client")
 
 _FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
@@ -510,12 +513,16 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     # count. "medium" effort approximates the modest amount of extra
     # reasoning a ~3000-token budget would have given on older models,
     # without jumping to the (slower/pricier) "high" default.
-    # max_tokens is raised 1800 -> 5000: thinking + the JSON response share
-    # the same max_tokens budget, so the old 1800 cap would truncate mid-
-    # thought as soon as thinking used any tokens at all.
+    # max_tokens is raised 1800 -> 16000: thinking + the JSON response share
+    # the same max_tokens budget, so a smaller cap risks the reasoning phase
+    # consuming the whole budget on a large context and truncating (or
+    # emptying) the final JSON answer, which surfaces as a confusing
+    # LlmError instead of a usable proposal. 16000 gives adaptive thinking
+    # real headroom while still comfortably inside this non-streaming
+    # request's 120s httpx timeout for these models.
     body: dict[str, Any] = {
         "model": settings.anthropic_model,
-        "max_tokens": 5000,
+        "max_tokens": 16000,
         "system": system_prompt,
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": "medium"},
@@ -528,6 +535,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         async with httpx.AsyncClient(timeout=120.0) as client:
             return await client.post(url, headers=headers, json=payload)
 
+    sent_body = body
     try:
         r = await _post(body)
     except httpx.HTTPError as e:
@@ -549,6 +557,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
                     {"role": "user", "content": user_prompt},
                 ],
             }
+            sent_body = fallback_body
             try:
                 r = await _post(fallback_body)
             except httpx.HTTPError as e:
@@ -566,6 +575,12 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         payload = r.json()
     except json.JSONDecodeError as e:
         raise LlmError("Claude returned non-JSON response") from e
+
+    if payload.get("stop_reason") == "max_tokens":
+        log.warning(
+            "Claude deep-analysis call hit max_tokens (%s); response may be truncated",
+            sent_body.get("max_tokens"),
+        )
 
     # content: [{ "type": "thinking", "thinking": "..." }, { "type": "text",
     # "text": "..." }, ...] when extended thinking is enabled — the thinking

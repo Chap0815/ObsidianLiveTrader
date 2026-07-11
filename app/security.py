@@ -98,6 +98,8 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         "/api/llm",
         "/api/setup",
         "/api/scan",
+        "/api/fills",
+        "/api/reevaluate",
     )
     if any(path.startswith(p) for p in private_prefixes):
         client = request.client.host if request.client else ""

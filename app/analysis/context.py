@@ -33,9 +33,16 @@ def _contract_public(meta: ContractMeta) -> dict[str, Any]:
 
 
 # |funding| beyond this per-interval rate is treated as a meaningful
-# crowded-side signal — matches the "0.03% per interval" threshold already
+# crowded-side signal — matches the "0.01% per interval" threshold already
 # used by the analysis prompt (app/llm/prompts.py step 7).
-_FUNDING_EXTREME_THRESHOLD = 0.0003
+#
+# Hyperliquid settles funding HOURLY (see _funding_annualized below), and
+# typical hourly rates run well under the old 0.03% mark — a threshold
+# calibrated for MEXC's 8h interval effectively never fired for Hyperliquid,
+# so crowded_long/crowded_short almost never triggered. 0.0001 (0.01% per
+# hour) annualizes to ~87.6% APR ((24*365)*0.0001), a level that's genuinely
+# unusual and worth flagging as crowded for hourly-settled funding.
+_FUNDING_EXTREME_THRESHOLD = 0.0001
 
 
 def _funding_annualized(rate: float, collect_cycle: int | None) -> float:

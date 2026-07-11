@@ -67,6 +67,22 @@ def test_mini_empty_symbols_is_ok():
     assert r.json() == {"results": [], "errors": []}
 
 
+def test_mini_invalid_symbol_skipped_valid_returned():
+    """An unparsable symbol must not 400 the whole overview request."""
+    mock = _mock_client({"BTC_USDT": _candles([100.0, 101.0])})
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        r = client.get(
+            "/api/mini", params={"symbols": "not-a-symbol,BTC_USDT", "limit": 2}
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert [x["symbol"] for x in body["results"]] == ["BTC_USDT"]
+    assert len(body["errors"]) == 1
+    assert "not-a-symbol" in body["errors"][0] or "NOT-A-SYMBOL" in body["errors"][0]
+
+
 def test_mini_per_symbol_error_isolated():
     def _mk():
         mock = MagicMock()
