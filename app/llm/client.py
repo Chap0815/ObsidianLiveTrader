@@ -493,23 +493,62 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         "Content-Type": "application/json",
     }
     # No temperature: Opus 4.8 rejects the deprecated param entirely
-    # max_tokens capped: the proposal schema is small and rationale is
-    # capped at ~90 words, so 1800 tokens comfortably fits a complete
-    # response while shortening how long a stall/truncation can run.
+    system_prompt = build_system_prompt()
+    user_prompt = build_user_prompt(context)
+
+    # Extended thinking for the deep-analysis call only (the scanner uses a
+    # smaller/cheaper model and stays fast — no thinking there).
+    #
+    # settings.anthropic_model defaults to "claude-opus-4-8". On the current
+    # Opus 4.6+ / Sonnet 4.6+ family the old `thinking.budget_tokens` field
+    # is REJECTED (400) — the only supported "on" mode is adaptive thinking,
+    # with depth controlled by `output_config.effort` instead of a token
+    # count. "medium" effort approximates the modest amount of extra
+    # reasoning a ~3000-token budget would have given on older models,
+    # without jumping to the (slower/pricier) "high" default.
+    # max_tokens is raised 1800 -> 5000: thinking + the JSON response share
+    # the same max_tokens budget, so the old 1800 cap would truncate mid-
+    # thought as soon as thinking used any tokens at all.
     body: dict[str, Any] = {
         "model": settings.anthropic_model,
-        "max_tokens": 1800,
-        "system": build_system_prompt(),
+        "max_tokens": 5000,
+        "system": system_prompt,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "medium"},
         "messages": [
-            {"role": "user", "content": build_user_prompt(context)},
+            {"role": "user", "content": user_prompt},
         ],
     }
 
-    try:
+    async def _post(payload: dict[str, Any]) -> httpx.Response:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=payload)
+
+    try:
+        r = await _post(body)
     except httpx.HTTPError as e:
         raise LlmError(f"Claude request failed: {e}") from e
+
+    # Defensive fallback: if this API version/account/model combination
+    # rejects the thinking/output_config request shape (e.g. a pinned older
+    # model via ANTHROPIC_MODEL that doesn't support adaptive thinking),
+    # retry once with the plain pre-thinking request rather than hard-
+    # failing the whole analysis.
+    if r.status_code == 400:
+        low = r.text.lower()
+        if "thinking" in low or "output_config" in low or "effort" in low:
+            fallback_body: dict[str, Any] = {
+                "model": settings.anthropic_model,
+                "max_tokens": 1800,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            try:
+                r = await _post(fallback_body)
+            except httpx.HTTPError as e:
+                raise LlmError(f"Claude request failed: {e}") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:800]
@@ -524,7 +563,10 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     except json.JSONDecodeError as e:
         raise LlmError("Claude returned non-JSON response") from e
 
-    # content: [{ "type": "text", "text": "..." }, ...]
+    # content: [{ "type": "thinking", "thinking": "..." }, { "type": "text",
+    # "text": "..." }, ...] when extended thinking is enabled — the thinking
+    # block always precedes the final text block. Only "text" blocks are
+    # joined here, so thinking content is never fed into the JSON parser.
     text_parts: list[str] = []
     try:
         for block in payload.get("content") or []:
