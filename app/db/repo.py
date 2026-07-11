@@ -194,3 +194,20 @@ class Database:
             "proposals": await self.recent_proposals(limit),
             "orders": await self.recent_orders(limit),
         }
+
+    async def clear_history(self) -> dict[str, int]:
+        """Delete all rows from the audit history tables (proposals + orders).
+
+        Does NOT touch order_previews (short-lived one-time confirm tokens,
+        not audit history) or any other table.
+        """
+        async with self._connect() as conn:
+            cur = await conn.execute("DELETE FROM proposals")
+            proposals_deleted = cur.rowcount if cur.rowcount is not None else 0
+            cur = await conn.execute("DELETE FROM orders")
+            orders_deleted = cur.rowcount if cur.rowcount is not None else 0
+            await conn.commit()
+            return {
+                "proposals": max(0, proposals_deleted),
+                "orders": max(0, orders_deleted),
+            }

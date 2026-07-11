@@ -2421,6 +2421,45 @@
     }
   }
 
+  async function clearHistory() {
+    if (state.historyClearBusy) return;
+    const text =
+      "Lokale Audit-Historie (KI-Vorschläge + Order-Log) unwiderruflich löschen? " +
+      "Börsen-Fills bleiben unberührt.";
+    if (!window.confirm(text)) return;
+    state.historyClearBusy = true;
+    try {
+      const res = await apiFetch("/api/history/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok || data.ok === false) {
+        showToast(detailToText(data.detail || data), "err");
+        return;
+      }
+      const del = data.deleted || {};
+      showToast(
+        "Historie geleert: " +
+          fmt(del.proposals, 0) +
+          " Vorschläge, " +
+          fmt(del.orders, 0) +
+          " Orders",
+        "ok"
+      );
+      loadHistory();
+    } catch (err) {
+      showToast(
+        "Historie leeren fehlgeschlagen: " + (err && err.message),
+        "err"
+      );
+    } finally {
+      state.historyClearBusy = false;
+    }
+  }
+
   function setApplyEnabled(enabled) {
     const btn = $("btn-apply-proposal");
     if (!btn) return;
@@ -3447,6 +3486,11 @@
       histBtn.addEventListener("click", () => {
         loadHistory();
       });
+    }
+
+    const histClearBtn = $("btn-history-clear");
+    if (histClearBtn) {
+      histClearBtn.addEventListener("click", () => clearHistory());
     }
 
     const sugBtn = $("btn-suggest-vol");

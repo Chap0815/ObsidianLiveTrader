@@ -578,6 +578,22 @@ async def history(
         raise HTTPException(status_code=500, detail=f"history read failed: {e}") from e
 
 
+@app.post("/api/history/clear")
+async def history_clear(
+    request: Request,
+    _: None = Depends(require_local_token),
+):
+    """Delete all local audit history (proposals + orders). Exchange fills are untouched."""
+    db: Database | None = getattr(request.app.state, "db", None)
+    if db is None:
+        raise HTTPException(status_code=503, detail="database not initialized")
+    try:
+        deleted = await db.clear_history()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"history clear failed: {e}") from e
+
+
 @app.post("/api/orders/preview")
 async def orders_preview(
     request: Request,
