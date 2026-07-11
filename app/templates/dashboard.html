@@ -119,19 +119,6 @@
     </div>
   </section>
 
-  <section class="panel positions-panel">
-    <div class="panel-head"><h2>Positionen</h2></div>
-    <div id="positions-body" class="positions-body muted">—</div>
-  </section>
-
-  <section class="panel orders-panel">
-    <div class="panel-head">
-      <h2>Offene Orders</h2>
-      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
-    </div>
-    <div id="open-orders-body" class="orders-body muted">—</div>
-  </section>
-
   <section class="panel proposal-panel">
     <div class="panel-head">
       <h2>KI-Analyse</h2>
@@ -159,6 +146,7 @@
     </div>
   </section>
 
+  <div class="side-rail">
   <aside class="panel ticket-panel" id="ticket-panel" data-side="long">
     <div class="panel-head"><h2>Order</h2></div>
     <form id="order-form" class="ticket-form" autocomplete="off">
@@ -276,6 +264,19 @@
     </form>
   </aside>
 
+  <section class="panel positions-panel">
+    <div class="panel-head"><h2>Positionen</h2></div>
+    <div id="positions-body" class="positions-body muted">—</div>
+  </section>
+
+  <section class="panel orders-panel">
+    <div class="panel-head">
+      <h2>Offene Orders</h2>
+      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
+    </div>
+    <div id="open-orders-body" class="orders-body muted">—</div>
+  </section>
+
   <section class="panel history-panel">
     <div class="panel-head">
       <h2>Historie</h2>
@@ -295,6 +296,7 @@
       Lade Historie…
     </div>
   </section>
+  </div>
 </main>
 
 <!-- Confirm modal -->

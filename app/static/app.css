@@ -486,10 +486,9 @@ select:focus {
   grid-template-columns: minmax(0, 2.2fr) minmax(400px, 0.85fr);
   grid-template-rows: auto;
   grid-template-areas:
-    "chart     ticket"
-    "stats     positions"
-    "proposal  orders"
-    "proposal  history";
+    "chart    side"
+    "stats    side"
+    "proposal side";
   gap: 10px;
   padding: 10px 12px 16px;
   align-items: start;
@@ -497,11 +496,17 @@ select:focus {
 
 .chart-panel     { grid-area: chart; height: 100%; min-height: 52vh; }
 .statbar         { grid-area: stats; }
-.positions-panel { grid-area: positions; }
-.orders-panel    { grid-area: orders; }
 .proposal-panel  { grid-area: proposal; max-height: 72vh; }
-.ticket-panel    { grid-area: ticket; }
-.history-panel   { grid-area: history; max-height: 40vh; }
+
+.side-rail {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-self: start;
+}
+
+.history-panel { max-height: 40vh; }
 
 /* ── Panels ─────────────────────────────────────────────── */
 .panel {
@@ -2573,15 +2578,12 @@ select:focus {
 /* ── Responsive ─────────────────────────────────────────── */
 @media (max-width: 1280px) {
   .layout {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1.3fr) minmax(340px, 1fr);
     grid-template-rows: none;
     grid-template-areas:
-      "chart     chart"
-      "stats     stats"
-      "ticket    ticket"
-      "positions orders"
-      "proposal  proposal"
-      "history   history";
+      "chart    side"
+      "stats    side"
+      "proposal side";
   }
 
   .statbar {
@@ -2608,11 +2610,8 @@ select:focus {
     grid-template-areas:
       "chart"
       "stats"
-      "ticket"
-      "positions"
-      "orders"
-      "proposal"
-      "history";
+      "side"
+      "proposal";
   }
 
   .proposal-panel,
