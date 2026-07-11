@@ -425,6 +425,70 @@ async def market(
     return snapshot_to_api_dict(snap)
 
 
+@app.get("/api/mini")
+async def mini(
+    request: Request,
+    symbols: str = Query("", description="Comma-separated coins for the overview grid"),
+    tf: str = Query("15m", description="Kline interval"),
+    limit: int = Query(96, ge=2, le=200, description="Candles per coin (~24h at 15m)"),
+):
+    """Lightweight multi-coin candle snapshot for the overview mini-charts.
+
+    Public data only: OHLC candles + last price + window change. No indicators,
+    structure, funding or private data — deliberately cheaper than /api/market
+    so the overview can load a dozen coins at once. Touches no risk gates.
+    """
+    raw = [s for s in (symbols or "").split(",") if s.strip()]
+    syms: list[str] = []
+    for s in raw:
+        n = normalize_symbol(s)
+        if n and n not in syms:
+            syms.append(n)
+    syms = syms[:24]  # hard cap: overview never fans out unbounded
+    if not syms:
+        return {"results": [], "errors": []}
+
+    client = getattr(request.app.state, "mexc", None) or getattr(
+        request.app.state, "exchange", None
+    )
+    if client is None:
+        raise HTTPException(status_code=503, detail="Exchange client not initialized")
+
+    async def one(sym: str):
+        candles = await client.klines(sym, tf, limit_hint=limit)
+        cs = candles[-limit:]
+        out = [
+            {
+                "time": c.time,
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+            }
+            for c in cs
+        ]
+        last = out[-1]["close"] if out else None
+        first = out[0]["close"] if out else None
+        change = (
+            round((last - first) / first * 100.0, 2)
+            if last is not None and first not in (None, 0)
+            else None
+        )
+        return {"symbol": sym, "last_price": last, "change_pct": change, "candles": out}
+
+    gathered = await asyncio.gather(
+        *(one(s) for s in syms), return_exceptions=True
+    )
+    results: list[dict] = []
+    errors: list[str] = []
+    for sym, r in zip(syms, gathered):
+        if isinstance(r, Exception):
+            errors.append(f"{sym}: {r}")
+        else:
+            results.append(r)
+    return {"results": results, "errors": errors}
+
+
 @app.get("/api/account")
 async def account(request: Request, _: None = Depends(require_local_token)):
     """Private balance + open positions. Always 200; errors in body for UI."""
