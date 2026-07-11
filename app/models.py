@@ -161,6 +161,34 @@ class AnalyzeRequest(BaseModel):
     htf: str = "1H"
 
 
+# --- Trade Reevaluation (advisory review of an ALREADY OPEN position) ---
+# Never places orders, moves stops or closes anything — the human applies
+# the recommendation via the app's existing SL/close controls.
+
+ReevaluateAction = Literal["HOLD", "MOVE_SL_BE", "PARTIAL_CLOSE", "CLOSE"]
+
+
+class ReevaluateProposal(BaseModel):
+    """Validated LLM reevaluation of an open position. Advisory only."""
+
+    action: ReevaluateAction
+    # Reuses the same low/medium/high scale as setup_confidence.
+    confidence: SetupConfidence = "medium"
+    reason: str = ""
+    new_sl: float | None = None
+    new_tp: float | None = None
+    # Suggested share of the current hold to close (0-100). Only meaningful
+    # for PARTIAL_CLOSE; null otherwise.
+    partial_close_pct: float | None = Field(None, ge=0, le=100)
+    risk_notes: str = ""
+
+
+class ReevaluateRequest(BaseModel):
+    symbol: str = "BTC_USDT"
+    tf: str = "15m"
+    htf: str = "1H"
+
+
 # --- Order ticket (user-submitted; gates re-validate) ---
 
 OrderSide = Literal["long", "short"]

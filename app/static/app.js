@@ -57,6 +57,8 @@
     _overviewTimer: null,
     _miniBusy: false, // in-flight /api/mini fetch guard
     _miniLast: 0, // ms timestamp of the last successful /api/mini fetch
+    reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
+    reevalResults: {}, // symbol -> last /api/reevaluate response (or {error}), survives re-renders
   };
 
   function $(id) {
@@ -1548,6 +1550,14 @@
         '<button type="button" class="cp-close-btn" data-frac="0.75">75%</button>' +
         '<button type="button" class="cp-close-btn cp-close-full" data-frac="1">100%</button>' +
         "</div>" +
+        '<div class="cp-reeval">' +
+        '<button type="button" class="cp-reeval-btn" data-sym="' +
+        escapeHtml(String(p.symbol || "")) + '">KI: Position bewerten</button>' +
+        '<div class="cp-reeval-result" data-sym-result="' +
+        escapeHtml(String(p.symbol || "").toUpperCase()) + '">' +
+        reevalResultHtml(p.symbol) +
+        "</div>" +
+        "</div>" +
         "</div>"
       );
     }
@@ -1570,6 +1580,15 @@
       });
     });
 
+    // "KI: Position bewerten" — advisory reevaluation of this OPEN position.
+    // Never places/moves/closes anything; purely informational.
+    el.querySelectorAll(".cp-reeval-btn").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation(); // never let this bubble into the card's click-to-open-chart
+        runReevaluate(btn.getAttribute("data-sym"));
+      });
+    });
+
     // K4: clicking a position card opens that coin's chart (goToSymbol).
     // Event delegation on the panel so it survives re-renders; ignore clicks
     // that land on a button or other interactive element inside the card
@@ -1589,6 +1608,138 @@
       '<span class="cp-cell-label">' + escapeHtml(label) + "</span>" +
       '<span class="cp-cell-val">' + escapeHtml(String(value)) + "</span></div>"
     );
+  }
+
+  /** German label for a /api/reevaluate action code. */
+  function _reevalActionLabel(action) {
+    switch (String(action || "").toUpperCase()) {
+      case "HOLD": return "Halten";
+      case "MOVE_SL_BE": return "SL → Break-Even";
+      case "PARTIAL_CLOSE": return "Teilweise schließen";
+      case "CLOSE": return "Ganz schließen";
+      default: return action || "—";
+    }
+  }
+
+  function _reevalConfCls(conf) {
+    const c = String(conf || "").toLowerCase();
+    return c === "high" ? "conf-high" : c === "medium" ? "conf-med" : "conf-low";
+  }
+
+  function _reevalConfLabel(conf) {
+    const c = String(conf || "").toLowerCase();
+    return c === "high" ? "Hoch" : c === "medium" ? "Mittel" : "Niedrig";
+  }
+
+  /** Render the cached /api/reevaluate result (or error) for one symbol, or
+   *  "" when nothing has been fetched yet — the position card then just
+   *  shows the "KI: Position bewerten" button with no extra block. */
+  function reevalResultHtml(sym) {
+    const key = String(sym || "").toUpperCase().trim();
+    const entry = key ? state.reevalResults[key] : null;
+    if (!entry) return "";
+    if (entry.error) {
+      return (
+        '<div class="cp-reeval-out cp-reeval-error">' + escapeHtml(entry.error) + "</div>"
+      );
+    }
+    const r = entry.reevaluation || {};
+    const actionCls = "reeval-action-" + String(r.action || "").toLowerCase();
+    let html =
+      '<div class="cp-reeval-out">' +
+      '<div class="cp-reeval-head">' +
+      '<span class="cp-reeval-action ' + actionCls + '">' +
+      escapeHtml(_reevalActionLabel(r.action)) + "</span>" +
+      (r.confidence
+        ? '<span class="pattern-conf ' + _reevalConfCls(r.confidence) + '">' +
+          escapeHtml(_reevalConfLabel(r.confidence)) + "</span>"
+        : "") +
+      "</div>";
+
+    const levels = [];
+    if (r.new_sl != null) {
+      levels.push('<span class="cp-reeval-lvl"><b>neuer SL:</b> ' + fmt(r.new_sl, 6) + "</span>");
+    }
+    if (r.new_tp != null) {
+      levels.push('<span class="cp-reeval-lvl"><b>neuer TP:</b> ' + fmt(r.new_tp, 6) + "</span>");
+    }
+    if (r.partial_close_pct != null) {
+      levels.push(
+        '<span class="cp-reeval-lvl"><b>Anteil:</b> ' + fmt(r.partial_close_pct, 0) + "%</span>"
+      );
+    }
+    if (levels.length) html += '<div class="cp-reeval-levels">' + levels.join(" ") + "</div>";
+
+    if (r.reason) html += '<div class="cp-reeval-reason">' + escapeHtml(r.reason) + "</div>";
+    if (r.risk_notes) {
+      html += '<div class="cp-reeval-risk">⚠ ' + escapeHtml(r.risk_notes) + "</div>";
+    }
+    html +=
+      '<div class="cp-reeval-foot">Nur Vorschlag — keine automatische Ausführung. ' +
+      "Halten/SL/Schließen macht der Trader selbst.</div>";
+    html += "</div>";
+    return html;
+  }
+
+  /** KI reevaluation of one ALREADY OPEN position ("KI: Position bewerten").
+   *  Advisory only — never places, moves or closes anything itself. Guards
+   *  against double-click/race per symbol via state.reevalBusy. */
+  async function runReevaluate(sym) {
+    const key = String(sym || "").toUpperCase().trim();
+    if (!key) return;
+    if (state.reevalBusy[key]) return;
+    state.reevalBusy[key] = true;
+
+    const btn = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
+    const out = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Bewerte…";
+    }
+    if (out) {
+      out.innerHTML = '<div class="cp-reeval-out cp-reeval-loading">KI bewertet Position…</div>';
+    }
+
+    try {
+      const res = await apiFetch("/api/reevaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: key,
+          tf: state.tf || "15m",
+          htf: state.htf || "1H",
+        }),
+      });
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = null;
+      }
+      if (!res.ok) {
+        const detail =
+          (data && (data.detail || data.message)) || res.statusText || "Bewertung fehlgeschlagen";
+        const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
+        state.reevalResults[key] = { error: msg };
+      } else {
+        state.reevalResults[key] = data;
+      }
+    } catch (err) {
+      state.reevalResults[key] = {
+        error: "Netzwerkfehler: " + (err && err.message ? err.message : err),
+      };
+    } finally {
+      state.reevalBusy[key] = false;
+      // Re-render just this card's result block; a full renderPositions()
+      // would be fine too, but this avoids reshuffling the whole panel.
+      const out2 = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
+      if (out2) out2.innerHTML = reevalResultHtml(key);
+      const btn2 = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
+      if (btn2) {
+        btn2.disabled = false;
+        btn2.textContent = "KI: Position bewerten";
+      }
+    }
   }
 
   /** Compact "also open on other coins" overview — grouped per symbol, click
@@ -4358,6 +4509,7 @@
     drawOrderLines,
     drawTradeZones,
     renderPositions,
+    runReevaluate,
     state,
   };
 

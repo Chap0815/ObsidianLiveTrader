@@ -1279,6 +1279,111 @@ select:focus {
   .cp-sl-missing { animation: none; }
 }
 
+/* ── "KI: Position bewerten" (advisory reevaluation of an open position) ── */
+.cp-reeval {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.cp-reeval-btn {
+  width: 100%;
+  border: 1px solid var(--accent, #9a86e8);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--accent, #9a86e8);
+  font-family: var(--mono);
+  font-size: 12.6px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 6px 0;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.cp-reeval-btn:hover:not(:disabled) {
+  background: var(--accent, #9a86e8);
+  color: #fff;
+}
+
+.cp-reeval-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.cp-reeval-result:empty { margin: 0; }
+
+.cp-reeval-out {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #2a2438);
+  border-radius: var(--radius);
+  background: var(--bg-inset);
+  font-family: var(--sans);
+  font-size: 12.6px;
+  line-height: 1.4;
+}
+
+.cp-reeval-loading { color: var(--muted, #8a86a0); font-family: var(--mono); }
+
+.cp-reeval-error {
+  color: var(--short, #e35349);
+  font-family: var(--mono);
+}
+
+.cp-reeval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.cp-reeval-action {
+  font-family: var(--mono);
+  font-size: 12.6px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.cp-reeval-action.reeval-action-hold {
+  color: var(--muted, #8a86a0);
+  background: var(--bg-elevated);
+}
+.cp-reeval-action.reeval-action-move_sl_be {
+  color: var(--long, #4fbe8e);
+  background: var(--long-dim);
+}
+.cp-reeval-action.reeval-action-partial_close {
+  color: var(--warn, #e0a23d);
+  background: rgba(224, 162, 61, 0.12);
+}
+.cp-reeval-action.reeval-action-close {
+  color: var(--short, #e35349);
+  background: var(--short-dim);
+}
+
+.cp-reeval-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 6px;
+  font-family: var(--mono);
+}
+.cp-reeval-levels b { color: var(--text); font-weight: 600; }
+
+.cp-reeval-reason { color: var(--text); margin-bottom: 4px; }
+
+.cp-reeval-risk { color: var(--warn, #e0a23d); margin-bottom: 4px; }
+
+.cp-reeval-foot {
+  color: var(--faint, #6a6580);
+  font-size: 11.1px;
+  font-family: var(--mono);
+}
+
 /* ── Custom Coin-Suche (ersetzt native Datalist) ─────────── */
 .symbol-picker { position: relative; }
 #symbol-input { width: 120px; }

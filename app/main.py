@@ -15,7 +15,7 @@ from app.config import Settings, get_settings
 from app.db.repo import Database
 from app.exchange_factory import create_exchange_client, exchange_ready
 from app.hyperliquid.errors import HyperliquidError
-from app.llm.client import LlmError, analyze_with_llm, build_llm_context
+from app.llm.client import LlmError, analyze_with_llm, build_llm_context, reevaluate_with_llm
 
 # Back-compat alias
 GrokError = LlmError
@@ -27,6 +27,7 @@ from app.models import (
     ClosePositionRequest,
     ConfirmRequest,
     OrderTicket,
+    ReevaluateRequest,
 )
 from app.orders.service import OrderError, OrderService
 from app.orders.tokens import PreviewStore
@@ -648,6 +649,165 @@ async def analyze(
         "proposal": proposal_dict,
         "annotations": annotations,
         "last_price": market_api.get("last_price"),
+    }
+
+
+def _extract_position_sl_tp(stops: list[dict]) -> tuple[float | None, float | None]:
+    """Best-effort current SL/TP from open trigger orders for one symbol.
+
+    Mirrors the frontend's `findPositionProtection` heuristic (app.js): an
+    explicit stopLossPrice/takeProfitPrice field wins; otherwise fall back to
+    triggerPrice/price + an orderType label; an unlabeled trigger defaults to
+    a protective stop. Read-only — never places/cancels anything.
+    """
+    sl: float | None = None
+    tp: float | None = None
+    for row in stops or []:
+        try:
+            sl_field = float(row.get("stopLossPrice"))
+        except (TypeError, ValueError):
+            sl_field = None
+        if sl_field and sl_field > 0:
+            sl = sl_field
+            continue
+        try:
+            tp_field = float(row.get("takeProfitPrice"))
+        except (TypeError, ValueError):
+            tp_field = None
+        if tp_field and tp_field > 0:
+            tp = tp_field
+            continue
+        raw_trg = row.get("triggerPrice")
+        if raw_trg is None:
+            raw_trg = row.get("price")
+        try:
+            trg = float(raw_trg)
+        except (TypeError, ValueError):
+            trg = None
+        if not trg or trg <= 0:
+            continue
+        label = str(row.get("orderType") or "").lower()
+        if label.startswith("tp") or "take" in label:
+            tp = trg
+        else:
+            sl = trg  # "stop"/"sl" label or unlabeled → treat as protective stop
+    return sl, tp
+
+
+@app.post("/api/reevaluate")
+async def reevaluate(
+    request: Request,
+    body: ReevaluateRequest,
+    _: None = Depends(require_local_token),
+):
+    """Advisory reevaluation of an ALREADY OPEN position: HOLD / MOVE_SL_BE /
+    PARTIAL_CLOSE / CLOSE, with a reason.
+
+    Same auth/shape as /api/analyze. Never places, moves or closes anything
+    itself and never bypasses risk gates — the human applies the
+    recommendation via the app's existing SL/close controls.
+    """
+    s = _llm_settings(request)  # honors the hot-swap dropdown
+    if not s.llm_ready:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "LLM not configured. Set ANTHROPIC_API_KEY (Claude, default) "
+                "or XAI_API_KEY with LLM_PROVIDER=xai."
+            ),
+        )
+
+    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="MEXC client not initialized")
+
+    symbol = normalize_symbol(body.symbol or s.default_symbol)
+    tf = body.tf or "15m"
+    htf = body.htf or "1H"
+
+    try:
+        acct = await client.account_snapshot()
+    except ExchangeError as e:
+        raise HTTPException(status_code=502, detail=f"MEXC account error: {e}") from e
+
+    position = next(
+        (
+            p
+            for p in (acct.get("positions") or [])
+            if str(p.get("symbol") or "").upper() == symbol.upper()
+            and abs(float(p.get("hold_vol") or 0)) > 0
+        ),
+        None,
+    )
+    if position is None:
+        raise HTTPException(status_code=404, detail=f"No open position for {symbol}")
+
+    try:
+        snap = await build_market_snapshot(
+            symbol, tf, htf, client, limit_hint=s.kline_limit_hint
+        )
+    except ExchangeError as e:
+        raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
+
+    market_api = snapshot_to_api_dict(snap)
+
+    # Current SL/TP protection (soft-fail like /api/orders/open: an error
+    # means UNKNOWN, not "no stop", so the LLM context says so honestly).
+    stops_error: str | None = None
+    try:
+        stops = await client.open_stop_orders(symbol)
+    except ExchangeError as e:
+        stops = []
+        stops_error = str(e)
+    current_sl, current_tp = _extract_position_sl_tp(stops)
+
+    pnl = position.get("unrealized_pnl")
+    im = position.get("im")
+    roe_pct: float | None = None
+    try:
+        if pnl is not None and im not in (None, 0):
+            roe_pct = round(float(pnl) / float(im) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        roe_pct = None
+
+    position_ctx = {
+        "symbol": symbol,
+        "side": position.get("side"),
+        "entry_price": position.get("entry_price"),
+        "hold_vol": position.get("hold_vol"),
+        "leverage": position.get("leverage"),
+        "open_type": position.get("open_type"),
+        "current_price": market_api.get("last_price"),
+        "unrealized_pnl": pnl,
+        "roe_pct": roe_pct,
+        "liquidate_price": position.get("liquidate_price"),
+        "im": im,
+        "margin_ratio": position.get("margin_ratio"),
+        "stop_loss": current_sl,
+        "take_profit": current_tp,
+        "stop_orders_known": stops_error is None,
+    }
+
+    # Same market context builder as /api/analyze, plus the position on top.
+    context = build_llm_context(market_api, acct, s)
+    context["position"] = position_ctx
+
+    try:
+        result = await reevaluate_with_llm(context, s)
+    except LlmError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    return {
+        "symbol": symbol,
+        "tf": tf,
+        "htf": htf,
+        "position": position_ctx,
+        "reevaluation": result.model_dump(),
+        "annotations": {
+            "advisory_only": True,
+            "gates_not_bypassed": True,
+            "stop_orders_known": stops_error is None,
+        },
     }
 
 

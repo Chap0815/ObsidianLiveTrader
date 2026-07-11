@@ -13,8 +13,13 @@ import httpx
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.llm.prompts import build_system_prompt, build_user_prompt
-from app.models import TradeProposal
+from app.llm.prompts import (
+    build_reevaluate_system_prompt,
+    build_reevaluate_user_prompt,
+    build_system_prompt,
+    build_user_prompt,
+)
+from app.models import ReevaluateProposal, TradeProposal
 
 _FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
@@ -165,6 +170,32 @@ def parse_proposal(text: str) -> TradeProposal:
     if isinstance(data, dict):
         data = _normalize_setup_confidence(data)
     return TradeProposal.model_validate(data)
+
+
+def _normalize_reevaluate_confidence(data: dict) -> dict:
+    """Same slip-tolerant coercion as `_normalize_setup_confidence`, applied
+    to the reevaluation's `confidence` field."""
+    val = data.get("confidence")
+    if val is None:
+        return data
+    if isinstance(val, str) and val.strip().lower() in _VALID_SETUP_CONFIDENCE:
+        data["confidence"] = val.strip().lower()
+    else:
+        data.pop("confidence", None)  # falls back to the model default
+    return data
+
+
+def parse_reevaluation(text: str) -> ReevaluateProposal:
+    try:
+        data = json.loads(extract_json_object(text))
+    except json.JSONDecodeError:
+        salvaged = salvage_proposal_json(text)
+        if salvaged is None:
+            raise
+        data = salvaged
+    if isinstance(data, dict):
+        data = _normalize_reevaluate_confidence(data)
+    return ReevaluateProposal.model_validate(data)
 
 
 def compute_simple_rrr(
@@ -437,6 +468,19 @@ def _parse_content_to_proposal(
     return annotate_proposal(proposal, context)
 
 
+def _parse_content_to_reevaluation(content: str, *, provider: str) -> ReevaluateProposal:
+    if not content or not str(content).strip():
+        raise LlmError(f"{provider} returned empty content")
+    try:
+        return parse_reevaluation(str(content))
+    except json.JSONDecodeError as e:
+        raise LlmError(f"{provider} output is not valid JSON: {e}", raw=content) from e
+    except ValidationError as e:
+        raise LlmError(
+            f"{provider} JSON failed schema validation: {e}", raw=content
+        ) from e
+
+
 async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProposal:
     key = (settings.anthropic_api_key or "").strip()
     if not key:
@@ -634,3 +678,210 @@ async def analyze_with_llm(context: dict[str, Any], settings: Settings) -> Trade
 # Back-compat name
 async def analyze_with_grok(context: dict[str, Any], settings: Settings) -> TradeProposal:
     return await analyze_with_llm(context, settings)
+
+
+# --- Reevaluate (advisory review of an ALREADY OPEN position) ---
+# Mirrors the analyze_with_llm dispatch above, but talks the reevaluate
+# system/user prompts and parses into ReevaluateProposal. Never places,
+# modifies or closes anything — advisory JSON only, same as analyze.
+
+
+async def _call_claude_reevaluate(
+    context: dict[str, Any], settings: Settings
+) -> ReevaluateProposal:
+    key = (settings.anthropic_api_key or "").strip()
+    if not key:
+        raise LlmError("Claude API key not configured (set ANTHROPIC_API_KEY / CLAUDE_API_KEY)")
+
+    url = settings.anthropic_base_url.rstrip("/") + "/v1/messages"
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": settings.anthropic_version,
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": settings.anthropic_model,
+        "max_tokens": 1200,
+        "system": build_reevaluate_system_prompt(),
+        "messages": [
+            {"role": "user", "content": build_reevaluate_user_prompt(context)},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise LlmError(f"Claude request failed: {e}") from e
+
+    if r.status_code >= 400:
+        detail: Any = r.text[:800]
+        try:
+            detail = r.json()
+        except Exception:
+            pass
+        raise LlmError(f"Claude HTTP {r.status_code}: {detail}", raw=detail)
+
+    try:
+        payload = r.json()
+    except json.JSONDecodeError as e:
+        raise LlmError("Claude returned non-JSON response") from e
+
+    text_parts: list[str] = []
+    try:
+        for block in payload.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(str(block.get("text") or ""))
+        content = "\n".join(text_parts).strip()
+    except (TypeError, AttributeError) as e:
+        raise LlmError("Claude response missing content blocks", raw=payload) from e
+
+    return _parse_content_to_reevaluation(content, provider="Claude")
+
+
+async def _call_xai_reevaluate(
+    context: dict[str, Any], settings: Settings
+) -> ReevaluateProposal:
+    if not settings.xai_api_key:
+        raise LlmError("xAI API key not configured (set XAI_API_KEY)")
+
+    url = settings.xai_base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.xai_api_key}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": settings.xai_model,
+        "max_tokens": 1200,
+        "messages": [
+            {"role": "system", "content": build_reevaluate_system_prompt()},
+            {"role": "user", "content": build_reevaluate_user_prompt(context)},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            r = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise LlmError(f"xAI request failed: {e}") from e
+
+    if r.status_code >= 400:
+        detail: Any = r.text[:500]
+        try:
+            detail = r.json()
+        except Exception:
+            pass
+        raise LlmError(f"xAI HTTP {r.status_code}: {detail}", raw=detail)
+
+    try:
+        payload = r.json()
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
+
+    return _parse_content_to_reevaluation(str(content), provider="xAI")
+
+
+async def _call_openai_compat_reevaluate(
+    context: dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    provider_label: str,
+    timeout: float = 120.0,
+    json_response_format: bool = True,
+) -> ReevaluateProposal:
+    """Chat-completions call for OpenAI-compatible APIs (OpenAI, Ollama)."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 1200,
+        "messages": [
+            {"role": "system", "content": build_reevaluate_system_prompt()},
+            {"role": "user", "content": build_reevaluate_user_prompt(context)},
+        ],
+        "temperature": 0.2,
+    }
+    if json_response_format:
+        body["response_format"] = {"type": "json_object"}
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise LlmError(f"{provider_label} request failed: {e}") from e
+
+    if r.status_code >= 400:
+        detail: Any = r.text[:500]
+        try:
+            detail = r.json()
+        except Exception:
+            pass
+        raise LlmError(f"{provider_label} HTTP {r.status_code}: {detail}", raw=detail)
+
+    try:
+        payload = r.json()
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        raise LlmError(
+            f"{provider_label} response missing choices content",
+            raw=getattr(r, "text", None),
+        ) from e
+
+    return _parse_content_to_reevaluation(str(content), provider=provider_label)
+
+
+async def _call_openai_reevaluate(
+    context: dict[str, Any], settings: Settings
+) -> ReevaluateProposal:
+    if not settings.openai_api_key:
+        raise LlmError("OpenAI API key not configured (set OPENAI_API_KEY)")
+    return await _call_openai_compat_reevaluate(
+        context,
+        base_url=settings.openai_base_url,
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        provider_label="Codex",
+    )
+
+
+async def _call_ollama_reevaluate(
+    context: dict[str, Any], settings: Settings
+) -> ReevaluateProposal:
+    return await _call_openai_compat_reevaluate(
+        context,
+        base_url=settings.ollama_base_url,
+        api_key="",
+        model=settings.ollama_model,
+        provider_label="Ollama",
+        timeout=300.0,
+        json_response_format=False,
+    )
+
+
+async def reevaluate_with_llm(
+    context: dict[str, Any], settings: Settings
+) -> ReevaluateProposal:
+    """Dispatch by LLM_PROVIDER: claude | xai | openai (Codex) | ollama.
+
+    Advisory only — reviews an already-open position; never places, moves or
+    closes anything itself.
+    """
+    provider = (settings.llm_provider or "claude").strip().lower()
+    if provider in ("claude", "anthropic"):
+        return await _call_claude_reevaluate(context, settings)
+    if provider in ("xai", "grok"):
+        return await _call_xai_reevaluate(context, settings)
+    if provider in ("openai", "codex"):
+        return await _call_openai_reevaluate(context, settings)
+    if provider in ("ollama", "local"):
+        return await _call_ollama_reevaluate(context, settings)
+    raise LlmError(
+        f"Unknown LLM_PROVIDER={provider!r} (use claude, xai, openai or ollama)"
+    )
