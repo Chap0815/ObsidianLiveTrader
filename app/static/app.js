@@ -51,6 +51,12 @@
     openTabs: [], // watched coins in the chart tab bar (localStorage-backed)
     _pendingNewTab: false, // set by "+" tab / scanner so the next switch opens a new tab
     fills: [], // account executions of the active symbol (chart markers)
+    activeView: "chart", // "chart" | "overview" (E5)
+    watchlist: [], // overview watch coins (localStorage-backed)
+    overviewData: {}, // symbol -> {last_price, change_pct, candles}
+    _overviewTimer: null,
+    _miniBusy: false, // in-flight /api/mini fetch guard
+    _miniLast: 0, // ms timestamp of the last successful /api/mini fetch
   };
 
   function $(id) {
@@ -1817,6 +1823,7 @@
       drawPositionLines();
       drawTradeZones();
       renderSymbolTabs(); // refresh the long/short dots on the chart tabs
+      if (state.activeView === "overview") refreshOverview(); // position tiles + PnL badges
     } catch (e) {
       console.error("account draw", e);
     }
@@ -2927,6 +2934,9 @@
     state._pendingNewTab = false;
     ensureSymbolOption(sym);
 
+    if (state.activeView === "overview") state._pendingNewTab = true; // coming from overview → open a tab
+    showChart();
+
     const existing = state.openTabs.indexOf(sym);
     if (existing === -1) {
       if (newTab) {
@@ -3055,11 +3065,25 @@
     bar.querySelectorAll(".symbol-tab").forEach(function (el) {
       el.remove();
     });
+    const inChart = state.activeView !== "overview";
     const active = String(state.symbol || "").toUpperCase();
+
+    // Fixed, non-closable overview tab in position 1
+    const ov = document.createElement("button");
+    ov.type = "button";
+    ov.className = "symbol-tab" + (!inChart ? " active" : "");
+    ov.setAttribute("role", "tab");
+    ov.setAttribute("data-view", "overview");
+    ov.innerHTML = '<span class="tab-dot"></span><span>Übersicht</span>';
+    ov.addEventListener("click", function () {
+      showOverview();
+    });
+    bar.insertBefore(ov, addBtn);
+
     state.openTabs.forEach(function (sym) {
       const tab = document.createElement("button");
       tab.type = "button";
-      tab.className = "symbol-tab" + (sym === active ? " active" : "");
+      tab.className = "symbol-tab" + (inChart && sym === active ? " active" : "");
       tab.setAttribute("role", "tab");
       tab.setAttribute("data-symbol", sym);
       const side = tabPositionSide(sym);
@@ -3090,6 +3114,242 @@
         }
       });
     }
+  }
+
+  /* ── Overview tab (E5): static mini-charts, ~30s snapshot refresh ────── */
+  function loadWatchlist() {
+    try {
+      const raw = localStorage.getItem("obsidian_watchlist");
+      const arr = raw ? JSON.parse(raw) : null;
+      state.watchlist = Array.isArray(arr) ? arr : [];
+    } catch (_) {
+      state.watchlist = [];
+    }
+  }
+  function saveWatchlist() {
+    try {
+      localStorage.setItem("obsidian_watchlist", JSON.stringify(state.watchlist));
+    } catch (_) {}
+  }
+  function addWatch(sym) {
+    sym = String(sym || "").toUpperCase().trim();
+    if (!sym) return;
+    ensureSymbolOption(sym);
+    if (state.watchlist.indexOf(sym) === -1) state.watchlist.push(sym);
+    saveWatchlist();
+    refreshOverview();
+  }
+  function removeWatch(sym) {
+    const i = state.watchlist.indexOf(sym);
+    if (i !== -1) {
+      state.watchlist.splice(i, 1);
+      saveWatchlist();
+    }
+    renderOverviewGrid();
+  }
+
+  function showOverview() {
+    state.activeView = "overview";
+    const layout = document.querySelector(".layout");
+    const ov = $("overview-view");
+    if (layout) layout.classList.add("hidden");
+    if (ov) ov.classList.remove("hidden");
+    renderSymbolTabs();
+    refreshOverview();
+  }
+  function showChart() {
+    state.activeView = "chart";
+    const layout = document.querySelector(".layout");
+    const ov = $("overview-view");
+    if (layout) layout.classList.remove("hidden");
+    if (ov) ov.classList.add("hidden");
+  }
+
+  /** Coins to show: every open position (auto) + the watchlist, de-duped. */
+  function overviewSymbols() {
+    const out = [];
+    const push = function (s) {
+      const u = String(s || "").toUpperCase().trim();
+      if (u && out.indexOf(u) === -1) out.push(u);
+    };
+    ((state.account && state.account.positions) || []).forEach(function (p) {
+      if (Math.abs(Number(p.hold_vol) || 0) > 0) push(p.symbol);
+    });
+    state.watchlist.forEach(push);
+    return out;
+  }
+
+  /** Hardened against double-fetches: a busy guard plus a 10s min-interval so
+   *  the account poll (30s) and the overview timer (30s) landing close
+   *  together can't fire two /api/mini requests back to back. Reuses the
+   *  cached candles (fresh position/PnL badges still redraw from state.account). */
+  async function refreshOverview() {
+    if (state.activeView !== "overview") return; // never redraw in background
+    const syms = overviewSymbols();
+    if (!syms.length) {
+      renderOverviewGrid();
+      return;
+    }
+    if (state._miniBusy) return;
+    const now = Date.now();
+    if (now - (state._miniLast || 0) < 10000 && Object.keys(state.overviewData).length) {
+      renderOverviewGrid(); // fresh enough — reuse cached candles, update PnL badges
+      return;
+    }
+    state._miniBusy = true;
+    try {
+      const res = await fetch(
+        "/api/mini?symbols=" + encodeURIComponent(syms.join(",")) + "&tf=15m&limit=96"
+      );
+      if (res.ok) {
+        const data = await res.json();
+        (data.results || []).forEach(function (r) {
+          state.overviewData[String(r.symbol || "").toUpperCase()] = r;
+        });
+        state._miniLast = Date.now();
+      }
+    } catch (e) {
+      console.error("refreshOverview", e);
+    } finally {
+      state._miniBusy = false;
+    }
+    if (state.activeView === "overview") renderOverviewGrid();
+  }
+
+  function positionFor(sym) {
+    return (
+      ((state.account && state.account.positions) || []).find(function (p) {
+        return symMatch(p.symbol, sym) && Math.abs(Number(p.hold_vol) || 0) > 0;
+      }) || null
+    );
+  }
+
+  function renderOverviewGrid() {
+    const grid = $("overview-grid");
+    if (!grid) return;
+    const syms = overviewSymbols();
+    if (!syms.length) {
+      grid.innerHTML =
+        '<div class="overview-empty">Keine offenen Positionen. Coins über „+ Beobachten" hinzufügen.</div>';
+      return;
+    }
+    grid.innerHTML = "";
+    const cs = contractSize();
+    syms.forEach(function (sym) {
+      const key = sym.toUpperCase();
+      const d = state.overviewData[key] || {};
+      const pos = positionFor(sym);
+      const isWatch = state.watchlist.indexOf(key) !== -1 && !pos;
+
+      const tile = document.createElement("div");
+      tile.className = "mini-tile" + (pos ? " pos " + String(pos.side || "").toLowerCase() : "");
+      tile.setAttribute("data-symbol", key);
+
+      const last = Number(d.last_price);
+      const chg = Number(d.change_pct);
+      const chgCls = Number.isFinite(chg) ? (chg >= 0 ? "pos-pos" : "pos-neg") : "";
+      const chgTxt = Number.isFinite(chg) ? (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%" : "—";
+
+      let pnlHtml = "";
+      if (pos && Number.isFinite(last)) {
+        const entry = Number(pos.entry_price);
+        const vol = Number(pos.hold_vol);
+        const short = String(pos.side || "").toLowerCase() === "short";
+        const pnl = (last - entry) * vol * cs * (short ? -1 : 1);
+        const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
+        pnlHtml = '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
+      }
+
+      tile.innerHTML =
+        (isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
+        '<div class="mini-head"><span class="mini-sym">' + escapeHtml(key) + "</span>" +
+        '<span class="mini-price">' + (Number.isFinite(last) ? fmt(last, 6) : "—") + "</span></div>" +
+        '<div class="mini-badges">' + pnlHtml +
+        '<span class="mini-chg ' + chgCls + '">' + chgTxt + "</span></div>" +
+        '<canvas class="mini-canvas"></canvas>';
+
+      const cv = tile.querySelector(".mini-canvas");
+      const marks = [];
+      if (pos) {
+        const mk = state.tradeMarkers && state.tradeMarkers[key];
+        marks.push({ price: Number(pos.entry_price), color: "#9d9ab6" });
+        if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: "#e35349" });
+        if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: "#4fbe8e" });
+      }
+      // Draw after insertion so the canvas has a measured width.
+      requestAnimationFrame(function () {
+        drawMiniCandles(cv, d.candles || [], marks);
+      });
+
+      tile.addEventListener("click", function (e) {
+        if (e.target.closest(".mini-remove")) {
+          removeWatch(key);
+          return;
+        }
+        goToSymbol(key, { newTab: true });
+      });
+      grid.appendChild(tile);
+    });
+  }
+
+  function drawMiniCandles(cv, candles, marks) {
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 240;
+    const h = cv.clientHeight || 84;
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const cs = (candles || []).slice(-60);
+    if (!cs.length) return;
+    let lo = Infinity,
+      hi = -Infinity;
+    cs.forEach(function (c) {
+      lo = Math.min(lo, c.low);
+      hi = Math.max(hi, c.high);
+    });
+    (marks || []).forEach(function (m) {
+      if (Number.isFinite(m.price)) {
+        lo = Math.min(lo, m.price);
+        hi = Math.max(hi, m.price);
+      }
+    });
+    if (!(hi > lo)) return;
+    const pad = 4,
+      plotH = h - 2 * pad;
+    const y = function (p) {
+      return pad + ((hi - p) / (hi - lo)) * plotH;
+    };
+    const n = cs.length,
+      bw = Math.max(1, (w - 2) / n);
+    cs.forEach(function (c, i) {
+      const x = 1 + i * bw + bw / 2;
+      const up = c.close >= c.open;
+      ctx.strokeStyle = up ? "#4fbe8e" : "#e35349";
+      ctx.fillStyle = up ? "#4fbe8e" : "#e35349";
+      ctx.beginPath();
+      ctx.moveTo(x, y(c.high));
+      ctx.lineTo(x, y(c.low));
+      ctx.stroke();
+      const bodyTop = y(Math.max(c.open, c.close));
+      const bodyH = Math.max(1, Math.abs(y(c.open) - y(c.close)));
+      ctx.fillRect(x - bw * 0.32, bodyTop, Math.max(1, bw * 0.64), bodyH);
+    });
+    (marks || []).forEach(function (m) {
+      if (!Number.isFinite(m.price)) return;
+      ctx.strokeStyle = m.color;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 2]);
+      const yy = y(m.price);
+      ctx.beginPath();
+      ctx.moveTo(0, yy);
+      ctx.lineTo(w, yy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
   }
 
   async function loadLlm() {
@@ -4106,26 +4366,48 @@
     let pollTick = 0;
     setInterval(function () {
       if (!state.symbol) return;
+      if (!state._chartKey) return; // overview start: no chart loaded yet → no market polling
       pollTick += 1;
       if (state.wsStatus === "live" && pollTick % 3 !== 0) return;
       loadMarket(state.symbol, state.tf || "15m", state.htf || "1H", {
         silent: true,
       });
     }, 5000);
+    // E5 start behavior: the overview tab is active on load. The big chart,
+    // its /api/market snapshot and the realtime WS start ONLY when the user
+    // opens a coin tab / tile (goToSymbol → showChart → loadMarket).
     const symbol =
       (h && h.default_symbol) ||
       ($("symbol-input") && $("symbol-input").value) ||
       "BTC";
     const active = document.querySelector(".tf-btn.active");
-    const tf = active ? active.getAttribute("data-tf") : "15m";
-    await loadMarket(symbol, tf, "1H");
-    // Now state.symbol is set: restore watched tabs (localStorage) and ensure
-    // the active coin has a tab.
-    loadOpenTabs();
-    addOpenTab(state.symbol);
+    state.tf = active ? active.getAttribute("data-tf") : "15m";
+    state.htf = "1H";
+    state.symbol = String(symbol).toUpperCase().trim();
+    const bootInput = $("symbol-input");
+    if (bootInput) bootInput.value = state.symbol;
+    loadOpenTabs(); // needs state.symbol as fallback seed
     sizeTradeOverlay();
-    drawTradeZones();
-    loadFills(); // initial markers for the boot symbol (reload case)
+
+    loadWatchlist();
+    renderSymbolTabs(); // draw the fixed overview tab now that tabs exist
+    const watchForm = $("watch-add");
+    if (watchForm) {
+      watchForm.addEventListener("submit", function (e) {
+        e.preventDefault();
+        const inp = $("watch-input");
+        if (inp && inp.value.trim()) {
+          addWatch(inp.value);
+          inp.value = "";
+        }
+      });
+    }
+    // Snapshot refresh, only while the overview tab is visible (no background work).
+    state._overviewTimer = setInterval(function () {
+      if (state.activeView === "overview") refreshOverview();
+    }, 30000);
+
+    showOverview(); // start on the overview tab; also triggers the first mini refresh
   });
 })();
 

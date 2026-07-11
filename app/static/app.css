@@ -1333,6 +1333,57 @@ select:focus {
 }
 .tab-add:hover { color: var(--accent); border-color: var(--accent); }
 
+/* Overview tab (E5): mini-chart tile grid, static canvas snapshots */
+.overview { padding: 10px 12px 16px; }
+.overview.hidden { display: none; }
+.overview-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.overview-head h2 {
+  margin: 0; font-family: var(--mono); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
+}
+.watch-add { display: flex; gap: 6px; }
+.watch-add input {
+  font-family: var(--mono); font-size: 12px; padding: 5px 8px;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); width: 220px;
+}
+.overview-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+.mini-tile {
+  position: relative; background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px 6px; cursor: pointer;
+  transition: border-color 0.12s ease;
+}
+.mini-tile:hover { border-color: var(--accent); }
+.mini-tile.pos { border-left: 2px solid var(--faint); }
+.mini-tile.pos.long { border-left-color: var(--long); }
+.mini-tile.pos.short { border-left-color: var(--short); }
+.mini-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 6px; font-family: var(--mono); margin-bottom: 4px;
+}
+.mini-sym { font-size: 12px; font-weight: 600; color: var(--text); }
+.mini-price { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini-badges { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; }
+.mini-chg.pos-pos { color: var(--long); }
+.mini-chg.pos-neg { color: var(--short); }
+.mini-pnl { padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+.mini-pnl.pos-pos { color: var(--long); background: rgba(79,190,142,0.12); }
+.mini-pnl.pos-neg { color: var(--short); background: rgba(227,83,73,0.12); }
+.mini-canvas { display: block; width: 100%; height: 84px; }
+.mini-remove {
+  position: absolute; top: 4px; right: 4px; border: none; background: transparent;
+  color: var(--faint); font-size: 13px; line-height: 1; cursor: pointer; opacity: .5;
+  padding: 0 3px; border-radius: 2px;
+}
+.mini-remove:hover { opacity: 1; color: var(--short); background: var(--bg-inset); }
+.overview-empty { color: var(--muted); font-size: 12.5px; padding: 20px 4px; }
+
 /* Setup-confidence badge in the KI-analysis panel */
 .setup-conf {
   display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
