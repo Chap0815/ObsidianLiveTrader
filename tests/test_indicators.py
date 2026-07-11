@@ -6,6 +6,7 @@ from app.analysis.indicators import (
     compute_ema,
     compute_macd,
     compute_rsi,
+    compute_rvol,
     compute_vwap,
 )
 from app.models import Candle
@@ -93,3 +94,29 @@ def test_atr_too_short_series():
 
     candles = [Candle(time=i, open=1, high=2, low=1, close=1.5, vol=1) for i in range(5)]
     assert compute_atr(candles, period=14) == [None] * 5
+
+
+def test_rvol_constant_volume_is_one():
+    candles = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(25)
+    ]
+    rvol, vol_trend = compute_rvol(candles)
+    assert rvol == pytest.approx(1.0)
+    assert vol_trend == "flat"
+
+
+def test_rvol_spike_is_above_one():
+    candles = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(19)
+    ] + [Candle(time=19, open=10, high=11, low=9, close=10, vol=50.0)]
+    rvol, vol_trend = compute_rvol(candles)
+    # last bar (50) vs mean of last 20 bars (19*5 + 50)/20 = 7.25 → ~6.9x
+    assert rvol > 1.5
+    assert vol_trend == "rising"
+
+
+def test_rvol_short_series_fallback_neutral():
+    candles = [Candle(time=i, open=1, high=2, low=1, close=1.5, vol=3.0) for i in range(5)]
+    rvol, vol_trend = compute_rvol(candles)
+    assert rvol == pytest.approx(1.0)
+    assert vol_trend == "flat"

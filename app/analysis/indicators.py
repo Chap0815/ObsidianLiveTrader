@@ -150,6 +150,45 @@ def compute_vwap(candles: list[Candle]) -> list[float | None]:
     return out
 
 
+def compute_rvol(candles: list[Candle], period: int = 20) -> tuple[float, str]:
+    """Relative volume: last bar's vol vs the mean of the last `period` bars
+    (the last bar is included in its own average, matching the simple "how
+    hot is this bar vs its recent norm" read the LLM prompt needs).
+
+    Falls back to a neutral 1.0 when there isn't enough history yet (< period
+    candles) or the window average is zero, so the field is always a usable
+    number for the LLM context rather than a null that needs special-casing.
+
+    `vol_trend` compares the mean of the last 3 bars vs the previous 3 bars
+    (a small +/-5% band avoids flip-flopping on noise) for a coarse
+    "rising"/"falling"/"flat" volume direction.
+    """
+    vols = [c.vol for c in candles]
+    n = len(vols)
+    if n < period:
+        rvol = 1.0
+    else:
+        window = vols[-period:]
+        avg = sum(window) / period
+        rvol = vols[-1] / avg if avg > 0 else 1.0
+
+    if n >= 6:
+        prev_avg = sum(vols[-6:-3]) / 3
+        last_avg = sum(vols[-3:]) / 3
+        if prev_avg <= 0:
+            vol_trend = "flat"
+        elif last_avg > prev_avg * 1.05:
+            vol_trend = "rising"
+        elif last_avg < prev_avg * 0.95:
+            vol_trend = "falling"
+        else:
+            vol_trend = "flat"
+    else:
+        vol_trend = "flat"
+
+    return round(rvol, 4), vol_trend
+
+
 def indicator_bundle(candles: list[Candle]) -> dict:
     """Compact indicator snapshot for API/LLM (last values + full series where useful)."""
     closes = [c.close for c in candles]
@@ -160,6 +199,7 @@ def indicator_bundle(candles: list[Candle]) -> dict:
     rsi = compute_rsi(closes, 14)
     vwap = compute_vwap(candles)
     atr = compute_atr(candles, 14)
+    rvol, vol_trend = compute_rvol(candles)
 
     def _last(series: list[float | None]) -> float | None:
         for v in reversed(series):
@@ -177,6 +217,8 @@ def indicator_bundle(candles: list[Candle]) -> dict:
         "macd_hist": macd["hist"],
         "vwap": vwap,
         "atr14": atr,
+        "rvol": rvol,
+        "vol_trend": vol_trend,
         "last": {
             "ema20": _last(ema20),
             "ema50": _last(ema50),

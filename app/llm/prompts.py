@@ -38,6 +38,12 @@ METHOD — work through these steps in order:
    break of a marked swing level WITH momentum confirmation (|macd_hist|
    expanding across indicators_tail, RSI leaving 40-60), or (c) a confirmed
    chart-pattern break/reclaim from step 2.
+   Volume confirmation: a break/reclaim needs ltf.read.rvol > 1.5 to count as
+   volume-confirmed. If rvol < 1.0 (below-average participation), treat the
+   break as unconfirmed and lower setup_confidence — a level break on thin
+   volume is unreliable regardless of how clean the price action looks.
+   ltf.read.vol_trend ("rising"/"falling"/"flat") is supporting context: rising
+   volume into a break strengthens it, falling volume into a break weakens it.
    No-chase rule: if last_price has already run more than 0.5 x LTF ATR14
    beyond the entry zone in the trade direction, do not propose that entry —
    either STAY_OUT or define a fresh trigger closer to current price.
@@ -83,6 +89,16 @@ METHOD — work through these steps in order:
    cost. If it works against the trade direction, note it explicitly in
    funding_alert and cap setup_confidence at "medium" (never "high") for that
    trade.
+   funding.fundingExtreme ("crowded_long"/"crowded_short"/"neutral", from
+   fundingRate vs +/-0.03%) and funding.fundingAnnualized (the same rate
+   annualized) tell you how crowded the trade is, not just its raw sign.
+   Extreme positive funding (crowded_long) means late longs are paying a
+   steep annualized cost and are exposed to a long-squeeze — treat this as a
+   headwind for NEW long entries (factor into funding_alert, cap confidence
+   as above) and, symmetrically, crowded_short raises short-squeeze risk for
+   new shorts. A large fundingAnnualized magnitude (e.g. well above typical
+   double-digit-% carry) reinforces the crowding read even if the raw
+   per-interval rate looks small.
 
 Rules:
 1. Every price level and every named pattern MUST be derivable from the provided

@@ -32,6 +32,35 @@ def _contract_public(meta: ContractMeta) -> dict[str, Any]:
     }
 
 
+# |funding| beyond this per-interval rate is treated as a meaningful
+# crowded-side signal — matches the "0.03% per interval" threshold already
+# used by the analysis prompt (app/llm/prompts.py step 7).
+_FUNDING_EXTREME_THRESHOLD = 0.0003
+
+
+def _funding_annualized(rate: float, collect_cycle: int | None) -> float:
+    """Annualize a per-settlement funding rate.
+
+    `collect_cycle` is the number of HOURS between funding settlements
+    (MEXC's `collectCycle` field, typically 8). When it's unknown/absent —
+    e.g. Hyperliquid's client (app/hyperliquid/client.py) never sets
+    `collect_cycle`, and Hyperliquid pays/charges funding hourly per its
+    docs — we assume a 1-hour settlement interval, i.e. the rate is already
+    hourly. periods/year = (24 * 365) / cycle_hours.
+    """
+    cycle_hours = collect_cycle if collect_cycle and collect_cycle > 0 else 1
+    periods_per_year = (24.0 * 365.0) / cycle_hours
+    return round(rate * periods_per_year, 6)
+
+
+def _funding_extreme(rate: float) -> str:
+    if rate > _FUNDING_EXTREME_THRESHOLD:
+        return "crowded_long"
+    if rate < -_FUNDING_EXTREME_THRESHOLD:
+        return "crowded_short"
+    return "neutral"
+
+
 def _funding_public(fr: FundingRate) -> dict[str, Any]:
     return {
         "symbol": fr.symbol,
@@ -41,6 +70,8 @@ def _funding_public(fr: FundingRate) -> dict[str, Any]:
         "collectCycle": fr.collect_cycle,
         "nextSettleTime": fr.next_settle_time,
         "timestamp": fr.timestamp,
+        "fundingAnnualized": _funding_annualized(fr.funding_rate, fr.collect_cycle),
+        "fundingExtreme": _funding_extreme(fr.funding_rate),
     }
 
 

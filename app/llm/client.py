@@ -340,7 +340,7 @@ def _ema_stack_label(last: dict[str, Any], last_close: float | None) -> str:
         return "unknown"
 
 
-def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 60) -> dict[str, Any]:
+def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> dict[str, Any]:
     candles = slice_dict.get("candles") or []
     indicators = slice_dict.get("indicators") or {}
     structure = slice_dict.get("structure") or {}
@@ -367,18 +367,22 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 60) -> 
         for s in (swings.get("lows") or [])[-4:]
     ]
 
-    # Momentum/vola direction, not just a snapshot
+    # Momentum/vola direction, not just a snapshot. EMA20/50 tails are
+    # deliberately omitted here — the `ema_stack` label + `price_vs_ema20_pct`
+    # below already cover EMA positioning, so raw EMA history would just be
+    # redundant tokens. RSI/macd_hist stay: they carry real momentum direction
+    # that a single last-value snapshot can't show.
     indicators_tail = {
         "rsi14": _series_tail(indicators.get("rsi14")),
         "macd_hist": _series_tail(indicators.get("macd_hist")),
         "atr14": _series_tail(indicators.get("atr14"), 6),
-        "ema20": _series_tail(indicators.get("ema20"), 6),
-        "ema50": _series_tail(indicators.get("ema50"), 6),
     }
 
     read = {
         "ema_stack": _ema_stack_label(last, last_close),
         "atr14": last.get("atr14"),
+        "rvol": indicators.get("rvol"),
+        "vol_trend": indicators.get("vol_trend"),
     }
     try:
         if last_close and last.get("ema20"):
