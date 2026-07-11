@@ -3477,26 +3477,53 @@
     });
   }
 
+  /** True if the coin already has an open position (hold_vol != 0) or an open
+   *  order/stop-order — scan suggestions for it are hidden, no point proposing
+   *  a trade that's already running. */
+  function hasOpenExposure(sym) {
+    if (!sym) return false;
+    const positions = (state.account && state.account.positions) || [];
+    const inPosition = positions.some(function (p) {
+      return symMatch(p.symbol, sym) && Math.abs(Number(p.hold_vol) || 0) > 0;
+    });
+    if (inPosition) return true;
+    const oo = state.openOrders;
+    const orders = (oo && oo.orders) || [];
+    const stops = (oo && oo.stop_orders) || [];
+    return (
+      orders.some(function (o) { return o.symbol && symMatch(o.symbol, sym); }) ||
+      stops.some(function (s) { return s.symbol && symMatch(s.symbol, sym); })
+    );
+  }
+
   /** Scan results live in a PERSISTENT strip above the analysis. Clicking a
    *  coin analyses it without destroying the other findings. */
   function renderScanResults(data) {
     const strip = $("scan-strip");
-    const rows = (data && data.results) || [];
+    const allRows = (data && data.results) || [];
+    const rows = allRows.filter(function (r) {
+      return !hasOpenExposure(r.symbol);
+    });
+    const hiddenCount = allRows.length - rows.length;
     state.scanResults = data;
 
     if (!strip) return;
     if (!rows.length) {
       strip.className = "scan-strip";
+      const emptyMsg = allRows.length
+        ? "Alle Top-Kandidaten bereits offen (Position oder Order) — nichts Neues vorzuschlagen."
+        : "Kein Setup mit klarem Edge — auch das ist ein Ergebnis.";
       strip.innerHTML =
         '<div class="scan-strip-head">Markt-Scan · ' +
         escapeHtml(String(data.model_used || "?")) + " · " +
         ((data.scanned || []).length || 0) + " Coins</div>" +
-        '<div class="scan-empty">Kein Setup mit klarem Edge — auch das ist ein Ergebnis.</div>';
+        '<div class="scan-empty">' + emptyMsg + '</div>';
       const body = $("proposal-body");
       if (body) {
         body.className = "placeholder";
-        body.textContent =
-          "Kein Coin mit klarem Setup gefunden. Einzelnen Coin wählen und Analysieren nutzen, oder später erneut scannen.";
+        body.textContent = allRows.length
+          ? "Alle gefundenen Setups laufen bereits (offene Position/Order). Einzelnen Coin wählen und Analysieren nutzen, oder später erneut scannen."
+          : "Kein Coin mit klarem Setup gefunden. Einzelnen Coin wählen und Analysieren nutzen, oder später erneut scannen.";
       }
       return;
     }
@@ -3504,8 +3531,11 @@
     let html =
       '<div class="scan-strip-head">Markt-Scan · ' +
       escapeHtml(String(data.model_used || "?")) + " · Top " + rows.length +
-      " von " + ((data.scanned || []).length || 0) +
-      ' Coins <span class="scan-hint">— Coin anklicken für Detail-Analyse</span></div>' +
+      " von " + ((data.scanned || []).length || 0) + " Coins" +
+      (hiddenCount
+        ? " (" + hiddenCount + " bereits offen ausgeblendet)"
+        : "") +
+      ' <span class="scan-hint">— Coin anklicken für Detail-Analyse</span></div>' +
       '<div class="scan-chips">';
     rows.forEach(function (r) {
       const long = String(r.bias || "").toLowerCase() === "long";

@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     # Markt-Scanner: billiges/schnelles Modell screent viele Coins,
     # die Detail-Analyse pro Coin läuft weiter über LLM_PROVIDER (z.B. Opus).
     scanner_model: str = "claude-sonnet-5"
-    scanner_max_coins: int = 10
+    scanner_max_coins: int = 20
     # Konservativ | Ausgewogen(balanced) | Frei(free). Presets fill only fields
     # NOT explicitly set in .env — see RISK_PROFILES above. These field defaults
     # MIRROR the default "balanced" preset so a config read never lies about the
