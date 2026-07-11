@@ -488,8 +488,8 @@ select:focus {
   grid-template-areas:
     "chart     ticket"
     "stats     positions"
-    "history   orders"
-    "history   proposal";
+    "proposal  orders"
+    "proposal  history";
   gap: 10px;
   padding: 10px 12px 16px;
   align-items: start;
@@ -499,9 +499,9 @@ select:focus {
 .statbar         { grid-area: stats; }
 .positions-panel { grid-area: positions; }
 .orders-panel    { grid-area: orders; }
-.proposal-panel  { grid-area: proposal; max-height: 60vh; }
+.proposal-panel  { grid-area: proposal; max-height: 72vh; }
 .ticket-panel    { grid-area: ticket; }
-.history-panel   { grid-area: history; }
+.history-panel   { grid-area: history; max-height: 40vh; }
 
 /* ── Panels ─────────────────────────────────────────────── */
 .panel {
@@ -1115,8 +1115,9 @@ select:focus {
 .orders-body {
   font-family: var(--mono);
   font-size: 11.5px;
-  max-height: 150px;
-  overflow: auto;
+  max-height: 200px;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .positions-body.muted,
@@ -2134,25 +2135,29 @@ select:focus {
 
 /* ── History ────────────────────────────────────────────── */
 .history-body {
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 0;
   flex: 1;
 }
 
 .history-content {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   min-height: 0;
 }
 
 .history-section {
-  padding: 10px 12px 12px;
-  overflow: auto;
+  padding: 8px 10px 10px;
+  overflow-x: auto;
+  overflow-y: visible;
   border-right: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
   min-height: 0;
 }
 
 .history-section:last-child {
+  border-bottom: none;
   border-right: none;
 }
 
@@ -2168,16 +2173,17 @@ select:focus {
 
 .history-table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
 
 .history-table th,
 .history-table td {
   text-align: left;
-  padding: 5px 8px;
+  padding: 4px 6px;
   border-bottom: 1px solid var(--hairline);
   white-space: nowrap;
 }
@@ -2185,8 +2191,8 @@ select:focus {
 .history-table th {
   color: var(--faint);
   font-weight: 600;
-  font-size: 9px;
-  letter-spacing: 0.12em;
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
@@ -2586,8 +2592,13 @@ select:focus {
     border-bottom: 1px solid var(--hairline);
   }
 
-  .proposal-panel {
+  .proposal-panel,
+  .history-panel {
     max-height: none;
+  }
+
+  .history-content {
+    grid-template-columns: 1fr 1fr;
   }
 }
 
@@ -2604,7 +2615,8 @@ select:focus {
       "history";
   }
 
-  .proposal-panel {
+  .proposal-panel,
+  .history-panel {
     max-height: none;
   }
 
