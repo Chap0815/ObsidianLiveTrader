@@ -1,9 +1,16 @@
 import asyncio
 import hashlib
+import html as _html
 import json
+import re as _re
+import time as _time
+import xml.etree.ElementTree as _ET
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -496,6 +503,139 @@ async def mini(
         else:
             results.append(r)
     return {"results": results, "errors": errors}
+
+
+# --- Crypto news (public RSS, no API key) ---------------------------------
+# Free, key-less RSS/Atom feeds. Exchange-independent (MEXC/HL-agnostic).
+NEWS_FEEDS: list[tuple[str, str]] = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("Decrypt", "https://decrypt.co/feed"),
+]
+NEWS_CACHE_TTL = 300.0      # 5 min — news moves slowly; spare the upstreams
+NEWS_FEED_TIMEOUT = 6.0     # per-feed hard timeout
+NEWS_MAX_ITEMS = 40
+_ATOM = "{http://www.w3.org/2005/Atom}"
+_TAG_RE = _re.compile(r"<[^>]+>")
+
+
+def _strip_html(s: str) -> str:
+    """Feed content is UNTRUSTED: drop tags, unescape entities. The frontend
+    escapes again (defence in depth)."""
+    if not s:
+        return ""
+    return _html.unescape(_TAG_RE.sub("", s)).strip()
+
+
+def _parse_news_date(raw: str) -> tuple[str, float]:
+    """RFC-822 (RSS pubDate) or ISO-8601 (Atom) -> (UTC ISO display, epoch sort key)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return "", 0.0
+    dt: datetime | None = None
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw, 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(), dt.timestamp()
+
+
+def _parse_feed(xml_text: str, source: str) -> list[dict]:
+    """Parse an RSS <item> or Atom <entry> document into news dicts.
+
+    Raises xml.etree.ElementTree.ParseError on malformed XML — the caller
+    isolates that per feed."""
+    root = _ET.fromstring(xml_text)
+    nodes = root.findall(".//item")
+    is_atom = False
+    if not nodes:
+        nodes = root.findall(f".//{_ATOM}entry")
+        is_atom = True
+    out: list[dict] = []
+    for node in nodes:
+        if is_atom:
+            title = node.findtext(f"{_ATOM}title", "")
+            link_el = node.find(f"{_ATOM}link")
+            url = link_el.get("href", "") if link_el is not None else ""
+            published = node.findtext(f"{_ATOM}updated") or node.findtext(f"{_ATOM}published") or ""
+            summary = node.findtext(f"{_ATOM}summary") or ""
+        else:
+            title = node.findtext("title", "")
+            url = node.findtext("link", "")
+            published = node.findtext("pubDate", "")
+            summary = node.findtext("description", "")
+        title = _strip_html(title)
+        if not title:
+            continue
+        iso, sort_key = _parse_news_date(published)
+        out.append(
+            {
+                "title": title,
+                "source": source,
+                "url": (url or "").strip(),
+                "published": iso,
+                "summary": _strip_html(summary)[:280],
+                "_sort": sort_key,
+            }
+        )
+    return out
+
+
+@app.get("/api/news")
+async def news(request: Request):
+    """Merged crypto headlines from public RSS/Atom feeds. Public + read-only.
+
+    No API key, no new dependency. Per-feed failures are isolated (a dead feed
+    never breaks the page), each feed has a hard timeout, and results are cached
+    5 min in-memory. On a total fetch failure the last good payload is served
+    stale. HTML is stripped server-side; the client escapes again."""
+    cache = getattr(request.app.state, "news_cache", None)
+    if cache and _time.monotonic() - cache[0] < NEWS_CACHE_TTL:
+        return cache[1]
+
+    async def one(source: str, url: str, client: httpx.AsyncClient) -> list[dict]:
+        resp = await client.get(url, headers={"User-Agent": "ObsidianLiveTrader/1.0"})
+        resp.raise_for_status()
+        return _parse_feed(resp.text, source)
+
+    async with httpx.AsyncClient(
+        timeout=NEWS_FEED_TIMEOUT, follow_redirects=True
+    ) as client:
+        gathered = await asyncio.gather(
+            *(one(src, url, client) for src, url in NEWS_FEEDS),
+            return_exceptions=True,
+        )
+
+    items: list[dict] = []
+    errors: list[str] = []
+    for (src, _url), r in zip(NEWS_FEEDS, gathered):
+        if isinstance(r, Exception):
+            errors.append(f"{src}: {r}")
+        else:
+            items.extend(r)
+
+    items.sort(key=lambda it: it.get("_sort", 0.0), reverse=True)
+    for it in items:
+        it.pop("_sort", None)
+    items = items[:NEWS_MAX_ITEMS]
+
+    payload = {"items": items, "errors": errors}
+    # Only overwrite the cache when we actually got items; otherwise keep
+    # serving the last good payload (stale) instead of an empty page.
+    if items or not cache:
+        request.app.state.news_cache = (_time.monotonic(), payload)
+        return payload
+    stale = dict(cache[1])
+    stale["stale"] = True
+    return stale
 
 
 @app.get("/api/account")
