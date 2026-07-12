@@ -1553,8 +1553,20 @@ class OrderService:
             raise OrderError("new_sl must be > 0")
 
         # Position must exist (and give us the size for the reduce-only stop).
-        hold, _open_type = await self._same_side_hold_vol(symbol, side)
+        # F-E1: distinguish a genuinely FLAT position from a positions-LOOKUP
+        # FAILURE — both surface as hold<=0 here, but only the former means
+        # "no open position". Reporting a failed lookup as "no open position"
+        # risks the user assuming they are flat when the true state is unknown.
+        hold, _open_type, hold_checked = await self._same_side_hold_vol_ok(
+            symbol, side
+        )
         if hold <= 0:
+            if not hold_checked:
+                raise OrderError(
+                    f"positions lookup failed — could not verify {side} position "
+                    f"on {symbol}. SL NOT modified. Retry, or verify on the "
+                    "exchange before assuming you are flat."
+                )
             raise OrderError(f"no open {side} position on {symbol}")
 
         # Mark price for side geometry.

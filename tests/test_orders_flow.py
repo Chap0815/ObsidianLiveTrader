@@ -552,6 +552,23 @@ async def test_modify_sl_no_position_rejected(store):
 
 
 @pytest.mark.asyncio
+async def test_modify_sl_positions_lookup_failure_is_distinct_from_no_position(store):
+    """F-E1: a positions LOOKUP FAILURE must not be reported as 'no open
+    position' — that risks the user assuming they are flat when the true
+    state is simply unknown. It must raise a distinct, non-misleading error."""
+    from app.hyperliquid.errors import HyperliquidError
+
+    c = _modify_client(positions=AsyncMock(side_effect=HyperliquidError("positions down")))
+    svc = OrderService(c, _modify_settings(), store)
+    with pytest.raises(OrderError) as ei:
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
+    msg = str(ei.value)
+    assert "no open long position" not in msg
+    assert "lookup failed" in msg or "could not verify" in msg
+    c.place_stop_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_modify_sl_disarmed_blocked(store):
     c = _modify_client()
     svc = OrderService(c, _modify_settings(trading_enabled=False), store)
