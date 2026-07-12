@@ -516,7 +516,27 @@ select:focus {
 }
 
 .chart-panel     { min-height: 52vh; }
-.proposal-panel  { max-height: 72vh; }
+
+/* Below the chart: a 40/60 row — a stack of KI-analysis + history (left, 40%)
+   beside the open-orders panel (right, 60%, made tall). */
+.left-split {
+  display: grid;
+  grid-template-columns: minmax(0, 0.4fr) minmax(0, 0.6fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.left-split-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.proposal-panel  { max-height: 60vh; }
+.history-panel   { max-height: 40vh; }
+.orders-panel .orders-body { max-height: 76vh; }
 
 .side-rail {
   display: flex;
@@ -525,7 +545,8 @@ select:focus {
   align-self: start;
 }
 
-.history-panel { max-height: 40vh; }
+/* Positions is now the main right-rail content — give it real room. */
+.positions-panel .positions-body { max-height: 64vh; }
 
 /* ── Panels ─────────────────────────────────────────────── */
 .panel {
@@ -2819,13 +2840,35 @@ a.news-item:hover .news-title { color: var(--accent); }
     border-bottom: 1px solid var(--hairline);
   }
 
-  .proposal-panel,
-  .history-panel {
-    max-height: none;
-  }
-
   .history-content {
     grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* Below ~1100px the page collapses to a single readable column:
+   chart · KI-analysis · orders · history · ticket · positions. The 40/60
+   sub-row unwraps (display:contents) so its panels can be ordered inline. */
+@media (max-width: 1100px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .left-split {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .left-split-col {
+    display: contents;
+  }
+
+  .proposal-panel { order: 1; max-height: none; }
+  .orders-panel   { order: 2; }
+  .history-panel  { order: 3; }
+
+  .orders-panel .orders-body,
+  .positions-panel .positions-body {
+    max-height: 340px;
   }
 }
 

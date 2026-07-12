@@ -139,6 +139,8 @@
     </div>
   </section>
 
+  <div class="left-split">
+  <div class="left-split-col">
   <section class="panel proposal-panel">
     <div class="panel-head">
       <h2>KI-Analyse</h2>
@@ -165,6 +167,36 @@
       Noch keine Analyse. „Analysieren" bewertet den aktuellen Coin, „Markt scannen" durchsucht die Top-Coins nach Setups. Der Vorschlag füllt nur das Ticket — jede Order läuft durch die Risk-Gates.
     </div>
   </section>
+
+  <section class="panel history-panel">
+    <div class="panel-head">
+      <h2>Historie</h2>
+      <button type="button" id="btn-history-refresh" class="btn btn-ghost" title="Historie neu laden">
+        Aktualisieren
+      </button>
+      <button
+        type="button"
+        id="btn-history-clear"
+        class="btn btn-ghost btn-reset"
+        title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben."
+      >
+        🧹 Reset
+      </button>
+    </div>
+    <div id="history-body" class="placeholder">
+      Lade Historie…
+    </div>
+  </section>
+  </div><!-- /.left-split-col -->
+
+  <section class="panel orders-panel">
+    <div class="panel-head">
+      <h2>Offene Orders</h2>
+      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
+    </div>
+    <div id="open-orders-body" class="orders-body muted">—</div>
+  </section>
+  </div><!-- /.left-split -->
   </div><!-- /.layout-main -->
 
   <div class="side-rail">
@@ -288,34 +320,6 @@
   <section class="panel positions-panel">
     <div class="panel-head"><h2>Positionen</h2></div>
     <div id="positions-body" class="positions-body muted">—</div>
-  </section>
-
-  <section class="panel orders-panel">
-    <div class="panel-head">
-      <h2>Offene Orders</h2>
-      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
-    </div>
-    <div id="open-orders-body" class="orders-body muted">—</div>
-  </section>
-
-  <section class="panel history-panel">
-    <div class="panel-head">
-      <h2>Historie</h2>
-      <button type="button" id="btn-history-refresh" class="btn btn-ghost" title="Historie neu laden">
-        Aktualisieren
-      </button>
-      <button
-        type="button"
-        id="btn-history-clear"
-        class="btn btn-ghost btn-reset"
-        title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben."
-      >
-        🧹 Reset
-      </button>
-    </div>
-    <div id="history-body" class="placeholder">
-      Lade Historie…
-    </div>
   </section>
   </div>
 </main>
