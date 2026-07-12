@@ -113,6 +113,63 @@ async def test_scan_with_llm_restricts_to_context_symbols(monkeypatch):
     assert [r.symbol for r in results] == ["BTC"]
 
 
+# --- B2: absolute score floor + analyzer non-negotiables in the payload ----
+
+
+def test_parse_scan_results_absolute_min_score_floor():
+    """min_score is a hard absolute gate: a score-5 coin is dropped when the
+    floor is 6, so the deep analyzer never gets marginal carry-through."""
+    text = (
+        '{"results": ['
+        '{"symbol": "A", "bias": "long", "score": 7},'
+        '{"symbol": "B", "bias": "long", "score": 5}'
+        "]}"
+    )
+    out = parse_scan_results(text, min_score=6.0)
+    assert [r.symbol for r in out] == ["A"]
+
+
+def test_parse_scan_results_default_has_no_floor():
+    text = '{"results": [{"symbol": "B", "bias": "long", "score": 5}]}'
+    assert [r.symbol for r in parse_scan_results(text)] == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_build_scan_contexts_adds_funding_extreme_and_daily_regime():
+    from app.analysis.context import clear_daily_cache
+
+    clear_daily_cache()
+
+    class FakeClient:
+        async def klines(self, symbol, interval, limit_hint=120):
+            base = 100.0
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 900) * 1000,
+                    open=base, high=base + 1, low=base - 1, close=base + 0.5, vol=5,
+                )
+                for i in range(60)
+            ]
+
+    overview = [{"symbol": "SCANX", "volume24": 1e9, "funding": 0.0005, "last": 100.5}]
+    contexts, errors = await build_scan_contexts(FakeClient(), overview, "15m", "1H")
+    assert errors == []
+    ctx = contexts[0]
+    assert ctx["funding_extreme"] == "crowded_long"  # 0.0005 > 0.0001 threshold
+    assert "funding_annualized" in ctx
+    assert "daily_stack" in ctx  # 1D regime anchor now fed to the screener
+
+
+def test_scanner_prompt_carries_analyzer_non_negotiables():
+    from app.llm.scanner import SCANNER_SYSTEM_PROMPT
+
+    p = SCANNER_SYSTEM_PROMPT
+    assert "No-chase" in p or "over-stretch" in p
+    assert "RRR" in p
+    assert "daily_stack" in p
+    assert "score >= 6" in p  # absolute bar raised from 5 -> 6
+
+
 def test_parse_scan_results_salvages_truncated_json():
     """Model cut off at max_tokens mid-array: keep the complete objects."""
     from app.llm.scanner import parse_scan_results
