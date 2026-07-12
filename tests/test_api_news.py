@@ -2,7 +2,9 @@
 
 from functools import partial
 
+import defusedxml
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -101,6 +103,20 @@ def test_parse_feed_atom():
     assert items[0]["title"] == "Atom headline"
     assert items[0]["url"] == "https://example.com/atom"
     assert items[0]["published"].startswith("2026-07-09")
+
+
+def test_parse_feed_rejects_dtd_entities():
+    # Feeds are untrusted network XML: a DTD/entity payload (billion-laughs or
+    # XXE vector) must be rejected by the hardened parser, not expanded. The
+    # per-feed try/except in news() then isolates it as an error.
+    bomb = (
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE rss [<!ENTITY lol "lol">]>'
+        "<rss><channel><item><title>&lol;</title>"
+        "<link>https://x/</link></item></channel></rss>"
+    )
+    with pytest.raises(defusedxml.common.DefusedXmlException):
+        _parse_feed(bomb, "Evil")
 
 
 # --- endpoint tests --------------------------------------------------------

@@ -4,7 +4,7 @@ import html as _html
 import json
 import re as _re
 import time as _time
-import xml.etree.ElementTree as _ET
+import defusedxml.ElementTree as _ET  # hardened parser: news feeds are untrusted
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
