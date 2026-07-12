@@ -57,6 +57,9 @@
     _overviewTimer: null,
     _miniBusy: false, // in-flight /api/mini fetch guard
     _miniLast: 0, // ms timestamp of the last successful /api/mini fetch
+    newsItems: [], // /api/news headlines for the overview
+    _newsBusy: false, // in-flight /api/news fetch guard
+    _newsLast: 0, // ms timestamp of the last successful /api/news fetch
     reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
     reevalResults: {}, // symbol -> last /api/reevaluate response (or {error}), survives re-renders
   };
@@ -3576,6 +3579,8 @@
     if (ov) ov.classList.remove("hidden");
     renderSymbolTabs();
     refreshOverview();
+    renderNews(); // paint cached headlines immediately
+    refreshNews(); // then refresh if stale (5-min guard)
   }
   function showChart() {
     state.activeView = "chart";
@@ -3603,6 +3608,78 @@
     });
     state.watchlist.forEach(push);
     return out;
+  }
+
+  function relTime(iso) {
+    if (!iso) return "";
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 60) return "gerade eben";
+    const m = Math.floor(s / 60);
+    if (m < 60) return "vor " + m + " Min";
+    const h = Math.floor(m / 60);
+    if (h < 24) return "vor " + h + " Std";
+    const d = Math.floor(h / 24);
+    return "vor " + d + " Tag" + (d === 1 ? "" : "en");
+  }
+
+  /** Render cached headlines. EVERY feed string goes through escapeHtml
+   *  (feeds are untrusted), links are http(s)-whitelisted + noopener. */
+  function renderNews() {
+    const box = $("overview-news");
+    if (!box) return;
+    const items = state.newsItems || [];
+    if (!items.length) {
+      box.innerHTML = '<div class="news-empty">Keine aktuellen Schlagzeilen.</div>';
+      return;
+    }
+    box.innerHTML = items
+      .map(function (it) {
+        const url = String((it && it.url) || "");
+        const safe = /^https?:\/\//i.test(url) ? url : "";
+        const open = safe
+          ? '<a class="news-item" href="' + escapeHtml(safe) +
+            '" target="_blank" rel="noopener noreferrer">'
+          : '<div class="news-item">';
+        const close = safe ? "</a>" : "</div>";
+        return (
+          open +
+          '<span class="news-title">' + escapeHtml((it && it.title) || "") + "</span>" +
+          '<span class="news-meta">' +
+          '<span class="news-src">' + escapeHtml((it && it.source) || "") + "</span>" +
+          '<span class="news-time">' + escapeHtml(relTime(it && it.published)) + "</span>" +
+          "</span>" +
+          close
+        );
+      })
+      .join("");
+  }
+
+  /** 5-min-throttled news refresh. Mirrors the _miniLast guard so the 30s
+   *  overview timer never hammers the feeds. */
+  async function refreshNews() {
+    if (state.activeView !== "overview") return;
+    if (state._newsBusy) return;
+    const now = Date.now();
+    if (now - (state._newsLast || 0) < 300000 && (state.newsItems || []).length) {
+      renderNews();
+      return;
+    }
+    state._newsBusy = true;
+    try {
+      const res = await fetch("/api/news");
+      if (res.ok) {
+        const data = await res.json();
+        state.newsItems = data.items || [];
+        state._newsLast = Date.now();
+      }
+    } catch (e) {
+      console.error("refreshNews", e);
+    } finally {
+      state._newsBusy = false;
+    }
+    if (state.activeView === "overview") renderNews();
   }
 
   /** Hardened against double-fetches: a busy guard plus a 10s min-interval so
@@ -4862,7 +4939,10 @@
     }
     // Snapshot refresh, only while the overview tab is visible (no background work).
     state._overviewTimer = setInterval(function () {
-      if (state.activeView === "overview") refreshOverview();
+      if (state.activeView === "overview") {
+        refreshOverview();
+        refreshNews(); // internally throttled to 5 min
+      }
     }, 30000);
 
     showOverview(); // start on the overview tab; also triggers the first mini refresh
