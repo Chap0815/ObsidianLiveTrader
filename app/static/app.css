@@ -3068,6 +3068,51 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   color: var(--text);
 }
 
+.setup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 13px;
+  border: 1px solid var(--border, #333);
+  color: var(--text);
+}
+
+.pill-ok {
+  border-color: rgba(74, 179, 104, 0.6);
+  background: rgba(74, 179, 104, 0.12);
+  color: #6fce8a;
+}
+
+.pill-bad {
+  border-color: rgba(214, 90, 90, 0.6);
+  background: rgba(214, 90, 90, 0.12);
+  color: #e08a8a;
+}
+
+.ki-keys-status {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ki-keys-status li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
 #setup-form .btn-submit {
   border-color: var(--accent);
   background: var(--accent-dim);

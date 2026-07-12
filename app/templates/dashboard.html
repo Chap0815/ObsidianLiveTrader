@@ -155,6 +155,7 @@
           <option value="openai">Codex</option>
           <option value="ollama">Ollama (lokal)</option>
         </select>
+        <button type="button" id="btn-ki-keys" class="btn btn-ghost" title="KI-Keys verwalten">KI-Keys</button>
         <button type="button" id="btn-analyze" class="btn btn-secondary" title="Analyse anfordern">
           Analysieren
         </button>
@@ -381,6 +382,52 @@
       <button type="button" id="btn-confirm-live" class="btn btn-confirm">Confirm LIVE</button>
     </div>
     <p id="confirm-error" class="error-text hidden" role="alert"></p>
+  </div>
+</div>
+
+<!-- KI-Keys modal (authenticated) -->
+<div id="ki-keys-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="ki-keys-title">
+  <div class="modal-backdrop" data-close-ki></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="ki-keys-title">KI-Keys verwalten</h2>
+      <button type="button" class="btn btn-ghost modal-close" data-close-ki aria-label="Schließen">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="hint muted">
+        Keys werden lokal in die <code>.env</code> geschrieben (atomar, nur diese Felder).
+        Gespeicherte Keys werden nie zurück angezeigt — Status zeigt nur „konfiguriert".
+      </p>
+      <ul id="ki-keys-status" class="ki-keys-status"></ul>
+      <div class="setup-grid" style="margin-top:10px">
+        <label>
+          <span>Anbieter</span>
+          <select id="ki-provider">
+            <option value="claude">Claude Opus</option>
+            <option value="xai">Grok</option>
+            <option value="openai">Codex</option>
+            <option value="ollama">Ollama (lokal)</option>
+          </select>
+        </label>
+        <label id="ki-key-field">
+          <span>API Key</span>
+          <input type="password" id="ki-api-key" placeholder="sk-…" spellcheck="false" autocomplete="off" />
+        </label>
+        <label>
+          <span>Modell</span>
+          <input type="text" id="ki-model" spellcheck="false" />
+        </label>
+      </div>
+      <div class="setup-row" style="margin-top:10px">
+        <button type="button" id="btn-ki-test" class="btn btn-ghost">Key testen</button>
+        <span id="ki-test-pill" class="pill hidden"></span>
+      </div>
+      <p id="ki-keys-error" class="error-text hidden" role="alert"></p>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-close-ki>Schließen</button>
+      <button type="button" id="btn-ki-save" class="btn btn-confirm">Speichern</button>
+    </div>
   </div>
 </div>
 

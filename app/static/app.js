@@ -4401,6 +4401,158 @@
     }
   }
 
+  // ── KI-Keys panel (authenticated post-setup key management) ──────────
+  var KI_DEFAULT_MODELS = {
+    claude: "claude-opus-4-8",
+    xai: "grok-4",
+    openai: "gpt-5.1",
+    ollama: "llama3.1",
+  };
+
+  function kiPill(ok, text) {
+    var pill = $("ki-test-pill");
+    if (!pill) return;
+    pill.classList.remove("hidden");
+    pill.classList.toggle("pill-ok", ok);
+    pill.classList.toggle("pill-bad", !ok);
+    pill.textContent = text;
+  }
+
+  function kiFail(msg) {
+    var el = $("ki-keys-error");
+    if (!el) return;
+    if (!msg) {
+      el.classList.add("hidden");
+      return;
+    }
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+
+  function renderKiStatus(data) {
+    var ul = $("ki-keys-status");
+    if (!ul) return;
+    ul.innerHTML = "";
+    (data.providers || []).forEach(function (p) {
+      var li = document.createElement("li");
+      var dot = document.createElement("span");
+      dot.className = "status-dot " + (p.configured ? "ok" : "unknown");
+      var txt = document.createElement("span");
+      txt.textContent =
+        p.label +
+        " — " +
+        (p.configured ? "konfiguriert" : "kein Key") +
+        (p.model ? " · " + p.model : "") +
+        (p.id === data.active ? "  (aktiv)" : "");
+      li.appendChild(dot);
+      li.appendChild(txt);
+      ul.appendChild(li);
+    });
+  }
+
+  function kiSyncProvider() {
+    var p = $("ki-provider").value;
+    var isOllama = p === "ollama";
+    var kf = $("ki-key-field");
+    if (kf) kf.classList.toggle("hidden", isOllama);
+    var modelInput = $("ki-model");
+    if (modelInput && !modelInput.value.trim()) {
+      modelInput.value = KI_DEFAULT_MODELS[p] || "";
+    }
+    var pill = $("ki-test-pill");
+    if (pill) pill.classList.add("hidden");
+  }
+
+  async function loadKiStatus() {
+    try {
+      const res = await apiFetch("/api/settings/llm");
+      if (!res.ok) return;
+      const data = await res.json();
+      renderKiStatus(data);
+    } catch (err) {
+      console.error("loadKiStatus", err);
+    }
+  }
+
+  function openKiModal() {
+    const modal = $("ki-keys-modal");
+    if (!modal) return;
+    kiFail("");
+    var pill = $("ki-test-pill");
+    if (pill) pill.classList.add("hidden");
+    var modelInput = $("ki-model");
+    if (modelInput) modelInput.value = "";
+    kiSyncProvider();
+    modal.classList.remove("hidden");
+    loadKiStatus();
+  }
+
+  function closeKiModal() {
+    const modal = $("ki-keys-modal");
+    if (modal) modal.classList.add("hidden");
+  }
+
+  async function kiTestProvider() {
+    var p = $("ki-provider").value;
+    kiPill(true, "teste…");
+    try {
+      const res = await apiFetch("/api/settings/test-provider", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: p,
+          api_key: $("ki-api-key").value.trim(),
+          model: $("ki-model").value.trim(),
+        }),
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok) {
+        kiPill(false, detailToText(data.detail || data) || "Fehler");
+        return;
+      }
+      var ms = data.latency_ms != null ? " (" + data.latency_ms + " ms)" : "";
+      kiPill(!!data.ok, (data.detail || (data.ok ? "OK" : "Fehler")) + ms);
+    } catch (err) {
+      kiPill(false, "Netzwerkfehler");
+    }
+  }
+
+  async function kiSaveKey() {
+    kiFail("");
+    var p = $("ki-provider").value;
+    var apiKey = $("ki-api-key").value.trim();
+    var model = $("ki-model").value.trim();
+    if (p !== "ollama" && !apiKey && !model) {
+      return kiFail("Nichts zu speichern — Key oder Modell eingeben.");
+    }
+    var btn = $("btn-ki-save");
+    btn.disabled = true;
+    try {
+      const res = await apiFetch("/api/settings/llm-key", {
+        method: "POST",
+        body: JSON.stringify({ provider: p, api_key: apiKey, model: model }),
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok) {
+        kiFail(detailToText(data.detail || data) || "Speichern fehlgeschlagen");
+        return;
+      }
+      renderKiStatus(data);
+      $("ki-api-key").value = "";
+      showToast("KI-Key gespeichert", "ok");
+      // Refresh the existing provider dropdown so the newly-configured
+      // provider becomes selectable in the hot-swap.
+      loadLlm();
+    } catch (err) {
+      kiFail("Netzwerkfehler: " + (err && err.message ? err.message : err));
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   /** Close a share of the position. fraction 1 = full, 0.25 = 25 %.
    *  The server closes that share of the CURRENT hold with lot rounding. */
   async function closePositionFrac(symbol, side, fraction) {
@@ -4858,7 +5010,10 @@
     }
 
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") closeConfirmModal();
+      if (e.key === "Escape") {
+        closeConfirmModal();
+        closeKiModal();
+      }
     });
 
     const histBtn = $("btn-history-refresh");
@@ -4898,6 +5053,30 @@
     if (llmSel) {
       llmSel.addEventListener("change", () => switchLlm(llmSel.value));
     }
+
+    const kiKeysBtn = $("btn-ki-keys");
+    if (kiKeysBtn) {
+      kiKeysBtn.addEventListener("click", () => openKiModal());
+    }
+    const kiProvider = $("ki-provider");
+    if (kiProvider) {
+      kiProvider.addEventListener("change", () => {
+        const m = $("ki-model");
+        if (m) m.value = "";
+        kiSyncProvider();
+      });
+    }
+    const kiTestBtn = $("btn-ki-test");
+    if (kiTestBtn) {
+      kiTestBtn.addEventListener("click", () => kiTestProvider());
+    }
+    const kiSaveBtn = $("btn-ki-save");
+    if (kiSaveBtn) {
+      kiSaveBtn.addEventListener("click", () => kiSaveKey());
+    }
+    document.querySelectorAll("[data-close-ki]").forEach((el) => {
+      el.addEventListener("click", () => closeKiModal());
+    });
 
     const scanBtn = $("btn-scan");
     if (scanBtn) {
