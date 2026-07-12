@@ -25,6 +25,7 @@ from app.analysis.context import (  # noqa: F401
 from app.config import Settings
 from app.llm.client import (
     LlmError,
+    _oi_read_label,
     compact_daily_for_llm,
     compact_tf_for_llm,
     extract_json_object,
@@ -36,7 +37,8 @@ Select ONLY coins with a clear, tradeable directional edge right now.
 
 This screen is the fast first stage before a stricter deep analysis. To stop
 surfacing coins the deep stage will only reject, apply that stage's cheap
-NON-NEGOTIABLE gates here too. REJECT a coin (do not include it) if ANY holds:
+NON-NEGOTIABLE gates here too. These are the ONLY hard rejects — REJECT a coin
+(do not include it) if ANY holds:
   - No-chase / over-stretch: price has already run far from value —
     |read.price_vs_ema20_pct| is large (roughly > 1.5x a normal push) with no
     fresh pullback level nearby. An already-extended breakout is not a fresh
@@ -45,9 +47,14 @@ NON-NEGOTIABLE gates here too. REJECT a coin (do not include it) if ANY holds:
     structure level (support for a short, resistance for a long) is smaller
     than a sane structure+ATR stop on the other side — i.e. reward < risk. If
     there is no room to a target, skip it.
-  - Against the daily regime: daily_stack (the 1D ema_stack anchor) is firmly
-    opposite the intended bias (e.g. long while daily_stack is bearish). A pick
-    hard against the daily regime is scored down heavily / dropped.
+
+Against the daily regime is NOT a hard reject. The deep analyzer does NOT veto
+an against-daily setup — it still TRADES it at low confidence (daily is a
+confidence CAP, not a veto). So do NOT drop a coin just because daily_stack (the
+1D ema_stack anchor) opposes the bias. Instead treat it as a SCORE PENALTY:
+CAP its score at 6 (surface it only if it otherwise clears both hard rejects
+above and still earns >= 6). Mirroring the analyzer here stops the screen from
+silently starving it of valid low-confidence against-daily setups.
 
 Selection method per coin:
 1. Regime: read.ema_stack + price vs EMAs, cross-checked against daily_stack.
@@ -59,11 +66,17 @@ Selection method per coin:
    "neutral") and fundingAnnualized, not just the raw rate — crowded funding
    against the setup (e.g. crowded_long under a long idea = squeeze risk)
    lowers the score.
+5. Positioning (only when a coin carries oi_read): an OI read that CONFIRMS the
+   bias (price_up_oi_up for a long, price_down_oi_up for a short) is a
+   supporting confluence that lifts the score; price_up_oi_down (short covering)
+   under a long idea is a fade-risk deprioritizer. When oi_read is absent
+   (MEXC / cold-start), ignore it — do not infer positioning.
 
 Scoring: 0-10 as an ABSOLUTE quality bar, not a relative ranking. A 6 means
 "a disciplined analyst would actually take this now." Only include coins with
-score >= 6 that clear every gate above. Maximum 6 results, sorted by score
-descending. Returning an empty list is the correct answer in a quiet market.
+score >= 6 that clear both hard rejects above (against-daily is a score cap, not
+a reject). Maximum 6 results, sorted by score descending. Returning an empty
+list is the correct answer in a quiet market.
 
 Output ONLY valid JSON, no markdown, exactly this schema:
 {
@@ -241,11 +254,16 @@ async def build_scan_contexts(
     tf: str,
     htf: str,
     *,
-    kline_limit: int = 120,
+    kline_limit: int = 260,
     concurrency: int = 4,
     daily: str = "1D",
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fetch klines per coin (bounded concurrency) and build mini contexts."""
+    """Fetch klines per coin (bounded concurrency) and build mini contexts.
+
+    `kline_limit` must stay >= 250 so EMA200 is computable for every timeframe:
+    with the old 120 the scanner's `read.ema_stack` and the 1D `daily_stack`
+    were ALWAYS "unknown", so the regime + against-daily gates could never fire
+    (audit B2). The same depth feeds the depth-aware daily cache (audit B1)."""
     sem = asyncio.Semaphore(concurrency)
     errors: list[str] = []
 
@@ -283,6 +301,18 @@ async def build_scan_contexts(
         if isinstance(rate, (int, float)):
             ctx["funding_extreme"] = _funding_extreme(rate)
             ctx["funding_annualized"] = _funding_annualized(rate, None)
+        # OI positioning read for the screener (audit I4). Only added when the
+        # overview row actually carries OI (null on MEXC / HL cold-start), so it
+        # stays graceful and never invents positioning.
+        oi_read = _oi_read_label(
+            {
+                "open_interest": row.get("open_interest"),
+                "oi_change_pct_1h": row.get("oi_change_pct_1h"),
+            },
+            _candles_public(ltf_candles),
+        )
+        if oi_read is not None:
+            ctx["oi_read"] = oi_read
         return ctx
 
     results = await asyncio.gather(*(_one(r) for r in overview))

@@ -170,6 +170,51 @@ def test_scanner_prompt_carries_analyzer_non_negotiables():
     assert "score >= 6" in p  # absolute bar raised from 5 -> 6
 
 
+def test_scanner_prompt_treats_against_daily_as_cap_not_reject():
+    """F1: the scanner must match the analyzer — against-daily is a score cap
+    (the deep stage still trades it low), NOT a hard reject."""
+    from app.llm.scanner import SCANNER_SYSTEM_PROMPT
+
+    p = SCANNER_SYSTEM_PROMPT
+    assert "Against the daily regime is NOT a hard reject" in p
+    assert "CAP its score at 6" in p
+    # the two true deep-stage vetoes remain the only hard rejects
+    assert "ONLY hard rejects" in p
+
+
+@pytest.mark.asyncio
+async def test_build_scan_contexts_threads_oi_read_when_present():
+    """I4: when the overview row carries OI, an oi_read positioning label is
+    threaded into the screener payload; it is absent (graceful) when OI is
+    null, as it always is on MEXC / HL cold-start."""
+    from app.analysis.context import clear_daily_cache
+
+    clear_daily_cache()
+
+    class FakeClient:
+        async def klines(self, symbol, interval, limit_hint=120):
+            # rising closes so the ~1h price direction reads 'up'
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 900) * 1000,
+                    open=100.0 + i, high=101.0 + i, low=99.0 + i,
+                    close=100.5 + i, vol=5,
+                )
+                for i in range(40)
+            ]
+
+    overview = [
+        {"symbol": "WITHOI", "volume24": 1e9, "funding": 0.0, "last": 140.0,
+         "open_interest": 5000.0, "oi_change_pct_1h": 4.0},
+        {"symbol": "NOOI", "volume24": 9e8, "funding": 0.0, "last": 140.0},
+    ]
+    contexts, errors = await build_scan_contexts(FakeClient(), overview, "15m", "1H")
+    assert errors == []
+    by_sym = {c["symbol"]: c for c in contexts}
+    assert by_sym["WITHOI"]["oi_read"] == "price_up_oi_up_real_trend"
+    assert "oi_read" not in by_sym["NOOI"]  # graceful when OI absent
+
+
 def test_parse_scan_results_salvages_truncated_json():
     """Model cut off at max_tokens mid-array: keep the complete objects."""
     from app.llm.scanner import parse_scan_results
