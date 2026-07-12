@@ -534,10 +534,7 @@ select:focus {
   min-width: 0;
 }
 
-.proposal-panel  { max-height: 74vh; }   /* KI-Analyse now alone in its column */
-.history-panel   { max-height: 34vh; }   /* stacked under orders in the right column */
-.history-panel #history-body { overflow-y: auto; max-height: 28vh; }
-.orders-panel .orders-body { max-height: 46vh; }
+.proposal-panel  { max-height: 74vh; }   /* KI-Analyse alone in the left 40% column */
 
 .side-rail {
   display: flex;
@@ -546,8 +543,139 @@ select:focus {
   align-self: start;
 }
 
-/* Positions is now the main right-rail content — give it real room. */
-.positions-panel .positions-body { max-height: 64vh; }
+/* ── Tabbed data panel (Positionen · Offene Orders · Historie · Trades) ──
+   One panel in the right 60% column consolidates what used to be three
+   stacked panels + the side-rail positions list. The tab bar is the single
+   new structural signature: mono uppercase, active tab = violet underline. */
+.data-panel { max-height: 74vh; }
+
+.data-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--bg-panel);
+  overflow-x: auto;
+}
+
+.data-tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 10px 12px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.data-tab:hover { color: var(--text); }
+.data-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.data-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.data-tab-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 8px;
+}
+.data-act.hidden { display: none; }
+
+.data-panes {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.data-pane {
+  min-height: 0;
+  overflow-y: auto;
+  max-height: 66vh;
+}
+.data-pane.hidden { display: none; }
+
+/* Inner bodies let the pane own the scroll — no nested scrollbars. */
+.data-panel .positions-body,
+.data-panel .orders-body,
+.data-panel #history-body { max-height: none; overflow: visible; }
+
+/* ── Trades tab (executed fills from state.fills) ── */
+.trades-list { display: flex; flex-direction: column; }
+.trade-row {
+  display: grid;
+  grid-template-columns: minmax(0, auto) auto minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.trade-sym { color: var(--text); font-weight: 600; }
+.trade-side {
+  text-transform: uppercase;
+  font-weight: 600;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+}
+.trade-side.buy { color: var(--long); }
+.trade-side.sell { color: var(--short); }
+.trade-sz { color: var(--muted); font-variant-numeric: tabular-nums; }
+.trade-px { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
+.trade-time { color: var(--faint); font-size: 11px; text-align: right; white-space: nowrap; }
+.trades-empty { padding: 18px 12px; color: var(--muted); font-family: var(--sans); font-size: 13px; }
+
+/* ── Accounts / equity panel (side-rail, below the ticket) ── */
+.accounts-panel .accounts-body { padding: 2px 0; }
+.acct-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.acct-row:last-child { border-bottom: none; }
+.acct-lbl {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.acct-val {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.acct-val.pnl-pos { color: var(--long); }
+.acct-val.pnl-neg { color: var(--short); }
+
+/* ── Environment banner (testnet / live) ── */
+.env-banner {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-align: center;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+.env-banner.hidden { display: none; }
+.env-banner.env-testnet { color: #120d02; background: var(--live); }
+.env-banner.env-live { color: #fff; background: var(--short); }
+.env-banner.env-safe { color: var(--muted); background: var(--bg-elevated); }
 
 /* ── Panels ─────────────────────────────────────────────── */
 .panel {
@@ -2914,12 +3042,10 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   }
 
   .proposal-panel { order: 1; max-height: none; }
-  .orders-panel   { order: 2; }
-  .history-panel  { order: 3; }
+  .data-panel     { order: 2; max-height: none; }
 
-  .orders-panel .orders-body,
-  .positions-panel .positions-body {
-    max-height: 340px;
+  .data-pane {
+    max-height: 360px;
   }
 }
 
@@ -2929,7 +3055,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   }
 
   .proposal-panel,
-  .history-panel {
+  .data-panel {
     max-height: none;
   }
 

@@ -1185,6 +1185,7 @@
       // zieht Daten mit"). Each draw path re-filters by symMatch, but setMarkers
       // persists the old arrows until called again — so wipe them now.
       state.fills = [];
+      try { renderTrades(); } catch (_) {}
       try {
         if (state.candleSeries && typeof state.candleSeries.setMarkers === "function") {
           state.candleSeries.setMarkers([]);
@@ -2253,6 +2254,7 @@
       if (reqSeq !== state._fillsSeq) return null; // superseded by a newer call
       state.fills = Array.isArray(data.fills) ? data.fills : [];
       applyTradeMarkers();
+      try { renderTrades(); } catch (_) {}
       return data;
     } catch (e) {
       console.error("loadFills", e);
@@ -2974,6 +2976,80 @@
           "Historie-Fehler: " + (err && err.message ? err.message : err);
       }
       return null;
+    }
+  }
+
+  /** Trades tab: executed fills (state.fills) as a compact ledger. Reuses the
+   *  same fill objects that drive the chart markers, newest first. HL-only
+   *  today (loadFills no-ops on MEXC) → empty state elsewhere. */
+  function renderTrades() {
+    const el = $("trades-body");
+    if (!el) return;
+    const fills = Array.isArray(state.fills) ? state.fills.slice() : [];
+    if (!fills.length) {
+      el.className = "trades-body muted";
+      el.innerHTML =
+        '<div class="trades-empty">Noch keine ausgeführten Trades für ' +
+        escapeHtml(String(state.symbol || "—").split("_")[0]) +
+        ".</div>";
+      return;
+    }
+    fills.sort(function (a, b) {
+      return (Number(b.time) || 0) - (Number(a.time) || 0);
+    });
+    el.className = "trades-body";
+    el.innerHTML =
+      '<div class="trades-list">' +
+      fills
+        .map(function (f) {
+          const side = f.side === "buy" ? "buy" : "sell";
+          const sym = String(f.symbol || state.symbol || "—").split("_")[0];
+          const t = Number(f.time);
+          const iso = Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null;
+          return (
+            '<div class="trade-row">' +
+            '<span class="trade-sym">' + escapeHtml(sym) + "</span>" +
+            '<span class="trade-side ' + side + '">' +
+            (side === "buy" ? "BUY" : "SELL") + "</span>" +
+            '<span class="trade-sz">' + fmt(f.sz, 4) + "</span>" +
+            '<span class="trade-px">' + fmt(f.px, 4) + "</span>" +
+            '<span class="trade-time">' + (iso ? escapeHtml(relTime(iso)) : "") + "</span>" +
+            "</div>"
+          );
+        })
+        .join("") +
+      "</div>";
+  }
+
+  /** Tabbed data panel: toggle the active pane, contextual action buttons and
+   *  trigger an immediate render/refresh of the selected tab's data. Polling
+   *  keeps writing into hidden panes; they simply show when re-selected. */
+  function switchDataTab(name) {
+    const tabs = document.querySelectorAll(".data-tab");
+    if (!tabs.length) return;
+    state.dataTab = name;
+    tabs.forEach(function (t) {
+      const on = t.getAttribute("data-tab") === name;
+      t.classList.toggle("active", on);
+      t.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    document.querySelectorAll(".data-pane").forEach(function (p) {
+      const on = p.getAttribute("data-pane") === name;
+      p.classList.toggle("active", on);
+      p.classList.toggle("hidden", !on);
+    });
+    document.querySelectorAll(".data-act").forEach(function (b) {
+      b.classList.toggle("hidden", b.getAttribute("data-for") !== name);
+    });
+    if (name === "positions") {
+      try { renderPositions(state.account); } catch (_) {}
+    } else if (name === "orders") {
+      loadOpenOrders();
+    } else if (name === "history") {
+      loadHistory();
+    } else if (name === "trades") {
+      try { renderTrades(); } catch (_) {}
+      loadFills();
     }
   }
 
@@ -4477,6 +4553,17 @@
     if (ordBtn) {
       ordBtn.addEventListener("click", () => loadOpenOrders());
     }
+
+    // Tabbed data panel: Positionen · Offene Orders · Historie · Trades
+    document.querySelectorAll(".data-tab").forEach(function (t) {
+      t.addEventListener("click", function () {
+        switchDataTab(t.getAttribute("data-tab"));
+      });
+    });
+    // Sync the default tab's action-button visibility (default = Positionen).
+    document.querySelectorAll(".data-act").forEach(function (b) {
+      b.classList.toggle("hidden", b.getAttribute("data-for") !== "positions");
+    });
 
     const llmSel = $("llm-select");
     if (llmSel) {

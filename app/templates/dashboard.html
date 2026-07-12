@@ -170,34 +170,44 @@
   </div><!-- /.left-split-col (KI-Analyse allein) -->
 
   <div class="left-split-col">
-  <section class="panel orders-panel">
-    <div class="panel-head">
-      <h2>Offene Orders</h2>
-      <button type="button" id="btn-orders-refresh" class="btn btn-ghost" title="Orders neu laden">↻</button>
+  <section class="panel data-panel">
+    <div class="data-tabs" role="tablist" aria-label="Daten-Panels">
+      <button type="button" class="data-tab active" role="tab" aria-selected="true" data-tab="positions">Positionen</button>
+      <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="orders">Offene Orders</button>
+      <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="history">Historie</button>
+      <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="trades">Trades</button>
+      <div class="data-tab-actions">
+        <button type="button" id="btn-orders-refresh" class="btn btn-ghost data-act hidden" data-for="orders" title="Orders neu laden">↻</button>
+        <button type="button" id="btn-history-refresh" class="btn btn-ghost data-act hidden" data-for="history" title="Historie neu laden">Aktualisieren</button>
+        <button
+          type="button"
+          id="btn-history-clear"
+          class="btn btn-ghost btn-reset data-act hidden"
+          data-for="history"
+          title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben."
+        >
+          🧹 Reset
+        </button>
+      </div>
     </div>
-    <div id="open-orders-body" class="orders-body muted">—</div>
+    <div class="data-panes">
+      <div class="data-pane active" role="tabpanel" aria-label="Positionen" data-pane="positions">
+        <div id="positions-body" class="positions-body muted">—</div>
+      </div>
+      <div class="data-pane hidden" role="tabpanel" aria-label="Offene Orders" data-pane="orders">
+        <div id="open-orders-body" class="orders-body muted">—</div>
+      </div>
+      <div class="data-pane hidden" role="tabpanel" aria-label="Historie" data-pane="history">
+        <div id="history-body" class="placeholder">
+          Lade Historie…
+        </div>
+      </div>
+      <div class="data-pane hidden" role="tabpanel" aria-label="Trades" data-pane="trades">
+        <div id="trades-body" class="trades-body muted">Noch keine Trades.</div>
+      </div>
+    </div>
   </section>
-
-  <section class="panel history-panel">
-    <div class="panel-head">
-      <h2>Historie</h2>
-      <button type="button" id="btn-history-refresh" class="btn btn-ghost" title="Historie neu laden">
-        Aktualisieren
-      </button>
-      <button
-        type="button"
-        id="btn-history-clear"
-        class="btn btn-ghost btn-reset"
-        title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben."
-      >
-        🧹 Reset
-      </button>
-    </div>
-    <div id="history-body" class="placeholder">
-      Lade Historie…
-    </div>
-  </section>
-  </div><!-- /.left-split-col (Orders + Historie) -->
+  </div><!-- /.left-split-col (Tabbed data panel) -->
   </div><!-- /.left-split -->
   </div><!-- /.layout-main -->
 
@@ -318,11 +328,6 @@
       <p id="ticket-error" class="error-text hidden" role="alert"></p>
     </form>
   </aside>
-
-  <section class="panel positions-panel">
-    <div class="panel-head"><h2>Positionen</h2></div>
-    <div id="positions-body" class="positions-body muted">—</div>
-  </section>
   </div>
 </main>
 
