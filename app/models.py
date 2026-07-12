@@ -165,6 +165,10 @@ class AnalyzeRequest(BaseModel):
     symbol: str = "BTC_USDT"
     tf: str = "15m"
     htf: str = "1H"
+    # Optional pre-screen from the market scanner for THIS coin (bias/setup/
+    # key_level/score). Advisory only — the analyzer confirms or refutes it and
+    # it is sanitized server-side; it can never relax a risk gate.
+    scanner_verdict: dict[str, Any] | None = None
 
 
 # --- Trade Reevaluation (advisory review of an ALREADY OPEN position) ---

@@ -3556,14 +3556,33 @@
     state.proposalSymbol = null;
     drawProposalLines();
 
+    // If this coin was surfaced by the market scanner, hand its verdict to the
+    // analyzer so it confirms/refutes the screen instead of re-deriving blind
+    // (B1 — closes the "scanner finds it, analysis says STAY_OUT" gap).
+    const symU = String(symbol).toUpperCase().trim();
+    let scannerVerdict = null;
+    const scanRows = (state.scanResults && state.scanResults.results) || [];
+    const hit = scanRows.find(function (r) {
+      return symMatch(r.symbol, symU);
+    });
+    if (hit) {
+      scannerVerdict = {
+        bias: hit.bias,
+        setup: hit.setup,
+        key_level: hit.key_level != null ? hit.key_level : hit.entry,
+        score: hit.score,
+      };
+    }
+
     try {
       const res = await apiFetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          symbol: String(symbol).toUpperCase().trim(),
+          symbol: symU,
           tf: tf,
           htf: htf,
+          scanner_verdict: scannerVerdict,
         }),
       });
       let data = null;

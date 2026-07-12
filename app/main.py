@@ -855,7 +855,7 @@ async def analyze(
             else "MEXC keys not configured"
         )
 
-    context = build_llm_context(market_api, acct, s)
+    context = build_llm_context(market_api, acct, s, scanner_verdict=body.scanner_verdict)
 
     try:
         proposal = await analyze_with_llm(context, s)
