@@ -257,132 +257,24 @@ async def llm_set(
     return _llm_status(request)
 
 
-# ── First-run setup (env generator) ─────────────────────────────────
-# Only usable while NO .env exists — once configured, the page locks so
-# no local process can rewrite keys through the browser.
+# ── First-run setup ─────────────────────────────────────────────────
+# The open, unauthenticated /setup window exists ONLY while setup is
+# incomplete (SETUP_COMPLETE marker) — i.e. before any real secret is
+# stored. Once complete it locks; the only write path is the
+# authenticated /api/settings/* endpoints.
 from app.config import ROOT as _ROOT  # noqa: E402
+from app.env_builder import build_full_env, normalize_answers  # noqa: E402
 
 ENV_PATH = _ROOT / ".env"
 
 
 def _setup_needed() -> bool:
-    return not ENV_PATH.exists()
-
-
-def build_env_content(p: dict) -> str:
-    """Build a complete .env from the setup form payload. Raises ValueError."""
-    import re as _re
-    import secrets as _secrets
-
-    def _san(name: str, raw) -> str:
-        """Strip + reject control chars: a value with an embedded newline
-        could otherwise inject extra .env lines (e.g. TRADING_ENABLED=true)."""
-        v = str(raw or "").strip()
-        if any(ord(ch) < 32 or ch == "\x7f" for ch in v):
-            raise ValueError(f"{name} enthält ungültige Steuerzeichen")
-        return v
-
-    ex = str(p.get("exchange") or "hl-testnet")
-    if ex not in ("hl-testnet", "hl-mainnet", "mexc"):
-        raise ValueError("Ungültige Börsen-Auswahl")
-    is_mexc = ex == "mexc"
-    hl_testnet = ex == "hl-testnet"
-
-    hl_key = _san("Private Key", p.get("hl_private_key"))
-    hl_addr = _san("Wallet-Adresse", p.get("hl_account_address"))
-    mexc_key = _san("MEXC API Key", p.get("mexc_api_key"))
-    mexc_sec = _san("MEXC API Secret", p.get("mexc_api_secret"))
-    if is_mexc and (not mexc_key or not mexc_sec):
-        raise ValueError("MEXC API Key und Secret werden benötigt")
-    if not is_mexc and not _re.fullmatch(r"0x[0-9a-fA-F]{64}", hl_key):
-        raise ValueError(
-            "Hyperliquid Private Key muss 0x + 64 Hex-Zeichen sein "
-            "(API/Agent-Wallet-Key aus der Hyperliquid-UI)"
-        )
-    if hl_addr and not _re.fullmatch(r"0x[0-9a-fA-F]{40}", hl_addr):
-        raise ValueError("Wallet-Adresse muss 0x + 40 Hex-Zeichen sein")
-
-    llm = str(p.get("llm_provider") or "claude").strip().lower()
-    if llm not in ("claude", "xai", "openai", "ollama", "none"):
-        raise ValueError("Ungültiger KI-Anbieter")
-    llm_key = _san("KI API Key", p.get("llm_api_key"))
-    if llm in ("claude", "xai", "openai") and not llm_key:
-        raise ValueError(f"API Key für {llm} fehlt")
-    ollama_model = _san("Ollama-Modell", p.get("ollama_model")) or "llama3.1"
-    include_account = p.get("include_account_in_llm", True)
-    include_account = "true" if (include_account is not False) else "false"
-
-    def _num(name: str, default: float, lo: float, hi: float) -> float:
-        try:
-            v = float(p.get(name, default))
-        except (TypeError, ValueError):
-            raise ValueError(f"{name} ist keine Zahl") from None
-        if not (lo <= v <= hi):
-            raise ValueError(f"{name} muss zwischen {lo} und {hi} liegen")
-        return v
-
-    risk_pct = _num("max_risk_pct", 1.0, 0.1, 10)
-    max_lev = int(_num("max_leverage", 20, 1, 125))
-    min_rrr = _num("min_rrr", 2.0, 1, 10)
-    max_notional = _num("max_notional_usdt", 500, 10, 1_000_000)
-
-    token = _secrets.token_urlsafe(24)
-    default_symbol = "BTC_USDT" if is_mexc else "BTC"
-    provider_for_env = "claude" if llm == "none" else llm
-
-    lines = [
-        "# Generiert vom Setup-Assistenten — Werte jederzeit hier änderbar.",
-        "HOST=127.0.0.1",
-        "PORT=8788",
-        "",
-        f"EXCHANGE={'mexc' if is_mexc else 'hyperliquid'}",
-        f"HL_TESTNET={'true' if hl_testnet else 'false'}",
-        f"HL_PRIVATE_KEY={hl_key}",
-        f"HL_ACCOUNT_ADDRESS={hl_addr}",
-        f"MEXC_API_KEY={mexc_key}",
-        f"MEXC_API_SECRET={mexc_sec}",
-        "MEXC_BASE_URL=https://contract.mexc.com",
-        "",
-        "# KI (Hot-Swap im UI möglich)",
-        f"LLM_PROVIDER={provider_for_env}",
-        f"ANTHROPIC_API_KEY={llm_key if llm == 'claude' else ''}",
-        "ANTHROPIC_MODEL=claude-opus-4-8",
-        f"XAI_API_KEY={llm_key if llm == 'xai' else ''}",
-        "XAI_MODEL=grok-4",
-        f"OPENAI_API_KEY={llm_key if llm == 'openai' else ''}",
-        "OPENAI_MODEL=gpt-5.1",
-        "OLLAMA_BASE_URL=http://127.0.0.1:11434/v1",
-        f"OLLAMA_MODEL={ollama_model}",
-        f"INCLUDE_ACCOUNT_IN_LLM={include_account}",
-        "",
-        "# Risiko-Gates (serverseitig erzwungen)",
-        f"MAX_RISK_PCT={risk_pct}",
-        f"MAX_LEVERAGE={max_lev}",
-        f"MIN_RRR={min_rrr}",
-        # RRR below MIN_RRR is a warning, not a hard block — the trader decides
-        # (SL is still mandatory; MAX_RISK_PCT / notional / leverage still hard).
-        "STRICT_RRR=false",
-        f"MAX_NOTIONAL_USDT={max_notional}",
-        "RISK_SLIPPAGE_PCT=0.05",
-        "MAX_PRICE_DRIFT_PCT=0.5",
-        "MARKET_ENTRY_SLIPPAGE_PCT=0.15",
-        "ALLOW_CROSS_MARGIN=false",
-        "ALLOW_UNPROTECTED_ENTRY=false",
-        "AUTO_FLATTEN_IF_SL_UNVERIFIED=true",
-        "",
-        "# Sicherheit — Trading bleibt aus, bis DU es hier einschaltest",
-        "TRADING_ENABLED=false",
-        f"LOCAL_API_TOKEN={token}",
-        "REQUIRE_LOOPBACK_WHEN_ARMED=true",
-        "STRICT_AVAILABLE_MARGIN=true",
-        "",
-        f"DEFAULT_SYMBOL={default_symbol}",
-        "PREVIEW_TOKEN_TTL_SECONDS=60",
-        "DATABASE_PATH=data/trader.db",
-        "KLINE_LIMIT_HINT=500",
-        "",
-    ]
-    return "\n".join(lines)
+    if not ENV_PATH.exists():
+        return True
+    try:
+        return not get_settings().setup_complete
+    except Exception:
+        return True
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -406,10 +298,11 @@ async def setup_save(request: Request, body: dict):
     if not _setup_needed():
         raise HTTPException(
             status_code=403,
-            detail=".env existiert bereits — Setup gesperrt. Zum Neu-Einrichten die .env löschen.",
+            detail="Setup bereits abgeschlossen (SETUP_COMPLETE) — gesperrt. KI-Keys über die authentifizierten Einstellungen ändern.",
         )
     try:
-        content = build_env_content(body or {})
+        answers = normalize_answers(body or {})
+        content = build_full_env(answers)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -440,6 +333,28 @@ async def setup_save(request: Request, body: dict):
         except Exception:
             pass
     return {"ok": True, "exchange": s.exchange, "llm_provider": s.llm_provider}
+
+
+@app.post("/api/setup/test-provider")
+async def setup_test_provider(request: Request, body: dict):
+    """Read-only KI-key ping during setup. Transient key, never persisted.
+
+    SSRF-safe: cloud hosts are pinned in app.llm.probe; Ollama uses the
+    server-side loopback-validated base URL.
+    """
+    if not _setup_needed():
+        raise HTTPException(status_code=403, detail="Setup abgeschlossen — gesperrt.")
+    from app.llm.probe import probe_provider
+
+    provider = str((body or {}).get("provider") or "").strip().lower()
+    api_key = str((body or {}).get("api_key") or "").strip()
+    model = str((body or {}).get("model") or "").strip()
+    return await probe_provider(
+        provider,
+        api_key=api_key,
+        model=model,
+        ollama_base_url=get_settings().ollama_base_url,
+    )
 
 
 # Majors fallback so the dropdown is usable even during an exchange outage
