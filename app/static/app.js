@@ -74,9 +74,12 @@
     if (!h["Content-Type"] && extra && extra["Content-Type"]) {
       h["Content-Type"] = extra["Content-Type"];
     }
+    // F-19: the auth token is normally delivered via an HttpOnly session
+    // cookie (sent automatically on same-origin requests), so we no longer
+    // read it from the DOM. An explicit state/localStorage token is still
+    // honored as a fallback for non-browser use.
     const tok =
       state.localToken ||
-      (typeof window !== "undefined" && window.LOCAL_API_TOKEN) ||
       (typeof localStorage !== "undefined" &&
         (localStorage.getItem("mexc_local_token") ||
           localStorage.getItem("local_api_token"))) ||
@@ -92,7 +95,11 @@
     if (method !== "GET" && method !== "HEAD" && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    return fetch(url, Object.assign({}, opts, { headers: headers }));
+    // F-19: same-origin so the HttpOnly auth cookie is sent automatically.
+    return fetch(
+      url,
+      Object.assign({}, opts, { headers: headers, credentials: "same-origin" })
+    );
   }
 
   function updateOrderButtonsEnabled() {
@@ -4993,10 +5000,8 @@
   };
 
   document.addEventListener("DOMContentLoaded", async () => {
-    // Token from server-rendered page (see base.html)
-    if (typeof window !== "undefined" && window.LOCAL_API_TOKEN) {
-      state.localToken = window.LOCAL_API_TOKEN;
-    }
+    // F-19: auth token now arrives as an HttpOnly session cookie sent
+    // automatically with same-origin requests — nothing to read from the DOM.
     initChart();
     wireUi();
     loadTradeMarkers();

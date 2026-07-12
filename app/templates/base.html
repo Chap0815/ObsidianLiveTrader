@@ -16,10 +16,9 @@
 <body>
   {% block body %}{% endblock %}
 
-  {# Localhost-only page: inject token so private API calls work without localStorage #}
-  <script>
-    window.LOCAL_API_TOKEN = {{ (local_api_token or "")|tojson }};
-  </script>
+  {# F-19: the local auth token is delivered as an HttpOnly session cookie
+     (set by the server on this page), not injected into the DOM. Same-origin
+     fetch/WebSocket send it automatically. #}
   <script src="/static/app.js?v={{ asset_version|default('r7') }}"></script>
   {% block scripts %}{% endblock %}
 </body>

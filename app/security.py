@@ -8,9 +8,14 @@ import re
 from typing import Callable
 from urllib.parse import urlparse
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Cookie, Header, HTTPException, Request
 
 from app.config import get_settings
+
+# F-19: name of the HttpOnly session cookie that carries the local auth token.
+# The dashboard sets it so the token no longer lives in the page DOM; the
+# header (X-Local-Token) remains a valid fallback for API/WS clients.
+AUTH_COOKIE_NAME = "local_auth"
 
 
 def _token_matches(got: str | None, expected: str) -> bool:
@@ -59,14 +64,21 @@ def normalize_symbol(symbol: str) -> str:
 
 def require_local_token(
     x_local_token: str | None = Header(default=None, alias="X-Local-Token"),
+    local_auth: str | None = Cookie(default=None, alias=AUTH_COOKIE_NAME),
 ) -> None:
-    """If LOCAL_API_TOKEN is set, require matching header on private routes."""
+    """If LOCAL_API_TOKEN is set, require a matching credential on private routes.
+
+    F-19: the HttpOnly session cookie (set on the dashboard) and the
+    X-Local-Token header are both accepted — additive, so browser (cookie),
+    API and WebSocket (header) clients all keep working.
+    """
     s = get_settings()
     expected = (s.local_api_token or "").strip()
     if not expected:
         return
-    if not _token_matches(x_local_token, expected):
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Local-Token")
+    if _token_matches(x_local_token, expected) or _token_matches(local_auth, expected):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing X-Local-Token")
 
 
 async def loopback_or_token_middleware(request: Request, call_next: Callable):
@@ -107,10 +119,15 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         # Starlette TestClient uses "testclient"
         if client and client not in loopbacks and not client.startswith("127."):
             s = get_settings()
-            # Allow only if local token presented and matches
+            # Allow only if a matching credential is presented — header token
+            # or the HttpOnly session cookie (F-19, additive).
             token = request.headers.get("X-Local-Token")
+            cookie_tok = request.cookies.get(AUTH_COOKIE_NAME)
             expected = (s.local_api_token or "").strip()
-            if not expected or not _token_matches(token, expected):
+            if not expected or not (
+                _token_matches(token, expected)
+                or _token_matches(cookie_tok, expected)
+            ):
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(

@@ -43,6 +43,7 @@ from app.orders.service import OrderError, OrderService, estimate_same_side_risk
 from app.orders.tokens import PreviewStore
 from app.risk.sizing import suggest_vol
 from app.security import (
+    AUTH_COOKIE_NAME,
     loopback_or_token_middleware,
     normalize_symbol,
     require_local_token,
@@ -1538,7 +1539,7 @@ async def index(request: Request):
     if _setup_needed():
         return RedirectResponse("/setup", status_code=303)
     s = get_settings()
-    return templates.TemplateResponse(
+    resp = templates.TemplateResponse(
         request,
         "dashboard.html",
         {
@@ -1547,9 +1548,21 @@ async def index(request: Request):
             "max_leverage": s.max_leverage,
             "exchange": s.exchange,
             "hl_testnet": s.hl_testnet if s.exchange == "hyperliquid" else False,
-            # Browser UI must send X-Local-Token when LOCAL_API_TOKEN is set
-            "local_api_token": s.local_api_token or "",
         },
     )
+    # F-19: carry the local auth token in an HttpOnly, SameSite=Strict cookie
+    # instead of the page DOM. Same-origin fetch/WebSocket send it
+    # automatically; the X-Local-Token header stays a valid fallback. Secure
+    # is not required on plain-http 127.0.0.1.
+    token = (s.local_api_token or "").strip()
+    if token:
+        resp.set_cookie(
+            AUTH_COOKIE_NAME,
+            token,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+    return resp
 
 
