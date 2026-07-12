@@ -60,7 +60,7 @@ body {
      Hierarchy comes from weight/size/tracking, not from switching families.
      The one exception (humanist sans) is the KI-Analyse prose. */
   font-family: var(--mono);
-  font-size: 13.5px;
+  font-size: 14.5px;
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
@@ -109,7 +109,7 @@ body {
   border: 1px solid var(--border);
   background: var(--bg-inset);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--muted);
@@ -144,7 +144,7 @@ body {
 .banner-chip,
 .disarmed-badge {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   letter-spacing: 0.08em;
   padding: 2px 8px;
   border-radius: 3px;
@@ -309,7 +309,7 @@ body {
 .field-inline > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -481,7 +481,7 @@ select:focus {
 
 .equity-label {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -570,7 +570,7 @@ select:focus {
 .panel-head h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.16em;
@@ -682,12 +682,12 @@ select:focus {
 
 .risk-sl .risk-label { color: var(--short); }
 .risk-tp .risk-label { color: var(--long); }
-.rr-money { font-size: 12px; color: var(--muted); }
+.rr-money { font-size: 13px; color: var(--muted); }
 .rr-dim { color: var(--faint); font-size: 13.2px; }
 .rr-good { color: var(--long); }
 .rr-warn { color: var(--warn); }
 .rr-error { color: var(--short); }
-.rr-bad { color: var(--short); font-size: 12px; }
+.rr-bad { color: var(--short); font-size: 13px; }
 
 /* ── Confirm modal: blockers + summary card ─────────────── */
 .blocker-box {
@@ -810,7 +810,7 @@ select:focus {
 
 .sum-sub {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--muted);
 }
 
@@ -870,7 +870,7 @@ select:focus {
 
 .scan-rank {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--faint);
   width: 16px;
@@ -1027,7 +1027,7 @@ select:focus {
 }
 
 .funding-cd {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--faint);
   font-weight: 400;
 }
@@ -1245,7 +1245,7 @@ select:focus {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px solid var(--border, #2a2438);
-  font-size: 12px;
+  font-size: 13px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted, #8a86a0);
@@ -1494,7 +1494,7 @@ select:focus {
 }
 .watch-add { display: flex; gap: 6px; }
 .watch-add input {
-  font-family: var(--mono); font-size: 12px; padding: 5px 8px;
+  font-family: var(--mono); font-size: 13px; padding: 5px 8px;
   background: var(--bg-inset); border: 1px solid var(--border);
   border-radius: var(--radius); color: var(--text); width: 220px;
 }
@@ -1515,7 +1515,7 @@ select:focus {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 6px; font-family: var(--mono); margin-bottom: 4px;
 }
-.mini-sym { font-size: 12px; font-weight: 600; color: var(--text); }
+.mini-sym { font-size: 13px; font-weight: 600; color: var(--text); }
 .mini-price { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .mini-badges { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; }
 .mini-chg.pos-pos { color: var(--long); }
@@ -1566,7 +1566,7 @@ a.news-item:hover .news-title { color: var(--accent); }
   display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
 }
 .setup-conf-label {
-  font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+  font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--muted);
 }
 
@@ -1594,7 +1594,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 
 .order-oid {
   color: var(--faint);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .order-row .btn-cancel-order,
@@ -1654,7 +1654,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 
 .scan-strip-head {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1773,7 +1773,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 
 .mtf-tf {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--faint);
@@ -1838,7 +1838,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 
 .tile-sub {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--muted);
 }
 
@@ -1885,7 +1885,7 @@ a.news-item:hover .news-title { color: var(--accent); }
   /* The analyst's voice speaks humanist sans — the one non-mono text in the
      instrument, held near 62ch so it reads like prose, not a data field. */
   font-family: var(--sans);
-  font-size: 13.5px;
+  font-size: 14.8px;
   line-height: 1.62;
   color: #cfc9e0;
   margin-bottom: 12px;
@@ -1898,7 +1898,7 @@ a.news-item:hover .news-title { color: var(--accent); }
   flex-direction: column;
   gap: 4px;
   font-family: var(--sans);
-  font-size: 12.8px;
+  font-size: 14px;
   line-height: 1.55;
   color: var(--muted);
   padding: 9px 11px;
@@ -1979,7 +1979,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 .kv dt {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2159,7 +2159,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 }
 .size-mode-btn {
   padding: 1px 8px;
-  font-size: 12px;
+  font-size: 13px;
   background: transparent;
   color: var(--muted, #8a86a0);
   border: none;
@@ -2937,7 +2937,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 .ir-v { font-size: 13.5px; font-weight: 600; letter-spacing: 0.01em; }
 .ir-num { font-variant-numeric: tabular-nums; }
 .ir-arm { display: flex; align-items: center; gap: 8px; }
-.ir-arm .ir-arm-txt { font-size: 12px; letter-spacing: 0.12em; color: var(--muted); }
+.ir-arm .ir-arm-txt { font-size: 13px; letter-spacing: 0.12em; color: var(--muted); }
 .ir-arm.on .ir-arm-txt { color: var(--live); }
 .ir-led {
   width: 8px; height: 8px; border-radius: 50%;
@@ -2978,7 +2978,7 @@ a.news-item:hover .news-title { color: var(--accent); }
 .ir-bigpnl.pnl-pos { color: var(--long); }
 .ir-bigpnl.pnl-neg { color: var(--short); }
 .ir-bigpnl small { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
-.ir-shield { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ir-shield { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
 .ir-shield.ok { color: var(--long); }
 .ir-shield.warn { color: var(--warn); }
 .ir-shield.danger { color: var(--short); font-weight: 600; }
