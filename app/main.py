@@ -69,6 +69,9 @@ async def lifespan(app: FastAPI):
     import asyncio as _asyncio
 
     app.state.trade_lock = _asyncio.Lock()
+    # Singleflight lock for /api/news: concurrent cache-miss callers await
+    # one in-flight refresh instead of each firing a full feed-fetch batch.
+    app.state.news_lock = _asyncio.Lock()
     try:
         yield
     finally:
@@ -515,6 +518,7 @@ NEWS_FEEDS: list[tuple[str, str]] = [
 NEWS_CACHE_TTL = 300.0      # 5 min — news moves slowly; spare the upstreams
 NEWS_FEED_TIMEOUT = 6.0     # per-feed hard timeout
 NEWS_MAX_ITEMS = 40
+NEWS_MAX_FEED_BYTES = 2 * 1024 * 1024  # 2 MB cap per feed response (F-14, DoS)
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _TAG_RE = _re.compile(r"<[^>]+>")
 
@@ -591,22 +595,34 @@ def _parse_feed(xml_text: str, source: str) -> list[dict]:
     return out
 
 
-@app.get("/api/news")
-async def news(request: Request):
-    """Merged crypto headlines from public RSS/Atom feeds. Public + read-only.
+async def _fetch_feed_body(client: httpx.AsyncClient, url: str) -> str:
+    """Stream a feed response, aborting once it exceeds NEWS_MAX_FEED_BYTES
+    instead of reading an unbounded body fully into memory (F-14, DoS)."""
+    async with client.stream(
+        "GET", url, headers={"User-Agent": "ObsidianLiveTrader/1.0"}
+    ) as resp:
+        resp.raise_for_status()
+        total = 0
+        chunks: list[bytes] = []
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > NEWS_MAX_FEED_BYTES:
+                raise ValueError(
+                    f"feed response exceeds {NEWS_MAX_FEED_BYTES} byte cap"
+                )
+            chunks.append(chunk)
+        encoding = resp.encoding or "utf-8"
+        return b"".join(chunks).decode(encoding, errors="replace")
 
-    No API key, no new dependency. Per-feed failures are isolated (a dead feed
-    never breaks the page), each feed has a hard timeout, and results are cached
-    5 min in-memory. On a total fetch failure the last good payload is served
-    stale. HTML is stripped server-side; the client escapes again."""
+
+async def _refresh_news(request: Request) -> dict:
+    """Do the actual multi-feed fetch + merge. Caller must hold news_lock and
+    is responsible for the cache read/write around this."""
     cache = getattr(request.app.state, "news_cache", None)
-    if cache and _time.monotonic() - cache[0] < NEWS_CACHE_TTL:
-        return cache[1]
 
     async def one(source: str, url: str, client: httpx.AsyncClient) -> list[dict]:
-        resp = await client.get(url, headers={"User-Agent": "ObsidianLiveTrader/1.0"})
-        resp.raise_for_status()
-        return _parse_feed(resp.text, source)
+        text = await _fetch_feed_body(client, url)
+        return _parse_feed(text, source)
 
     # Known stable HTTPS feed endpoints — a feed that suddenly issues a
     # redirect (e.g. a compromised/hijacked host pointing at loopback, LAN or
@@ -642,6 +658,34 @@ async def news(request: Request):
     stale = dict(cache[1])
     stale["stale"] = True
     return stale
+
+
+@app.get("/api/news")
+async def news(request: Request):
+    """Merged crypto headlines from public RSS/Atom feeds. Public + read-only.
+
+    No API key, no new dependency. Per-feed failures are isolated (a dead feed
+    never breaks the page), each feed has a hard timeout, each response is
+    size-capped, and results are cached 5 min in-memory. Concurrent cache-miss
+    callers share one in-flight refresh (singleflight) instead of each firing
+    a full fetch batch. On a total fetch failure the last good payload is
+    served stale. HTML is stripped server-side; the client escapes again."""
+    cache = getattr(request.app.state, "news_cache", None)
+    if cache and _time.monotonic() - cache[0] < NEWS_CACHE_TTL:
+        return cache[1]
+
+    lock = getattr(request.app.state, "news_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.news_lock = lock
+
+    async with lock:
+        # Re-check: another caller may have already refreshed while we were
+        # waiting for the lock (singleflight — only one refresh in flight).
+        cache = getattr(request.app.state, "news_cache", None)
+        if cache and _time.monotonic() - cache[0] < NEWS_CACHE_TTL:
+            return cache[1]
+        return await _refresh_news(request)
 
 
 @app.get("/api/account")

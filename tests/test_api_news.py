@@ -40,9 +40,31 @@ ATOM_XML = """<?xml version="1.0"?>
 class _FakeResp:
     def __init__(self, text):
         self.text = text
+        self.encoding = "utf-8"
 
     def raise_for_status(self):
         return None
+
+    async def aiter_bytes(self):
+        # Chunked to exercise the streaming size-guard (F-14) like a real
+        # response instead of handing back one giant chunk.
+        data = self.text.encode("utf-8")
+        step = 4096
+        for i in range(0, len(data), step):
+            yield data[i : i + step]
+
+
+class _FakeStreamCtx:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        if isinstance(self._value, Exception):
+            raise self._value
+        return _FakeResp(self._value)
+
+    async def __aexit__(self, *a):
+        return False
 
 
 class _FakeClient:
@@ -63,11 +85,8 @@ class _FakeClient:
         # a _FakeClient here; its shutdown path calls aclose().
         return None
 
-    async def get(self, url, **k):
-        v = self._by_url.get(url)
-        if isinstance(v, Exception):
-            raise v
-        return _FakeResp(v)
+    def stream(self, method, url, **k):
+        return _FakeStreamCtx(self._by_url.get(url))
 
 
 def _patch(monkeypatch, feeds, by_url):
@@ -189,6 +208,60 @@ def test_news_client_does_not_follow_redirects(monkeypatch):
     news_calls = [c for c in _RecordingClient.calls if "follow_redirects" in c]
     assert news_calls, "expected the news endpoint to construct an AsyncClient"
     assert news_calls[0].get("follow_redirects") is False
+
+
+# --- F-14: resource DoS — size cap + singleflight refresh --------------------
+def test_news_oversized_feed_is_rejected_isolated(monkeypatch):
+    """A feed response larger than the cap must be aborted mid-stream and
+    reported as a per-feed error, never parsed/cached whole."""
+    huge = "<rss><channel>" + ("<item><title>x</title></item>" * 200_000) + "</channel></rss>"
+    assert len(huge.encode("utf-8")) > main.NEWS_MAX_FEED_BYTES
+    feeds = [("Huge", "http://huge"), ("Good", "http://ok")]
+    _patch(monkeypatch, feeds, {"http://huge": huge, "http://ok": RSS_XML})
+    with TestClient(app) as client:
+        client.app.state.news_cache = None
+        r = client.get("/api/news")
+    body = r.json()
+    assert len(body["errors"]) == 1 and body["errors"][0].startswith("Huge:")
+    # The good feed still comes through — isolated failure, not a crash.
+    assert [i["source"] for i in body["items"]] == ["Good", "Good"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cache_miss_only_refreshes_once(monkeypatch):
+    """Singleflight: two concurrent cache-miss requests must trigger only one
+    feed-fetch batch — the second reuses the first's result instead of firing
+    its own full fetch storm."""
+    import asyncio as _asyncio
+
+    fetch_batches = 0
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def fake_refresh(request):
+        nonlocal fetch_batches
+        fetch_batches += 1
+        started.set()
+        await release.wait()
+        payload = {"items": [{"title": "one"}], "errors": []}
+        request.app.state.news_cache = (main._time.monotonic(), payload)
+        return payload
+
+    monkeypatch.setattr(main, "_refresh_news", fake_refresh)
+    app.state.news_cache = None
+    app.state.news_lock = _asyncio.Lock()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        t1 = _asyncio.create_task(client.get("/api/news"))
+        await _asyncio.wait_for(started.wait(), timeout=2.0)
+        t2 = _asyncio.create_task(client.get("/api/news"))
+        await _asyncio.sleep(0.1)  # let t2 reach (and block on) the lock
+        release.set()
+        r1 = await t1
+        r2 = await t2
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert fetch_batches == 1
 
 
 def test_news_total_failure_serves_stale_cache(monkeypatch):
