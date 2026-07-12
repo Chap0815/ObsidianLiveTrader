@@ -109,7 +109,10 @@ def require_local_token(
         return
     if _token_matches(x_local_token, expected) or _token_matches(local_auth, expected):
         return
-    raise HTTPException(status_code=401, detail="Invalid or missing X-Local-Token")
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or missing local auth token (X-Local-Token header or local_auth cookie)",
+    )
 
 
 async def loopback_or_token_middleware(request: Request, call_next: Callable):

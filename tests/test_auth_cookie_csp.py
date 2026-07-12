@@ -67,6 +67,11 @@ def test_private_endpoint_rejects_missing_credential(tokened_app):
     with TestClient(tokened_app) as tc:
         r = tc.get("/api/llm")  # no cookie, no header
     assert r.status_code == 401, r.text
+    # The cookie is an equally valid credential (see above), so the 401
+    # detail must not read as if only the header is accepted.
+    detail = r.json()["detail"]
+    assert "x-local-token" in detail.lower()
+    assert "cookie" in detail.lower()
 
 
 def test_private_endpoint_rejects_wrong_cookie(tokened_app):
