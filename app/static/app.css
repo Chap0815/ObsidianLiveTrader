@@ -2032,6 +2032,15 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .setup-tile.tile-sl { border-top-color: var(--short); }
 .setup-tile.tile-tp { border-top-color: var(--long); }
 .setup-tile.tile-rrr { border-top-color: var(--violet); }
+.setup-tile.tile-action { border-top-color: var(--accent); }
+.setup-tile.tile-conf { border-top-color: var(--violet); }
+.setup-tile.tile-dir-long { border-top-color: var(--long); }
+.setup-tile.tile-dir-short { border-top-color: var(--short); }
+.tile-dir-long .tile-value { color: var(--long); }
+.tile-dir-short .tile-value { color: var(--short); }
+.tile-action-val { letter-spacing: 0.03em; }
+/* Konfidenz tile holds a badge chip, not a number — let it sit at chip size */
+.tile-conf .tile-value { font-size: 15px; }
 
 .tile-label {
   font-family: var(--mono);

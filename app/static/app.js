@@ -3263,16 +3263,17 @@
       _trendCell("LTF", data.tf || state.tf || "LTF", p.ltf_trend) +
       "</div>";
 
-    // Overall setup confidence (structured signal quality from the model)
+    // Overall setup confidence (structured signal quality from the model).
+    // The badge itself is KEPT — it now lives as the value of the
+    // "Setup-Konfidenz" tile in the unified header grid below.
     const sconf = String(p.setup_confidence || "").toLowerCase();
+    let confBadge = "";
     if (sconf) {
       const scCls =
         sconf === "high" ? "conf-high" : sconf === "medium" ? "conf-med" : "conf-low";
       const scLabel =
         sconf === "high" ? "Hoch" : sconf === "medium" ? "Mittel" : "Niedrig";
-      html +=
-        '<div class="setup-conf"><span class="setup-conf-label">Setup-Konfidenz</span>' +
-        '<span class="pattern-conf ' + scCls + '">' + scLabel + "</span></div>";
+      confBadge = '<span class="pattern-conf ' + scCls + '">' + scLabel + "</span>";
     }
 
     // Detected chart pattern (only shown when the model found a real one)
@@ -3290,10 +3291,23 @@
         "</div>";
     }
 
-    // Trade setup tiles — only when there is a trade
+    // Unified tile header: Action + Setup-Konfidenz are ALWAYS shown as tiles
+    // (even on STAY_OUT); Entry/SL/TP/RRR join the grid when there's a trade.
+    // One clean grid instead of prose+fields mixed; mono + tabular-nums values,
+    // directional green/red where meaningful. Analyst prose stays BELOW.
+    const actDir = _actionDir(p.action);
+    html += '<div class="setup-tiles">';
+    html += _tileHtml(
+      "Aktion",
+      '<span class="tile-action-val">' +
+        escapeHtml((p.action || "—").replace(/_/g, " ")) +
+        "</span>",
+      "",
+      "tile-action" + (actDir ? " tile-dir-" + actDir : "")
+    );
+    html += _tileHtml("Setup-Konfidenz", confBadge || "—", "", "tile-conf");
     if (!stayOut) {
       html +=
-        '<div class="setup-tiles">' +
         _tile("Entry", fmtN(p.entry_price),
               anno.entry_vs_last_pct != null ? fmt(anno.entry_vs_last_pct, 2) + "% vs. Preis" : "", "tile-entry") +
         _tile("Stop-Loss", fmtN(p.stop_loss),
@@ -3302,12 +3316,12 @@
         (p.tp2 != null ? _tile("Take-Profit 2", fmtN(p.tp2), rMult(p.tp2), "tile-tp") : "") +
         (p.tp3 != null ? _tile("Take-Profit 3", fmtN(p.tp3), rMult(p.tp3), "tile-tp") : "") +
         _tile("Chance/Risiko", p.rrr != null ? "1 : " + fmt(p.rrr, 2) : "—",
-              p.rrr != null && p.rrr >= 2 ? "solide" : "knapp", "tile-rrr") +
-        "</div>";
-      if (p.trigger_entry_zone) {
-        html += '<div class="an-zone"><b>Einstiegszone:</b> ' +
-          escapeHtml(p.trigger_entry_zone) + "</div>";
-      }
+              p.rrr != null && p.rrr >= 2 ? "solide" : "knapp", "tile-rrr");
+    }
+    html += "</div>";
+    if (!stayOut && p.trigger_entry_zone) {
+      html += '<div class="an-zone"><b>Einstiegszone:</b> ' +
+        escapeHtml(p.trigger_entry_zone) + "</div>";
     }
 
     // Key levels + funding as a compact strip
@@ -3368,6 +3382,26 @@
       (sub ? '<span class="tile-sub">' + escapeHtml(String(sub)) + "</span>" : "") +
       "</div>"
     );
+  }
+
+  /** Like _tile but the value is trusted HTML (e.g. a confidence badge chip),
+   *  not an escaped string. Label and sub are still escaped. */
+  function _tileHtml(label, valueHtml, sub, cls) {
+    return (
+      '<div class="setup-tile ' + (cls || "") + '">' +
+      '<span class="tile-label">' + escapeHtml(label) + "</span>" +
+      '<span class="tile-value">' + (valueHtml || "—") + "</span>" +
+      (sub ? '<span class="tile-sub">' + escapeHtml(String(sub)) + "</span>" : "") +
+      "</div>"
+    );
+  }
+
+  /** Directional bucket for a TradeAction — drives the green/red tile accent. */
+  function _actionDir(action) {
+    const a = String(action || "").toUpperCase();
+    if (a === "STRONG_BUY" || a === "BUY") return "long";
+    if (a === "SELL" || a === "STRONG_SHORT") return "short";
+    return "";
   }
 
   function _lvl(label, value) {
