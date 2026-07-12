@@ -1,5 +1,6 @@
 ﻿"""Regression tests for deep-audit money-safety fixes."""
 
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1080,3 +1081,66 @@ async def test_close_reread_failure_is_uncertain_not_closed():
     assert out["status"] == "close_unverified"
     assert out.get("residual_vol") is None
     assert db.insert_order.await_args.kwargs["status"] != "closed"
+
+
+# ── F-04: unguarded r.json() after 2xx must not crash — treat as uncertain ───
+
+
+@pytest.mark.asyncio
+async def test_request_2xx_empty_body_raises_mexc_error_not_json_crash():
+    """A 2xx response with an empty/non-JSON body must surface as a MexcError
+    (the existing recovery path), never an unhandled JSONDecodeError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    c._client = httpx.AsyncClient(
+        base_url=c.base_url, transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(MexcError):
+        await c.place_order({"symbol": "BTC_USDT"})
+
+
+@pytest.mark.asyncio
+async def test_request_2xx_malformed_json_raises_mexc_error_not_crash():
+    """Truncated/malformed JSON body on a 2xx response must also raise
+    MexcError instead of an unhandled JSONDecodeError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"success": true, "data": {')
+
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    c._client = httpx.AsyncClient(
+        base_url=c.base_url, transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(MexcError):
+        await c.place_order({"symbol": "BTC_USDT"})
+
+
+@pytest.mark.asyncio
+async def test_place_order_empty_body_2xx_recovers_via_external_oid():
+    """A place-order response that is 2xx but empty/non-JSON must be treated
+    as an UNCERTAIN outcome (order may be live) and reconciled via
+    externalOid — exactly like the existing timeout-recovery path — not
+    surfaced as a hard failure that hides a possibly-live order."""
+    client = _happy_client({"orderId": 1})
+
+    async def _place(_body):
+        raise MexcError(
+            "invalid JSON in response body: Expecting value: line 1 column 1 (char 0)"
+        )
+
+    client.place_order = AsyncMock(side_effect=_place)
+
+    async def _by_ext(symbol, external_oid):
+        return {"orderId": 42, "externalOid": external_oid, "symbol": symbol}
+
+    client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+    out = await svc.confirm(prev["token"])
+    assert out["ok"] is True
+    assert "recovered_placed" in out["status"]
+    assert any("DO NOT re-preview" in w for w in out["warnings"])

@@ -180,7 +180,17 @@ class MexcClient:
         except httpx.HTTPError as e:
             raise MexcError(f"HTTP error: {e}") from e
 
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError as e:
+            # 2xx with an empty/truncated/non-JSON body. The order may still
+            # be LIVE on the exchange (e.g. place-order accepted but response
+            # body dropped) — this must surface as a recoverable MexcError,
+            # never an unhandled crash that hides a possibly-live order.
+            raise MexcError(
+                f"invalid JSON in 2xx response body: {e}",
+                raw={"status": r.status_code, "body": r.text[:300]},
+            ) from e
         if isinstance(data, dict) and data.get("success") is False:
             raise MexcError(
                 str(data.get("message") or data.get("code") or "MEXC error"),

@@ -735,10 +735,22 @@ class OrderService:
         try:
             resp = await self.client.place_order(body)
         except ExchangeError as e:
-            # Timeout / network: try recover by externalOid before declaring failure
+            # Timeout / network / uncertain-response: try recover by externalOid
+            # before declaring failure. An unparseable 2xx body (F-04) is just as
+            # uncertain as a timeout — the order may already be live — so it must
+            # go through the same reconciliation path, not a hard failure.
             recovered = None
             err_l = str(e).lower()
-            if any(x in err_l for x in ("timeout", "timed out", "connect", "network")):
+            if any(
+                x in err_l
+                for x in (
+                    "timeout",
+                    "timed out",
+                    "connect",
+                    "network",
+                    "invalid json",
+                )
+            ):
                 try:
                     recovered = await self.client.order_by_external_oid(
                         symbol, external_oid
