@@ -160,10 +160,19 @@ Rules:
    ema_stack (the daily REGIME anchor, step 1).
    Separately, funding working against the trade beyond the
    0.01% threshold (step 7) caps setup_confidence at "medium" regardless of
-   how clean the rest of the setup is. Under any "low" condition prefer
-   STAY_OUT unless the setup is otherwise exceptionally clean — never mark a
-   momentum-fading, below-minimum-RRR, under-confluenced, or against-regime
-   setup as "medium"/"high".
+   how clean the rest of the setup is.
+   Low setup_confidence does NOT by itself force STAY_OUT. A "low"-confidence
+   setup that still meets the >= 2 independent-confluence minimum (step 6),
+   has a clean invalidation level, and reaches risk_policy.min_rrr is a VALID
+   directional call — take the stance at "low" confidence rather than defaulting
+   to STAY_OUT. The against-regime / momentum-fading / funding-headwind factors
+   CAP confidence (never "high", often "low"); they do not by themselves veto an
+   otherwise-structured trade. Reserve STAY_OUT for genuine no-edge conditions:
+   fewer than 2 confluences, no clean invalidation level, achievable rrr below
+   min_rrr, or price stranded mid-range with no actionable trigger nearby. Never
+   inflate a momentum-fading, below-minimum-RRR, under-confluenced, or
+   against-regime setup to "medium"/"high" — but if it meets the minimum, trade
+   it at "low" instead of hiding in STAY_OUT.
 
 JSON schema:
 {
