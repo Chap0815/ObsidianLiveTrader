@@ -183,12 +183,19 @@ def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
     from app.main import app
 
     with TestClient(app) as tc:
-        # loopback Origin is allowed by the CSRF guard (may still fail later for
-        # other reasons, but must NOT be the 403 cross-origin block)
+        # SAME-origin (Origin host:port == the server the request hit) is allowed
+        # by the CSRF guard (may still fail later for other reasons, but must NOT
+        # be the 403 cross-origin block). TestClient's host is "testserver".
         r1 = tc.post(
-            "/api/scan", json={}, headers={"Origin": "http://127.0.0.1:8787"}
+            "/api/scan", json={}, headers={"Origin": "http://testserver"}
         )
         # no Origin/Referer (non-browser) also passes the guard
         r2 = tc.post("/api/scan", json={})
+        # cross-PORT on the same loopback host is a DIFFERENT origin → blocked
+        # (the port-aware same-origin fix; hostname-only would have let it pass)
+        r3 = tc.post(
+            "/api/scan", json={}, headers={"Origin": "http://testserver:9999"}
+        )
     assert r1.status_code != 403 or "cross-origin" not in r1.json().get("detail", "").lower()
     assert r2.status_code != 403 or "cross-origin" not in r2.json().get("detail", "").lower()
+    assert r3.status_code == 403 and "cross-origin" in r3.json()["detail"].lower()

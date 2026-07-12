@@ -66,6 +66,20 @@ def _is_loopback_origin(value: str) -> bool:
     host = (urlparse(value).hostname or "").lower()
     return host in _LOOPBACK_HOSTS
 
+
+def _origin_matches_request(value: str, request) -> bool:
+    """True only if the Origin/Referer is the SAME ORIGIN as the server the
+    request actually hit — host AND port must match. A page on another
+    localhost port (e.g. 127.0.0.1:9999) is a DIFFERENT origin in the browser's
+    model and must be blocked for mutating /api/* calls; matching by hostname
+    alone (the old check) let a cross-port drive-by through (audit CSRF-port)."""
+    o = urlparse(value)
+    o_host = (o.hostname or "").lower()
+    o_port = o.port or (443 if o.scheme == "https" else 80)
+    req_host = (request.url.hostname or "").lower()
+    req_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    return o_host == req_host and o_port == req_port
+
 # MEXC: BTC_USDT | Hyperliquid: BTC or BTC_USDT (coin part used on HL)
 SYMBOL_RE_MEXC = re.compile(r"^[A-Z0-9]{2,32}_[A-Z0-9]{2,16}$")
 SYMBOL_RE_HL = re.compile(r"^[A-Z0-9]{2,20}(_[A-Z0-9]{2,16})?$")
@@ -127,7 +141,7 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         probe = request.headers.get("origin")
         if probe is None:
             probe = request.headers.get("referer")
-        if probe is not None and not _is_loopback_origin(probe):
+        if probe is not None and not _origin_matches_request(probe, request):
             from fastapi.responses import JSONResponse
 
             return JSONResponse(

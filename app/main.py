@@ -274,7 +274,11 @@ def _setup_needed() -> bool:
     try:
         return not get_settings().setup_complete
     except Exception:
-        return True
+        # .env EXISTS but can't be parsed: fail CLOSED (audit L-1). Re-opening
+        # the unauthenticated /setup write path on a configured-but-broken
+        # install would let a local process overwrite keys; a broken .env must
+        # be fixed/deleted manually instead.
+        return False
 
 
 @app.get("/setup", response_class=HTMLResponse)
