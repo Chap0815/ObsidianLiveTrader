@@ -2687,9 +2687,15 @@
     }
     if (rrrEl) {
       if (entry && sl && tp) {
-        const risk = Math.abs(entry - sl);
-        const reward = Math.abs(tp - entry);
-        const rrr = risk > 0 ? reward / risk : null;
+        // Directional geometry, mirrors the backend's compute_simple_rrr:
+        // for a long, reward = tp-entry and risk = entry-sl; for a short,
+        // mirrored. abs()-only distances would report a positive RRR even
+        // when TP/SL sit on the wrong side of entry (e.g. a long's TP below
+        // entry) — exactly the geometry the server rejects — so the UI must
+        // not show a misleading "good" ratio before that rejection (F-23).
+        const risk = isLong ? entry - sl : sl - entry;
+        const reward = isLong ? tp - entry : entry - tp;
+        const rrr = risk > 0 && reward > 0 ? reward / risk : null;
         rrrEl.textContent = rrr != null ? "1 : " + fmt(rrr, 2) : "—";
         rrrEl.className =
           "risk-val" + (rrr != null && rrr >= 2 ? " rr-good" : rrr != null ? " rr-warn" : "");
