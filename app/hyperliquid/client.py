@@ -44,6 +44,11 @@ def to_hl_coin(symbol: str) -> str:
 # Hyperliquid perp min order value (USDC notional)
 HL_MIN_NOTIONAL_USD = 10.0
 
+# TTL for the perp universe/meta cache (tick + leverage rules, listed coins).
+# Was cached forever, so tick/leverage-rule updates and newly-listed coins never
+# refreshed within a session (audit exchange M-1). 1h keeps upstream load low.
+_META_TTL_S = 3600.0
+
 
 def round_hl_price(px: float, sz_decimals: int) -> float:
     """Round price to Hyperliquid tick rules.
@@ -103,7 +108,7 @@ class HyperliquidClient:
         self.account_address = (account_address or "").strip()
         self._info = None
         self._exchange = None
-        self._meta_cache: dict[str, Any] | None = None
+        self._meta_cache: tuple[float, dict[str, Any]] | None = None
         self._asset_index: dict[str, int] = {}
         # Short-TTL cache for meta_and_asset_ctxs (whole-universe fetch used for
         # funding). ticker() and funding_rate() both need it — without this each
@@ -223,11 +228,12 @@ class HyperliquidClient:
             raise HyperliquidError(f"hyperliquid api: {e}") from e
 
     def _load_meta_sync(self) -> dict[str, Any]:
-        if self._meta_cache is not None:
-            return self._meta_cache
+        now = time.time()
+        if self._meta_cache is not None and (now - self._meta_cache[0]) < _META_TTL_S:
+            return self._meta_cache[1]
         info = self._get_info()
         meta = info.meta()
-        self._meta_cache = meta
+        self._meta_cache = (now, meta)
         self._asset_index = {
             str(a["name"]).upper(): i
             for i, a in enumerate(meta.get("universe") or [])

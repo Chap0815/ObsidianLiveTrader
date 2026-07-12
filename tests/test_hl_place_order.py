@@ -6,6 +6,7 @@ Covers the untested place_order mapping + cloid stamping + timeout recovery
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,8 +46,11 @@ def _resp_resting(oid: int = 777) -> dict:
 
 def _client() -> HyperliquidClient:
     c = HyperliquidClient(private_key="0x" + "1" * 64, testnet=True)
-    # Preload meta so _asset_row() needs no network.
-    c._meta_cache = {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]}
+    # Preload meta so _asset_row() needs no network (now a (ts, meta) tuple).
+    c._meta_cache = (
+        time.time(),
+        {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]},
+    )
     c._exchange = MagicMock()
     # A real market_open fills the requested size — echo `sz` (call arg #3) as the
     # reported fill so trigger sizing (now tied to the ACTUAL fill) is faithful.

@@ -1155,6 +1155,10 @@
         return;
       }
       if (msg.type === "candle" && msg.bar) {
+        // Same coin guard as trade/mid: a straggler candle from the previous
+        // symbol during a switch must not feed the new coin's chart / SL-alarm /
+        // uPnL with the wrong price (audit exchange H-1).
+        if (msg.coin && !symMatch(msg.coin, state.symbol)) return;
         applyLiveCandle(msg.bar);
       }
     };
