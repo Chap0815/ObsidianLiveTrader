@@ -2,10 +2,11 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.mexc.client import map_account_snapshot, map_position, usdt_balances
+from app.mexc.client import MexcClient, map_account_snapshot, map_position, usdt_balances
 from app.mexc.errors import MexcError
 
 
@@ -89,6 +90,35 @@ def test_map_position_short_cross():
     assert p["hold_vol"] == 3.0
 
 
+def test_map_position_default_contract_size_is_one():
+    """No contract_size passed in -> safe default of 1.0 (F-10)."""
+    p = map_position(SAMPLE_POSITIONS[0])
+    assert p["contract_size"] == 1.0
+
+
+def test_map_position_carries_own_contract_size():
+    """Each position exposes its OWN contract_size, not the active chart symbol's (F-10)."""
+    p = map_position(SAMPLE_POSITIONS[0], contract_size=0.0001)
+    assert p["contract_size"] == 0.0001
+
+    # A different position with a different contract size must not be affected.
+    other = map_position(
+        {
+            "positionId": 2,
+            "symbol": "SHIB_USDT",
+            "positionType": 1,
+            "openType": 1,
+            "holdVol": 100,
+            "holdAvgPrice": 0.00002,
+            "leverage": 10,
+            "unRealizedPnl": 0.0,
+        },
+        contract_size=10000.0,
+    )
+    assert other["contract_size"] == 10000.0
+    assert p["contract_size"] == 0.0001
+
+
 def test_map_account_snapshot():
     snap = map_account_snapshot(SAMPLE_ASSETS, SAMPLE_POSITIONS)
     assert snap["equity_usdt"] == 100.25
@@ -96,6 +126,91 @@ def test_map_account_snapshot():
     assert snap["error"] is None
     assert len(snap["positions"]) == 1
     assert snap["positions"][0]["symbol"] == "BTC_USDT"
+    # No contract_sizes lookup supplied -> safe default, never the other
+    # position's or the active chart symbol's contract size (F-10).
+    assert snap["positions"][0]["contract_size"] == 1.0
+
+
+def test_map_account_snapshot_per_symbol_contract_size():
+    """Two open positions on different symbols each keep their OWN contract
+    size — this is the actual F-10 fix (previously the frontend applied the
+    active chart symbol's contractSize to every position)."""
+    positions = SAMPLE_POSITIONS + [
+        {
+            "positionId": 2,
+            "symbol": "SHIB_USDT",
+            "positionType": 1,
+            "openType": 1,
+            "holdVol": 100,
+            "holdAvgPrice": 0.00002,
+            "leverage": 10,
+            "unRealizedPnl": 0.0,
+        }
+    ]
+    snap = map_account_snapshot(
+        SAMPLE_ASSETS,
+        positions,
+        contract_sizes={"BTC_USDT": 0.0001, "SHIB_USDT": 10000.0},
+    )
+    by_symbol = {p["symbol"]: p["contract_size"] for p in snap["positions"]}
+    assert by_symbol == {"BTC_USDT": 0.0001, "SHIB_USDT": 10000.0}
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_resolves_per_symbol_contract_size():
+    """MexcClient.account_snapshot() wires real contract metadata into each
+    position, so opening BTC (small contract size) and SHIB (large contract
+    size) at once no longer share one (wrong) contract size (F-10)."""
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            return SAMPLE_POSITIONS + [
+                {
+                    "positionId": 2,
+                    "symbol": "SHIB_USDT",
+                    "positionType": 1,
+                    "openType": 1,
+                    "holdVol": 100,
+                    "holdAvgPrice": 0.00002,
+                    "leverage": 10,
+                    "unRealizedPnl": 0.0,
+                }
+            ]
+        if path == "/api/v1/contract/detail":
+            return [
+                {"symbol": "BTC_USDT", "contractSize": 0.0001},
+                {"symbol": "SHIB_USDT", "contractSize": 10000.0},
+                {"symbol": "ETH_USDT", "contractSize": 0.01},
+            ]
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    snap = await c.account_snapshot()
+    by_symbol = {p["symbol"]: p["contract_size"] for p in snap["positions"]}
+    assert by_symbol == {"BTC_USDT": 0.0001, "SHIB_USDT": 10000.0}
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_defaults_when_contract_detail_fails():
+    """If the contract-metadata lookup errors, positions still come back with
+    the safe 1.0 default instead of the whole /api/account call failing."""
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            return SAMPLE_POSITIONS
+        if path == "/api/v1/contract/detail":
+            raise MexcError("contract detail unavailable")
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    snap = await c.account_snapshot()
+    assert snap["positions"][0]["contract_size"] == 1.0
 
 
 def test_account_keys_not_configured(monkeypatch):

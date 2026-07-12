@@ -343,10 +343,31 @@ class MexcClient:
         return list(data or [])
 
     async def account_snapshot(self) -> dict[str, Any]:
-        """Fetch assets + open positions and map to API account shape."""
+        """Fetch assets + open positions and map to API account shape.
+
+        Each position gets its OWN contract_size (F-10) — resolved from
+        MEXC's contract metadata (one /contract/detail call covering all
+        symbols) rather than the active chart symbol's. If that lookup
+        fails or a symbol is missing from it, map_position safely defaults
+        that position's contract_size to 1.0.
+        """
         assets_raw = await self.assets()
         positions_raw = await self.positions()
-        return map_account_snapshot(assets_raw, positions_raw)
+        contract_sizes: dict[str, float] = {}
+        if positions_raw:
+            try:
+                detail = await self.contract_detail()
+                rows = detail if isinstance(detail, list) else [detail]
+                for r in rows:
+                    sym = str(r.get("symbol") or "")
+                    if not sym:
+                        continue
+                    contract_sizes[sym] = float(r.get("contractSize") or 0) or 1.0
+            except MexcError:
+                pass  # per-position default (1.0) still applies below
+        return map_account_snapshot(
+            assets_raw, positions_raw, contract_sizes=contract_sizes
+        )
 
     async def set_leverage(
         self,
@@ -565,8 +586,17 @@ def usdt_balances(assets: list[dict[str, Any]]) -> tuple[float, float]:
     return _f(usdt.get("equity")), _f(usdt.get("availableBalance"))
 
 
-def map_position(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize one MEXC open-position row for the account API."""
+def map_position(row: dict[str, Any], contract_size: float = 1.0) -> dict[str, Any]:
+    """Normalize one MEXC open-position row for the account API.
+
+    `contract_size` is this position's OWN per-symbol contract size (from
+    MEXC contract metadata), NOT the active chart symbol's — the frontend
+    used to apply the active symbol's contractSize to every open position,
+    which is wrong whenever positions span symbols with different contract
+    sizes (F-10). Callers that don't have per-symbol metadata handy may omit
+    it; it then safely defaults to 1.0 (correct for e.g. Hyperliquid, which
+    is coin-denominated).
+    """
     pt = row.get("positionType")
     if pt == 1:
         side = "long"
@@ -602,6 +632,7 @@ def map_position(row: dict[str, Any]) -> dict[str, Any]:
         "im": _opt_float(row.get("im")),
         "margin_ratio": _opt_float(row.get("marginRatio")),
         "state": row.get("state"),
+        "contract_size": float(contract_size) if contract_size else 1.0,
     }
 
 
@@ -609,13 +640,26 @@ def map_account_snapshot(
     assets: list[dict[str, Any]],
     positions: list[dict[str, Any]],
     *,
+    contract_sizes: dict[str, float] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
+    """Map raw assets/positions to the /api/account shape.
+
+    `contract_sizes` is an optional {symbol: contractSize} lookup so each
+    mapped position gets its OWN contract size rather than one size applied
+    to every position (F-10). Omitted -> every position defaults to 1.0
+    (correct for Hyperliquid; MEXC callers should pass real per-symbol
+    sizes from contract metadata).
+    """
     equity, available = usdt_balances(assets)
+    sizes = contract_sizes or {}
     return {
         "equity_usdt": equity,
         "available_usdt": available,
-        "positions": [map_position(p) for p in positions],
+        "positions": [
+            map_position(p, sizes.get(str(p.get("symbol") or ""), 1.0))
+            for p in positions
+        ],
         "error": error,
     }
 
