@@ -618,7 +618,15 @@
     const na = String(a || "").toUpperCase();
     const nb = String(b || "").toUpperCase();
     if (na === "" || nb === "") return false;
-    const isHyperliquid = !!(state.health && state.health.exchange === "hyperliquid");
+    let ex = state.health && state.health.exchange;
+    if (!ex) {
+      // /api/health not loaded yet: seed the exchange from the server-rendered
+      // label so HL positions (bare base-coin symbols like "BTC") aren't
+      // transiently hidden by the full-string fallback on first paint (audit F4).
+      const lbl = $("exchange-label");
+      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
+    }
+    const isHyperliquid = ex === "hyperliquid";
     if (isHyperliquid) {
       const ca = na.split("_")[0];
       const cb = nb.split("_")[0];
@@ -1200,6 +1208,16 @@
       }
       try { drawProposalLines(); } catch (_) {}
       try { drawTradeZones(); } catch (_) {}
+      // Also drop the old coin's position/order price lines now — they re-filter
+      // by symMatch but linger until the next fetch resolves (audit F3).
+      try { drawPositionLines(); } catch (_) {}
+      try { drawOrderLines(); } catch (_) {}
+      // Clear the ticket's ABSOLUTE price fields: prices from the old coin are
+      // meaningless for the new one and would corrupt the %-mode reference price
+      // and the risk readout until overwritten (audit F2).
+      ["ticket-entry", "ticket-price", "ticket-sl", "ticket-tp1", "ticket-tp2", "ticket-tp3"]
+        .forEach(function (id) { const el = $(id); if (el) el.value = ""; });
+      try { updateRiskReadout(); } catch (_) {}
     }
     // Sequence guard: fast coin switches can let an older fetch resolve AFTER a
     // newer one and overwrite the chart with stale data. Stamp each call and
@@ -1571,7 +1589,7 @@
       ' data-sym="' + escapeHtml(String(p.symbol || "")) + '"' +
       ' data-entry="' + escapeHtml(String(p.entry_price != null ? p.entry_price : "")) + '"' +
       ' data-vol="' + escapeHtml(String(p.hold_vol != null ? p.hold_vol : "")) + '"' +
-      ' data-cs="' + escapeHtml(String(cs)) + '"' +
+      ' data-cs="' + escapeHtml(String(posCs)) + '"' +
       ' data-im="' + escapeHtml(String(p.im != null ? p.im : "")) + '"' +
       ' data-side="' + sideVal + '"'
     );
@@ -4365,14 +4383,35 @@
       const data = await res.json().catch(function () {
         return {};
       });
-      if (!res.ok) {
+      if (!res.ok || data.ok === false) {
+        // A close can fail (or only PARTIALLY fill / stay unverified) while still
+        // returning HTTP 200 — never paint that green (audit F-A1): the residual
+        // position keeps running and the trader must not believe they are flat.
         showToast(detailToText(data.detail || data), "err");
+        loadAccount();
+        loadOpenOrders();
         return;
       }
-      showToast(
-        "Geschlossen: " + fmt(data.closed_vol, 4) + " von " + fmt(data.hold_vol, 4),
-        "ok"
-      );
+      const closedTxt =
+        "Geschlossen: " + fmt(data.closed_vol, 4) + " von " + fmt(data.hold_vol, 4);
+      const warns = Array.isArray(data.warnings)
+        ? data.warnings.filter(Boolean)
+        : [];
+      const notFlat =
+        data.status && String(data.status).toLowerCase() !== "closed";
+      if (warns.length || notFlat) {
+        // Partial / unverified close: surface it as a warning, not success —
+        // the position may still be open. Verify on the exchange.
+        showToast(
+          closedTxt +
+            (notFlat ? " · " + escapeHtml(String(data.status)) : "") +
+            (warns.length ? " — " + escapeHtml(warns.join("; ")) : "") +
+            " — Position prüfen!",
+          "err"
+        );
+      } else {
+        showToast(closedTxt, "ok");
+      }
       loadAccount();
       loadOpenOrders();
       loadHistory();
