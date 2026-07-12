@@ -498,7 +498,11 @@ class HyperliquidClient:
                     "equity": equity,
                     "availableBalance": available,
                     "cashBalance": withdrawable,
-                    "unrealized": float(margin.get("totalNtlPos") or 0),
+                    # H-2: totalNtlPos is total NOTIONAL position value, NOT
+                    # unrealized PnL (that is per-position `unrealizedPnl`, read
+                    # in positions()). Name it honestly so no future PnL/UI
+                    # caller mistakes notional exposure for realized/unreal PnL.
+                    "notional_position": float(margin.get("totalNtlPos") or 0),
                 }
             ]
 

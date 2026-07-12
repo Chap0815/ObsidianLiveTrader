@@ -128,3 +128,19 @@ async def test_assets_and_positions_ok_on_complete_state():
     rows = await c.assets()
     assert rows[0]["equity"] == 1000.0
     assert await c.positions() == []
+
+
+# ── H-2: totalNtlPos is notional exposure, not unrealized PnL ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_assets_does_not_mislabel_notional_as_unrealized():
+    """`marginSummary.totalNtlPos` is total NOTIONAL position value, not
+    unrealized PnL. It must not be surfaced under a misleading 'unrealized' key
+    that a future PnL/UI caller could trust."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    row = (await c.assets())[0]
+    assert "unrealized" not in row
+    assert row["notional_position"] == 500.0
