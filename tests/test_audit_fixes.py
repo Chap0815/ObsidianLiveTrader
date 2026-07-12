@@ -910,6 +910,73 @@ async def test_pre_hold_failure_prevents_auto_close():
 # ── F-03: manual close must verify the close response semantically ────────────
 
 
+# ── F-12: unlabeled trigger must be classified by side/entry, never assumed SL ──
+
+
+def test_unlabeled_trigger_below_long_entry_is_sl():
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp(
+        [{"triggerPrice": 99_000.0}], side="long", entry_price=100_000.0
+    )
+    assert sl == 99_000.0
+    assert tp is None
+
+
+def test_unlabeled_trigger_above_long_entry_is_tp_not_sl():
+    """This is the F-12 bug: a TP above a long entry must NOT become a
+    fabricated SL (which would make an unprotected position look protected)."""
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp(
+        [{"triggerPrice": 102_000.0}], side="long", entry_price=100_000.0
+    )
+    assert tp == 102_000.0
+    assert sl is None
+
+
+def test_unlabeled_trigger_above_short_entry_is_sl():
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp(
+        [{"triggerPrice": 101_000.0}], side="short", entry_price=100_000.0
+    )
+    assert sl == 101_000.0
+    assert tp is None
+
+
+def test_unlabeled_trigger_below_short_entry_is_tp():
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp(
+        [{"triggerPrice": 98_000.0}], side="short", entry_price=100_000.0
+    )
+    assert tp == 98_000.0
+    assert sl is None
+
+
+def test_unlabeled_trigger_unresolvable_is_unknown_not_sl():
+    """No side/entry known → neither sl nor tp assigned. Never assume SL."""
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp([{"triggerPrice": 99_000.0}], side=None, entry_price=None)
+    assert sl is None
+    assert tp is None
+
+
+def test_labeled_stop_still_classified_as_sl_regardless_of_side():
+    """An explicit 'stop'/'sl' label still wins over side/entry inference."""
+    from app.main import _extract_position_sl_tp
+
+    sl, tp = _extract_position_sl_tp(
+        [{"triggerPrice": 99_000.0, "orderType": "stop_market"}],
+        side="long",
+        entry_price=100_000.0,
+    )
+    assert sl == 99_000.0
+    assert tp is None
+
+
 @pytest.mark.asyncio
 async def test_close_inner_error_not_reported_closed():
     """An outwardly-200 close response carrying an inner error (Hyperliquid

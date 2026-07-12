@@ -802,13 +802,41 @@ async def analyze(
     }
 
 
-def _extract_position_sl_tp(stops: list[dict]) -> tuple[float | None, float | None]:
+def _classify_unlabeled_trigger(
+    trigger_price: float, side: str | None, entry_price: float | None
+) -> str | None:
+    """Classify an unlabeled trigger order as 'sl' or 'tp' by position side +
+    entry: a stop sits on the loss side of entry, a take-profit on the profit
+    side. Returns None ("unknown") when side/entry aren't known or the
+    trigger sits exactly on entry — callers must NEVER default to SL in that
+    case (F-12: a fabricated SL can mask an actually-unprotected position)."""
+    side_n = (side or "").strip().lower()
+    if side_n not in ("long", "short"):
+        return None
+    try:
+        entry = float(entry_price)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0:
+        return None
+    if trigger_price == entry:
+        return None
+    if side_n == "long":
+        return "sl" if trigger_price < entry else "tp"
+    return "sl" if trigger_price > entry else "tp"
+
+
+def _extract_position_sl_tp(
+    stops: list[dict], *, side: str | None = None, entry_price: float | None = None
+) -> tuple[float | None, float | None]:
     """Best-effort current SL/TP from open trigger orders for one symbol.
 
     Mirrors the frontend's `findPositionProtection` heuristic (app.js): an
     explicit stopLossPrice/takeProfitPrice field wins; otherwise fall back to
-    triggerPrice/price + an orderType label; an unlabeled trigger defaults to
-    a protective stop. Read-only — never places/cancels anything.
+    triggerPrice/price + an orderType label. An unlabeled trigger is
+    classified by position side + entry (loss side = SL, profit side = TP);
+    if that can't be determined it counts as neither (unknown), never a
+    fabricated SL. Read-only — never places/cancels anything.
     """
     sl: float | None = None
     tp: float | None = None
@@ -839,8 +867,16 @@ def _extract_position_sl_tp(stops: list[dict]) -> tuple[float | None, float | No
         label = str(row.get("orderType") or "").lower()
         if label.startswith("tp") or "take" in label:
             tp = trg
+        elif label.startswith("sl") or "stop" in label:
+            sl = trg
         else:
-            sl = trg  # "stop"/"sl" label or unlabeled → treat as protective stop
+            # Unlabeled trigger: never assume SL. Classify by side + entry;
+            # if that's not resolvable, it's unknown protection (neither).
+            kind = _classify_unlabeled_trigger(trg, side, entry_price)
+            if kind == "sl":
+                sl = trg
+            elif kind == "tp":
+                tp = trg
     return sl, tp
 
 
@@ -909,7 +945,9 @@ async def reevaluate(
     except ExchangeError as e:
         stops = []
         stops_error = str(e)
-    current_sl, current_tp = _extract_position_sl_tp(stops)
+    current_sl, current_tp = _extract_position_sl_tp(
+        stops, side=position.get("side"), entry_price=position.get("entry_price")
+    )
 
     pnl = position.get("unrealized_pnl")
     im = position.get("im")
