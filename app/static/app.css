@@ -6,33 +6,35 @@
    ============================================================ */
 
 :root {
-  /* Obsidian — logo-true: deep purple-black volcanic glass, indigo-violet
-     signature accent (the arrowhead). Green/red stay semantic for P&L. */
-  --bg: #0a0810;
-  --bg-panel: #16131f;
-  --bg-elevated: #201c2b;
-  --bg-inset: #0d0b14;
-  --border: #2b2740;
-  --hairline: #1d1a2b;
-  --text: #e9e7f2;
-  --muted: #9d9ab6;
-  --faint: #6b6788;
+  /* Obsidian Remake — refined volcanic glass. Monochrome base; colour = meaning.
+     Deeper elevation steps, indigo-violet arrowhead as the ONLY interactive
+     accent, green/red/amber reserved strictly for P&L / direction / warning. */
+  --bg: #08060d;              /* void — page ground */
+  --bg-panel: #100c18;        /* panels */
+  --bg-elevated: #191320;     /* inputs / raised */
+  --bg-inset: #0b0810;        /* wells / chart / segments */
+  --border: #292339;          /* panel edges */
+  --hairline: #1c1728;        /* subtle dividers */
+  --text: #eceaf4;
+  --muted: #a5a1bc;
+  --faint: #6a6584;
 
-  --accent: #9a86e8;          /* indigo-violet signature (arrowhead) */
-  --accent-dim: rgba(122, 108, 224, 0.16);
-  --violet: #b07ae0;          /* secondary neon, sparing */
+  --accent: #9b87f5;          /* indigo-violet signature (arrowhead) */
+  --accent-dim: rgba(155, 135, 245, 0.14);
+  --accent-line: rgba(155, 135, 245, 0.42);
+  --violet: #b79cff;          /* secondary neon, sparing */
 
-  --long: #4fbe8e;
-  --long-dim: rgba(79, 190, 142, 0.14);
-  --short: #e35349;
-  --short-dim: rgba(227, 83, 73, 0.14);
+  --long: #46c08a;
+  --long-dim: rgba(70, 192, 138, 0.13);
+  --short: #e6584e;
+  --short-dim: rgba(230, 88, 78, 0.13);
 
   /* legacy aliases still referenced from JS-injected inline styles */
-  --green: #4fbe8e;
-  --red: #e35349;
+  --green: #46c08a;
+  --red: #e6584e;
 
-  --live: #c0392b;            /* armed banner */
-  --warn: #e0a23d;
+  --live: #e0a23d;            /* armed / live-money attention (amber, serious) */
+  --warn: #e5a93c;
 
   --radius: 4px;
   --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
@@ -50,11 +52,18 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
-  background: var(--bg);
+  /* subtle top vignette gives the obsidian ground depth without decoration */
+  background:
+    radial-gradient(130% 80% at 50% -12%, #130e1d 0%, var(--bg) 58%) fixed;
   color: var(--text);
-  font-family: var(--sans);
-  font-size: 15.6px;
+  /* Remake: the instrument speaks mono — the numbers ARE the typography.
+     Hierarchy comes from weight/size/tracking, not from switching families.
+     The one exception (humanist sans) is the KI-Analyse prose. */
+  font-family: var(--mono);
+  font-size: 13.5px;
   line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 
 .hidden {
@@ -923,7 +932,10 @@ select:focus {
 .placeholder {
   padding: 14px 12px;
   color: var(--muted);
-  font-size: 15px;
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.6;
+  max-width: 62ch;
 }
 
 /* ── Statbar: instrument tiles under the chart ──────────── */
@@ -1810,10 +1822,14 @@ select:focus {
 }
 
 .an-reason {
-  font-size: 15.6px;
-  line-height: 1.65;
-  color: var(--text);
+  /* The analyst's voice speaks humanist sans — the one non-mono text in the
+     instrument, held near 62ch so it reads like prose, not a data field. */
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.62;
+  color: #cfc9e0;
   margin-bottom: 12px;
+  max-width: 62ch;
   white-space: pre-wrap;
 }
 
@@ -1821,7 +1837,9 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 14.4px;
+  font-family: var(--sans);
+  font-size: 12.8px;
+  line-height: 1.55;
   color: var(--muted);
   padding: 9px 11px;
   background: var(--bg-inset);
