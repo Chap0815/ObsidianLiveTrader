@@ -957,6 +957,41 @@ class OrderService:
                         f"(new_fill={new_fill} via {fill_source}, "
                         f"pre_hold={pre_hold}) after unverified SL"
                     )
+                    # F-03 follow-up: verify the flatten actually reduced the
+                    # position — a partial IOC fill leaves residual OPEN and
+                    # unprotected. Best-effort; never claim a clean flatten on
+                    # a residual, never overwrite the send result on doubt.
+                    try:
+                        resid, _r_ot, resid_ok = await self._same_side_hold_vol_ok(
+                            symbol, ticket.side
+                        )
+                        # Expected residual after flatten is the untouched
+                        # pre-existing hold; anything meaningfully above it means
+                        # our flatten under-filled.
+                        eps = max(float(gate.rounded_vol) * 1e-4, 1e-9)
+                        if not resid_ok:
+                            warnings.append(
+                                "AUTO_FLATTEN: Rest-Position nicht nachprüfbar "
+                                "(positions-Abfrage fehlgeschlagen) — Position auf "
+                                "der Börse prüfen (evtl. Teilausführung)."
+                            )
+                        elif resid - pre_hold > eps:
+                            warnings.append(
+                                f"AUTO_FLATTEN UNVOLLSTÄNDIG: Rest {resid} offen "
+                                f"(erwartet ~{pre_hold}) — Teilausführung, Position "
+                                "manuell schließen/prüfen."
+                            )
+                            if isinstance(flatten_result, dict):
+                                flatten_result = {
+                                    **flatten_result,
+                                    "residual_vol": resid,
+                                    "incomplete": True,
+                                }
+                    except Exception:  # noqa: BLE001 — order live, must not bubble
+                        warnings.append(
+                            "AUTO_FLATTEN: Rest-Prüfung fehlgeschlagen — Position "
+                            "auf der Börse prüfen."
+                        )
             except Exception as fe:  # noqa: BLE001
                 warnings.append(
                     f"AUTO_FLATTEN failed: {fe} — close manually on the exchange"
@@ -1143,6 +1178,74 @@ class OrderService:
                 "open; verify on the exchange"
             )
 
+        # F-03 FOLLOW-UP: the inner-error check above only proves the exchange
+        # ACCEPTED the close — a marketable IOC can still PARTIALLY fill (a
+        # `filled` is present, no inner error) and leave a residual position
+        # open. Re-read the live position and confirm the residual is what we
+        # intended to leave (0 for a full close, hold-close_vol for a partial).
+        expected_residual = max(0.0, hold - close_vol)
+        residual, _rot, reread_ok = await self._same_side_hold_vol_ok(symbol, side)
+        # Dust tolerance: one lot step, else a tiny relative epsilon (HL sizes
+        # can be stepless). Never flags a genuine full close (residual ~0).
+        epsilon = max(vol_unit, hold * 1e-4, 1e-9)
+
+        if not reread_ok:
+            # Fail-safe: the verification query failed. Do NOT claim fully
+            # closed — surface that completion could not be confirmed.
+            warn = (
+                "Schließen gesendet, aber Positions-Nachprüfung fehlgeschlagen — "
+                "Status UNBEKANNT. Position JETZT manuell auf der Börse prüfen "
+                "(evtl. Teilausführung)."
+            )
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol,
+                    side=side,
+                    request_json={"action": "manual_close", "vol": close_vol},
+                    response_json=resp if isinstance(resp, dict) else {"data": resp},
+                    status="close_unverified",
+                    error="post-close position reread failed",
+                )
+            return {
+                "ok": False,
+                "status": "close_unverified",
+                "closed_vol": close_vol,
+                "hold_vol": hold,
+                "residual_vol": None,
+                "verified": False,
+                "response": resp,
+                "warnings": [warn],
+            }
+
+        if residual - expected_residual > epsilon:
+            # PARTIAL fill: a meaningful residual beyond what we meant to leave
+            # is still open. Do NOT report fully closed.
+            warn = (
+                f"TEILAUSFÜHRUNG: Schließen von {close_vol} gesendet, aber "
+                f"{residual} bleiben offen (erwartet ~{expected_residual}). "
+                "Position ist NICHT vollständig geschlossen — Rest manuell "
+                "schließen/prüfen."
+            )
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol,
+                    side=side,
+                    request_json={"action": "manual_close", "vol": close_vol},
+                    response_json=resp if isinstance(resp, dict) else {"data": resp},
+                    status="close_incomplete",
+                    error=f"residual {residual} remains after close",
+                )
+            return {
+                "ok": False,
+                "status": "partial",
+                "closed_vol": close_vol,
+                "hold_vol": hold,
+                "residual_vol": residual,
+                "verified": False,
+                "response": resp,
+                "warnings": [warn],
+            }
+
         if self.db is not None:
             await self.db.insert_order(
                 symbol=symbol,
@@ -1152,7 +1255,15 @@ class OrderService:
                 status="closed",
                 error=None,
             )
-        return {"ok": True, "closed_vol": close_vol, "hold_vol": hold, "response": resp}
+        return {
+            "ok": True,
+            "status": "closed",
+            "closed_vol": close_vol,
+            "hold_vol": hold,
+            "residual_vol": residual,
+            "verified": True,
+            "response": resp,
+        }
 
     async def cancel(
         self,

@@ -1006,3 +1006,77 @@ async def test_close_inner_error_not_reported_closed():
     # Audit must record the failure, never status=closed.
     db.insert_order.assert_awaited()
     assert db.insert_order.await_args.kwargs["status"] == "close_error"
+
+
+# ── F-03 follow-up: post-close position re-read (partial-fill detection) ──────
+#
+# A marketable IOC close can be ACCEPTED (transport 200, no inner error, a
+# `filled` present) yet only PARTIALLY fill, leaving a residual position open.
+# The inner-error check alone would still report it `closed`/ok. The service
+# must re-read the live position after a close and only claim fully closed when
+# the residual matches what we intended to leave.
+
+
+def _close_client(*, first_hold, reread, close_resp=None):
+    """MEXC client whose positions() returns `first_hold` then `reread`.
+
+    `reread` may be a list (positions rows) or an exception instance (query
+    failure). `close_resp` is the market-close response (benign by default).
+    """
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
+    client.positions = AsyncMock(side_effect=[first_hold, reread])
+    client.close_position_market = AsyncMock(
+        return_value=close_resp if close_resp is not None else {"orderId": 9, "dealVol": 3.0}
+    )
+    return client
+
+
+def _pos(hold, side_type=1):
+    return [{"symbol": "BTC_USDT", "positionType": side_type, "holdVol": hold,
+             "holdAvgPrice": 100_000.0}]
+
+
+@pytest.mark.asyncio
+async def test_close_partial_fill_not_reported_fully_closed():
+    """Full close accepted, but reread shows a residual still open → NOT ok."""
+    client = _close_client(first_hold=_pos(5.0), reread=_pos(2.0))
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+    assert out["ok"] is False
+    assert out["residual_vol"] == 2.0
+    assert out["status"] in ("partial", "close_incomplete")
+    # Audit must NOT record status=closed for a residual position.
+    assert db.insert_order.await_args.kwargs["status"] != "closed"
+
+
+@pytest.mark.asyncio
+async def test_close_full_fill_still_reports_ok():
+    """A genuine full close (residual ~0) must still report ok:true — the
+    verification must never block a legitimate complete close."""
+    client = _close_client(first_hold=_pos(5.0), reread=[])  # nothing left open
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+    assert out["ok"] is True
+    assert out["closed_vol"] == 5.0
+    assert db.insert_order.await_args.kwargs["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_close_reread_failure_is_uncertain_not_closed():
+    """If the post-close reread itself fails, fail-safe: uncertain, never a
+    false fully-closed."""
+    client = _close_client(first_hold=_pos(5.0), reread=MexcError("positions boom"))
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+    assert out["ok"] is False
+    assert out["status"] == "close_unverified"
+    assert out.get("residual_vol") is None
+    assert db.insert_order.await_args.kwargs["status"] != "closed"
