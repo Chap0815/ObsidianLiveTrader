@@ -967,14 +967,60 @@ class HyperliquidClient:
         def _cl():
             ex = self._get_exchange()
             coin = to_hl_coin(symbol)
-            # Emergency close: allow wider slippage so the flatten actually fills
-            slippage = max(0.01, self.market_slippage)
-            return ex.market_close(
-                coin, sz=float(vol) if vol else None, slippage=slippage
+            want = (side or "").lower()
+            if want not in ("long", "short"):
+                raise HyperliquidError(
+                    f"close side must be long/short, got {side!r}"
+                )
+            # ── F-08 TOCTOU guard: the service checked the side earlier, but the
+            # SDK's market_close ignores `side` and closes WHATEVER position is
+            # live. Re-read the live side/size immediately before closing; if the
+            # position flipped externally between check and execution, refuse
+            # instead of market-closing the new opposite side.
+            info = self._get_info()
+            addr = self._resolve_address()
+            state = info.user_state(addr) if addr else {}
+            live_szi = 0.0
+            for ap in (state or {}).get("assetPositions") or []:
+                pos = ap.get("position") or {}
+                if str(pos.get("coin") or "").upper() == coin:
+                    live_szi = float(pos.get("szi") or 0)
+                    break
+            live_side = (
+                "long" if live_szi > 0 else ("short" if live_szi < 0 else None)
             )
+            if live_side is None:
+                raise HyperliquidError(
+                    f"no open {want} position on {coin} to close"
+                )
+            if live_side != want:
+                raise HyperliquidError(
+                    f"refusing close: requested {want} but live position is "
+                    f"{live_side} (side flipped externally) — not closing the "
+                    "wrong side"
+                )
+            live_sz = abs(live_szi)
+            close_sz = (
+                min(float(vol), live_sz) if vol and float(vol) > 0 else live_sz
+            )
+            if close_sz <= 0:
+                raise HyperliquidError("close size resolved to 0")
+            # Emergency close: allow wider slippage so the flatten actually fills.
+            slippage = max(0.01, self.market_slippage)
+            # market_close is a reduce-only IOC close of the (now-verified) side.
+            result = ex.market_close(coin, sz=close_sz, slippage=slippage)
+            # ── F-03: HL returns order rejections INSIDE an outwardly-ok
+            # response. Treat an inner error as a FAILED close so the service
+            # never logs `closed` / answers ok while the position is still open.
+            err = _status_error(result)
+            if err:
+                raise HyperliquidError(f"close rejected: {err}", raw=result)
+            return result
 
         try:
             return await self._to_thread(_cl)
+        except HyperliquidError:
+            raise
         except Exception as e:
             raise HyperliquidError(f"close failed: {e}") from e
 

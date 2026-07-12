@@ -114,6 +114,48 @@ async def test_place_stop_order_maps_reduce_only_trigger():
     assert c._exchange.order.call_args.args[1] is True
 
 
+def _fake_info(coin: str, szi: float):
+    """Info stub whose user_state reports one position (coin/szi)."""
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value={
+            "assetPositions": [
+                {"position": {"coin": coin, "szi": str(szi)}}
+            ]
+        }
+    )
+    return info
+
+
+@pytest.mark.asyncio
+async def test_close_refuses_when_live_side_flipped():
+    """F-08: the SDK's market_close ignores `side`. If the live position flipped
+    from long to short between the service check and execution, the close must
+    be REFUSED, not blindly executed against the new opposite side."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", -0.5)  # live is SHORT now
+    c._exchange.market_close = MagicMock(return_value=_OK)
+    with pytest.raises(HyperliquidError) as ei:
+        await c.close_position_market("BTC", side="long", vol=0.5)  # requested LONG
+    assert "flipped" in str(ei.value).lower() or "refus" in str(ei.value).lower()
+    c._exchange.market_close.assert_not_called()  # never touched the short
+
+
+@pytest.mark.asyncio
+async def test_close_executes_when_side_matches():
+    """Matching live side → close proceeds and returns the (ok) response."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)  # live LONG matches request
+    c._exchange.market_close = MagicMock(return_value=_OK)
+    out = await c.close_position_market("BTC", side="long", vol=0.5)
+    assert out == _OK
+    c._exchange.market_close.assert_called_once()
+    # Size is capped to the live size.
+    assert c._exchange.market_close.call_args.kwargs["sz"] == pytest.approx(0.5)
+
+
 @pytest.mark.asyncio
 async def test_hl_place_order_scale_out_places_two_tp_triggers():
     c = _client()
