@@ -60,7 +60,7 @@ body {
      Hierarchy comes from weight/size/tracking, not from switching families.
      The one exception (humanist sans) is the KI-Analyse prose. */
   font-family: var(--mono);
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
@@ -109,7 +109,7 @@ body {
   border: 1px solid var(--border);
   background: var(--bg-inset);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--muted);
@@ -144,7 +144,7 @@ body {
 .banner-chip,
 .disarmed-badge {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   letter-spacing: 0.08em;
   padding: 2px 8px;
   border-radius: 3px;
@@ -173,7 +173,7 @@ body {
   background: var(--bg-elevated);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 13.8px;
+  font-size: 15.2px;
   font-weight: 400;
   line-height: 1.45;
   letter-spacing: normal;
@@ -235,7 +235,7 @@ body {
   border-radius: 50%;
   border: 1px solid var(--faint);
   color: var(--faint);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 700;
   font-family: var(--sans);
   cursor: help;
@@ -278,7 +278,7 @@ body {
 
 .brand-mark {
   color: var(--accent);
-  font-size: 21.6px;
+  font-size: 23.8px;
   line-height: 1;
 }
 
@@ -292,7 +292,7 @@ body {
 
 .brand-name {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   line-height: 1.25;
   letter-spacing: 0.22em;
@@ -309,7 +309,7 @@ body {
 .field-inline > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -324,7 +324,7 @@ select {
   border-radius: var(--radius);
   padding: 6px 9px;
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-variant-numeric: tabular-nums;
   transition: border-color 0.12s ease;
 }
@@ -361,7 +361,7 @@ select:focus {
   padding: 6px 11px;
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 14.4px;
+  font-size: 15.8px;
   transition: background 0.12s ease, color 0.12s ease;
 }
 
@@ -387,7 +387,7 @@ select:focus {
   padding: 6px 12px;
   cursor: pointer;
   font-family: var(--sans);
-  font-size: 15px;
+  font-size: 16.5px;
   font-weight: 500;
   background: var(--bg-elevated);
   color: var(--text);
@@ -444,7 +444,7 @@ select:focus {
   align-items: center;
   gap: 6px;
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   letter-spacing: 0.05em;
   color: var(--muted);
 }
@@ -481,7 +481,7 @@ select:focus {
 
 .equity-label {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -490,7 +490,7 @@ select:focus {
 
 .equity strong {
   font-family: var(--mono);
-  font-size: 19.2px;
+  font-size: 21.1px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--text);
@@ -534,9 +534,10 @@ select:focus {
   min-width: 0;
 }
 
-.proposal-panel  { max-height: 60vh; }
-.history-panel   { max-height: 40vh; }
-.orders-panel .orders-body { max-height: 76vh; }
+.proposal-panel  { max-height: 74vh; }   /* KI-Analyse now alone in its column */
+.history-panel   { max-height: 34vh; }   /* stacked under orders in the right column */
+.history-panel #history-body { overflow-y: auto; max-height: 28vh; }
+.orders-panel .orders-body { max-height: 46vh; }
 
 .side-rail {
   display: flex;
@@ -570,7 +571,7 @@ select:focus {
 .panel-head h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.16em;
@@ -588,12 +589,12 @@ select:focus {
   align-items: center;
   gap: 8px;
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
 }
 
 .btn-ai-lines {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -622,7 +623,7 @@ select:focus {
 
 .llm-select {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 4px 6px;
 }
 
@@ -637,7 +638,7 @@ select:focus {
 
 #ticket-size-hint {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
@@ -666,7 +667,7 @@ select:focus {
 
 .risk-label {
   font-family: var(--mono);
-  font-size: 10.2px;
+  font-size: 11.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -675,19 +676,19 @@ select:focus {
 
 .risk-val {
   font-family: var(--mono);
-  font-size: 14.4px;
+  font-size: 15.8px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
 
 .risk-sl .risk-label { color: var(--short); }
 .risk-tp .risk-label { color: var(--long); }
-.rr-money { font-size: 13px; color: var(--muted); }
-.rr-dim { color: var(--faint); font-size: 13.2px; }
+.rr-money { font-size: 14.3px; color: var(--muted); }
+.rr-dim { color: var(--faint); font-size: 14.5px; }
 .rr-good { color: var(--long); }
 .rr-warn { color: var(--warn); }
 .rr-error { color: var(--short); }
-.rr-bad { color: var(--short); font-size: 13px; }
+.rr-bad { color: var(--short); font-size: 14.3px; }
 
 /* ── Confirm modal: blockers + summary card ─────────────── */
 .blocker-box {
@@ -705,7 +706,7 @@ select:focus {
 
 .blocker-title {
   font-weight: 600;
-  font-size: 15.6px;
+  font-size: 17.2px;
   color: #ffc9c4;
   margin-bottom: 6px;
 }
@@ -717,19 +718,19 @@ select:focus {
 .blocker-list {
   margin: 0;
   padding-left: 18px;
-  font-size: 15px;
+  font-size: 16.5px;
   line-height: 1.55;
 }
 
 .blocker-box p {
   margin: 4px 0 0;
-  font-size: 14.4px;
+  font-size: 15.8px;
   line-height: 1.5;
 }
 
 .blocker-box code {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   background: rgba(0, 0, 0, 0.3);
   border-radius: 3px;
   padding: 1px 5px;
@@ -757,7 +758,7 @@ select:focus {
 .sum-side {
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 15.6px;
+  font-size: 17.2px;
   letter-spacing: 0.08em;
 }
 
@@ -767,12 +768,12 @@ select:focus {
 .sum-sym {
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 16.8px;
+  font-size: 18.5px;
 }
 
 .sum-type {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--muted);
   margin-left: auto;
 }
@@ -794,7 +795,7 @@ select:focus {
 
 .sum-label {
   font-family: var(--mono);
-  font-size: 10.2px;
+  font-size: 11.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -803,14 +804,14 @@ select:focus {
 
 .sum-value {
   font-family: var(--mono);
-  font-size: 16.8px;
+  font-size: 18.5px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
 
 .sum-sub {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   color: var(--muted);
 }
 
@@ -826,7 +827,7 @@ select:focus {
 }
 
 .warn-title {
-  font-size: 13.2px;
+  font-size: 14.5px;
   font-weight: 600;
   color: var(--warn);
   margin-bottom: 4px;
@@ -870,7 +871,7 @@ select:focus {
 
 .scan-rank {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   color: var(--faint);
   width: 16px;
@@ -879,7 +880,7 @@ select:focus {
 
 .scan-score {
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-weight: 600;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
@@ -887,14 +888,14 @@ select:focus {
 
 .scan-score::after {
   content: "/10";
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 400;
   color: var(--faint);
 }
 
 .scan-setup {
   font-family: var(--mono);
-  font-size: 11.4px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -905,7 +906,7 @@ select:focus {
 }
 
 .scan-reason {
-  font-size: 14.4px;
+  font-size: 15.8px;
   color: var(--text);
   flex: 1 1 240px;
   min-width: 180px;
@@ -913,14 +914,14 @@ select:focus {
 
 .btn-scan-open {
   margin-left: auto;
-  font-size: 13.8px;
+  font-size: 15.2px;
   padding: 4px 12px;
 }
 
 .rt-badge,
 #rt-badge {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.1em;
   padding: 2px 6px;
@@ -964,7 +965,7 @@ select:focus {
   padding: 14px 12px;
   color: var(--muted);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 14.3px;
   line-height: 1.6;
   max-width: 62ch;
 }
@@ -994,7 +995,7 @@ select:focus {
 
 .stat-label {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -1004,7 +1005,7 @@ select:focus {
 
 .stat-value {
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
@@ -1017,7 +1018,7 @@ select:focus {
 }
 
 .stat-price .stat-value {
-  font-size: 25.2px;
+  font-size: 27.7px;
   font-weight: 600;
   line-height: 1.1;
 }
@@ -1027,7 +1028,7 @@ select:focus {
 }
 
 .funding-cd {
-  font-size: 13px;
+  font-size: 14.3px;
   color: var(--faint);
   font-weight: 400;
 }
@@ -1067,20 +1068,20 @@ select:focus {
 
 .cp-sym {
   font-family: var(--mono);
-  font-size: 16.8px;
+  font-size: 18.5px;
   font-weight: 600;
 }
 
 .cp-lev {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--muted);
 }
 
 .cp-pnl {
   font-family: var(--mono);
-  font-size: 31.2px;
+  font-size: 34.3px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
@@ -1095,7 +1096,7 @@ select:focus {
 .cp-pnl.pnl-neg { color: var(--short); }
 
 .cp-pnl-sub {
-  font-size: 14.4px;
+  font-size: 15.8px;
   font-weight: 500;
   opacity: 0.85;
 }
@@ -1121,7 +1122,7 @@ select:focus {
 
 .cp-cell-label {
   font-family: var(--mono);
-  font-size: 10.2px;
+  font-size: 11.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1130,7 +1131,7 @@ select:focus {
 
 .cp-cell-val {
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 16.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1144,7 +1145,7 @@ select:focus {
 
 .cp-close-label {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1159,7 +1160,7 @@ select:focus {
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 5px 0;
   cursor: pointer;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
@@ -1179,7 +1180,7 @@ select:focus {
 .positions-body,
 .orders-body {
   font-family: var(--mono);
-  font-size: 13.8px;
+  font-size: 15.2px;
   max-height: 200px;
   overflow-y: auto;
   overflow-x: hidden;
@@ -1208,11 +1209,11 @@ select:focus {
 
 .pos-sym {
   font-weight: 600;
-  font-size: 15.6px;
+  font-size: 17.2px;
 }
 
 .side-tag {
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.1em;
   padding: 2px 7px;
@@ -1245,7 +1246,7 @@ select:focus {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px solid var(--border, #2a2438);
-  font-size: 13px;
+  font-size: 14.3px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--muted, #8a86a0);
@@ -1271,12 +1272,12 @@ select:focus {
 }
 .other-coin-detail {
   color: var(--muted, #8a86a0);
-  font-size: 13.2px;
+  font-size: 14.5px;
 }
 .other-coin-go {
   margin-left: auto;
   color: var(--accent, #9a86e8);
-  font-size: 13.2px;
+  font-size: 14.5px;
 }
 
 /* SL-status banner in the position cockpit — the key safety nudge */
@@ -1284,7 +1285,7 @@ select:focus {
   margin: 6px 0;
   padding: 5px 9px;
   border-radius: 5px;
-  font-size: 13.2px;
+  font-size: 14.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -1336,7 +1337,7 @@ select:focus {
   background: transparent;
   color: var(--accent, #9a86e8);
   font-family: var(--mono);
-  font-size: 12.6px;
+  font-size: 13.9px;
   font-weight: 600;
   letter-spacing: 0.02em;
   padding: 6px 0;
@@ -1363,7 +1364,7 @@ select:focus {
   border-radius: var(--radius);
   background: var(--bg-inset);
   font-family: var(--sans);
-  font-size: 12.6px;
+  font-size: 13.9px;
   line-height: 1.4;
 }
 
@@ -1383,7 +1384,7 @@ select:focus {
 
 .cp-reeval-action {
   font-family: var(--mono);
-  font-size: 12.6px;
+  font-size: 13.9px;
   font-weight: 700;
   letter-spacing: 0.04em;
   padding: 3px 8px;
@@ -1423,7 +1424,7 @@ select:focus {
 
 .cp-reeval-foot {
   color: var(--faint, #6a6580);
-  font-size: 11.1px;
+  font-size: 12.2px;
   font-family: var(--mono);
 }
 
@@ -1441,13 +1442,13 @@ select:focus {
 .symbol-dropdown::-webkit-scrollbar-track { background: transparent; }
 .symbol-option {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 6px 9px; border-radius: 3px; font-family: var(--mono); font-size: 14.4px;
+  padding: 6px 9px; border-radius: 3px; font-family: var(--mono); font-size: 15.8px;
   font-weight: 600; letter-spacing: 0.02em; color: var(--text); cursor: pointer;
 }
 .symbol-option:hover, .symbol-option.hl { background: var(--accent-dim); color: var(--accent); }
 .symbol-option.current { color: var(--accent); }
-.symbol-option.current::after { content: "●"; font-size: 9.6px; color: var(--accent); }
-.symbol-empty { padding: 10px 9px; color: var(--faint); font-family: var(--mono); font-size: 13.8px; }
+.symbol-option.current::after { content: "●"; font-size: 10.6px; color: var(--accent); }
+.symbol-empty { padding: 10px 9px; color: var(--faint); font-family: var(--mono); font-size: 15.2px; }
 
 /* ── Chart-Tab-Leiste ─────────────────────────────────────── */
 .symbol-tabs {
@@ -1460,7 +1461,7 @@ select:focus {
 .symbol-tab {
   display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
   padding: 5px 8px 5px 10px; border: 1px solid transparent; border-radius: var(--radius);
-  background: transparent; color: var(--muted); font-family: var(--mono); font-size: 13.8px;
+  background: transparent; color: var(--muted); font-family: var(--mono); font-size: 15.2px;
   font-weight: 600; letter-spacing: 0.02em; cursor: pointer; white-space: nowrap;
   transition: background .12s ease, color .12s ease, border-color .12s ease;
 }
@@ -1470,14 +1471,14 @@ select:focus {
 .tab-dot.long { background: var(--long); opacity: 1; }
 .tab-dot.short { background: var(--short); opacity: 1; }
 .tab-close {
-  border: none; background: transparent; color: inherit; opacity: .45; font-size: 15.6px;
+  border: none; background: transparent; color: inherit; opacity: .45; font-size: 17.2px;
   line-height: 1; padding: 0 2px; border-radius: 2px; cursor: pointer;
 }
 .tab-close:hover { opacity: 1; color: var(--short); background: var(--bg-inset); }
 .tab-add {
   flex: 0 0 auto; width: 24px; height: 24px; border: 1px dashed var(--border);
   border-radius: var(--radius); background: transparent; color: var(--muted);
-  font-size: 16.8px; line-height: 1; cursor: pointer;
+  font-size: 18.5px; line-height: 1; cursor: pointer;
 }
 .tab-add:hover { color: var(--accent); border-color: var(--accent); }
 
@@ -1489,12 +1490,12 @@ select:focus {
   gap: 12px; margin-bottom: 10px;
 }
 .overview-head h2 {
-  margin: 0; font-family: var(--mono); font-size: 11px; font-weight: 600;
+  margin: 0; font-family: var(--mono); font-size: 12.1px; font-weight: 600;
   letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
 }
 .watch-add { display: flex; gap: 6px; }
 .watch-add input {
-  font-family: var(--mono); font-size: 13px; padding: 5px 8px;
+  font-family: var(--mono); font-size: 14.3px; padding: 5px 8px;
   background: var(--bg-inset); border: 1px solid var(--border);
   border-radius: var(--radius); color: var(--text); width: 220px;
 }
@@ -1515,9 +1516,9 @@ select:focus {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 6px; font-family: var(--mono); margin-bottom: 4px;
 }
-.mini-sym { font-size: 13px; font-weight: 600; color: var(--text); }
-.mini-price { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.mini-badges { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; }
+.mini-sym { font-size: 14.3px; font-weight: 600; color: var(--text); }
+.mini-price { font-size: 12.1px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini-badges { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.6px; }
 .mini-chg.pos-pos { color: var(--long); }
 .mini-chg.pos-neg { color: var(--short); }
 .mini-pnl { padding: 1px 5px; border-radius: 3px; font-weight: 600; }
@@ -1526,11 +1527,11 @@ select:focus {
 .mini-canvas { display: block; width: 100%; height: 84px; }
 .mini-remove {
   position: absolute; top: 4px; right: 4px; border: none; background: transparent;
-  color: var(--faint); font-size: 13px; line-height: 1; cursor: pointer; opacity: .5;
+  color: var(--faint); font-size: 14.3px; line-height: 1; cursor: pointer; opacity: .5;
   padding: 0 3px; border-radius: 2px;
 }
 .mini-remove:hover { opacity: 1; color: var(--short); background: var(--bg-inset); }
-.overview-empty { color: var(--muted); font-size: 12.5px; padding: 20px 4px; }
+.overview-empty { color: var(--muted); font-size: 13.8px; padding: 20px 4px; }
 
 /* Projekt J: crypto news desk above the mini-chart tiles.
    Top 1–3 headlines are featured as "lead" cards; the rest sit in a tighter
@@ -1540,7 +1541,7 @@ select:focus {
   margin-bottom: 20px;
 }
 .overview-subhead {
-  margin: 0 0 10px; font-family: var(--mono); font-size: 11px; font-weight: 600;
+  margin: 0 0 10px; font-family: var(--mono); font-size: 12.1px; font-weight: 600;
   letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
 }
 
@@ -1564,13 +1565,19 @@ select:focus {
 }
 a.news-lead:hover { border-color: var(--accent); background: var(--bg-inset); }
 .news-lead-title {
-  font-family: var(--sans); font-size: 16px; font-weight: 600;
-  color: var(--text); line-height: 1.32;
+  font-family: var(--sans); font-size: 19.2px; font-weight: 600;
+  color: var(--text); line-height: 1.3;
 }
 a.news-lead:hover .news-lead-title { color: var(--accent); }
+.news-lead-teaser {
+  font-family: var(--sans); font-size: 15.4px; color: var(--muted);
+  line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .news-lead-meta {
   display: flex; align-items: baseline; gap: 6px;
-  font-family: var(--mono); font-size: 11px; white-space: nowrap;
+  font-family: var(--mono); font-size: 13.2px; white-space: nowrap;
   letter-spacing: 0.02em;
 }
 
@@ -1588,26 +1595,29 @@ a.news-lead:hover .news-lead-title { color: var(--accent); }
 }
 .news-row:last-child { border-bottom: none; }
 a.news-row:hover { background: var(--bg-inset); }
+.news-row {
+  padding: 11px 13px;
+}
 .news-row-title {
-  font-family: var(--sans); font-size: 13.5px; color: var(--text);
-  line-height: 1.35; flex: 1 1 auto;
+  font-family: var(--sans); font-size: 16px; color: var(--text);
+  line-height: 1.4; flex: 1 1 auto;
 }
 a.news-row:hover .news-row-title { color: var(--accent); }
 .news-row-meta {
   display: flex; align-items: baseline; gap: 6px; flex: 0 0 auto;
-  font-family: var(--mono); font-size: 11px; white-space: nowrap;
+  font-family: var(--mono); font-size: 13.2px; white-space: nowrap;
 }
 .news-src { color: var(--muted); }
 .news-dot { color: var(--faint); }
 .news-time { color: var(--faint); }
-.news-empty { color: var(--muted); font-size: 12.5px; padding: 14px 4px; }
+.news-empty { color: var(--muted); font-size: 13.8px; padding: 14px 4px; }
 
 /* Setup-confidence badge in the KI-analysis panel */
 .setup-conf {
   display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
 }
 .setup-conf-label {
-  font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase;
+  font-size: 14.3px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--muted);
 }
 
@@ -1620,7 +1630,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .pos-kv b {
   font-weight: 400;
-  font-size: 10.8px;
+  font-size: 11.9px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--faint);
@@ -1635,13 +1645,13 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .order-oid {
   color: var(--faint);
-  font-size: 13px;
+  font-size: 14.3px;
 }
 
 .order-row .btn-cancel-order,
 .pos-row .btn-cancel-order {
   margin-left: auto;
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 3px 10px;
   background: transparent;
   border: 1px solid var(--border);
@@ -1675,7 +1685,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .proposal-actions .btn {
-  font-size: 13.8px;
+  font-size: 15.2px;
   padding: 4px 10px;
 }
 
@@ -1695,7 +1705,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .scan-strip-head {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1713,7 +1723,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .scan-empty {
   font-family: var(--sans);
-  font-size: 15px;
+  font-size: 16.5px;
   padding: 4px 0;
 }
 
@@ -1747,14 +1757,14 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .chip-score {
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-weight: 600;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
 
 .chip-sym {
-  font-size: 15px;
+  font-size: 16.5px;
   font-weight: 600;
   color: var(--text);
 }
@@ -1763,7 +1773,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .chip-short .chip-bias { color: var(--short); }
 
 .chip-setup {
-  font-size: 10.8px;
+  font-size: 11.9px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
@@ -1783,13 +1793,13 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .an-sym {
   font-family: var(--mono);
-  font-size: 19.2px;
+  font-size: 21.1px;
   font-weight: 600;
 }
 
 .an-lev {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--muted);
   margin-left: auto;
 }
@@ -1814,16 +1824,16 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .mtf-tf {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.1em;
   color: var(--faint);
 }
 
-.mtf-arrow { font-size: 16.8px; }
+.mtf-arrow { font-size: 18.5px; }
 .mtf-trend {
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   margin-left: auto;
 }
 
@@ -1859,7 +1869,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .tile-label {
   font-family: var(--mono);
-  font-size: 10.2px;
+  font-size: 11.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1868,7 +1878,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .tile-value {
   font-family: var(--mono);
-  font-size: 18px;
+  font-size: 19.8px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -1879,12 +1889,12 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .tile-sub {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.3px;
   color: var(--muted);
 }
 
 .an-zone {
-  font-size: 14.4px;
+  font-size: 15.8px;
   color: var(--text);
   padding: 8px 10px;
   background: var(--bg-inset);
@@ -1909,7 +1919,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .an-lvl-label {
   font-family: var(--mono);
-  font-size: 10.2px;
+  font-size: 11.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1918,7 +1928,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .an-lvl-val {
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 16.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1926,7 +1936,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   /* The analyst's voice speaks humanist sans — the one non-mono text in the
      instrument, held near 62ch so it reads like prose, not a data field. */
   font-family: var(--sans);
-  font-size: 14.8px;
+  font-size: 16.3px;
   line-height: 1.62;
   color: #cfc9e0;
   margin-bottom: 12px;
@@ -1939,7 +1949,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   flex-direction: column;
   gap: 4px;
   font-family: var(--sans);
-  font-size: 14px;
+  font-size: 15.4px;
   line-height: 1.55;
   color: var(--muted);
   padding: 9px 11px;
@@ -1952,7 +1962,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .an-mgmt b { color: var(--text); font-weight: 600; }
 
 .an-foot {
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--faint);
 }
 
@@ -1966,7 +1976,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   display: inline-block;
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 15.6px;
+  font-size: 17.2px;
   letter-spacing: 0.08em;
   padding: 4px 12px;
   border-radius: 3px;
@@ -1996,7 +2006,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .proposal-rationale {
   margin: 10px 0 0;
-  font-size: 15px;
+  font-size: 16.5px;
   line-height: 1.55;
   white-space: pre-wrap;
   color: var(--text);
@@ -2004,7 +2014,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .proposal-meta {
   margin: 10px 0 0;
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--faint);
 }
 
@@ -2020,7 +2030,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .kv dt {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 13px;
+  font-size: 14.3px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2031,7 +2041,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .kv dd {
   margin: 0;
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 16.5px;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
 }
@@ -2074,7 +2084,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2107,7 +2117,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 6px 0;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -2137,7 +2147,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .ticket-form label > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 11.4px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2175,7 +2185,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .sltp-mode-label {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2200,7 +2210,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 .size-mode-btn {
   padding: 1px 8px;
-  font-size: 13px;
+  font-size: 14.3px;
   background: transparent;
   color: var(--muted, #8a86a0);
   border: none;
@@ -2215,7 +2225,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 4px 14px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -2242,7 +2252,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   padding: 4px 14px;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
@@ -2264,7 +2274,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   align-items: flex-start;
   gap: 8px;
   margin-top: 8px;
-  font-size: 14.4px;
+  font-size: 15.8px;
   color: var(--text);
   cursor: pointer;
 }
@@ -2282,7 +2292,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   display: block;
   color: var(--short);
   font-weight: 600;
-  font-size: 14.4px;
+  font-size: 15.8px;
   line-height: 1.45;
   margin: 6px 0 0;
   padding: 7px 10px;
@@ -2293,7 +2303,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .liq-readout {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   color: var(--muted);
   margin: 5px 0 0;
 }
@@ -2317,12 +2327,12 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .pattern-icon {
   color: var(--violet);
-  font-size: 15.6px;
+  font-size: 17.2px;
 }
 
 .pattern-name {
   font-family: var(--mono);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-weight: 600;
   color: var(--text);
 }
@@ -2330,7 +2340,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .pattern-conf {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.9px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2378,7 +2388,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 #ticket-notional-hint {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
@@ -2390,7 +2400,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: var(--long-dim);
   color: var(--long);
   font-family: var(--sans);
-  font-size: 16.2px;
+  font-size: 17.8px;
   font-weight: 600;
   padding: 11px 0;
   cursor: pointer;
@@ -2420,13 +2430,13 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .hint {
   margin: 0;
-  font-size: 13.2px;
+  font-size: 14.5px;
   line-height: 1.5;
 }
 
 .error-text {
   color: var(--short);
-  font-size: 14.4px;
+  font-size: 15.8px;
   margin: 0;
 }
 
@@ -2461,7 +2471,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .history-section h3 {
   margin: 0 0 8px;
   font-family: var(--mono);
-  font-size: 11.4px;
+  font-size: 12.5px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.14em;
@@ -2473,7 +2483,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   min-width: max-content;
   border-collapse: collapse;
   font-family: var(--mono);
-  font-size: 12.6px;
+  font-size: 13.9px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2488,7 +2498,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .history-table th {
   color: var(--faint);
   font-weight: 600;
-  font-size: 10.2px;
+  font-size: 11.2px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -2499,7 +2509,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .history-empty {
   margin: 0;
-  font-size: 14.4px;
+  font-size: 15.8px;
 }
 
 .hist-ok { color: var(--long); }
@@ -2568,7 +2578,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .modal-head h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 14.4px;
+  font-size: 15.8px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2576,7 +2586,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .modal-close {
-  font-size: 21.6px;
+  font-size: 23.8px;
   line-height: 1;
 }
 
@@ -2592,7 +2602,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .modal-body .err-list {
   margin: 12px 0 0;
   padding-left: 18px;
-  font-size: 13.8px;
+  font-size: 15.2px;
   line-height: 1.55;
 }
 
@@ -2607,7 +2617,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: var(--short-dim);
   color: #ffb9c2;
   font-weight: 600;
-  font-size: 14.4px;
+  font-size: 15.8px;
 }
 
 .modal-actions {
@@ -2624,7 +2634,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: var(--short);
   color: #fff;
   font-family: var(--sans);
-  font-size: 15.6px;
+  font-size: 17.2px;
   font-weight: 600;
   padding: 8px 18px;
   cursor: pointer;
@@ -2657,7 +2667,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   border: 1px solid var(--border);
   border-left-width: 3px;
   color: var(--text);
-  font-size: 15px;
+  font-size: 16.5px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
   animation: toast-in 0.16s ease-out;
 }
@@ -2697,21 +2707,21 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .setup-head .brand-mark {
-  font-size: 33.6px;
+  font-size: 37px;
   line-height: 1.2;
 }
 
 .setup-head h1 {
   margin: 0 0 4px;
   font-family: var(--mono);
-  font-size: 20.4px;
+  font-size: 22.4px;
   font-weight: 600;
   letter-spacing: 0.04em;
 }
 
 .setup-head p {
   margin: 0;
-  font-size: 15px;
+  font-size: 16.5px;
   line-height: 1.5;
 }
 
@@ -2719,7 +2729,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .setup-note code,
 .setup-body code {
   font-family: var(--mono);
-  font-size: 13.2px;
+  font-size: 14.5px;
   background: var(--bg-inset);
   border: 1px solid var(--hairline);
   border-radius: 3px;
@@ -2772,14 +2782,14 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .choice-title {
   display: block;
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 16.5px;
   font-weight: 600;
   margin-bottom: 2px;
 }
 
 .choice-desc {
   display: block;
-  font-size: 13.8px;
+  font-size: 15.2px;
   color: var(--muted);
   line-height: 1.45;
 }
@@ -2799,7 +2809,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .setup-body label > span {
   font-family: var(--mono);
   color: var(--faint);
-  font-size: 11.4px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2831,7 +2841,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   text-transform: none !important;
   letter-spacing: normal !important;
   font-family: var(--sans) !important;
-  font-size: 14.4px !important;
+  font-size: 15.8px !important;
   color: var(--text) !important;
   font-weight: 400 !important;
 }
@@ -2841,7 +2851,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   border: 1px solid rgba(224, 162, 61, 0.5);
   border-radius: var(--radius);
   background: rgba(227, 179, 65, 0.07);
-  font-size: 14.4px;
+  font-size: 15.8px;
   line-height: 1.55;
   color: var(--text);
 }
@@ -2970,15 +2980,15 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 .ir-cell:last-child { border-right: 0; }
 .ir-lbl {
-  font-size: 9px;
+  font-size: 9.9px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--faint);
 }
-.ir-v { font-size: 13.5px; font-weight: 600; letter-spacing: 0.01em; }
+.ir-v { font-size: 14.9px; font-weight: 600; letter-spacing: 0.01em; }
 .ir-num { font-variant-numeric: tabular-nums; }
 .ir-arm { display: flex; align-items: center; gap: 8px; }
-.ir-arm .ir-arm-txt { font-size: 13px; letter-spacing: 0.12em; color: var(--muted); }
+.ir-arm .ir-arm-txt { font-size: 14.3px; letter-spacing: 0.12em; color: var(--muted); }
 .ir-arm.on .ir-arm-txt { color: var(--live); }
 .ir-led {
   width: 8px; height: 8px; border-radius: 50%;
@@ -3001,25 +3011,25 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   align-items: center;
   padding: 0 20px;
   color: var(--faint);
-  font-size: 11.5px;
+  font-size: 12.7px;
 }
-.ir-posline { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 500; }
+.ir-posline { display: flex; align-items: center; gap: 9px; font-size: 14.3px; font-weight: 500; }
 .ir-side {
-  font-size: 9.5px; letter-spacing: 0.12em; font-weight: 700;
+  font-size: 10.5px; letter-spacing: 0.12em; font-weight: 700;
   padding: 3px 8px; border-radius: 3px;
 }
 .ir-side.long { background: var(--long-dim); color: var(--long); box-shadow: inset 0 0 0 1px rgba(70, 192, 138, 0.3); }
 .ir-side.short { background: var(--short-dim); color: var(--short); box-shadow: inset 0 0 0 1px rgba(230, 88, 78, 0.3); }
 .ir-pnlcell { min-width: 190px; }
 .ir-bigpnl {
-  font-size: 25px; font-weight: 600; letter-spacing: -0.01em; line-height: 1;
+  font-size: 27.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1;
   font-variant-numeric: tabular-nums; color: var(--text);
   display: flex; align-items: baseline; gap: 9px;
 }
 .ir-bigpnl.pnl-pos { color: var(--long); }
 .ir-bigpnl.pnl-neg { color: var(--short); }
-.ir-bigpnl small { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
-.ir-shield { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.ir-bigpnl small { font-size: 12.1px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
+.ir-shield { display: inline-flex; align-items: center; gap: 6px; font-size: 14.3px; color: var(--muted); }
 .ir-shield.ok { color: var(--long); }
 .ir-shield.warn { color: var(--warn); }
 .ir-shield.danger { color: var(--short); font-weight: 600; }

@@ -152,7 +152,7 @@
         background: { color: "#0a0810" },
         textColor: "#b4b0c8",
         fontFamily: '"IBM Plex Mono", Consolas, monospace',
-        fontSize: 13, // larger price-axis / time-axis labels (UX-2: were too small)
+        fontSize: 14, // larger price-axis / time-axis labels (UX-2: were too small)
       },
       grid: {
         vertLines: { color: "#1a1626" },
@@ -3745,9 +3745,20 @@
       const close = safe ? "</a>" : "</div>";
       const titleCls = kind === "lead" ? "news-lead-title" : "news-row-title";
       const metaCls = kind === "lead" ? "news-lead-meta" : "news-row-meta";
+      // Lead cards get a teaser line from the feed summary; compact rows stay
+      // title-only. Summary is server-side tag-stripped, escaped again here.
+      let teaser = "";
+      if (kind === "lead") {
+        const s = String((it && it.summary) || "").trim();
+        if (s) {
+          const clipped = s.length > 160 ? s.slice(0, 157).replace(/\s+\S*$/, "") + "…" : s;
+          teaser = '<span class="news-lead-teaser">' + escapeHtml(clipped) + "</span>";
+        }
+      }
       return (
         open +
         '<span class="' + titleCls + '">' + escapeHtml((it && it.title) || "") + "</span>" +
+        teaser +
         '<span class="' + metaCls + '">' +
         '<span class="news-src">' + escapeHtml((it && it.source) || "") + "</span>" +
         '<span class="news-dot" aria-hidden="true">·</span>' +

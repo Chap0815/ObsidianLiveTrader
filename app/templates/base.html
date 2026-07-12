@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r8') }}" />
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r9') }}" />
   <!-- Vendored locally (v4.2.0, Apache-2.0) — no CDN dependency for the chart -->
   <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
   {% block head %}{% endblock %}
@@ -19,7 +19,7 @@
   {# F-19: the local auth token is delivered as an HttpOnly session cookie
      (set by the server on this page), not injected into the DOM. Same-origin
      fetch/WebSocket send it automatically. #}
-  <script src="/static/app.js?v={{ asset_version|default('r8') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r9') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
