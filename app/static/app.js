@@ -2938,6 +2938,10 @@
   async function suggestVol() {
     setTicketError("");
     const ticket = readTicket();
+    // Symbol at request time; compared against the active symbol when the
+    // response lands so a sizing result computed off a different coin's SL
+    // distance/price can never be written into the current ticket (M-1).
+    const reqSymbol = ticket.symbol;
     if (ticket.stop_loss == null) {
       setTicketError("Erst Stop-Loss-Kurs eintragen — dann kann die Größe berechnet werden.");
       return;
@@ -2951,6 +2955,13 @@
       const data = await res.json().catch(function () {
         return {};
       });
+      const curSymbol =
+        ($("symbol-input") && $("symbol-input").value) || state.symbol || "";
+      if (!symMatch(reqSymbol, curSymbol)) {
+        // Symbol changed while this sizing request was in flight — discard
+        // the stale result instead of writing it into the new ticket.
+        return;
+      }
       if (!res.ok) {
         setTicketError(detailToText(data.detail || data));
         return;
@@ -3170,7 +3181,6 @@
   function switchDataTab(name) {
     const tabs = document.querySelectorAll(".data-tab");
     if (!tabs.length) return;
-    state.dataTab = name;
     tabs.forEach(function (t) {
       const on = t.getAttribute("data-tab") === name;
       t.classList.toggle("active", on);
@@ -3455,7 +3465,8 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function showProposalError(msg) {
@@ -3478,6 +3489,15 @@
   function applyProposalToTicket() {
     const p = state.proposal;
     if (!p || p.action === "STAY_OUT") return;
+    // Defense-in-depth (H-1): even though runAnalyze now discards stale
+    // cross-symbol responses, never let a proposal be applied to a ticket
+    // for a different active symbol than the one it was generated for.
+    if (!symMatch(state.proposalSymbol, state.symbol)) {
+      setTicketError(
+        "Vorschlag gehört zu " + state.proposalSymbol + ", nicht zum aktiven Symbol."
+      );
+      return;
+    }
 
     const sideEl = $("ticket-side");
     const typeEl = $("ticket-type");
@@ -3536,7 +3556,14 @@
   }
 
   async function runAnalyze() {
-    if (state.analyzeBusy) return;
+    if (state.analyzeBusy) {
+      // Reached when triggered programmatically (e.g. a scan-chip click)
+      // while a manual "Analysieren" click is already in flight — the button
+      // itself is disabled during a manual click, so this path otherwise
+      // fires silently and leaves the trader waiting for nothing (M-2).
+      showToast("Analyse läuft bereits — bitte warten.", null);
+      return;
+    }
     const btn = $("btn-analyze");
     const symbol =
       ($("symbol-input") && $("symbol-input").value) || state.symbol || "BTC_USDT";
@@ -3577,6 +3604,12 @@
       };
     }
 
+    // Capture the symbol this request was issued for; the LLM call can take
+    // 10-30s and the trader may switch coins before it resolves. Compared
+    // against state.symbol at resolve time below to discard a stale response
+    // instead of rendering/enabling Apply for the wrong coin (H-1).
+    const reqSymbol = symU;
+
     try {
       const res = await apiFetch("/api/analyze", {
         method: "POST",
@@ -3593,6 +3626,12 @@
         data = await res.json();
       } catch (_) {
         data = null;
+      }
+      if (!symMatch(reqSymbol, state.symbol)) {
+        // Symbol changed while this analyze was in flight — drop the
+        // response entirely: don't render it, don't show an error for it,
+        // don't touch the (now different coin's) proposal/ticket state.
+        return;
       }
       if (!res.ok) {
         const detail =
