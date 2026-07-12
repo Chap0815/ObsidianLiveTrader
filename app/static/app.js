@@ -592,11 +592,29 @@
     });
   }
 
-  /** BTC_USDT and BTC refer to the same market (HL uses bare coins). */
+  /** Symbol equality. On Hyperliquid, positions/orders/WS ticks carry a bare
+   *  base coin ("BTC") while state.symbol may be the full pair ("BTC_USDC"),
+   *  so HL compares base-coin-only (ca.split("_")[0]).
+   *  On MEXC, comparing only the base coin is WRONG and unsafe: MEXC lists
+   *  both USDT-M and USDC-M futures for the same coin (e.g. BTC_USDT vs
+   *  BTC_USDC are two DIFFERENT instruments), so base-coin-only matching
+   *  would conflate them and mis-assign positions/orders/stops/markers
+   *  between them (F-11). MEXC always reports the full "COIN_QUOTE" symbol
+   *  on both sides being compared, so require a full-string match there.
+   *  If the exchange isn't known yet, default to the SAFER full-string
+   *  compare (a temporary false-negative "no match" is much less harmful
+   *  than mixing up two different instruments). */
   function symMatch(a, b) {
-    const ca = String(a || "").toUpperCase().split("_")[0];
-    const cb = String(b || "").toUpperCase().split("_")[0];
-    return ca !== "" && ca === cb;
+    const na = String(a || "").toUpperCase();
+    const nb = String(b || "").toUpperCase();
+    if (na === "" || nb === "") return false;
+    const isHyperliquid = !!(state.health && state.health.exchange === "hyperliquid");
+    if (isHyperliquid) {
+      const ca = na.split("_")[0];
+      const cb = nb.split("_")[0];
+      return ca !== "" && ca === cb;
+    }
+    return na === nb;
   }
 
   function drawProposalLines() {
