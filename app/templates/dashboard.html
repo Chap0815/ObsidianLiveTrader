@@ -63,6 +63,25 @@
   <button type="button" class="tab-add" id="tab-add-btn" title="Coin beobachten" aria-label="Coin hinzufügen">+</button>
 </div>
 
+<!-- Instrument-Leiste: der kritische Read (Arm · Börse · Equity · Positions-Instrument) immer sichtbar -->
+<section class="irail" id="instrument-rail" aria-label="Instrumente">
+  <div class="ir-cell">
+    <span class="ir-lbl">System</span>
+    <span class="ir-arm" id="ir-arm"><span class="ir-led"></span><b class="ir-arm-txt">—</b></span>
+  </div>
+  <div class="ir-cell">
+    <span class="ir-lbl">Börse</span>
+    <span class="ir-v" id="ir-exchange">—</span>
+  </div>
+  <div class="ir-cell">
+    <span class="ir-lbl">Equity</span>
+    <span class="ir-v ir-num" id="ir-equity">—</span>
+  </div>
+  <div class="ir-position ir-flat" id="ir-position">
+    <span class="ir-flatmsg">Keine Position im aktiven Symbol</span>
+  </div>
+</section>
+
 <main class="layout">
   <section class="panel chart-panel">
     <div class="panel-head">

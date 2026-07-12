@@ -960,6 +960,7 @@
         sub.textContent = (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE";
       }
     });
+    try { updateRailPnl(px); } catch (_) {}
     drawTradeZones(); // keep zones aligned as price moves
   }
 
@@ -1330,6 +1331,7 @@
         const t = arm.querySelector(".arm-text");
         if (t) t.textContent = h.trading_enabled ? "LIVE" : "DISARMED";
       }
+      try { renderInstrumentRail(); } catch (_) {}
 
       // Active-exchange LED + label (works for hyperliquid AND mexc)
       setDot($("dot-exchange"), !!h.exchange_configured);
@@ -1519,6 +1521,143 @@
       return '<div class="cp-sl-status cp-sl-unknown">Stop-Loss-Status wird geladen…</div>';
     }
     return '<div class="cp-sl-status cp-sl-missing">⚠ KEIN STOP-LOSS AKTIV — Position ungeschützt</div>';
+  }
+
+  /* ── Instrument rail (signature) ─────────────────────────────────────
+     Keeps the critical read — armed state, exchange, equity, and the active
+     position's live P&L / protection / liq distance — always visible above
+     the workspace, instead of scattered across header + panels. */
+  function renderInstrumentRail() {
+    const rail = $("instrument-rail");
+    if (!rail) return;
+    const h = state.health || {};
+    const armed = h.trading_enabled === true;
+    const armEl = $("ir-arm");
+    if (armEl) {
+      armEl.className = "ir-arm" + (armed ? " on" : "");
+      const t = armEl.querySelector(".ir-arm-txt");
+      if (t) t.textContent = armed ? "ARMED" : "DISARMED";
+    }
+    const exEl = $("ir-exchange");
+    if (exEl) {
+      exEl.textContent =
+        String(h.exchange || "—").toUpperCase() + (h.hl_testnet ? " · TESTNET" : "");
+    }
+    const acct = state.account || {};
+    const eqEl = $("ir-equity");
+    if (eqEl) {
+      eqEl.textContent =
+        acct.equity_usdt != null ? fmt(acct.equity_usdt, 2) + " " + ccy() : "—";
+    }
+    const inst = $("ir-position");
+    if (!inst) return;
+    const positions = (acct.positions || []).filter(function (p) {
+      return Math.abs(Number(p.hold_vol) || 0) > 0;
+    });
+    const active = positions.find(function (p) {
+      return symMatch(p.symbol, state.symbol);
+    });
+    if (!active) {
+      inst.className = "ir-position ir-flat";
+      const msg =
+        positions.length > 0
+          ? positions.length + " Position(en) offen — Coin wechseln zum Ansehen"
+          : "Keine offene Position";
+      inst.innerHTML = '<span class="ir-flatmsg">' + escapeHtml(msg) + "</span>";
+      return;
+    }
+    const short = String(active.side || "").toLowerCase() === "short";
+    const entry = Number(active.entry_price);
+    const vol = Number(active.hold_vol);
+    const cs = contractSize();
+    const im = Number(active.margin != null ? active.margin : active.im);
+    const px = Number(state.lastPx);
+    let pnl = active.unrealized_pnl != null ? Number(active.unrealized_pnl) : null;
+    if (Number.isFinite(px) && Number.isFinite(entry) && Number.isFinite(vol)) {
+      pnl = (px - entry) * vol * cs * (short ? -1 : 1);
+    }
+    const roe = pnl != null && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const prot = findPositionProtection(active);
+    const liq = Number(active.liquidate_price);
+    let liqPct = null;
+    if (Number.isFinite(liq) && liq > 0 && Number.isFinite(px) && px > 0) {
+      liqPct = (Math.abs(px - liq) / px) * 100;
+    }
+    const pnlCls = pnl == null ? "" : pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "";
+    let protHtml;
+    if (prot.sl != null && prot.manual) {
+      protHtml = '<span class="ir-shield warn">SL MANUELL ' + fmt(prot.sl, 4) + "</span>";
+    } else if (prot.sl != null) {
+      protHtml = '<span class="ir-shield ok">🛡 SL ' + fmt(prot.sl, 4) + "</span>";
+    } else if (!prot.ordersKnown) {
+      protHtml = '<span class="ir-shield">SL lädt…</span>';
+    } else {
+      protHtml = '<span class="ir-shield danger">⚠ KEIN SL</span>';
+    }
+    // liq gauge: fills as price nears liq (small distance = high fill)
+    const gaugeFill =
+      liqPct != null ? Math.max(4, Math.min(100, 100 - Math.min(liqPct, 100))) : 0;
+    inst.className = "ir-position";
+    inst.innerHTML =
+      '<div class="ir-cell"><span class="ir-lbl">Position</span>' +
+      '<span class="ir-posline"><span class="ir-side ' +
+      (short ? "short" : "long") +
+      '">' +
+      (short ? "SHORT" : "LONG") +
+      "</span> " +
+      escapeHtml(String(active.symbol || "").split("_")[0]) +
+      " · " +
+      fmt(vol, 4) +
+      "</span></div>" +
+      '<div class="ir-cell ir-pnlcell"><span class="ir-lbl">Unrealisiert</span>' +
+      '<span class="ir-bigpnl ' +
+      pnlCls +
+      '"><span class="js-ir-pnl">' +
+      (pnl == null ? "—" : (pnl >= 0 ? "+" : "") + fmt(pnl, 2)) +
+      "</span>" +
+      (roe != null
+        ? '<small class="js-ir-roe">' + (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE</small>"
+        : "") +
+      "</span></div>" +
+      '<div class="ir-cell"><span class="ir-lbl">Schutz</span>' +
+      protHtml +
+      "</div>" +
+      '<div class="ir-cell"><span class="ir-lbl">Liq-Distanz</span>' +
+      '<span class="ir-v ir-num">' +
+      (liqPct != null ? fmt(liqPct, 1) + "%" : "—") +
+      "</span>" +
+      '<span class="ir-gauge"><i style="width:' +
+      gaugeFill +
+      '%"></i></span></div>';
+  }
+
+  /** Cheap per-tick update of just the rail's live P&L number (active symbol). */
+  function updateRailPnl(px) {
+    const inst = $("ir-position");
+    if (!inst || px == null || !Number.isFinite(Number(px))) return;
+    const acct = state.account || {};
+    const active = (acct.positions || []).find(function (p) {
+      return (
+        symMatch(p.symbol, state.symbol) && Math.abs(Number(p.hold_vol) || 0) > 0
+      );
+    });
+    if (!active) return;
+    const short = String(active.side || "").toLowerCase() === "short";
+    const entry = Number(active.entry_price);
+    const vol = Number(active.hold_vol);
+    const im = Number(active.margin != null ? active.margin : active.im);
+    if (!Number.isFinite(entry) || !Number.isFinite(vol)) return;
+    const pnl = (Number(px) - entry) * vol * contractSize() * (short ? -1 : 1);
+    const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const big = inst.querySelector(".ir-bigpnl");
+    const numEl = inst.querySelector(".js-ir-pnl");
+    if (numEl) numEl.textContent = (pnl >= 0 ? "+" : "") + fmt(pnl, 2);
+    if (big) {
+      big.className =
+        "ir-bigpnl " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
+    }
+    const roeEl = inst.querySelector(".js-ir-roe");
+    if (roeEl && roe != null) roeEl.textContent = (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE";
   }
 
   function renderPositions(data) {
@@ -2003,6 +2142,7 @@
     try {
       updateEquity(data);
       renderPositions(data);
+      renderInstrumentRail();
     } catch (e) {
       console.error("account render", e);
     }
