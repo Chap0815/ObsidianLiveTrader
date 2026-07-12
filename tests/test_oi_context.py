@@ -74,3 +74,37 @@ async def test_build_market_snapshot_mexc_like_client_yields_none_market():
     snap = await build_market_snapshot("BTC_USDT", "15m", "1H", _FakeMarketClient())
     assert snap.market["open_interest"] is None
     assert snap.market["oi_change_pct_1h"] is None
+
+
+def _hl_client():
+    from app.hyperliquid.client import HyperliquidClient
+    return HyperliquidClient(testnet=True)  # no keys needed for OI-history math
+
+
+def test_oi_change_none_on_first_sample():
+    c = _hl_client()
+    assert c._record_oi_and_change("BTC", 1000.0, now=10_000.0) == (None, None)
+
+
+def test_oi_change_1h_computed_4h_insufficient():
+    c = _hl_client()
+    t0 = 10_000.0
+    c._record_oi_and_change("BTC", 1000.0, now=t0)
+    ch1, ch4 = c._record_oi_and_change("BTC", 1100.0, now=t0 + 3600.0)
+    assert ch1 == 10.0     # +10% over exactly 1h
+    assert ch4 is None     # only 1h of history — not >= 50% of the 4h lookback
+
+
+def test_oi_change_ignores_nonpositive_and_none_oi():
+    c = _hl_client()
+    assert c._record_oi_and_change("BTC", None, now=1.0) == (None, None)
+    assert c._record_oi_and_change("BTC", 0.0, now=2.0) == (None, None)
+    assert c._oi_history.get("BTC", []) == []  # nothing recorded
+
+
+def test_prompt_mentions_open_interest_and_null_skip():
+    from app.llm.prompts import build_system_prompt
+    p = build_system_prompt()
+    assert "Open interest" in p
+    assert "short covering" in p
+    assert "SKIP this step" in p

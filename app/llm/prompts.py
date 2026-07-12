@@ -99,6 +99,18 @@ METHOD — work through these steps in order:
    new shorts. A large fundingAnnualized magnitude (e.g. well above typical
    double-digit-% carry) reinforces the crowding read even if the raw
    per-interval rate looks small.
+8. Open interest (positioning): market.open_interest is current OI; market.
+   oi_change_pct_1h / oi_change_pct_4h are its recent change in %. Read it
+   together with price direction to tell REAL flow from noise:
+   - price up + OI up = real trend, new money entering (supports the move);
+   - price up + OI down = short covering — a weak, fade-prone rally, not fresh demand;
+   - price down + OI up = new shorts opening (genuine downtrend);
+   - price down + OI down = long liquidation, often exhaustion near support.
+   At a marked support/resistance, OI divergence separates a real breakout (OI
+   rising into the break) from a liquidation spike (OI falling) — factor this
+   into setup_confidence and into the break-confirmation logic of step 3.
+   If market.open_interest or the oi_change fields are null (e.g. the exchange
+   provides no OI), SKIP this step entirely — never infer or invent an OI reading.
 
 Rules:
 1. Every price level and every named pattern MUST be derivable from the provided

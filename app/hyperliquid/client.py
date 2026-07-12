@@ -109,6 +109,10 @@ class HyperliquidClient:
         # funding). ticker() and funding_rate() both need it — without this each
         # /api/market call hit the upstream 2× on top of every poll.
         self._ctx_cache: tuple[float, Any] | None = None
+        # OI history per coin: list of (unix_ts, open_interest), pruned to ~4.5h.
+        # Feeds oi_change_pct_1h / _4h in market_extras(). In-memory only —
+        # resets on restart (advisory context, not persisted state).
+        self._oi_history: dict[str, list[tuple[float, float]]] = {}
 
     def _meta_ctxs_sync(self, ttl: float = 2.0):
         """meta_and_asset_ctxs() with a short TTL cache (runs inside a thread)."""
@@ -118,6 +122,57 @@ class HyperliquidClient:
         ctx = self._get_info().meta_and_asset_ctxs()
         self._ctx_cache = (now, ctx)
         return ctx
+
+    def _record_oi_and_change(
+        self, coin: str, oi: float | None, *, now: float | None = None
+    ) -> tuple[float | None, float | None]:
+        """Append the current OI to this coin's history and return the % change
+        vs ~1h and ~4h ago. Returns (None, None) until enough history exists."""
+        if oi is None or oi <= 0:
+            return None, None
+        now = time.time() if now is None else float(now)
+        hist = self._oi_history.setdefault(coin, [])
+        # Sample-throttle (Plan-Review): max 1 sample/minute — the 5s market
+        # poll would otherwise grow ~3200 tuples/coin in the 4.5h window. If
+        # the newest sample is <60s old, skip the append and just compute.
+        if not hist or (now - hist[-1][0]) >= 60.0:
+            hist.append((now, float(oi)))
+        cutoff = now - 4.5 * 3600.0
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
+        return (
+            self._oi_change_over(hist, now, 3600.0),
+            self._oi_change_over(hist, now, 4 * 3600.0),
+        )
+
+    @staticmethod
+    def _oi_change_over(
+        hist: list[tuple[float, float]], now: float, lookback_s: float
+    ) -> float | None:
+        """% change of the latest OI vs the sample ~lookback_s ago.
+
+        Uses the last sample at/before the target time. If none is old enough,
+        falls back to the oldest sample ONLY when it already spans >= 50% of the
+        lookback (avoids a misleading '1h change' computed over 2 minutes)."""
+        if not hist:
+            return None
+        target = now - lookback_s
+        ref = None
+        for ts, val in hist:
+            if ts <= target:
+                ref = (ts, val)
+            else:
+                break
+        if ref is None:
+            oldest_ts, oldest_val = hist[0]
+            if now - oldest_ts < 0.5 * lookback_s:
+                return None
+            ref = (oldest_ts, oldest_val)
+        ref_val = ref[1]
+        cur = hist[-1][1]
+        if ref_val <= 0:
+            return None
+        return round((cur - ref_val) / ref_val * 100.0, 3)
 
     def _get_info(self):
         if self._info is None:
@@ -313,9 +368,10 @@ class HyperliquidClient:
         """Open interest / premium context from meta_and_asset_ctxs.
 
         Reads the SAME short-TTL ctx cache as ticker()/funding_rate() so this
-        adds no extra upstream hit. oi_change_pct_* are filled in Task 2 from an
-        in-memory OI history; here they are None. MEXC has no equivalent and does
-        NOT implement this method (see app/analysis/context._fetch_market_extras).
+        adds no extra upstream hit. oi_change_pct_* come from an in-memory
+        per-coin OI history (_record_oi_and_change) and are None until enough
+        history has accumulated. MEXC has no equivalent and does NOT implement
+        this method (see app/analysis/context._fetch_market_extras).
         """
 
         def _x():
@@ -331,12 +387,13 @@ class HyperliquidClient:
                     premium = _opt_f(c.get("premium"))
                     prev_day_px = _opt_f(c.get("prevDayPx"))
                     break
+            ch1, ch4 = self._record_oi_and_change(coin, oi)
             return {
                 "open_interest": oi,
                 "premium": premium,
                 "prev_day_px": prev_day_px,
-                "oi_change_pct_1h": None,
-                "oi_change_pct_4h": None,
+                "oi_change_pct_1h": ch1,
+                "oi_change_pct_4h": ch4,
             }
 
         return await self._to_thread(_x)
