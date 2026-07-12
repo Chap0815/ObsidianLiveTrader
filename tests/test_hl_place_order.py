@@ -157,6 +157,23 @@ async def test_close_executes_when_side_matches():
 
 
 @pytest.mark.asyncio
+async def test_close_inner_error_raises_not_silent_ok():
+    """F-03: an outwardly-ok market_close carrying an inner statuses[].error must
+    raise, so the service never reports a still-open position as closed."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)  # live LONG matches
+    inner_err = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"error": "insufficient margin"}]}},
+    }
+    c._exchange.market_close = MagicMock(return_value=inner_err)
+    with pytest.raises(HyperliquidError) as ei:
+        await c.close_position_market("BTC", side="long", vol=0.5)
+    assert "reject" in str(ei.value).lower() or "insufficient" in str(ei.value).lower()
+
+
+@pytest.mark.asyncio
 async def test_hl_place_order_scale_out_places_two_tp_triggers():
     c = _client()
     await c.place_order({

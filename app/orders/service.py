@@ -203,6 +203,37 @@ def _extract_filled_vol(resp: Any) -> float | None:
     return None
 
 
+def _close_response_error(resp: Any) -> str | None:
+    """Detect an inner rejection in a market-close response.
+
+    Mirrors the Hyperliquid ``_status_error`` pattern but is exchange-agnostic:
+    Hyperliquid returns order errors INSIDE an outwardly-200 response
+    (``status != ok`` or a nested ``statuses[].error``), and MEXC surfaces
+    ``success: false`` / a non-zero ``code``. Returning the error text here lets
+    the close path report a FAILED close instead of a false ``closed``/``ok``.
+    """
+    if not isinstance(resp, dict):
+        return None
+    # MEXC-shaped rejections.
+    if resp.get("success") is False:
+        return str(resp.get("message") or resp.get("code") or "close not successful")
+    code = resp.get("code")
+    if code not in (None, 0, "0", 200, "200"):
+        return f"code={code} {resp.get('message') or ''}".strip()
+    # Hyperliquid-shaped rejections (same shape as client._status_error).
+    status = resp.get("status")
+    if status is not None and status != "ok":
+        return str(status)
+    try:
+        statuses = resp.get("response", {}).get("data", {}).get("statuses", [])
+        for st in statuses:
+            if isinstance(st, dict) and "error" in st:
+                return str(st["error"])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _sl_matches(expected: float, candidate: float | None, tol_pct: float = 0.15) -> bool:
     if candidate is None or expected <= 0:
         return False
@@ -1092,6 +1123,25 @@ class OrderService:
                     error=str(e),
                 )
             raise OrderError(f"close failed: {e}") from e
+
+        # F-03: a transport-200 response can still carry an INNER rejection
+        # (Hyperliquid nests errors inside statuses[]). Semantically check it —
+        # otherwise we log `closed` / answer ok while the position is still open.
+        close_err = _close_response_error(resp)
+        if close_err:
+            if self.db is not None:
+                await self.db.insert_order(
+                    symbol=symbol,
+                    side=side,
+                    request_json={"action": "manual_close", "vol": close_vol},
+                    response_json=resp if isinstance(resp, dict) else {"data": resp},
+                    status="close_error",
+                    error=close_err,
+                )
+            raise OrderError(
+                f"close rejected by exchange: {close_err} — position may still be "
+                "open; verify on the exchange"
+            )
 
         if self.db is not None:
             await self.db.insert_order(

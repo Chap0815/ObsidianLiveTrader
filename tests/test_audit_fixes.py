@@ -905,3 +905,37 @@ async def test_pre_hold_failure_prevents_auto_close():
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
     assert out["flatten"] and out["flatten"].get("action") == "skipped_pre_hold_unknown"
+
+
+# ── F-03: manual close must verify the close response semantically ────────────
+
+
+@pytest.mark.asyncio
+async def test_close_inner_error_not_reported_closed():
+    """An outwardly-200 close response carrying an inner error (Hyperliquid
+    nests rejections inside statuses[]) must NOT be reported as closed/ok."""
+    inner_error_resp = {
+        "status": "ok",
+        "response": {
+            "data": {"statuses": [{"error": "Order could not immediately match"}]}
+        },
+    }
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.contract_meta = AsyncMock(return_value=_contract())
+    client.positions = AsyncMock(
+        return_value=[
+            {"symbol": "BTC_USDT", "positionType": 1, "holdVol": 1.0,
+             "holdAvgPrice": 100_000.0}
+        ]
+    )
+    client.close_position_market = AsyncMock(return_value=inner_error_resp)
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    with pytest.raises(OrderError) as ei:
+        await svc.close_position(symbol="BTC_USDT", side="long")
+    assert "reject" in str(ei.value).lower() or "still" in str(ei.value).lower()
+    # Audit must record the failure, never status=closed.
+    db.insert_order.assert_awaited()
+    assert db.insert_order.await_args.kwargs["status"] == "close_error"
