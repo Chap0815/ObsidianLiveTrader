@@ -37,7 +37,7 @@ from app.models import (
     OrderTicket,
     ReevaluateRequest,
 )
-from app.orders.service import OrderError, OrderService
+from app.orders.service import OrderError, OrderService, estimate_same_side_risk_usdt
 from app.orders.tokens import PreviewStore
 from app.risk.sizing import suggest_vol
 from app.security import (
@@ -1231,12 +1231,23 @@ async def sizing_suggest(
     ticket: OrderTicket,
     _: None = Depends(require_local_token),
 ):
-    """Suggest contract vol for MAX_RISK_PCT given SL/entry."""
+    """Suggest contract vol for MAX_RISK_PCT given SL/entry.
+
+    F-09: this must size CONSISTENTLY with the real gate the Preview/Confirm
+    path enforces (app.risk.gates.validate_order) — otherwise a suggested
+    size can be too large (or geometrically invalid) at the actual gate.
+    So the same inputs the gate uses are threaded through here: the market
+    adverse-fill slippage buffer, the RISK_SLIPPAGE_PCT buffer on SL
+    distance, directional SL geometry, existing same-side risk, available
+    margin and the equity-relative notional cap. See suggest_vol() in
+    app/risk/sizing.py for the shared clamp math.
+    """
     s = get_settings()
     client: MexcClient | None = getattr(request.app.state, "mexc", None)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
     symbol = normalize_symbol(ticket.symbol)
+    side_l = (ticket.side or "").lower()
     try:
         contract = await client.contract_meta(symbol)
         ticker = await client.ticker(symbol)
@@ -1247,17 +1258,42 @@ async def sizing_suggest(
     entry = float(ticket.entry or ticket.price or last or 0)
     if (ticket.order_type or "").lower() == "market" and last > 0:
         entry = last
+        # Same adverse-fill slippage buffer validate_order applies to
+        # entry_for_risk for market orders (G3) — a market suggestion must
+        # not assume a friendlier fill than the gate will.
+        slip = float(getattr(s, "market_entry_slippage_pct", 0.0) or 0.0)
+        if slip > 0 and side_l in ("long", "short"):
+            if side_l == "long":
+                entry = entry * (1.0 + slip / 100.0)
+            else:
+                entry = entry * (1.0 - slip / 100.0)
     stop = float(ticket.stop_loss or 0)
     if entry <= 0 or stop <= 0:
         raise HTTPException(status_code=400, detail="entry and stop_loss required")
 
     equity = 0.0
+    available = 0.0
+    existing_risk = 0.0
     if exchange_ready(s):
         try:
             snap = await client.account_snapshot()
             equity = float(snap.get("equity_usdt") or 0)
+            available = float(snap.get("available_usdt") or 0)
         except ExchangeError:
             equity = 0.0
+            available = 0.0
+        if equity > 0 and side_l in ("long", "short"):
+            try:
+                existing_risk = estimate_same_side_risk_usdt(
+                    snap.get("positions") or [],
+                    symbol=symbol,
+                    side=side_l,
+                    contract_size=contract.contract_size,
+                )
+            except ValueError as e:
+                # Fail-closed, same as preview/confirm: unknown same-side
+                # exposure must never be silently treated as 0 risk.
+                raise HTTPException(status_code=400, detail=str(e)) from e
     if equity <= 0:
         raise HTTPException(status_code=400, detail="equity unavailable for sizing")
 
@@ -1278,6 +1314,12 @@ async def sizing_suggest(
         stop,
         contract.vol_unit,
         contract.min_vol,
+        side=side_l,
+        slippage_pct=s.risk_slippage_pct,
+        existing_risk_usdt=existing_risk,
+        available_usdt=available,
+        leverage=ticket.leverage,
+        max_notional_pct_of_equity=s.max_notional_pct_of_equity,
     )
     notional = vol * contract.contract_size * entry
     coin = vol * contract.contract_size
@@ -1289,6 +1331,8 @@ async def sizing_suggest(
         "entry": entry,
         "stop_loss": stop,
         "equity_usdt": equity,
+        "available_usdt": available,
+        "existing_same_side_risk_usdt": existing_risk,
         "risk_pct": effective_risk,
         "max_risk_pct": s.max_risk_pct,
     }

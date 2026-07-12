@@ -63,8 +63,34 @@ def suggest_vol(
     stop: float,
     vol_unit: float,
     min_vol: float,
+    *,
+    side: str | None = None,
+    slippage_pct: float = 0.0,
+    existing_risk_usdt: float = 0.0,
+    available_usdt: float | None = None,
+    leverage: float = 1.0,
+    max_notional_pct_of_equity: float = 0.0,
 ) -> float:
     """Largest vol (floored to vol_unit) that risks ≈ risk_pct of equity at SL.
+
+    Mirrors the SAME clamps app.risk.gates.validate_order applies at
+    Preview/Confirm, so a suggested size can never exceed what the real gate
+    would accept:
+
+      - ``slippage_pct``: RISK_SLIPPAGE_PCT buffer on the SL distance (same
+        as ``risk_usdt`` above / G3 in gates.py).
+      - ``side``: directional SL geometry (long SL must be below entry,
+        short SL must be above entry) — an inverted stop is invalid
+        geometry, not "more risk", and must suggest 0, not a bogus size.
+      - ``existing_risk_usdt``: existing same-side open risk is deducted
+        from the risk budget first (aggregate MAX_RISK_PCT, like G3).
+      - ``max_notional_pct_of_equity`` / ``available_usdt`` + ``leverage``:
+        the equity-relative notional cap and the available-margin cap both
+        clamp vol further, same as the notional/margin checks in gates.py.
+
+    All new parameters are keyword-only and default to a no-op, so existing
+    callers that only pass the base positional args keep their exact legacy
+    result.
 
     Never inflates to min_vol when the risk budget cannot afford it — returns 0
     so the UI/API can show that no gate-safe size exists.
@@ -74,8 +100,33 @@ def suggest_vol(
     distance = abs(float(entry) - float(stop))
     if distance <= 0:
         return 0.0
-    budget = float(equity) * float(risk_pct) / 100.0
+
+    side_l = (side or "").strip().lower()
+    if side_l == "long" and float(stop) >= float(entry):
+        return 0.0
+    if side_l == "short" and float(stop) <= float(entry):
+        return 0.0
+
+    if slippage_pct and slippage_pct > 0:
+        distance = distance * (1.0 + float(slippage_pct) / 100.0)
+
+    budget = float(equity) * float(risk_pct) / 100.0 - max(0.0, float(existing_risk_usdt or 0.0))
+    if budget <= 0:
+        return 0.0
+
     raw = budget / (float(contract_size) * distance)
+
+    notional_per_vol = float(contract_size) * float(entry)
+    if max_notional_pct_of_equity and max_notional_pct_of_equity > 0 and notional_per_vol > 0:
+        cap_notional = float(equity) * float(max_notional_pct_of_equity) / 100.0
+        raw = min(raw, cap_notional / notional_per_vol)
+
+    if available_usdt is not None:
+        if float(available_usdt) <= 0:
+            return 0.0
+        if leverage and float(leverage) > 0 and notional_per_vol > 0:
+            raw = min(raw, (float(available_usdt) * float(leverage)) / notional_per_vol)
+
     rounded = round_down_to_unit(raw, vol_unit)
     if rounded <= 0:
         return 0.0
