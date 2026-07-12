@@ -434,9 +434,12 @@
       if (xStart > xEnd) xStart = 0;
 
       const vol = Number(p.hold_vol) || 0;
-      const cs = Number(
-        (state.market && state.market.contract && state.market.contract.contractSize) || 1
-      );
+      // F-10: this position's own contract_size drives the $ risk band; fall
+      // back to the active chart symbol's contractSize only if it's missing.
+      const csRaw = Number(p.contract_size);
+      const cs = Number.isFinite(csRaw) && csRaw > 0
+        ? csRaw
+        : Number((state.market && state.market.contract && state.market.contract.contractSize) || 1);
       // $ risk = distance * vol * contractSize
       const riskAmt =
         sl != null ? Math.abs(entry - sl) * vol * cs : null;
@@ -1563,7 +1566,7 @@
     );
   }
 
-  function _posDataAttrs(p, sideVal, cs) {
+  function _posDataAttrs(p, sideVal, posCs) {
     return (
       ' data-sym="' + escapeHtml(String(p.symbol || "")) + '"' +
       ' data-entry="' + escapeHtml(String(p.entry_price != null ? p.entry_price : "")) + '"' +
@@ -1699,7 +1702,9 @@
     const short = String(active.side || "").toLowerCase() === "short";
     const entry = Number(active.entry_price);
     const vol = Number(active.hold_vol);
-    const cs = contractSize();
+    // F-10: use this position's own contract_size when present.
+    const csRaw = Number(active.contract_size);
+    const cs = Number.isFinite(csRaw) && csRaw > 0 ? csRaw : contractSize();
     const im = Number(active.margin != null ? active.margin : active.im);
     const px = Number(state.lastPx);
     let pnl = active.unrealized_pnl != null ? Number(active.unrealized_pnl) : null;
@@ -1777,7 +1782,9 @@
     const vol = Number(active.hold_vol);
     const im = Number(active.margin != null ? active.margin : active.im);
     if (!Number.isFinite(entry) || !Number.isFinite(vol)) return;
-    const pnl = (Number(px) - entry) * vol * contractSize() * (short ? -1 : 1);
+    const csRaw = Number(active.contract_size);
+    const cs = Number.isFinite(csRaw) && csRaw > 0 ? csRaw : contractSize();
+    const pnl = (Number(px) - entry) * vol * cs * (short ? -1 : 1);
     const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
     const big = inst.querySelector(".ir-bigpnl");
     const numEl = inst.querySelector(".js-ir-pnl");
@@ -1833,11 +1840,22 @@
       // aren't available, show no notional rather than a fabricated number.
       const posLev = Number(p.leverage);
       const posIm = Number(p.im);
-      const notional = isActive
-        ? Number(p.hold_vol) * cs * Number(p.entry_price || 0)
-        : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
-          ? posIm * posLev
-          : null;
+      // F-10: each position now carries its OWN contract_size. Prefer it for
+      // notional and the per-tick PnL recompute; only fall back to the old
+      // proxies (active-symbol cs, or margin×leverage) when the field is
+      // absent (older /api/account payload).
+      const posCsRaw = Number(p.contract_size);
+      const hasPosCs = Number.isFinite(posCsRaw) && posCsRaw > 0;
+      const entryPx = Number(p.entry_price || 0);
+      const notional =
+        hasPosCs && Number.isFinite(entryPx) && entryPx > 0
+          ? Number(p.hold_vol) * posCsRaw * entryPx
+          : isActive
+            ? Number(p.hold_vol) * cs * entryPx
+            : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
+              ? posIm * posLev
+              : null;
+      const posCs = hasPosCs ? posCsRaw : cs;
       // Break-even stop incl. ~round-trip taker fees (0.06% total) — same math
       // as the BE chart line. Long: entry above; short: entry below, so the
       // stop at BE actually covers fees rather than sitting at raw entry.
@@ -1851,7 +1869,7 @@
           : null;
       const beRow =
         bePrice != null
-          ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, cs) +
+          ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
             ' data-be="' + escapeHtml(String(bePrice)) + '">' +
             '<span class="cp-actions-label">Stop</span>' +
             '<button type="button" class="cp-be-btn" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>' +
@@ -1860,7 +1878,7 @@
       return (
         '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
         (isActive ? " cp-active" : "") + '"' +
-        _posDataAttrs(p, sideVal, cs) + ">" +
+        _posDataAttrs(p, sideVal, posCs) + ">" +
         '<div class="cp-head">' +
         sideTag(p.side) +
         '<span class="cp-sym">' + escapeHtml(p.symbol || "—") + "</span>" +
@@ -1882,7 +1900,7 @@
         _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
         "</div>" +
         beRow +
-        '<div class="cp-close" ' + _posDataAttrs(p, sideVal, cs) + ">" +
+        '<div class="cp-close" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
         '<span class="cp-close-label">Schließen</span>' +
         '<button type="button" class="cp-close-btn" data-frac="0.25">25%</button>' +
         '<button type="button" class="cp-close-btn" data-frac="0.5">50%</button>' +
@@ -4146,8 +4164,11 @@
           const entry = Number(pos.entry_price);
           const vol = Number(pos.hold_vol);
           const short = String(pos.side || "").toLowerCase() === "short";
+          // F-10: prefer this position's own contract_size for the live recompute.
+          const pcsRaw = Number(pos.contract_size);
+          const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : cs;
           if (Number.isFinite(entry) && Number.isFinite(vol)) {
-            pnl = (last - entry) * vol * cs * (short ? -1 : 1);
+            pnl = (last - entry) * vol * pcs * (short ? -1 : 1);
           }
         } else {
           pnl = Number(pos.unrealized_pnl);
