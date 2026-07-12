@@ -1,0 +1,64 @@
+# requirements.lock — exact, reproducible pin of the tested environment (F-18).
+# Generated from the project .venv with the full suite green (303 passed, 2026-07-12).
+# requirements.txt keeps version RANGES for flexibility; this lockfile is the
+# byte-for-byte reproducible set. To reproduce exactly:
+#   .venv/Scripts/python.exe -m pip install --require-virtualenv -r requirements.lock
+# Regenerate after intentional dependency changes:
+#   .venv/Scripts/python.exe -m pip freeze > requirements.lock
+#
+aiosqlite==0.22.1
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.1
+bitarray==3.8.2
+certifi==2026.6.17
+charset-normalizer==3.4.9
+ckzg==2.1.7
+click==8.4.2
+colorama==0.4.6
+cytoolz==1.1.0
+defusedxml==0.7.1
+eth-account==0.13.7
+eth-hash==0.8.0
+eth-keyfile==0.8.1
+eth-keys==0.7.0
+eth-rlp==2.2.0
+eth-typing==6.0.0
+eth-utils==5.3.1
+eth_abi==6.0.0b1
+fastapi==0.139.0
+h11==0.16.0
+hexbytes==1.3.1
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+hyperliquid-python-sdk==0.24.0
+idna==3.18
+iniconfig==2.3.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+msgpack==1.2.1
+packaging==26.2
+parsimonious==0.10.0
+pluggy==1.6.0
+pycryptodome==3.23.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic_core==2.46.4
+Pygments==2.20.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+regex==2026.6.28
+requests==2.34.2
+rlp==4.1.0
+starlette==1.3.1
+toolz==1.1.0
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvicorn==0.51.0
+watchfiles==1.2.0
+websocket-client==1.9.0
+websockets==16.0
