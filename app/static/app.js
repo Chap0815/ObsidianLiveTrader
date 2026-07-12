@@ -1838,6 +1838,25 @@
         : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
           ? posIm * posLev
           : null;
+      // Break-even stop incl. ~round-trip taker fees (0.06% total) — same math
+      // as the BE chart line. Long: entry above; short: entry below, so the
+      // stop at BE actually covers fees rather than sitting at raw entry.
+      const beEntry = Number(p.entry_price);
+      const beFeeRt = 0.0006;
+      const bePrice =
+        Number.isFinite(beEntry) && beEntry > 0
+          ? sideVal === "short"
+            ? beEntry * (1 - beFeeRt)
+            : beEntry * (1 + beFeeRt)
+          : null;
+      const beRow =
+        bePrice != null
+          ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, cs) +
+            ' data-be="' + escapeHtml(String(bePrice)) + '">' +
+            '<span class="cp-actions-label">Stop</span>' +
+            '<button type="button" class="cp-be-btn" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>' +
+            "</div>"
+          : "";
       return (
         '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
         (isActive ? " cp-active" : "") + '"' +
@@ -1862,6 +1881,7 @@
         _cpCell("Liq", fmt(p.liquidate_price, 4), "cp-liq") +
         _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
         "</div>" +
+        beRow +
         '<div class="cp-close" ' + _posDataAttrs(p, sideVal, cs) + ">" +
         '<span class="cp-close-label">Schließen</span>' +
         '<button type="button" class="cp-close-btn" data-frac="0.25">25%</button>' +
@@ -1895,6 +1915,22 @@
           box.getAttribute("data-sym"),
           box.getAttribute("data-side"),
           Number(btn.getAttribute("data-frac"))
+        );
+      });
+    });
+
+    // SL → Break-Even (cockpit): places/moves the stop to the fee-adjusted
+    // break-even price via /api/orders/modify-sl (new stop → verify → cancel
+    // old). A real money action — confirmed before it fires.
+    el.querySelectorAll(".cp-be-btn").forEach(function (btn) {
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation(); // never bubble into the card's click-to-open-chart
+        const box = btn.closest(".cp-actions");
+        if (!box) return;
+        moveStopToBreakEven(
+          box.getAttribute("data-sym"),
+          box.getAttribute("data-side"),
+          Number(box.getAttribute("data-be"))
         );
       });
     });
@@ -4249,6 +4285,56 @@
       showToast("Schließen fehlgeschlagen: " + (err && err.message), "err");
     } finally {
       state.closeBusy = false;
+    }
+  }
+
+  /** Move/replace the stop-loss of an OPEN position to its fee-adjusted
+   *  break-even. A REAL money action: always confirmed, guarded against
+   *  double-submit (state.slBusy), and any backend detail is surfaced verbatim.
+   *  The server places the new stop, OID-verifies it, THEN cancels the old one,
+   *  so the position is never left unprotected during the move. */
+  async function moveStopToBreakEven(symbol, side, be) {
+    if (state.slBusy || state.closeBusy || state.orderBusy) return;
+    if (!symbol || !side || !Number.isFinite(be) || be <= 0) return;
+    const text =
+      "Stop-Loss der " + String(side).toUpperCase() + "-Position " + symbol +
+      " auf Break-Even " + fmt(be, 6) + " setzen?\n\n" +
+      "Ein neuer Stop wird platziert und verifiziert, danach ein bestehender " +
+      "alter Stop gecancelt. Dies ist eine echte Order-Aktion.";
+    if (!window.confirm(text)) return;
+    state.slBusy = true;
+    try {
+      const res = await apiFetch("/api/orders/modify-sl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: symbol, side: side, new_sl: be }),
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok) {
+        showToast(detailToText(data.detail || data), "err");
+        return;
+      }
+      const warn =
+        Array.isArray(data.warnings) && data.warnings.length
+          ? " — ⚠ " + data.warnings.join("; ")
+          : "";
+      showToast(
+        "SL → Break-Even gesetzt: " +
+          fmt(data.new_sl != null ? data.new_sl : be, 6) +
+          warn,
+        warn ? "err" : "ok"
+      );
+      loadAccount();
+      loadOpenOrders();
+    } catch (err) {
+      showToast(
+        "SL verschieben fehlgeschlagen: " + (err && err.message),
+        "err"
+      );
+    } finally {
+      state.slBusy = false;
     }
   }
 

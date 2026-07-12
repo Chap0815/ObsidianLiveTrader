@@ -1305,6 +1305,44 @@ select:focus {
   border-color: var(--short);
 }
 
+/* SL → Break-Even action row — a real money action, so it's a deliberate,
+   secondary control (accent on hover, not a one-tap primary). */
+.cp-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.cp-actions-label {
+  font-family: var(--mono);
+  font-size: 11.9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-right: 2px;
+}
+
+.cp-be-btn {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 14.5px;
+  padding: 5px 0;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.cp-be-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
 .positions-body,
 .orders-body {
   font-family: var(--mono);
