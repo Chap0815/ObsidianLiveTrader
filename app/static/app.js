@@ -143,8 +143,9 @@
     state.chart = LightweightCharts.createChart(el, {
       layout: {
         background: { color: "#0a0810" },
-        textColor: "#9d9ab6",
+        textColor: "#b4b0c8",
         fontFamily: '"IBM Plex Mono", Consolas, monospace',
+        fontSize: 13, // larger price-axis / time-axis labels (UX-2: were too small)
       },
       grid: {
         vertLines: { color: "#1a1626" },
@@ -1151,7 +1152,26 @@
     state.htf = htf;
     // A real coin switch must tear down the old WS at once so no residual tick
     // of the previous coin is evaluated against the new symbol's SL (audit F2).
-    if (!silent && _prevSym && _prevSym !== symbol) stopRealtime();
+    if (!silent && _prevSym && _prevSym !== symbol) {
+      stopRealtime();
+      // Clear the previous coin's chart overlays IMMEDIATELY so no stale marker,
+      // zone, or KI-proposal of the old symbol lingers on the new chart until
+      // the new data loads (UB-2 "AVAX marker im BTC-Chart" / UB-3 "Tab-Wechsel
+      // zieht Daten mit"). Each draw path re-filters by symMatch, but setMarkers
+      // persists the old arrows until called again — so wipe them now.
+      state.fills = [];
+      try {
+        if (state.candleSeries && typeof state.candleSeries.setMarkers === "function") {
+          state.candleSeries.setMarkers([]);
+        }
+      } catch (_) {}
+      if (state.proposalSymbol && !symMatch(state.proposalSymbol, symbol)) {
+        state.proposal = null;
+        state.proposalSymbol = null;
+      }
+      try { drawProposalLines(); } catch (_) {}
+      try { drawTradeZones(); } catch (_) {}
+    }
     // Sequence guard: fast coin switches can let an older fetch resolve AFTER a
     // newer one and overwrite the chart with stale data. Stamp each call and
     // bail if a newer load (different symbol/tf) superseded this one.
