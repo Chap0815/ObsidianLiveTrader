@@ -1367,12 +1367,39 @@
     return data;
   }
 
+  /** Unmissable environment strip under the topbar. Testnet → amber "no real
+   *  funds"; mainnet + armed (live_trading) → red "LIVE"; otherwise a neutral
+   *  mainnet/disarmed note. Guards a real-money switch from ever being mistaken
+   *  for testnet. */
+  function renderEnvBanner(h) {
+    const el = $("env-banner");
+    if (!el) return;
+    h = h || state.health || {};
+    const ex = String(h.exchange || "—").toUpperCase();
+    const testnet = h.exchange === "hyperliquid" && h.hl_testnet === true;
+    const live = h.live_trading === true;
+    el.classList.remove("hidden", "env-testnet", "env-live", "env-safe");
+    if (testnet) {
+      el.classList.add("env-testnet");
+      el.textContent = "⚠ TESTNET (" + ex + ") — keine echten Gelder. Sicher zum Testen.";
+    } else if (live) {
+      el.classList.add("env-live");
+      el.textContent =
+        "● MAINNET · LIVE (" + ex + ") — echtes Geld. Orders treffen den echten Markt.";
+    } else {
+      el.classList.add("env-safe");
+      el.textContent =
+        "MAINNET (" + ex + ") · DISARMED — Trading gesperrt (TRADING_ENABLED=false).";
+    }
+  }
+
   async function loadHealth() {
     try {
       const res = await fetch("/api/health");
       if (!res.ok) throw new Error("health " + res.status);
       const h = await res.json();
       state.health = h;
+      try { renderEnvBanner(h); } catch (_) {}
 
       const arm = $("arm-status");
       if (arm) {
