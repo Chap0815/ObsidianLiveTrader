@@ -6,7 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import app.main as main
-from app.main import _parse_feed, app
+from app.main import _parse_feed, _parse_news_date, app
 
 RSS_XML = """<?xml version="1.0"?>
 <rss version="2.0"><channel><title>Feed</title>
@@ -76,6 +76,14 @@ def _patch(monkeypatch, feeds, by_url):
 
 
 # --- pure parser unit tests ------------------------------------------------
+def test_parse_news_date_unparseable_is_html_stripped():
+    # An unparseable date must still be tag-stripped: no feed-derived string
+    # may reach the payload un-stripped (defence in depth with the frontend).
+    display, sort_key = _parse_news_date("<b>not a date</b>")
+    assert display == "not a date"
+    assert sort_key == 0.0
+
+
 def test_parse_feed_rss_strips_html_and_maps_fields():
     items = _parse_feed(RSS_XML, "CoinDesk")
     assert [i["title"] for i in items] == ["Bitcoin hits new high", "Older story"]

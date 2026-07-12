@@ -541,7 +541,9 @@ def _parse_news_date(raw: str) -> tuple[str, float]:
         try:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
-            return raw, 0.0
+            # Unparseable date: still strip the raw feed string (untrusted)
+            # so no feed-derived value reaches the payload un-stripped.
+            return _strip_html(raw), 0.0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
