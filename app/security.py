@@ -27,6 +27,37 @@ def _token_matches(got: str | None, expected: str) -> bool:
     return hmac.compare_digest(a, b)
 
 
+def build_csp(script_nonce: str | None = None) -> str:
+    """F-20: conservative Content-Security-Policy for the app's HTML pages.
+
+    script-src is 'self' with NO 'unsafe-inline' — this is the key control:
+    an injected inline <script> is blocked even if an escaping gap appears.
+    The vendored chart lib and app.js load from /static (self). A page that
+    still has a legitimate inline <script> (the setup wizard) passes a
+    per-response nonce so only that exact block runs.
+
+    style-src keeps 'unsafe-inline' because lightweight-charts injects inline
+    styles dynamically (a nonce cannot cover those) and the page links the
+    Google Fonts stylesheet. connect-src 'self' covers same-origin fetch and
+    the same-origin ws:// WebSocket handshake.
+    """
+    script_src = "'self'"
+    if script_nonce:
+        script_src += f" 'nonce-{script_nonce}'"
+    directives = [
+        "default-src 'self'",
+        f"script-src {script_src}",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' data:",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "frame-ancestors 'none'",
+    ]
+    return "; ".join(directives)
+
+
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 

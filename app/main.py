@@ -44,6 +44,7 @@ from app.orders.tokens import PreviewStore
 from app.risk.sizing import suggest_vol
 from app.security import (
     AUTH_COOKIE_NAME,
+    build_csp,
     loopback_or_token_middleware,
     normalize_symbol,
     require_local_token,
@@ -389,7 +390,14 @@ async def setup_page(request: Request):
     """First-run wizard; locked once a .env exists."""
     if not _setup_needed():
         return RedirectResponse("/", status_code=303)
-    return templates.TemplateResponse(request, "setup.html", {})
+    # F-20: the setup page has one legitimate inline <script>; give it a
+    # per-response nonce so script-src can stay 'self' + nonce (no unsafe-inline).
+    import secrets as _secrets
+
+    nonce = _secrets.token_urlsafe(16)
+    resp = templates.TemplateResponse(request, "setup.html", {"csp_nonce": nonce})
+    resp.headers["Content-Security-Policy"] = build_csp(script_nonce=nonce)
+    return resp
 
 
 @app.post("/api/setup")
@@ -1563,6 +1571,9 @@ async def index(request: Request):
             samesite="strict",
             path="/",
         )
+    # F-20: strict CSP. The dashboard has no inline <script> (F-19 removed the
+    # token script), so script-src is a plain 'self' — no nonce needed.
+    resp.headers["Content-Security-Policy"] = build_csp()
     return resp
 
 
