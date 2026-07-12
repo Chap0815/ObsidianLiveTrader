@@ -1396,22 +1396,11 @@
     const el = $("env-banner");
     if (!el) return;
     h = h || state.health || {};
-    const ex = String(h.exchange || "—").toUpperCase();
-    const testnet = h.exchange === "hyperliquid" && h.hl_testnet === true;
-    const live = h.live_trading === true;
-    el.classList.remove("hidden", "env-testnet", "env-live", "env-safe");
-    if (testnet) {
-      el.classList.add("env-testnet");
-      el.textContent = "⚠ TESTNET (" + ex + ") — keine echten Gelder. Sicher zum Testen.";
-    } else if (live) {
-      el.classList.add("env-live");
-      el.textContent =
-        "● MAINNET · LIVE (" + ex + ") — echtes Geld. Orders treffen den echten Markt.";
-    } else {
-      el.classList.add("env-safe");
-      el.textContent =
-        "MAINNET (" + ex + ") · DISARMED — Trading gesperrt (TRADING_ENABLED=false).";
-    }
+    // Env banner removed per user request (they know they're on testnet/what
+    // they're doing). Kept as a no-op so callers don't need changing; the
+    // #env-banner element is gone from the template.
+    el.classList.add("hidden");
+    el.textContent = "";
   }
 
   async function loadHealth() {
@@ -4280,6 +4269,25 @@
     const y = function (p) {
       return pad + ((hi - p) / (hi - lo)) * plotH;
     };
+    // Faint raster so each tile reads like a real chart, not a sparkline.
+    ctx.strokeStyle = "rgba(160,150,190,0.10)";
+    ctx.lineWidth = 1;
+    const hLines = 4;
+    for (let g = 1; g < hLines; g++) {
+      const gy = Math.round(pad + (plotH * g) / hLines) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0, gy);
+      ctx.lineTo(w, gy);
+      ctx.stroke();
+    }
+    const vLines = 6;
+    for (let g = 1; g < vLines; g++) {
+      const gx = Math.round((w * g) / vLines) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(gx, pad);
+      ctx.lineTo(gx, h - pad);
+      ctx.stroke();
+    }
     const n = cs.length,
       bw = Math.max(1, (w - 2) / n);
     cs.forEach(function (c, i) {
