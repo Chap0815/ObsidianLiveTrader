@@ -409,6 +409,45 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
     }
 
 
+def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
+    """Ultra-compact daily REGIME anchor: ONLY read + last 3 swings per side.
+
+    No recent_candles, no indicator tails — deliberately ~150 tokens. Mirrors the
+    `read` computation of compact_tf_for_llm but drops everything the anchor
+    doesn't need (the daily block sets regime bias, not entry timing)."""
+    indicators = slice_dict.get("indicators") or {}
+    structure = slice_dict.get("structure") or {}
+    candles = slice_dict.get("candles") or []
+    last = (indicators.get("last") if isinstance(indicators, dict) else None) or {}
+    last_close = candles[-1].get("close") if candles else None
+
+    read: dict[str, Any] = {
+        "ema_stack": _ema_stack_label(last, last_close),
+        "rvol": indicators.get("rvol"),
+    }
+    try:
+        if last_close and last.get("ema20"):
+            read["price_vs_ema20_pct"] = round(
+                (last_close - last["ema20"]) / last["ema20"] * 100.0, 3
+            )
+    except (TypeError, ZeroDivisionError):
+        pass
+
+    swings = structure.get("swings") or {}
+    return {
+        "tf": slice_dict.get("tf"),
+        "read": read,
+        "recent_swing_highs": [
+            {"price": s.get("price"), "time": s.get("time")}
+            for s in (swings.get("highs") or [])[-3:]
+        ],
+        "recent_swing_lows": [
+            {"price": s.get("price"), "time": s.get("time")}
+            for s in (swings.get("lows") or [])[-3:]
+        ],
+    }
+
+
 def build_llm_context(
     market_api: dict[str, Any],
     account: dict[str, Any] | None,
@@ -428,6 +467,7 @@ def build_llm_context(
             "premium": (market_api.get("market") or {}).get("premium"),
         },
         "contract": market_api.get("contract") or {},
+        "daily": compact_daily_for_llm(market_api.get("daily") or {}),
         "htf": compact_tf_for_llm(market_api.get("htf") or {}),
         "ltf": compact_tf_for_llm(market_api.get("ltf") or {}),
         "risk_policy": {
@@ -438,8 +478,8 @@ def build_llm_context(
             "max_notional_usdt": settings.max_notional_usdt,
         },
         "note": (
-            "Advisory only. Read htf (regime) before ltf (timing). "
-            "Human must apply and pass risk gates before any order. "
+            "Advisory only. Read daily (regime anchor), then htf (regime), then "
+            "ltf (timing). Human must apply and pass risk gates before any order. "
             "Prefer STAY_OUT over forced trades."
         ),
     }

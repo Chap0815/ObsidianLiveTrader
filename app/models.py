@@ -101,6 +101,9 @@ class MarketSnapshot(BaseModel):
     # Positioning extras (Hyperliquid meta ctx): open_interest, premium,
     # prev_day_px, oi_change_pct_1h/4h. Empty dict on exchanges without OI.
     market: dict[str, Any] = Field(default_factory=dict)
+    # Daily REGIME anchor (ultra-compact in the LLM context). Optional so
+    # existing MarketSnapshot(...) construction without daily still validates.
+    daily: TimeframeSlice | None = None
 
 
 # --- Grok Trade Proposal (design §7) ---

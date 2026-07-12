@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Protocol
 
 from app.analysis.indicators import indicator_bundle
@@ -145,6 +146,37 @@ _DEFAULT_MARKET_EXTRAS: dict[str, Any] = {
 }
 
 
+# Daily candles change slowly; build_market_snapshot runs on every poll and coin
+# switch, so cache the 1D fetch per (symbol, interval) for 5 min to cut one
+# klines() call per poll. In-memory, process-local; clear_daily_cache() for tests.
+_DAILY_TTL_S: float = 300.0
+_daily_cache: dict[tuple[str, str], tuple[float, list[Candle]]] = {}
+
+
+def clear_daily_cache() -> None:
+    _daily_cache.clear()
+
+
+async def _fetch_daily_candles(
+    client: Any, symbol: str, daily: str, limit_hint: int, *, ttl: float = _DAILY_TTL_S
+) -> list[Candle]:
+    """Daily anchor fetch. ADVISORY: must NEVER break the snapshot — a failed
+    1D fetch returns [] (daily_slice=None, prompt falls back to htf). Errors
+    are NOT cached so a transient failure doesn't stick for 5 minutes; an
+    empty-but-successful result (new coin) IS cached."""
+    key = (symbol, daily)
+    now = time.time()
+    hit = _daily_cache.get(key)
+    if hit is not None and (now - hit[0]) < ttl:
+        return hit[1]
+    try:
+        candles = await client.klines(symbol, daily, limit_hint=limit_hint)
+    except Exception:
+        return []  # do not cache errors
+    _daily_cache[key] = (now, candles)
+    return candles
+
+
 async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
     """OI/premium extras if the client exposes market_extras(); else None-filled.
 
@@ -169,25 +201,31 @@ async def build_market_snapshot(
     client: MarketClient,
     *,
     limit_hint: int = 500,
+    daily: str = "1D",
+    daily_limit_hint: int = 200,
 ) -> MarketSnapshot:
-    """Fetch public market data and compute LTF/HTF indicators + structure.
+    """Fetch public market data and compute LTF/HTF/Daily indicators + structure.
 
     Does not require private API keys.
     """
     # Fetch all public market data in parallel — these are independent upstream
     # calls; running them sequentially was the main source of chart lag on every
     # coin switch and poll. The ctx cache keeps ticker+funding from double-hitting.
-    ticker, funding, contract, ltf_candles, htf_candles, extras = await asyncio.gather(
+    (
+        ticker, funding, contract, ltf_candles, htf_candles, daily_candles, extras
+    ) = await asyncio.gather(
         client.ticker(symbol),
         client.funding_rate(symbol),
         client.contract_meta(symbol),
         client.klines(symbol, ltf, limit_hint=limit_hint),
         client.klines(symbol, htf, limit_hint=limit_hint),
+        _fetch_daily_candles(client, symbol, daily, daily_limit_hint),
         _fetch_market_extras(client, symbol),
     )
 
     ltf_slice = build_tf_slice(ltf, ltf_candles)
     htf_slice = build_tf_slice(htf, htf_candles)
+    daily_slice = build_tf_slice(daily, daily_candles) if daily_candles else None
 
     return MarketSnapshot(
         symbol=symbol,
@@ -197,6 +235,7 @@ async def build_market_snapshot(
         ltf=ltf_slice,
         htf=htf_slice,
         market=extras,
+        daily=daily_slice,
     )
 
 
@@ -218,4 +257,5 @@ def snapshot_to_api_dict(snap: MarketSnapshot) -> dict[str, Any]:
         "ltf": slice_dict(snap.ltf),
         "htf": slice_dict(snap.htf),
         "market": snap.market or {},
+        "daily": slice_dict(snap.daily) if snap.daily else None,
     }
