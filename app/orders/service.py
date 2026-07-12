@@ -523,12 +523,20 @@ class OrderService:
             stops_ever_ok,
         )
 
-    async def _same_side_hold_vol(self, symbol: str, side: str) -> tuple[float, int]:
-        """Return (hold_vol, open_type 1|2) for same-side position; (0, 1) if none."""
+    async def _same_side_hold_vol_ok(
+        self, symbol: str, side: str
+    ) -> tuple[float, int, bool]:
+        """Return (hold_vol, open_type 1|2, checked) for same-side position.
+
+        ``checked`` is True only if the positions query SUCCEEDED. On lookup
+        failure it is False so callers can fail-closed instead of trusting the
+        silent 0.0 — a fake "no pre-existing size" would let auto-flatten treat
+        an OLD position as a fresh fill and market-close it.
+        """
         try:
             positions = await self.client.positions(symbol)
         except ExchangeError:
-            return 0.0, 1
+            return 0.0, 1, False
         for raw in positions or []:
             p = map_position(raw) if "hold_vol" not in raw else raw
             if str(p.get("symbol") or "").upper() != symbol.upper():
@@ -541,8 +549,13 @@ class OrderService:
                 ot = 2
             else:
                 ot = 1
-            return max(hv, 0.0), ot
-        return 0.0, 1
+            return max(hv, 0.0), ot, True
+        return 0.0, 1, True
+
+    async def _same_side_hold_vol(self, symbol: str, side: str) -> tuple[float, int]:
+        """Return (hold_vol, open_type 1|2) for same-side position; (0, 1) if none."""
+        hv, ot, _ = await self._same_side_hold_vol_ok(symbol, side)
+        return hv, ot
 
     async def confirm(self, token: str) -> dict[str, Any]:
         """Consume token, re-check arming + gates, set leverage, place order."""
@@ -679,8 +692,12 @@ class OrderService:
         except ExchangeError as e:
             raise OrderError(f"set_leverage failed — order blocked: {e}") from e
 
-        # Hold before place — used so auto-flatten never closes pre-existing size
-        pre_hold, _ = await self._same_side_hold_vol(symbol, ticket.side)
+        # Hold before place — used so auto-flatten never closes pre-existing size.
+        # pre_hold_ok records whether the query was RELIABLE; a failed lookup
+        # must fail-closed (no differential-flatten) rather than assume 0.
+        pre_hold, _, pre_hold_ok = await self._same_side_hold_vol_ok(
+            symbol, ticket.side
+        )
 
         recovered_from_timeout = False
         transport_err: str | None = None
@@ -822,9 +839,30 @@ class OrderService:
                 # order's volume, so a concurrent external bot adding same-side
                 # size in this window cannot inflate what we close.
                 reported_fill = _extract_filled_vol(resp)
+                new_fill: float | None
+                fill_source = ""
                 if reported_fill is not None:
                     new_fill = min(float(gate.rounded_vol), reported_fill)
                     fill_source = "order response"
+                elif not pre_hold_ok:
+                    # FAIL-CLOSED: no reported fill AND the pre-trade quantity
+                    # was never reliably read. The hold difference would then be
+                    # measured against a fake pre_hold=0, so a pre-existing OLD
+                    # position looks like a fresh fill and could be market-closed
+                    # up to our order size. Execute NEITHER close NOR
+                    # differential-flatten — warn and leave it to manual review.
+                    new_fill = None
+                    flatten_result = {
+                        "action": "skipped_pre_hold_unknown",
+                        "error": "pre_hold unavailable and no reported fill",
+                        "pre_hold_checked": False,
+                    }
+                    warnings.append(
+                        "AUTO_FLATTEN übersprungen: Vor-Handels-Menge unbekannt "
+                        "(positions-Abfrage fehlgeschlagen) und keine Fill-Menge "
+                        "in der Order-Antwort — es wird NICHTS geschlossen. "
+                        "Position und SL JETZT manuell auf der Börse prüfen."
+                    )
                 else:
                     # FALLBACK ONLY (response carried no fill field): the hold
                     # difference. This can include an external bot's same-side
@@ -833,7 +871,9 @@ class OrderService:
                     # order volume, but it may over-attribute a partial fill.
                     new_fill = max(0.0, hold_now - pre_hold)
                     fill_source = "hold difference (fallback)"
-                if new_fill <= 1e-12:
+                if new_fill is None:
+                    pass  # fail-closed above — no close/cancel action taken
+                elif new_fill <= 1e-12:
                     # Unfilled resting entry: cancel it, do not close old pos
                     cancel_ids: list[Any] = []
                     if isinstance(resp, dict):

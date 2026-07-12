@@ -869,3 +869,39 @@ async def test_manual_mode_persists_placed_manual_status_in_audit():
     assert db.insert_order.await_args.kwargs["status"] == "placed_manual"
     # Manual mode must never auto-flatten, even with a db attached
     client.close_position_market.assert_not_awaited()
+
+
+# ── F-01: pre_hold must fail-closed (no differential-flatten on unknown) ──────
+
+
+@pytest.mark.asyncio
+async def test_pre_hold_failure_prevents_auto_close():
+    """If the pre-trade hold query fails AND the order response carries no fill
+    quantity, auto-flatten must execute NEITHER a market-close NOR a
+    differential-flatten — a failed pre_hold=0 would otherwise let the OLD
+    position be read as a fresh fill and closed."""
+    client = _happy_client({"orderId": 1})  # no fill field, no SL evidence
+    # preview risk, confirm risk, pre_hold (FAILS), post-place SL pos, flatten
+    client.positions = AsyncMock(
+        side_effect=[
+            [],  # preview existing risk
+            [],  # confirm existing risk
+            MexcError("positions endpoint down"),  # pre_hold — unreliable
+            _filled_pos(1.0),  # post-place SL verify (no SL → unverified)
+            _filled_pos(1.0),  # flatten hold_now
+        ]
+    )
+    client.open_stop_orders = AsyncMock(return_value=[])  # SL genuinely missing
+    svc = OrderService(
+        client,
+        _settings(auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    # Fail-closed: nothing is closed or cancelled on unknown pre_hold.
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+    assert out["flatten"] and out["flatten"].get("action") == "skipped_pre_hold_unknown"
