@@ -2545,6 +2545,18 @@
     _tradeMarkersSynced = Object.assign({}, state.tradeMarkers);
   }
 
+  /** Wipe all persisted manual trade markers (localStorage + in-memory) for a
+   *  clean production start. Exchange fills stay (they redraw from state.fills);
+   *  only the manual/persisted markers are cleared and the chart is refreshed. */
+  function resetTradeMarkers() {
+    state.tradeMarkers = {};
+    _tradeMarkersSynced = {};
+    try {
+      localStorage.removeItem(TRADE_MARKERS_KEY);
+    } catch (_) {}
+    applyTradeMarkers();
+  }
+
   /** Drop persisted markers whose symbol no longer has an open position.
    *  Fresh markers (< 5 min) are kept: confirm() sets the marker before the
    *  position shows up in the next account poll. Markers without ts are
@@ -2889,8 +2901,10 @@
   async function clearHistory() {
     if (state.historyClearBusy) return;
     const text =
-      "Lokale Audit-Historie (KI-Vorschläge + Order-Log) unwiderruflich löschen? " +
-      "Börsen-Fills bleiben unberührt.";
+      "Alles für sauberen Produktionsstart zurücksetzen?\n\n" +
+      "• Lokale Audit-Historie (KI-Vorschläge + Order-Log)\n" +
+      "• Persistierte Chart-Marker\n\n" +
+      "Börsen-Positionen und -Fills bleiben unberührt. Nicht umkehrbar.";
     if (!window.confirm(text)) return;
     state.historyClearBusy = true;
     try {
@@ -2905,13 +2919,14 @@
         showToast(detailToText(data.detail || data), "err");
         return;
       }
+      resetTradeMarkers(); // clean slate: also drop persisted chart markers
       const del = data.deleted || {};
       showToast(
-        "Historie geleert: " +
+        "Zurückgesetzt: " +
           fmt(del.proposals, 0) +
           " Vorschläge, " +
           fmt(del.orders, 0) +
-          " Orders",
+          " Orders, Chart-Marker",
         "ok"
       );
       loadHistory();

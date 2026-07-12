@@ -419,6 +419,13 @@ select:focus {
   border-color: var(--border);
 }
 
+/* Danger action kept quiet until hover, then reads red (clean-slate reset) */
+.btn-reset:hover:not(:disabled) {
+  color: #ffb9c2;
+  border-color: var(--short);
+  background: rgba(230, 88, 78, 0.1);
+}
+
 /* kept for JS/legacy markup */
 .btn-danger {
   background: rgba(246, 70, 93, 0.1);

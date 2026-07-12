@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r4') }}" />
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r5') }}" />
   <!-- Vendored locally (v4.2.0, Apache-2.0) — no CDN dependency for the chart -->
   <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
   {% block head %}{% endblock %}
@@ -20,7 +20,7 @@
   <script>
     window.LOCAL_API_TOKEN = {{ (local_api_token or "")|tojson }};
   </script>
-  <script src="/static/app.js?v={{ asset_version|default('r4') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r5') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
