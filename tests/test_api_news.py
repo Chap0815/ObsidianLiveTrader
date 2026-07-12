@@ -77,6 +77,16 @@ def _patch(monkeypatch, feeds, by_url):
     )
 
 
+class _RecordingClient(_FakeClient):
+    """Like _FakeClient but records the kwargs the app constructed it with."""
+
+    calls: list[dict] = []
+
+    def __init__(self, by_url, *a, **k):
+        super().__init__(by_url, *a, **k)
+        _RecordingClient.calls.append(k)
+
+
 # --- pure parser unit tests ------------------------------------------------
 def test_parse_news_date_unparseable_is_html_stripped():
     # An unparseable date must still be tag-stripped: no feed-derived string
@@ -159,6 +169,26 @@ def test_news_malformed_xml_isolated(monkeypatch):
     body = r.json()
     assert len(body["errors"]) == 1 and body["errors"][0].startswith("Junk:")
     assert len(body["items"]) == 2
+
+
+# --- F-13: SSRF — feed redirects must never be followed ---------------------
+def test_news_client_does_not_follow_redirects(monkeypatch):
+    """A compromised/misconfigured feed could 30x-redirect to loopback/LAN/
+    cloud-metadata targets. The news AsyncClient must be built with
+    follow_redirects=False so such a response fails isolated instead."""
+    feeds = [("A", "http://a")]
+    _RecordingClient.calls = []
+    monkeypatch.setattr(main, "NEWS_FEEDS", feeds)
+    monkeypatch.setattr(
+        main.httpx, "AsyncClient", partial(_RecordingClient, {"http://a": RSS_XML})
+    )
+    with TestClient(app) as client:
+        client.app.state.news_cache = None
+        r = client.get("/api/news")
+    assert r.status_code == 200
+    news_calls = [c for c in _RecordingClient.calls if "follow_redirects" in c]
+    assert news_calls, "expected the news endpoint to construct an AsyncClient"
+    assert news_calls[0].get("follow_redirects") is False
 
 
 def test_news_total_failure_serves_stale_cache(monkeypatch):

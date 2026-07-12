@@ -608,8 +608,12 @@ async def news(request: Request):
         resp.raise_for_status()
         return _parse_feed(resp.text, source)
 
+    # Known stable HTTPS feed endpoints — a feed that suddenly issues a
+    # redirect (e.g. a compromised/hijacked host pointing at loopback, LAN or
+    # cloud-metadata targets) must fail isolated for that feed, not be
+    # followed (F-13, SSRF).
     async with httpx.AsyncClient(
-        timeout=NEWS_FEED_TIMEOUT, follow_redirects=True
+        timeout=NEWS_FEED_TIMEOUT, follow_redirects=False
     ) as client:
         gathered = await asyncio.gather(
             *(one(src, url, client) for src, url in NEWS_FEEDS),
