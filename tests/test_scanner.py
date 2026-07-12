@@ -63,6 +63,56 @@ async def test_build_scan_contexts_survives_single_coin_failure():
     assert ctx["funding_rate"] == 0.0001
 
 
+# --- F-22: results must be restricted to the actually-scanned symbol set ---
+def test_parse_scan_results_filters_hallucinated_symbol():
+    """A symbol the LLM invents (not among the coins it was actually given)
+    must never reach the UI, even if it otherwise looks valid."""
+    text = (
+        '{"results": ['
+        '{"symbol": "BTC", "bias": "long", "score": 8},'
+        '{"symbol": "NOTREAL", "bias": "short", "score": 9}'
+        "]}"
+    )
+    out = parse_scan_results(text, allowed_symbols={"BTC", "ETH"})
+    assert [r.symbol for r in out] == ["BTC"]
+
+
+def test_parse_scan_results_allowlist_is_case_insensitive():
+    text = '{"results": [{"symbol": "btc", "bias": "long", "score": 8}]}'
+    out = parse_scan_results(text, allowed_symbols={"BTC"})
+    assert [r.symbol for r in out] == ["btc"]
+
+
+def test_parse_scan_results_no_allowlist_keeps_legacy_behavior():
+    """Backward-compat: omitting allowed_symbols does not filter anything."""
+    text = '{"results": [{"symbol": "ANYTHING", "bias": "long", "score": 8}]}'
+    out = parse_scan_results(text)
+    assert [r.symbol for r in out] == ["ANYTHING"]
+
+
+@pytest.mark.asyncio
+async def test_scan_with_llm_restricts_to_context_symbols(monkeypatch):
+    """End-to-end: scan_with_llm must pass the context's own symbol set as
+    the allowlist so a hallucinated symbol never survives even if the LLM
+    text-parsing path is exercised for real."""
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    async def fake_anthropic_text(system, user, model, settings, timeout=120.0):
+        return (
+            '{"results": ['
+            '{"symbol": "BTC", "bias": "long", "score": 8},'
+            '{"symbol": "MADE_UP", "bias": "short", "score": 9}'
+            "]}"
+        )
+
+    monkeypatch.setattr(scanner_mod, "_anthropic_text", fake_anthropic_text)
+    settings = Settings(anthropic_api_key="k")
+    contexts = [{"symbol": "BTC"}, {"symbol": "ETH"}]
+    results, model = await scanner_mod.scan_with_llm(contexts, settings)
+    assert [r.symbol for r in results] == ["BTC"]
+
+
 def test_parse_scan_results_salvages_truncated_json():
     """Model cut off at max_tokens mid-array: keep the complete objects."""
     from app.llm.scanner import parse_scan_results

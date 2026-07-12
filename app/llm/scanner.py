@@ -111,11 +111,17 @@ def _salvage_result_objects(text: str) -> list[dict]:
     return objs
 
 
-def parse_scan_results(text: str) -> list[ScanResult]:
+def parse_scan_results(
+    text: str, allowed_symbols: set[str] | None = None
+) -> list[ScanResult]:
     """Parse + validate the screener output. Invalid rows are dropped.
 
     Falls back to per-object salvage when the whole JSON won't parse (e.g. the
-    model was cut off at max_tokens mid-array) so partial results still show."""
+    model was cut off at max_tokens mid-array) so partial results still show.
+
+    F-22: when `allowed_symbols` is given, any result whose symbol isn't in
+    that server-side set (the coins actually sent to the LLM) is dropped —
+    the LLM's output isn't trusted to only mention symbols it was given."""
     rows: list[dict] = []
     try:
         data = json.loads(extract_json_object(text))
@@ -126,6 +132,9 @@ def parse_scan_results(text: str) -> list[ScanResult]:
         if not rows:
             raise  # truly unparseable — let the caller report it
 
+    allowed_upper = (
+        {s.upper() for s in allowed_symbols} if allowed_symbols is not None else None
+    )
     out: list[ScanResult] = []
     seen: set[str] = set()
     for row in rows:
@@ -134,6 +143,8 @@ def parse_scan_results(text: str) -> list[ScanResult]:
         except ValidationError:
             continue
         key = r.symbol.upper()
+        if allowed_upper is not None and key not in allowed_upper:
+            continue  # hallucinated / out-of-scope symbol — never surfaced
         if key in seen:
             continue
         seen.add(key)
@@ -300,8 +311,13 @@ async def scan_with_llm(
     else:
         raise LlmError("No LLM configured for the scanner")
 
+    # Server-side allowlist: only symbols we actually sent to the LLM may
+    # come back (F-22) — a hallucinated-but-valid-looking symbol is dropped.
+    allowed_symbols = {
+        str(c.get("symbol") or "").upper() for c in contexts if c.get("symbol")
+    }
     try:
-        return parse_scan_results(text), model
+        return parse_scan_results(text, allowed_symbols=allowed_symbols), model
     except json.JSONDecodeError as e:
         preview = (text or "")[:200].replace("\n", " ")
         raise LlmError(
