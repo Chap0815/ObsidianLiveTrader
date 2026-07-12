@@ -700,6 +700,12 @@ class HyperliquidClient:
                 # A genuine partial market fill DOES report totalSz, so this only
                 # fires on an unexpected/empty response shape, never on a real
                 # partial. Snap to the requested size to keep the position safe.
+                # RESIDUAL RISK (F-02 review, accepted tradeoff): if a same-side
+                # position ALREADY exists and this rare no-parseable-fill case
+                # fires, the full-size reduce-only stop attaches to the combined
+                # hold — reduce-only caps damage (can't over-close or open) but
+                # could close the pre-existing position at the new stop. We prefer
+                # guaranteed protection of the common case over this rare edge.
                 filled_sz = sz
             protect_sz = filled_sz
 
