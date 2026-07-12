@@ -1750,8 +1750,19 @@
       const roe = Number.isFinite(pnl) && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
       const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
       const isActive = symMatch(p.symbol, state.symbol);
-      const notional =
-        Number(p.hold_vol) * cs * Number(p.entry_price || 0);
+      // `cs` above is the ACTIVE chart symbol's contractSize — correct only
+      // for that symbol. MEXC coins can have different contract sizes, so
+      // reusing it for every other open position's notional would be wrong
+      // (F-10). For any other symbol, derive notional from exchange-reported
+      // margin × leverage instead (independent of contractSize); if those
+      // aren't available, show no notional rather than a fabricated number.
+      const posLev = Number(p.leverage);
+      const posIm = Number(p.im);
+      const notional = isActive
+        ? Number(p.hold_vol) * cs * Number(p.entry_price || 0)
+        : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
+          ? posIm * posLev
+          : null;
       return (
         '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
         (isActive ? " cp-active" : "") + '"' +
@@ -1769,7 +1780,10 @@
         "</div>" +
         '<div class="cp-grid">' +
         _cpCell("Entry", fmt(p.entry_price, 4)) +
-        _cpCell("Größe", fmt(p.hold_vol, 4) + " · " + fmt(notional, 0) + " " + ccy()) +
+        _cpCell(
+          "Größe",
+          fmt(p.hold_vol, 4) + (notional != null ? " · " + fmt(notional, 0) + " " + ccy() : "")
+        ) +
         _cpCell("Liq", fmt(p.liquidate_price, 4), "cp-liq") +
         _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
         "</div>" +
@@ -3846,13 +3860,31 @@
       const chgTxt = Number.isFinite(chg) ? (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%" : "—";
 
       let pnlHtml = "";
-      if (pos && Number.isFinite(last)) {
-        const entry = Number(pos.entry_price);
-        const vol = Number(pos.hold_vol);
-        const short = String(pos.side || "").toLowerCase() === "short";
-        const pnl = (last - entry) * vol * cs * (short ? -1 : 1);
-        const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
-        pnlHtml = '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
+      if (pos) {
+        // `cs` is the ACTIVE chart symbol's contractSize. Reusing it to
+        // recompute PnL for every tile would be wrong on MEXC, where coins
+        // can have different contract sizes (F-10). Only the active
+        // symbol's own tile may use that local recompute (correct cs, and
+        // it doubles as a live refresh against the streaming price); every
+        // other tile uses the exchange's own unrealized_pnl straight from
+        // /api/account instead of guessing with another symbol's cs.
+        const isActiveSym = symMatch(sym, state.symbol);
+        let pnl = null;
+        if (isActiveSym && Number.isFinite(last)) {
+          const entry = Number(pos.entry_price);
+          const vol = Number(pos.hold_vol);
+          const short = String(pos.side || "").toLowerCase() === "short";
+          if (Number.isFinite(entry) && Number.isFinite(vol)) {
+            pnl = (last - entry) * vol * cs * (short ? -1 : 1);
+          }
+        } else {
+          pnl = Number(pos.unrealized_pnl);
+        }
+        if (Number.isFinite(pnl)) {
+          const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
+          pnlHtml =
+            '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
+        }
       }
 
       tile.innerHTML =
