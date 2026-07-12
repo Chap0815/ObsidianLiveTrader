@@ -2205,10 +2205,26 @@
     const tf = state.tf || "15m";
     const groups = new Map(); // "time|side" -> aggregated group
 
+    // Fills older than the loaded chart window are clamped by the chart to the
+    // first bar, piling dozens of markers on the left edge. Only mark fills that
+    // fall inside the visible candle range.
+    const candles =
+      (state.market && state.market.ltf && state.market.ltf.candles) || [];
+    let firstT = null;
+    let lastT = null;
+    if (candles.length) {
+      firstT = barOpenTimeSec(candles[0].time || candles[0].time_ms, tf);
+      lastT = barOpenTimeSec(
+        candles[candles.length - 1].time || candles[candles.length - 1].time_ms,
+        tf
+      );
+    }
+
     (state.fills || []).forEach(function (f) {
       if (!symMatch(f.symbol, state.symbol) || !(Number(f.time) > 0)) return;
       const side = f.side === "buy" ? "buy" : "sell";
       const time = barOpenTimeSec(f.time, tf);
+      if (firstT != null && (time < firstT || time > lastT)) return; // outside window
       const sz = Number(f.sz) || 0;
       const px = Number(f.px) || 0;
       const dirStr = String(f.dir || "").toLowerCase();
