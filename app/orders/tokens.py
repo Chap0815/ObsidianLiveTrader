@@ -22,6 +22,18 @@ class PreviewStore:
     create() → raw token string
     consume() → payload dict; raises TokenError if invalid
     peek() → payload without consuming (optional; for diagnostics)
+
+    F-16 — SINGLE-WORKER REQUIRED: this store is process-local (a plain
+    dict guarded by a threading.Lock), not backed by a shared cache or DB.
+    One instance lives on app.state, created once in app.main's lifespan.
+    If the app is ever run with more than one uvicorn/gunicorn worker
+    process, each worker gets its OWN store: a preview token minted by
+    worker A is invisible to worker B, so Confirm can 404 a perfectly
+    valid token depending on which worker happens to handle the request.
+    The bundled launcher (scripts/launch.py) never passes --workers, which
+    is required for correctness, not just performance. See
+    app.main._detect_multi_worker_env() for the startup warning this
+    triggers if a common multi-worker env var is detected.
     """
 
     def __init__(self) -> None:

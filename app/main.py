@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import html as _html
 import json
+import logging
+import os
 import re as _re
 import time as _time
 import defusedxml.ElementTree as _ET  # hardened parser: news feeds are untrusted
@@ -52,6 +54,46 @@ BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 STATIC_DIR = BASE / "static"
 
+log = logging.getLogger("app.main")
+
+# F-16 (deployment/concurrency): env var names some process managers use to
+# announce a multi-worker/multi-process launch. Checked at startup so a
+# non-default deployment (this app's own launcher, scripts/launch.py, never
+# sets these) gets a loud warning instead of silently corrupting state.
+_MULTI_WORKER_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS")
+
+
+def _detect_multi_worker_env(env: dict[str, str] | None = None) -> str | None:
+    """Return a loud warning string if the environment announces more than
+    one worker process, else None. Never raises — see module docstring
+    note at the preview-store/trade-lock state below for WHY this matters.
+    """
+    src = os.environ if env is None else env
+    for var in _MULTI_WORKER_ENV_VARS:
+        raw = src.get(var)
+        if raw is None:
+            continue
+        try:
+            n = int(str(raw).strip())
+        except ValueError:
+            continue
+        if n > 1:
+            return (
+                f"SINGLE-WORKER REQUIRED: {var}={n} detected, but this "
+                "app's preview-token store (app.orders.tokens.PreviewStore) "
+                "and its confirm/close trade_lock are IN-PROCESS ONLY "
+                "(no shared cache/DB backing). With more than one worker, "
+                "each process gets its own copy: a preview token minted by "
+                "one worker is invisible to another (Confirm can 404 a "
+                "valid token), and the trade_lock no longer serializes "
+                "concurrent confirm/close calls across workers (a race can "
+                "pass risk gates twice / double-fill). Run with a single "
+                "worker (the bundled launcher, scripts/launch.py, never "
+                "passes --workers; do not add --workers > 1 or a "
+                f"multi-process WSGI/ASGI manager without removing {var})."
+            )
+    return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,6 +101,12 @@ async def lifespan(app: FastAPI):
     client = create_exchange_client(s)
     db = Database(s.database_path)
     await db.init()
+    # F-16: PreviewStore is an in-process, in-memory TTL store (see
+    # app/orders/tokens.py) — it is NOT shared across worker processes.
+    # This app MUST run with a single uvicorn worker (the launcher,
+    # scripts/launch.py, never passes --workers). See
+    # _detect_multi_worker_env() above for the failure mode if that
+    # invariant is ever violated.
     store = PreviewStore()
     app.state.mexc = client  # legacy name: active exchange client
     app.state.exchange = client
@@ -66,12 +114,19 @@ async def lifespan(app: FastAPI):
     app.state.preview_store = store
     # App-global lock: a new OrderService is built per request, so the lock
     # that serializes confirm/close must live here, not on the instance.
+    # F-16: like PreviewStore above, this asyncio.Lock only serializes
+    # requests WITHIN this one process — it provides no cross-worker
+    # mutual exclusion. Single-worker is required for this to be a real
+    # guarantee against concurrent double-fills.
     import asyncio as _asyncio
 
     app.state.trade_lock = _asyncio.Lock()
     # Singleflight lock for /api/news: concurrent cache-miss callers await
     # one in-flight refresh instead of each firing a full feed-fetch batch.
     app.state.news_lock = _asyncio.Lock()
+    multi_worker_warning = _detect_multi_worker_env()
+    if multi_worker_warning:
+        log.warning(multi_worker_warning)
     try:
         yield
     finally:
