@@ -970,10 +970,27 @@ class HyperliquidClient:
                 addr = Account.from_key(self.private_key).address
             if not addr:
                 return []
-            try:
-                orders = info.frontend_open_orders(addr)
-            except Exception:
-                orders = info.open_orders(addr)
+            # C-1 fail-safe: the trigger-aware endpoint is the ONLY authoritative
+            # source for SL/TP triggers. It must NOT be silently swapped for the
+            # non-trigger-aware open_orders() on failure — that endpoint does not
+            # carry isTrigger/triggerPx rows, so the heuristic below would find no
+            # triggers and return a CONFIDENT empty list, indistinguishable from a
+            # genuine "no stop orders". A protected position would then read as
+            # MISSING and auto_flatten_if_sl_unverified could market-close it on a
+            # transient endpoint hiccup. Mirror MEXC's gold-standard behaviour: if
+            # the trigger-aware lookup cannot be completed with a RECOGNIZED
+            # response, let it raise (the outer handler turns it into a
+            # HyperliquidError → the caller resolves SL status to UNKNOWN, never
+            # MISSING, and UNKNOWN never auto-flattens).
+            orders = info.frontend_open_orders(addr)
+            if not isinstance(orders, list):
+                # 200-OK-but-degraded/unrecognized body (e.g. {} or None) is NOT
+                # proof of "no triggers" — refuse it rather than trust an empty
+                # confident list.
+                raise HyperliquidError(
+                    "frontend_open_orders returned an unrecognized shape "
+                    f"({type(orders).__name__}); refusing to treat as 'no stops'"
+                )
             coin_f = to_hl_coin(symbol) if symbol else None
             out = []
             for o in orders or []:

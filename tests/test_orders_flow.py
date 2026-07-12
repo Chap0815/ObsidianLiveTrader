@@ -685,3 +685,37 @@ async def test_modify_stop_loss_rejected_on_non_hyperliquid(store):
     with pytest.raises(OrderError) as ei:
         await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
     assert "nur auf Hyperliquid" in str(ei.value)
+
+
+# ── C-1: an errored trigger-aware stop lookup must yield UNKNOWN, not flatten ─
+
+
+@pytest.mark.asyncio
+async def test_stop_lookup_error_yields_unknown_not_flatten(client, store):
+    """C-1 fail-safe (service side): if the trigger-aware stop lookup errors, the
+    SL status must resolve to UNKNOWN (sl_checked=False), NOT a confident MISSING,
+    and auto-flatten must NOT market-close the (possibly protected) position."""
+    from app.hyperliquid.errors import HyperliquidError
+
+    # place_order returns NO trigger oid → forces the _verify_sl_attached path.
+    client.place_order = AsyncMock(return_value={"orderId": 1})
+    # The authoritative stop lookup errors out (transient HL hiccup).
+    client.open_stop_orders = AsyncMock(
+        side_effect=HyperliquidError("open_stop_orders failed: 503")
+    )
+    svc = OrderService(
+        client,
+        _settings(
+            trading_enabled=True,
+            auto_flatten_if_sl_unverified=True,
+            sl_verify_attempts=1,
+            sl_verify_delay_s=0.0,
+        ),
+        store,
+    )
+    prev = await svc.preview(_good_ticket())
+    conf = await svc.confirm(prev["token"])
+    assert conf["sl_checked"] is False  # UNKNOWN, not MISSING
+    assert conf["sl_verified"] is False
+    assert conf["status"] == "placed_sl_unknown"
+    client.close_position_market.assert_not_called()
