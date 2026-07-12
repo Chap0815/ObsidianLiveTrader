@@ -121,9 +121,14 @@ def _llm_settings(request: Request):
 async def health(request: Request):
     s = get_settings()
     eff = _llm_settings(request)
+    # F-24: report the ACTUAL armed/mainnet state, not a hardcoded True —
+    # monitoring must be able to trust this instead of misreading a disarmed
+    # or testnet instance as live-armed.
+    on_testnet = s.exchange == "hyperliquid" and s.hl_testnet
+    live_trading = bool(s.trading_enabled) and not on_testnet
     return {
         "ok": True,
-        "live_trading": True,
+        "live_trading": live_trading,
         "exchange": s.exchange,
         "hl_testnet": s.hl_testnet if s.exchange == "hyperliquid" else None,
         "trading_enabled": s.trading_enabled,
