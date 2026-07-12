@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -286,6 +287,79 @@ class Settings(BaseSettings):
             name="OPENAI_BASE_URL",
             allowed=OPENAI_ALLOWED_HOSTS,
         )
+
+    # ── F-06: money/risk floats must be finite and within sane bounds. NaN
+    # or Infinity would make gate comparisons (e.g. `risk_pct > max_risk_pct`)
+    # silently False, so a gate could fail OPEN instead of blocking. ─────────
+
+    @field_validator("max_risk_pct")
+    @classmethod
+    def max_risk_pct_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 < v <= 100):
+            raise ValueError(
+                f"MAX_RISK_PCT must be a finite number in (0, 100] (got {v!r})"
+            )
+        return v
+
+    @field_validator("max_leverage")
+    @classmethod
+    def max_leverage_ok(cls, v: int) -> int:
+        if not (1 <= v <= 500):
+            raise ValueError(
+                f"MAX_LEVERAGE must be an integer in [1, 500] (got {v!r})"
+            )
+        return v
+
+    @field_validator("min_rrr")
+    @classmethod
+    def min_rrr_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 1000):
+            raise ValueError(
+                f"MIN_RRR must be a finite number in [0, 1000] (got {v!r})"
+            )
+        return v
+
+    @field_validator("max_notional_pct_of_equity")
+    @classmethod
+    def max_notional_pct_of_equity_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 1_000_000):
+            raise ValueError(
+                "MAX_NOTIONAL_PCT_OF_EQUITY must be a finite number in "
+                f"[0, 1000000] (0 = off) (got {v!r})"
+            )
+        return v
+
+    @field_validator("max_notional_usdt")
+    @classmethod
+    def max_notional_usdt_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(
+                "MAX_NOTIONAL_USDT must be a finite number >= 0 (0 = off; "
+                f"warning threshold, not a hard cap) (got {v!r})"
+            )
+        return v
+
+    @field_validator(
+        "risk_slippage_pct", "max_price_drift_pct", "market_entry_slippage_pct"
+    )
+    @classmethod
+    def slippage_pct_ok(cls, v: float, info) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 100):
+            raise ValueError(
+                f"{info.field_name.upper()} must be a finite number in "
+                f"[0, 100] (got {v!r})"
+            )
+        return v
+
+    @field_validator("sl_verify_delay_s")
+    @classmethod
+    def sl_verify_delay_s_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 60):
+            raise ValueError(
+                f"SL_VERIFY_DELAY_S must be a finite number in [0, 60] "
+                f"(got {v!r})"
+            )
+        return v
 
     @model_validator(mode="after")
     def armed_requires_local_token(self) -> "Settings":

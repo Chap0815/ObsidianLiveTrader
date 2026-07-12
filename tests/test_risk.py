@@ -245,6 +245,39 @@ def test_max_notional_pct_of_equity_hard_cap():
     assert any("MAX_NOTIONAL_PCT_OF_EQUITY" in e for e in g.errors)
 
 
+def test_gate_fails_closed_on_nonfinite_max_risk_pct():
+    """F-06 defense-in-depth: Settings() now rejects NaN at construction, but
+    if a non-finite value ever reaches the gate (e.g. via attribute mutation
+    after construction, since validate_assignment is off), the risk gate must
+    fail CLOSED instead of silently letting risk_pct > nan (always False)
+    disable the check."""
+    s = _settings(max_risk_pct=1.0)
+    object.__setattr__(s, "max_risk_pct", float("nan"))
+    g = validate_order(
+        _ticket(vol=50_000, take_profit=200_000),  # would normally exceed 1%
+        _contract(),
+        equity=10_000,
+        settings=s,
+        last_price=100_000,
+    )
+    assert g.ok is False
+    assert any("MAX_RISK_PCT" in e for e in g.errors)
+
+
+def test_gate_fails_closed_on_nonfinite_notional_pct_cap():
+    s = _settings(max_risk_pct=100.0, max_notional_usdt=0)
+    object.__setattr__(s, "max_notional_pct_of_equity", float("inf"))
+    g = validate_order(
+        _ticket(vol=100, take_profit=102_000),
+        _contract(),
+        equity=1_000,
+        settings=s,
+        last_price=100_000,
+    )
+    assert g.ok is False
+    assert any("MAX_NOTIONAL_PCT_OF_EQUITY" in e for e in g.errors)
+
+
 def test_happy_path_gate_ok():
     g = validate_order(
         _ticket(),

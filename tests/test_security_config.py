@@ -31,6 +31,61 @@ def test_ollama_url_must_be_loopback():
     assert "127.0.0.1" in s.ollama_base_url
 
 
+def test_risk_floats_reject_nan_and_infinity():
+    """F-06: NaN/Infinity in money/risk fields must be rejected at construction,
+    not silently accepted (which would make gate comparisons fail-open)."""
+    for field in (
+        "max_risk_pct",
+        "min_rrr",
+        "max_notional_pct_of_equity",
+        "risk_slippage_pct",
+        "max_notional_usdt",
+        "max_price_drift_pct",
+        "market_entry_slippage_pct",
+        "sl_verify_delay_s",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(**{field: float("nan")})
+        with pytest.raises(ValidationError):
+            Settings(**{field: float("inf")})
+        with pytest.raises(ValidationError):
+            Settings(**{field: float("-inf")})
+
+
+def test_risk_floats_reject_out_of_range():
+    with pytest.raises(ValidationError):
+        Settings(max_risk_pct=0.0)  # must be > 0
+    with pytest.raises(ValidationError):
+        Settings(max_risk_pct=150.0)  # > 100
+    with pytest.raises(ValidationError):
+        Settings(max_leverage=0)  # must be >= 1
+    with pytest.raises(ValidationError):
+        Settings(max_notional_pct_of_equity=-1.0)  # must be >= 0
+    with pytest.raises(ValidationError):
+        Settings(max_notional_usdt=-1.0)  # must be >= 0
+
+
+def test_risk_floats_accept_valid_values():
+    s = Settings(
+        max_risk_pct=5.0,
+        min_rrr=2.0,
+        max_notional_pct_of_equity=5000.0,
+        risk_slippage_pct=0.05,
+        max_notional_usdt=500.0,
+        max_price_drift_pct=0.5,
+        market_entry_slippage_pct=0.15,
+        sl_verify_delay_s=0.7,
+        max_leverage=50,
+    )
+    assert s.max_risk_pct == 5.0
+    assert s.max_notional_pct_of_equity == 5000.0
+    # 0 = off must still be allowed for the equity-relative cap and the
+    # fixed-USDT warning threshold
+    s2 = Settings(max_notional_pct_of_equity=0.0, max_notional_usdt=0.0)
+    assert s2.max_notional_pct_of_equity == 0.0
+    assert s2.max_notional_usdt == 0.0
+
+
 def test_llm_base_urls_https_allowlist():
     with pytest.raises(ValidationError):
         Settings(anthropic_base_url="https://evil.example.com")

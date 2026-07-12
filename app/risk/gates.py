@@ -5,6 +5,7 @@ Grok proposals never bypass these — every ticket is re-validated.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -282,7 +283,16 @@ def validate_order(
                     f"{existing_same_side_risk_usdt:.4f} USDT "
                     "(conservative estimate from liquidation distance, not SL)"
                 )
-            if risk_p > settings.max_risk_pct + 1e-9:
+            # Defense-in-depth: config.py already rejects non-finite
+            # max_risk_pct, but guard here too so a NaN/Infinity that
+            # somehow slips through can't silently fail this gate open
+            # (risk_p > nan is always False).
+            if not math.isfinite(settings.max_risk_pct):
+                errors.append(
+                    "MAX_RISK_PCT is not a finite number — refusing to "
+                    "evaluate the risk gate (fail-closed)"
+                )
+            elif risk_p > settings.max_risk_pct + 1e-9:
                 errors.append(
                     f"risk {risk_p:.4f}% of equity exceeds MAX_RISK_PCT="
                     f"{settings.max_risk_pct} (incl. RISK_SLIPPAGE_PCT="
@@ -329,7 +339,16 @@ def validate_order(
         # HARD equity-relative fat-finger cap: notional <= equity × pct/100.
         # Scales with the account and stays fail-closed to known equity. 0 = off.
         pct_cap = float(getattr(settings, "max_notional_pct_of_equity", 0) or 0)
-        if pct_cap > 0 and equity is not None and float(equity) > 0:
+        # Defense-in-depth: guard against a non-finite pct_cap, which would
+        # otherwise silently disable this equity-relative cap (any comparison
+        # against NaN is False; cap computed from Infinity would never bind).
+        if not math.isfinite(pct_cap):
+            errors.append(
+                "MAX_NOTIONAL_PCT_OF_EQUITY is not a finite number — "
+                "refusing to evaluate the equity-relative notional gate "
+                "(fail-closed)"
+            )
+        elif pct_cap > 0 and equity is not None and float(equity) > 0:
             cap = float(equity) * pct_cap / 100.0
             if notional > cap + 1e-9:
                 errors.append(
