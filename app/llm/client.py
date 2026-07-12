@@ -454,7 +454,9 @@ def build_llm_context(
     settings: Settings,
 ) -> dict[str, Any]:
     account = account or {}
-    include_acct = bool(getattr(settings, "include_account_in_llm", True))
+    # F-15 (privacy): default to false (opt-in) — a missing attribute must
+    # fail closed toward NOT leaking account data, not toward sending it.
+    include_acct = bool(getattr(settings, "include_account_in_llm", False))
     # Order: daily (regime anchor) first, then htf (regime), then ltf (timing)
     ctx: dict[str, Any] = {
         "symbol": market_api.get("symbol"),

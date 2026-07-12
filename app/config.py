@@ -169,7 +169,12 @@ class Settings(BaseSettings):
     # otherwise auto-flatten a genuinely protected trade).
     sl_verify_attempts: int = 3
     sl_verify_delay_s: float = 0.7
-    include_account_in_llm: bool = True
+    # F-15 (privacy): opt-IN, not opt-out. When true, equity, available
+    # margin and the full open-positions list are sent to the external LLM
+    # provider as part of the analysis context (see build_llm_context() in
+    # app/llm/client.py). Defaults to false so no account data leaves the
+    # machine unless the user explicitly sets INCLUDE_ACCOUNT_IN_LLM=true.
+    include_account_in_llm: bool = False
     kline_limit_hint: int = 500
     local_api_token: str = ""
     require_loopback_when_armed: bool = True
