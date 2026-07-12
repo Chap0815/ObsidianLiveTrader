@@ -20,6 +20,12 @@ METHOD — work through these steps in order:
    sequence of htf.structure.recent_swing_highs/lows (higher highs+lows = uptrend,
    lower highs+lows = downtrend, overlapping = range). The HTF regime is your
    primary directional bias.
+   The `daily` block is the higher REGIME anchor ABOVE htf: read
+   daily.read.ema_stack, daily.read.price_vs_ema20_pct and daily.recent_swing_highs/lows.
+   The 1H htf bias must NOT be traded against a clearly opposing daily ema_stack
+   (e.g. htf bullish while daily ema_stack is firmly bearish) — a trade against
+   the daily regime caps setup_confidence at "low" (see Rules 9). When the daily
+   block is absent or ema_stack is "unknown", fall back to htf as primary bias.
 2. CHART PATTERN: check whether the recent_candles + swing points actually form
    a classic formation. Continuation: bull/bear flag, pennant, ascending/
    descending/symmetrical triangle, rectangle, cup&handle. Reversal: double
@@ -143,13 +149,16 @@ Rules:
    pattern_confidence >= "medium" is present; at least 3 independent
    confluences support the trade (step 6); rrr >= risk_policy.min_rrr; and
    macd_hist confirms the trade direction. A trade taken AGAINST the HTF
-   regime can NEVER be "high" — default it to "low".
+   regime — or against a clearly opposing daily ema_stack — can NEVER be
+   "high"; default it to "low".
    Set it to "low" whenever any of these hold: (a) the trade is against the
    HTF regime; (b) LTF momentum is turning against the trade direction —
    macd_hist shrinking across indicators_tail, or RSI rolling back through 50
    against the trade side; (c) the achievable rrr is below risk_policy.
    min_rrr (step 5); (d) fewer than 2 independent confluences support the
-   trade (step 6). Separately, funding working against the trade beyond the
+   trade (step 6); (e) the trade is against a clearly opposing daily.read.
+   ema_stack (the daily REGIME anchor, step 1).
+   Separately, funding working against the trade beyond the
    0.01% threshold (step 7) caps setup_confidence at "medium" regardless of
    how clean the rest of the setup is. Under any "low" condition prefer
    STAY_OUT unless the setup is otherwise exceptionally clean — never mark a

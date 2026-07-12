@@ -78,3 +78,39 @@ async def test_daily_cache_expires(monkeypatch):
     t[0] += ctxmod._DAILY_TTL_S + 1.0
     await build_market_snapshot("BTC_C", "15m", "1H", client)
     assert client.kline_calls["1D"] == 2
+
+
+class _DailyRaisingClient(_CountingClient):
+    """Same as _CountingClient, but klines() raises for the daily interval —
+    used to verify the fail-safe: a daily fetch error must not blow up
+    build_market_snapshot, it must just yield daily=None."""
+
+    async def klines(self, symbol, interval, limit_hint=200):
+        if interval == "1D":
+            self.kline_calls[interval] = self.kline_calls.get(interval, 0) + 1
+            raise RuntimeError("daily fetch boom")
+        return await super().klines(symbol, interval, limit_hint=limit_hint)
+
+
+@pytest.mark.asyncio
+async def test_daily_fetch_error_yields_none_daily():
+    clear_daily_cache()
+    client = _DailyRaisingClient()
+    snap = await build_market_snapshot("BTC_D", "15m", "1H", client)
+    d = snapshot_to_api_dict(snap)
+    assert d["daily"] is None
+    assert d["htf"] is not None and d["ltf"] is not None
+
+
+def test_prompt_mentions_daily_regime_anchor():
+    from app.llm.prompts import build_system_prompt
+    p = build_system_prompt()
+    assert "REGIME anchor" in p
+    assert "daily.read.ema_stack" in p
+
+
+def test_prompt_daily_caps_confidence_low():
+    from app.llm.prompts import build_system_prompt
+    p = build_system_prompt()
+    # against-daily-regime must appear as a 'low' setup_confidence condition
+    assert 'caps setup_confidence at "low"' in p

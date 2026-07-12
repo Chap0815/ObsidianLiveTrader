@@ -455,7 +455,7 @@ def build_llm_context(
 ) -> dict[str, Any]:
     account = account or {}
     include_acct = bool(getattr(settings, "include_account_in_llm", True))
-    # HTF first so the model reads regime before LTF timing context
+    # Order: daily (regime anchor) first, then htf (regime), then ltf (timing)
     ctx: dict[str, Any] = {
         "symbol": market_api.get("symbol"),
         "last_price": market_api.get("last_price"),
