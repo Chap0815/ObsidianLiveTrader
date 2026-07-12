@@ -149,8 +149,16 @@ _DEFAULT_MARKET_EXTRAS: dict[str, Any] = {
 # Daily candles change slowly; build_market_snapshot runs on every poll and coin
 # switch, so cache the 1D fetch per (symbol, interval) for 5 min to cut one
 # klines() call per poll. In-memory, process-local; clear_daily_cache() for tests.
+#
+# The cache is DEPTH-AWARE (audit B1): the entry stores the depth (`limit_hint`)
+# the series was fetched with. The scanner asks for a shallow anchor and the deep
+# analysis asks for a deeper one (EMA200 needs >= 200 candles). Keying only on
+# (symbol, interval) meant a shallow scan fetch was served back to the deeper
+# analysis request within the TTL, so daily.ema_stack silently went "unknown" on
+# the normal scan->analyze path. We now refetch when the cached series is
+# shallower than requested, and keep the deepest result.
 _DAILY_TTL_S: float = 300.0
-_daily_cache: dict[tuple[str, str], tuple[float, list[Candle]]] = {}
+_daily_cache: dict[tuple[str, str], tuple[float, list[Candle], int]] = {}
 
 
 def clear_daily_cache() -> None:
@@ -163,17 +171,21 @@ async def _fetch_daily_candles(
     """Daily anchor fetch. ADVISORY: must NEVER break the snapshot — a failed
     1D fetch returns [] (daily_slice=None, prompt falls back to htf). Errors
     are NOT cached so a transient failure doesn't stick for 5 minutes; an
-    empty-but-successful result (new coin) IS cached."""
+    empty-but-successful result (new coin) IS cached.
+
+    DEPTH-AWARE: a cached series is only reused when it was fetched at least as
+    deep as the current request. A shallow scan fetch is therefore NEVER served
+    to a deeper analysis request (which would leave EMA200/ema_stack "unknown")."""
     key = (symbol, daily)
     now = time.time()
     hit = _daily_cache.get(key)
-    if hit is not None and (now - hit[0]) < ttl:
+    if hit is not None and (now - hit[0]) < ttl and hit[2] >= limit_hint:
         return hit[1]
     try:
         candles = await client.klines(symbol, daily, limit_hint=limit_hint)
     except Exception:
         return []  # do not cache errors
-    _daily_cache[key] = (now, candles)
+    _daily_cache[key] = (now, candles, limit_hint)
     return candles
 
 
@@ -202,7 +214,7 @@ async def build_market_snapshot(
     *,
     limit_hint: int = 500,
     daily: str = "1D",
-    daily_limit_hint: int = 200,
+    daily_limit_hint: int = 260,
 ) -> MarketSnapshot:
     """Fetch public market data and compute LTF/HTF/Daily indicators + structure.
 

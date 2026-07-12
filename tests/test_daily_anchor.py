@@ -102,6 +102,65 @@ async def test_daily_fetch_error_yields_none_daily():
     assert d["htf"] is not None and d["ltf"] is not None
 
 
+class _DepthClient:
+    """klines() returns exactly `limit_hint` rising daily candles and records
+    every depth it was asked for — lets us prove the cache is depth-aware."""
+
+    def __init__(self):
+        self.daily_limits: list[int] = []
+
+    async def klines(self, symbol, interval, limit_hint=200):
+        self.daily_limits.append(limit_hint)
+        return [
+            Candle(
+                time=(1_700_000_000 + i * 86400) * 1000,
+                open=100.0 + i * 0.5, high=101.0 + i * 0.5,
+                low=99.0 + i * 0.5, close=100.5 + i * 0.5, vol=5.0,
+            )
+            for i in range(limit_hint)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_daily_cache_is_depth_aware_shallow_not_served_to_deep():
+    """B1: a shallow scan fetch (120) must NEVER be served back to the deeper
+    analysis request (260) within the TTL — that was leaving daily.ema_stack
+    'unknown' on the normal scan->analyze flow. The deeper series then also
+    satisfies later shallow requests without an extra fetch."""
+    from app.analysis.context import _fetch_daily_candles
+
+    clear_daily_cache()
+    client = _DepthClient()
+    shallow = await _fetch_daily_candles(client, "DEPTH", "1D", 120)
+    assert len(shallow) == 120
+    assert client.daily_limits == [120]
+
+    deep = await _fetch_daily_candles(client, "DEPTH", "1D", 260)
+    assert len(deep) == 260                     # NOT the cached 120 series
+    assert client.daily_limits == [120, 260]    # a real refetch happened
+
+    again = await _fetch_daily_candles(client, "DEPTH", "1D", 120)
+    assert len(again) == 260                     # deeper cache satisfies shallow
+    assert client.daily_limits == [120, 260]     # no extra fetch
+
+
+def test_daily_stack_is_real_with_sufficient_candles_but_unknown_when_shallow():
+    """B2: EMA200 needs >= 200 candles. With the scanner's old 120 the daily
+    regime anchor was ALWAYS 'unknown'; with >= 250 it computes for real."""
+    from app.llm.scanner import _daily_stack
+
+    candles = [
+        Candle(
+            time=(1_700_000_000 + i * 86400) * 1000,
+            open=100.0 + i * 0.5, high=101.0 + i * 0.5,
+            low=99.0 + i * 0.5, close=100.5 + i * 0.5, vol=5.0,
+        )
+        for i in range(260)
+    ]
+    assert _daily_stack("1D", candles) == "bullish"      # real anchor
+    assert _daily_stack("1D", candles[:120]) == "unknown"  # the dead-anchor bug
+
+
 def test_prompt_mentions_daily_regime_anchor():
     from app.llm.prompts import build_system_prompt
     p = build_system_prompt()
