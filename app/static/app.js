@@ -155,6 +155,7 @@
       rightPriceScale: {
         borderColor: "#2b2740",
         scaleMargins: { top: 0.08, bottom: 0.22 }, // room for volume below
+        entireTextOnly: true, // never draw a half-clipped price label at the edge
       },
       timeScale: {
         borderColor: "#2b2740",
@@ -251,15 +252,21 @@
       }
     }
 
-    window.addEventListener("resize", () => {
-      if (!state.chart || !el) return;
-      state.chart.applyOptions({
-        width: el.clientWidth,
-        height: Math.max(el.clientHeight, 280),
+    window.addEventListener("resize", scheduleChartResize);
+
+    // The window "resize" event alone misses container-size changes that
+    // aren't a viewport resize: grid/layout shifts, a scrollbar appearing,
+    // or the overview↔chart toggle (the container is display:none while the
+    // overview tab is active, so clientWidth is 0 and any resize during that
+    // window would otherwise collapse the canvas). Observe the actual wrap
+    // element so the chart always tracks its real box.
+    const wrapEl = $("chart-wrap") || el;
+    if (typeof ResizeObserver === "function") {
+      state._chartResizeObserver = new ResizeObserver(function () {
+        scheduleChartResize();
       });
-      sizeTradeOverlay();
-      drawTradeZones();
-    });
+      state._chartResizeObserver.observe(wrapEl);
+    }
 
     // Redraw trade zones whenever the chart is panned/zoomed
     try {
@@ -270,6 +277,35 @@
       /* older LWC */
     }
     sizeTradeOverlay();
+  }
+
+  /** Actually apply the chart's box size from its live container. Guarded
+   *  against a zero-size read (container hidden via display:none, e.g. while
+   *  the overview tab is active) so a stray resize event can't collapse the
+   *  chart to nothing. */
+  function resizeChart() {
+    const el = $("chart");
+    if (!state.chart || !el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (!w || !h) return; // hidden container — nothing to size yet
+    state.chart.applyOptions({ width: w, height: Math.max(h, 280) });
+    sizeTradeOverlay();
+    drawTradeZones();
+  }
+
+  // rAF-throttled entry point for both the window resize listener and the
+  // ResizeObserver — applyOptions() itself doesn't change the observed
+  // element's box, so this can't recurse into another observer callback;
+  // the rAF coalescing is just to avoid doing the work more than once per
+  // frame when both fire close together.
+  let _chartResizeRaf = null;
+  function scheduleChartResize() {
+    if (_chartResizeRaf != null) return;
+    _chartResizeRaf = requestAnimationFrame(function () {
+      _chartResizeRaf = null;
+      resizeChart();
+    });
   }
 
   /* ── Trade zones overlay: SL (red) / TP (green) fields from entry ─────
@@ -2008,29 +2044,98 @@
     }
   }
 
+  /** Many partial fills can land on the same candle (e.g. a large order that
+   *  ladders in over 30 small executions). One marker per fill turns into an
+   *  unreadable column of arrows + text stacked on one bar, and the actual
+   *  entry gets buried. Aggregate fills by (bar, side) into a single marker:
+   *  size = sum, price = size-weighted average. Open fills (per Hyperliquid's
+   *  `dir`, e.g. "Open Long") get the full-strength color so the entry stays
+   *  visually obvious; close-only groups get a dimmed variant. Text labels
+   *  are capped to the biggest groups by notional so a busy symbol doesn't
+   *  regress back into text spam, and the marker count itself is capped. */
+  const TRADE_MARKER_TEXT_CAP = 6;
+  const TRADE_MARKER_TOTAL_CAP = 40;
+
   function applyTradeMarkers() {
     if (
       !state.candleSeries ||
       typeof state.candleSeries.setMarkers !== "function"
     )
       return;
-    const markers = (state.fills || [])
-      .filter(function (f) {
-        return symMatch(f.symbol, state.symbol) && Number(f.time) > 0;
-      })
-      .map(function (f) {
-        const buy = f.side === "buy";
-        return {
-          time: barOpenTimeSec(f.time, state.tf || "15m"),
-          position: buy ? "belowBar" : "aboveBar",
-          color: buy ? "#4fbe8e" : "#e35349",
-          shape: buy ? "arrowUp" : "arrowDown",
-          text: (buy ? "▲ " : "▼ ") + fmt(f.sz, 4) + " @ " + fmt(f.px, 4),
-        };
-      });
-    markers.sort(function (a, b) {
+    const tf = state.tf || "15m";
+    const groups = new Map(); // "time|side" -> aggregated group
+
+    (state.fills || []).forEach(function (f) {
+      if (!symMatch(f.symbol, state.symbol) || !(Number(f.time) > 0)) return;
+      const side = f.side === "buy" ? "buy" : "sell";
+      const time = barOpenTimeSec(f.time, tf);
+      const sz = Number(f.sz) || 0;
+      const px = Number(f.px) || 0;
+      const dirStr = String(f.dir || "").toLowerCase();
+      const isClose = dirStr.indexOf("close") !== -1;
+      const key = time + "|" + side;
+      let g = groups.get(key);
+      if (!g) {
+        g = { time: time, side: side, sz: 0, notional: 0, anyOpen: false, anyClose: false };
+        groups.set(key, g);
+      }
+      g.sz += sz;
+      g.notional += sz * px;
+      if (isClose) g.anyClose = true;
+      else g.anyOpen = true;
+    });
+
+    let groupList = Array.from(groups.values());
+    groupList.sort(function (a, b) {
       return a.time - b.time;
     });
+    // Cap total markers: drop the oldest groups first.
+    if (groupList.length > TRADE_MARKER_TOTAL_CAP) {
+      groupList = groupList.slice(groupList.length - TRADE_MARKER_TOTAL_CAP);
+    }
+    // Only label the biggest groups (by notional) once there are more than
+    // a handful — otherwise text spam creeps back in on busy symbols.
+    let textKeys = null;
+    if (groupList.length > TRADE_MARKER_TEXT_CAP) {
+      textKeys = new Set(
+        groupList
+          .slice()
+          .sort(function (a, b) {
+            return b.notional - a.notional;
+          })
+          .slice(0, TRADE_MARKER_TEXT_CAP)
+          .map(function (g) {
+            return g.time + "|" + g.side;
+          })
+      );
+    }
+
+    const markers = groupList.map(function (g) {
+      const buy = g.side === "buy";
+      const avgPx = g.sz > 0 ? g.notional / g.sz : 0;
+      // A bucket with ANY open fill is treated as an entry (full color) even
+      // if it also contains a close fill — the entry is what must stand out.
+      const closeOnly = g.anyClose && !g.anyOpen;
+      const color = closeOnly
+        ? buy
+          ? "rgba(79, 190, 142, 0.45)" // dimmed: close of a long
+          : "rgba(227, 83, 73, 0.45)" // dimmed: close of a short
+        : buy
+          ? "#4fbe8e"
+          : "#e35349";
+      const marker = {
+        time: g.time,
+        position: buy ? "belowBar" : "aboveBar",
+        color: color,
+        shape: buy ? "arrowUp" : "arrowDown",
+      };
+      const wantText = !textKeys || textKeys.has(g.time + "|" + g.side);
+      if (wantText) {
+        marker.text = (buy ? "▲ " : "▼ ") + fmt(g.sz, 4) + " @ " + fmt(avgPx, 4);
+      }
+      return marker;
+    });
+
     try {
       state.candleSeries.setMarkers(markers);
     } catch (e) {
@@ -3322,6 +3427,12 @@
     const ov = $("overview-view");
     if (layout) layout.classList.remove("hidden");
     if (ov) ov.classList.add("hidden");
+    // The chart container was display:none while the overview tab was
+    // active (clientWidth 0). Force a fresh size read now that it's visible
+    // again — the ResizeObserver normally catches this, but do it
+    // explicitly too since display:none → block isn't reliably observed by
+    // all ResizeObserver implementations in the same frame it becomes true.
+    scheduleChartResize();
   }
 
   /** Coins to show: every open position (auto) + the watchlist, de-duped. */
