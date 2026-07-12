@@ -462,6 +462,7 @@ class OrderService:
         symbol: str,
         expected_sl: float,
         side: str,
+        pre_existing_same_side: bool = False,
     ) -> tuple[bool, str, bool]:
         """Best-effort check that exchange has SL protection near expected_sl.
 
@@ -476,6 +477,19 @@ class OrderService:
 
         Retries a few times because exchanges reflect a freshly placed trigger
         with a short delay — an immediate single lookup can miss a real SL.
+
+        F-C1 hardening: this fallback only runs when no concrete new-trigger oid
+        is available (see caller — the oid short-circuit at confirm time already
+        covers the safe case). Without an oid, a price-only match here cannot
+        tell OUR new stop apart from an OLD same-side stop that happens to rest
+        near the same price (e.g. adding to a position, or re-entering at a
+        similar level) — that old stop is sized for the OLD volume only and
+        does not protect the freshly added size. `pre_existing_same_side=True`
+        signals that ambiguity was possible; in that case a price-only match is
+        recorded as unresolved evidence and the result is UNKNOWN (checked=
+        False), never a false "verified". UNKNOWN never auto-flattens (see
+        confirm's flatten gate, which requires sl_checked=True) — it only
+        surfaces a loud manual-check warning, so the existing fail-safe holds.
         """
         sl_keys = (
             "stopLossPrice",
@@ -490,6 +504,8 @@ class OrderService:
         attempts = max(1, int(getattr(self.settings, "sl_verify_attempts", 3)))
         delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
         for attempt in range(attempts):
+            ambiguous_price_match = False
+
             # 1) Stop / plan orders — the authoritative SL source.
             try:
                 stops = await self.client.open_stop_orders(symbol)
@@ -519,6 +535,15 @@ class OrderService:
                         ):
                             continue
                         if _sl_matches(expected_sl, s.get(key)):
+                            if pre_existing_same_side:
+                                ambiguous_price_match = True
+                                last_detail = (
+                                    f"price-only match on stop order field {key} "
+                                    "— cannot confirm it protects the newly added "
+                                    "size (a same-side position pre-existed); not "
+                                    "counted as verified"
+                                )
+                                continue
                             return True, f"stop order field {key} matched", True
             except ExchangeError as e:
                 last_detail = str(e)
@@ -540,9 +565,24 @@ class OrderService:
                         elif key in p:
                             val = p.get(key)
                         if _sl_matches(expected_sl, val):
+                            if pre_existing_same_side:
+                                ambiguous_price_match = True
+                                last_detail = (
+                                    f"price-only match on position field {key} "
+                                    "— cannot confirm it protects the newly added "
+                                    "size (a same-side position pre-existed); not "
+                                    "counted as verified"
+                                )
+                                continue
                             return True, f"position field {key} matched", True
             except ExchangeError as e:
                 last_detail = last_detail or str(e)
+
+            if ambiguous_price_match:
+                # Do not resolve to MISSING either (that could wrongly trip
+                # auto-flatten against a still-protected old position) — return
+                # UNKNOWN immediately; retrying will not resolve the ambiguity.
+                return False, last_detail, False
 
             # Not found yet — the trigger may simply not be reflected. Wait & retry.
             if attempt < attempts - 1 and delay_s > 0:
@@ -834,7 +874,10 @@ class OrderService:
                     sl_detail = f"exchange accepted SL trigger (oid={sl_trigger_oid})"
                 else:
                     sl_verified, sl_detail, sl_checked = await self._verify_sl_attached(
-                        symbol=symbol, expected_sl=float(sl), side=ticket.side
+                        symbol=symbol,
+                        expected_sl=float(sl),
+                        side=ticket.side,
+                        pre_existing_same_side=bool(pre_hold_ok and pre_hold > 0),
                     )
                     if trigger_errors:
                         sl_detail += (

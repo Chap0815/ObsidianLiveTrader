@@ -518,6 +518,57 @@ async def test_sl_unknown_when_stop_endpoint_down_does_not_flatten():
 
 
 @pytest.mark.asyncio
+async def test_price_match_against_preexisting_stop_is_unknown_not_verified():
+    """F-C1: a same-side position pre-existed with its OWN old stop resting
+    near the same price as the new order's expected SL (e.g. re-entering at a
+    similar level). No concrete new-trigger oid is returned (place_order
+    response carries none, forcing the price-tolerance fallback). The OLD
+    stop must NOT be credited to the freshly added size — that would falsely
+    mark the new size 'verified' while only the old volume is protected.
+    Expected: UNKNOWN (sl_verified False, sl_checked False), not verified."""
+    client = _happy_client({"orderId": 1})  # no slTriggerOid → fallback path
+    pre = [
+        {
+            "symbol": "BTC_USDT",
+            "positionType": 1,
+            "holdVol": 50.0,
+            "holdAvgPrice": 100_000.0,
+            "liquidatePrice": 90_000.0,
+        }
+    ]
+    # preview existing risk, confirm existing risk, pre_hold, verify-step2 positions
+    client.positions = AsyncMock(side_effect=[pre, pre, pre, pre])
+    # An OLD stop order already resting, priced exactly at the NEW order's
+    # expected SL (99_000.0) — sized for the OLD 50 units only.
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {"orderId": 111, "symbol": "BTC_USDT", "orderType": "Stop",
+             "triggerPrice": 99_000.0}
+        ]
+    )
+    client.assets = AsyncMock(
+        return_value=[
+            {"currency": "USDT", "equity": 1_000_000.0, "availableBalance": 900_000.0}
+        ]
+    )
+    svc = OrderService(
+        client,
+        _settings(max_risk_pct=100.0, max_notional_usdt=1_000_000.0,
+                  auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False  # UNKNOWN, not a false "verified"
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNBEKANNT" in w for w in out["warnings"])
+    # UNKNOWN never auto-flattens (fail-safe requires sl_checked=True to flatten)
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_shared_trade_lock_serializes_confirm_across_instances():
     """A new OrderService is built per request, so the lock that serializes
     confirm/close MUST be shared. With a shared lock held, a second confirm
