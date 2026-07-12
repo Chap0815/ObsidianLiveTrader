@@ -164,34 +164,38 @@ def run_with_venv(vpy: Path, script_rel: str, *args: str) -> int:
     )
 
 
-def ensure_env(vpy: Path) -> None:
-    code = run_with_venv(vpy, "scripts/ensure_env.py")
+def bootstrap_env(vpy: Path, *, port: int) -> None:
+    """Write a minimal safe .env (via the shared builder) if none exists.
+
+    Canonical first-run path: the browser opens at /setup and the user finishes
+    setup there. No interactive CLI wizard runs by default.
+    """
+    if (ROOT / ".env").is_file():
+        return
+    code = run_with_venv(vpy, "scripts/write_bootstrap_env.py", "--port", str(port))
     if code != 0:
         raise SystemExit(code)
 
 
-def maybe_run_wizard(vpy: Path, *, force: bool, skip: bool) -> None:
-    if skip:
-        print("Setup-Assistent übersprungen (--skip-setup)")
-        return
-    if force:
-        code = run_with_venv(vpy, "scripts/setup_wizard.py", "--force")
-        if code != 0:
-            raise SystemExit(code)
-        return
-    code = run_with_venv(vpy, "scripts/setup_wizard.py", "--check-only")
-    if code == 2:
-        print()
-        print("Exchange-Keys fehlen noch — starte Einrichtungsassistent …")
-        print()
-        code = run_with_venv(vpy, "scripts/setup_wizard.py")
-        if code != 0:
-            raise SystemExit(code)
-    elif code == 0:
-        print("Einrichtung OK (Keys vorhanden). Assistent: launch.py --setup")
-    else:
-        # ensure_env noise may still exit 0; non-0/2 is error
-        print(f"Hinweis: setup_wizard --check-only exit {code}")
+def run_setup_cli(vpy: Path) -> None:
+    """Headless fallback: the CLI wizard shares the same builder + questions."""
+    code = run_with_venv(vpy, "scripts/setup_wizard.py", "--force")
+    if code != 0:
+        raise SystemExit(code)
+
+
+def read_setup_complete() -> bool:
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        return False
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        if k.strip() == "SETUP_COMPLETE":
+            return v.strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 def read_port_host() -> tuple[str, int]:
@@ -239,8 +243,20 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Launch Local Futures Trader")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--skip-install", action="store_true")
-    p.add_argument("--setup", action="store_true", help="Immer Einrichtungsassistent")
-    p.add_argument("--skip-setup", action="store_true", help="Kein Wizard")
+    p.add_argument(
+        "--setup-cli",
+        action="store_true",
+        help="Headless-Einrichtung im Terminal statt im Browser",
+    )
+    p.add_argument("--skip-setup", action="store_true", help="Kein Bootstrap/Wizard")
+    p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port für Bootstrap-.env (Default 8787). Bei belegtem Port beim "
+        "Erst-Start setzen; ein im /setup geänderter Port greift erst beim "
+        "nächsten Start (laufendes uvicorn kann nicht neu binden).",
+    )
     p.add_argument("--reload", action="store_true", help="uvicorn --reload (dev)")
     args = p.parse_args()
 
@@ -257,16 +273,21 @@ def main() -> None:
     vpy = ensure_venv(_venv_python())
     # 2) deps only into venv
     ensure_deps(vpy, skip=args.skip_install)
-    # 3) env + wizard via venv python
-    ensure_env(vpy)
-    maybe_run_wizard(vpy, force=args.setup, skip=args.skip_setup)
+    # 3) first-run bootstrap: write a minimal safe .env (browser finishes setup)
+    if not args.skip_setup:
+        if args.setup_cli:
+            run_setup_cli(vpy)
+        else:
+            bootstrap_env(vpy, port=(args.port or 8787))
 
     host, port = read_port_host()
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: HOST={host} is not loopback — forcing 127.0.0.1")
         host = "127.0.0.1"
 
-    url = f"http://127.0.0.1:{port}"
+    # Open the browser at /setup while setup is incomplete, else the dashboard.
+    setup_open = not read_setup_complete()
+    url = f"http://127.0.0.1:{port}{'/setup' if setup_open else ''}"
     print()
     print(f"Exchange: {read_exchange_banner()}")
     print(f"Server:   {url}")
