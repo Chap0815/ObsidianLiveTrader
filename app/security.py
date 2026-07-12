@@ -143,6 +143,7 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         "/api/history",
         "/api/llm",
         "/api/setup",
+        "/api/settings",
         "/api/scan",
         "/api/fills",
         "/api/reevaluate",

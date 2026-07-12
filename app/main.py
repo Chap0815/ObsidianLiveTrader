@@ -357,6 +357,143 @@ async def setup_test_provider(request: Request, body: dict):
     )
 
 
+# ── Post-setup KI-key management (authenticated) ─────────────────────
+# /api/settings/* is in private_prefixes (loopback+token) and every route
+# below depends on require_local_token. Writes go through the whitelist-only
+# atomic patcher; stored secrets are NEVER returned to the client.
+_PROVIDER_LABELS = {
+    "claude": "Claude Opus",
+    "xai": "Grok",
+    "openai": "Codex",
+    "ollama": "Ollama (lokal)",
+}
+
+
+def _settings_llm_status(request: Request) -> dict:
+    from app.env_builder import LLM_KEY_VARS
+
+    s = get_settings()
+    eff = _llm_settings(request)
+    configured = {
+        "claude": s.claude_ready,
+        "xai": s.xai_ready,
+        "openai": s.openai_ready,
+        "ollama": s.ollama_ready,
+    }
+    models = {
+        "claude": s.anthropic_model,
+        "xai": s.xai_model,
+        "openai": s.openai_model,
+        "ollama": s.ollama_model,
+    }
+    providers = [
+        {
+            "id": pid,
+            "label": _PROVIDER_LABELS[pid],
+            "configured": bool(configured[pid]),
+            "model": models[pid],
+        }
+        for pid in LLM_KEY_VARS
+    ]
+    return {"providers": providers, "active": eff.llm_provider}
+
+
+@app.get("/api/settings/llm")
+async def settings_llm_get(
+    request: Request, _: None = Depends(require_local_token)
+) -> dict:
+    """KI-Keys panel status. No secrets returned — only configured + model."""
+    return _settings_llm_status(request)
+
+
+@app.post("/api/settings/llm-key")
+async def settings_llm_key(
+    request: Request, body: dict, _: None = Depends(require_local_token)
+) -> dict:
+    """Append/update ONE provider's key + model. Whitelist-only, atomic.
+
+    Never changes LLM_PROVIDER (that stays the job of POST /api/llm) and never
+    echoes the key. api_key empty leaves the existing key line untouched.
+    """
+    from app.env_builder import (
+        DEFAULT_MODELS,
+        LLM_KEY_VARS,
+        SETTINGS_LLM_WRITABLE,
+        patch_env_vars,
+    )
+
+    provider = str((body or {}).get("provider") or "").strip().lower()
+    aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
+    provider = aliases.get(provider, provider)
+    if provider not in LLM_KEY_VARS:
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be one of: claude, xai, openai, ollama",
+        )
+    key_var, model_var = LLM_KEY_VARS[provider]
+    api_key = str((body or {}).get("api_key") or "").strip()
+    model = str((body or {}).get("model") or "").strip()
+
+    s = get_settings()
+    current_model = {
+        "claude": s.anthropic_model,
+        "xai": s.xai_model,
+        "openai": s.openai_model,
+        "ollama": s.ollama_model,
+    }[provider]
+
+    updates: dict[str, str] = {}
+    if key_var is not None and api_key:
+        updates[key_var] = api_key
+    if model:
+        updates[model_var] = model
+    elif not (current_model or "").strip():
+        updates[model_var] = DEFAULT_MODELS[provider]
+
+    if updates:
+        try:
+            patch_env_vars(
+                ENV_PATH, updates, allowed=set(SETTINGS_LLM_WRITABLE)
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        get_settings.cache_clear()
+
+    return _settings_llm_status(request)
+
+
+@app.post("/api/settings/test-provider")
+async def settings_test_provider(
+    request: Request, body: dict, _: None = Depends(require_local_token)
+) -> dict:
+    """Authenticated read-only probe. If api_key omitted, use the STORED key
+    (server-side; never returned)."""
+    from app.env_builder import LLM_KEY_VARS
+    from app.llm.probe import probe_provider
+
+    provider = str((body or {}).get("provider") or "").strip().lower()
+    aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
+    provider = aliases.get(provider, provider)
+    if provider not in LLM_KEY_VARS:
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be one of: claude, xai, openai, ollama",
+        )
+    api_key = str((body or {}).get("api_key") or "").strip()
+    model = str((body or {}).get("model") or "").strip()
+    s = get_settings()
+    if not api_key:
+        api_key = {
+            "claude": s.anthropic_api_key,
+            "xai": s.xai_api_key,
+            "openai": s.openai_api_key,
+            "ollama": "",
+        }[provider]
+    return await probe_provider(
+        provider, api_key=api_key, model=model, ollama_base_url=s.ollama_base_url
+    )
+
+
 # Majors fallback so the dropdown is usable even during an exchange outage
 FALLBACK_COINS = [
     "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK",
