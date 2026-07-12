@@ -23,6 +23,10 @@
     previewSummary: null,
     orderBusy: false,
     closeBusy: false,
+    slBusy: false, // SL→BE move in flight (double-submit guard)
+    historyClearBusy: false, // history reset in flight
+    _cancelBusy: {}, // per-order cancel guards (F6/F7)
+    llmLabel: "KI", // active provider label for the analyze spinner
     apiAllowed: null,
     localToken: "", // optional: set window.LOCAL_API_TOKEN or localStorage mexc_local_token
     market: null,
@@ -1562,13 +1566,16 @@
   }
 
   function posKv(label, value, cls) {
+    // Escape both — latent XSS sink hardening (F5). All current callers pass
+    // static labels + fmt() numbers, so escaping is a no-op today but closes
+    // the hole if this is ever fed exchange/feed data.
     return (
       '<span class="pos-kv"><b>' +
-      label +
+      escapeHtml(String(label)) +
       "</b><span" +
       (cls ? ' class="' + cls + '"' : "") +
       ">" +
-      value +
+      escapeHtml(String(value)) +
       "</span></span>"
     );
   }
@@ -2286,6 +2293,11 @@
 
   async function cancelOrder(orderId) {
     if (!orderId) return;
+    // Per-order double-submit guard: a double-click must not fire two cancels
+    // for the same order (F6). Keyed by id so distinct orders still cancel.
+    if (!state._cancelBusy) state._cancelBusy = {};
+    if (state._cancelBusy[orderId]) return;
+    state._cancelBusy[orderId] = true;
     try {
       const res = await apiFetch("/api/orders/cancel", {
         method: "POST",
@@ -2308,6 +2320,8 @@
       loadHistory();
     } catch (err) {
       showToast("Cancel Fehler: " + (err && err.message), "err");
+    } finally {
+      delete state._cancelBusy[orderId];
     }
   }
 
