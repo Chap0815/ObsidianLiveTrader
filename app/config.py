@@ -148,10 +148,10 @@ class Settings(BaseSettings):
     trading_enabled: bool = False
     allow_unprotected_entry: bool = False
     # Manual trigger_mode places an entry WITHOUT an exchange-side SL/TP (the
-    # trader manages the exit). Default True keeps existing behaviour; set False
-    # to fail-closed and block manual orders on confirm even when
-    # ALLOW_UNPROTECTED_ENTRY=false would otherwise let manual bypass the stop.
-    allow_manual_trigger: bool = True
+    # trader manages the exit). Fail-closed default False so a hand-written or
+    # incomplete .env cannot silently allow a naked manual entry; set True in
+    # .env to opt in.
+    allow_manual_trigger: bool = False
     risk_slippage_pct: float = 0.05
     # WARNING threshold only — NOT a hard cap. A larger order still passes as
     # long as the equity-relative cap (max_notional_pct_of_equity, the real

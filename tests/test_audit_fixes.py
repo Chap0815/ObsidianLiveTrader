@@ -26,6 +26,9 @@ def _settings(**kwargs) -> Settings:
         max_price_drift_pct=0.5,
         market_entry_slippage_pct=0.15,
         allow_cross_margin=False,
+        # Global default is now fail-closed (False); these order tests exercise
+        # the manual path, so opt in explicitly (mirrors an .env that set it).
+        allow_manual_trigger=True,
         auto_flatten_if_sl_unverified=True,
         preview_token_ttl_seconds=60,
         sl_verify_attempts=1,
