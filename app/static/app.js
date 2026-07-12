@@ -3664,31 +3664,50 @@
   function renderNews() {
     const box = $("overview-news");
     if (!box) return;
-    const items = state.newsItems || [];
-    if (!items.length) {
+    const all = state.newsItems || [];
+    if (!all.length) {
       box.innerHTML = '<div class="news-empty">Keine aktuellen Schlagzeilen.</div>';
       return;
     }
-    box.innerHTML = items
-      .map(function (it) {
-        const url = String((it && it.url) || "");
-        const safe = /^https?:\/\//i.test(url) ? url : "";
-        const open = safe
-          ? '<a class="news-item" href="' + escapeHtml(safe) +
-            '" target="_blank" rel="noopener noreferrer">'
-          : '<div class="news-item">';
-        const close = safe ? "</a>" : "</div>";
-        return (
-          open +
-          '<span class="news-title">' + escapeHtml((it && it.title) || "") + "</span>" +
-          '<span class="news-meta">' +
-          '<span class="news-src">' + escapeHtml((it && it.source) || "") + "</span>" +
-          '<span class="news-time">' + escapeHtml(relTime(it && it.published)) + "</span>" +
-          "</span>" +
-          close
-        );
-      })
+    // Curated desk, not a log: a handful of items, the freshest featured.
+    const items = all.slice(0, 14);
+    const leadCount = Math.min(3, items.length);
+
+    // Build one clickable card. EVERY feed string is escaped (feeds are
+    // untrusted); links are http(s)-whitelisted + rel="noopener noreferrer".
+    function card(it, kind) {
+      const url = String((it && it.url) || "");
+      const safe = /^https?:\/\//i.test(url) ? url : "";
+      const cls = kind === "lead" ? "news-lead" : "news-row";
+      const open = safe
+        ? '<a class="' + cls + '" href="' + escapeHtml(safe) +
+          '" target="_blank" rel="noopener noreferrer">'
+        : '<div class="' + cls + '">';
+      const close = safe ? "</a>" : "</div>";
+      const titleCls = kind === "lead" ? "news-lead-title" : "news-row-title";
+      const metaCls = kind === "lead" ? "news-lead-meta" : "news-row-meta";
+      return (
+        open +
+        '<span class="' + titleCls + '">' + escapeHtml((it && it.title) || "") + "</span>" +
+        '<span class="' + metaCls + '">' +
+        '<span class="news-src">' + escapeHtml((it && it.source) || "") + "</span>" +
+        '<span class="news-dot" aria-hidden="true">·</span>' +
+        '<span class="news-time">' + escapeHtml(relTime(it && it.published)) + "</span>" +
+        "</span>" +
+        close
+      );
+    }
+
+    const leads = items.slice(0, leadCount)
+      .map(function (it) { return card(it, "lead"); })
       .join("");
+    const rest = items.slice(leadCount)
+      .map(function (it) { return card(it, "row"); })
+      .join("");
+
+    let html = '<div class="news-leads">' + leads + "</div>";
+    if (rest) html += '<div class="news-rest">' + rest + "</div>";
+    box.innerHTML = html;
   }
 
   /** 5-min-throttled news refresh. Mirrors the _miniLast guard so the 30s
