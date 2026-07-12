@@ -1144,3 +1144,62 @@ async def test_place_order_empty_body_2xx_recovers_via_external_oid():
     assert out["ok"] is True
     assert "recovered_placed" in out["status"]
     assert any("DO NOT re-preview" in w for w in out["warnings"])
+
+
+# ── F-05: stale/ambiguous stop-order endpoint must yield UNKNOWN, not MISSING ─
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_all_paths_ambiguous_raises_not_empty():
+    """A stale/deprecated stop-order endpoint that replies 2xx with an
+    unrecognized shape (not a list, no resultList) must NOT be trusted as
+    'no stop orders' — if every candidate path returns such an ambiguous
+    body, open_stop_orders must raise (so callers mark the check UNKNOWN),
+    not silently return []."""
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        return {}  # unrecognized: no resultList key, not a list
+
+    c._request = fake_request  # type: ignore[assignment]
+    with pytest.raises(MexcError):
+        await c.open_stop_orders("BTC_USDT")
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_trusts_recognized_empty_list():
+    """A genuinely recognized empty result (bare list) is still trustworthy —
+    the fix must not turn every empty response into a false UNKNOWN."""
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        return []
+
+    c._request = fake_request  # type: ignore[assignment]
+    out = await c.open_stop_orders("BTC_USDT")
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_sl_ambiguous_stop_endpoint_is_unknown_not_missing_no_flatten():
+    """If the stop-order lookup returns an ambiguous/empty body (client
+    raises), SL state must be UNKNOWN (checked=False), never MISSING —
+    auto-flatten must not close a possibly-protected position."""
+    client = _happy_client({"orderId": 1}, post_hold=1.0)
+    client.open_stop_orders = AsyncMock(
+        side_effect=MexcError(
+            "unrecognized stop-order response shape from all candidate paths"
+        )
+    )
+    svc = OrderService(
+        client,
+        _settings(auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    client.close_position_market.assert_not_awaited()

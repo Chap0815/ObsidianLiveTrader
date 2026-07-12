@@ -440,9 +440,17 @@ class MexcClient:
         """GET open stop / plan orders.
 
         The exact path varies by MEXC revision and is not guaranteed by a live
-        test here — try several known candidates and return the first that the
-        API accepts. Only if ALL candidates error do we propagate the last error
-        (so the SL-verify path can treat it as UNKNOWN, never MISSING).
+        test here — try several known candidates and return the first that
+        answers with a RECOGNIZED order-list schema (a bare list, or a dict
+        containing "resultList" — an empty list/resultList is still trusted,
+        that's a genuine "no stop orders" answer).
+
+        A stale/deprecated endpoint that responds 2xx with an unrecognized
+        shape (e.g. `{}` or `null` instead of erroring) is NOT proof of "no
+        stop orders" — it is treated the same as a failing candidate, so if
+        every candidate is either an error or unrecognized, the last error is
+        propagated (never a silent []) and the SL-verify path treats the check
+        as UNKNOWN, never MISSING.
         """
         params: dict[str, Any] = {"page_num": 1, "page_size": 100}
         if symbol:
@@ -458,7 +466,11 @@ class MexcClient:
                 return list(data.get("resultList") or [])
             if isinstance(data, list):
                 return data
-            return list(data or []) if data else []
+            # Unrecognized schema — do not trust as "no stop orders"; the
+            # endpoint may be stale/deprecated. Keep trying other candidates.
+            last_err = MexcError(
+                f"unrecognized stop-order response shape from {path}", raw=data
+            )
         if last_err is not None:
             raise last_err
         return []
