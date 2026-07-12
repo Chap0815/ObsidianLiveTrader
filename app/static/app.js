@@ -1512,6 +1512,9 @@
     // so we must not raise a false "no stop-loss" alarm.
     const ordersKnown = !!(oo && oo.stop_orders && !oo.stops_error);
     const stops = (oo && oo.stop_orders) || [];
+    const entry = Number(p.entry_price);
+    const hasEntry = Number.isFinite(entry) && entry > 0;
+    const short = String(p.side || "").toLowerCase() === "short";
     stops.forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, p.symbol)) return;
       const slField = Number(s.stopLossPrice);
@@ -1525,10 +1528,21 @@
       const t = String(s.orderType || "").toLowerCase();
       if (t.indexOf("take") >= 0 || t.indexOf("tp") === 0) { tp = trg; return; }
       if (t.indexOf("stop") >= 0 || t.indexOf("sl") === 0) { sl = trg; return; }
-      // 3) No field/label available → default to SL, consistent with
-      // drawOrderLines() and the order list, which both treat an
-      // unlabeled trigger as a protective stop rather than guessing from price.
-      sl = trg;
+      // 3) No field/label available → classify by side vs entry (mirrors the
+      // backend's _classify_unlabeled_trigger): a stop sits on the LOSS side
+      // of entry, a take-profit on the PROFIT side. A trigger at/very near
+      // entry is a break-even stop — it IS protection, so classify it as SL
+      // rather than "unknown" (a real breakeven stop must not read as
+      // unprotected). If side/entry can't be resolved, leave it unknown
+      // rather than guessing SL (F-12b: a fabricated SL can mask an actually
+      // unprotected position, same as a fabricated "unprotected" can hide a
+      // real breakeven stop).
+      if (!hasEntry) return;
+      const beTolerance = entry * 0.001; // within ~0.1% of entry = breakeven
+      if (Math.abs(trg - entry) <= beTolerance) { sl = trg; return; }
+      const below = trg < entry;
+      if (short ? !below : below) sl = trg;
+      else tp = trg;
     });
     const mk = state.tradeMarkers && state.tradeMarkers[String(p.symbol || "").toUpperCase()];
     let manual = false;
