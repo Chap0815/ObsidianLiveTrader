@@ -98,6 +98,9 @@ class MarketSnapshot(BaseModel):
     contract: dict[str, Any] = Field(default_factory=dict)
     ltf: TimeframeSlice
     htf: TimeframeSlice
+    # Positioning extras (Hyperliquid meta ctx): open_interest, premium,
+    # prev_day_px, oi_change_pct_1h/4h. Empty dict on exchanges without OI.
+    market: dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Grok Trade Proposal (design §7) ---

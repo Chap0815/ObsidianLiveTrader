@@ -136,6 +136,32 @@ def build_tf_slice(tf: str, candles: list[Candle]) -> TimeframeSlice:
     )
 
 
+_DEFAULT_MARKET_EXTRAS: dict[str, Any] = {
+    "open_interest": None,
+    "premium": None,
+    "prev_day_px": None,
+    "oi_change_pct_1h": None,
+    "oi_change_pct_4h": None,
+}
+
+
+async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
+    """OI/premium extras if the client exposes market_extras(); else None-filled.
+
+    MEXC has no open interest in ticker() and does NOT implement market_extras,
+    so this returns the all-None default. Any fetch error is swallowed to a
+    None-dict — OI is advisory context and must never break the snapshot.
+    """
+    fn = getattr(client, "market_extras", None)
+    if fn is None:
+        return dict(_DEFAULT_MARKET_EXTRAS)
+    try:
+        extras = await fn(symbol)
+    except Exception:
+        return dict(_DEFAULT_MARKET_EXTRAS)
+    return {**_DEFAULT_MARKET_EXTRAS, **(extras or {})}
+
+
 async def build_market_snapshot(
     symbol: str,
     ltf: str,
@@ -151,12 +177,13 @@ async def build_market_snapshot(
     # Fetch all public market data in parallel — these are independent upstream
     # calls; running them sequentially was the main source of chart lag on every
     # coin switch and poll. The ctx cache keeps ticker+funding from double-hitting.
-    ticker, funding, contract, ltf_candles, htf_candles = await asyncio.gather(
+    ticker, funding, contract, ltf_candles, htf_candles, extras = await asyncio.gather(
         client.ticker(symbol),
         client.funding_rate(symbol),
         client.contract_meta(symbol),
         client.klines(symbol, ltf, limit_hint=limit_hint),
         client.klines(symbol, htf, limit_hint=limit_hint),
+        _fetch_market_extras(client, symbol),
     )
 
     ltf_slice = build_tf_slice(ltf, ltf_candles)
@@ -169,6 +196,7 @@ async def build_market_snapshot(
         contract=_contract_public(contract),
         ltf=ltf_slice,
         htf=htf_slice,
+        market=extras,
     )
 
 
@@ -189,4 +217,5 @@ def snapshot_to_api_dict(snap: MarketSnapshot) -> dict[str, Any]:
         "contract": snap.contract,
         "ltf": slice_dict(snap.ltf),
         "htf": slice_dict(snap.htf),
+        "market": snap.market or {},
     }

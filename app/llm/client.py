@@ -421,6 +421,12 @@ def build_llm_context(
         "symbol": market_api.get("symbol"),
         "last_price": market_api.get("last_price"),
         "funding": market_api.get("funding") or {},
+        "market": {
+            "open_interest": (market_api.get("market") or {}).get("open_interest"),
+            "oi_change_pct_1h": (market_api.get("market") or {}).get("oi_change_pct_1h"),
+            "oi_change_pct_4h": (market_api.get("market") or {}).get("oi_change_pct_4h"),
+            "premium": (market_api.get("market") or {}).get("premium"),
+        },
         "contract": market_api.get("contract") or {},
         "htf": compact_tf_for_llm(market_api.get("htf") or {}),
         "ltf": compact_tf_for_llm(market_api.get("ltf") or {}),

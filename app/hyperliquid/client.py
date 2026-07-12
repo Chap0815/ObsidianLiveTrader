@@ -23,6 +23,16 @@ INTERVAL_MAP = {
 }
 
 
+def _opt_f(v: Any) -> float | None:
+    """float(v) or None — for optional numeric ctx fields (openInterest, premium)."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def to_hl_coin(symbol: str) -> str:
     """BTC_USDT / BTC-USDT / BTC → BTC."""
     s = (symbol or "").strip().upper().replace("-", "_")
@@ -298,6 +308,38 @@ class HyperliquidClient:
             funding_rate=float(t.funding_rate or 0),
             timestamp=t.timestamp,
         )
+
+    async def market_extras(self, symbol: str) -> dict[str, Any]:
+        """Open interest / premium context from meta_and_asset_ctxs.
+
+        Reads the SAME short-TTL ctx cache as ticker()/funding_rate() so this
+        adds no extra upstream hit. oi_change_pct_* are filled in Task 2 from an
+        in-memory OI history; here they are None. MEXC has no equivalent and does
+        NOT implement this method (see app/analysis/context._fetch_market_extras).
+        """
+
+        def _x():
+            coin = to_hl_coin(symbol)
+            meta_ctx = self._meta_ctxs_sync()
+            universe = meta_ctx[0].get("universe") if meta_ctx else []
+            ctxs = meta_ctx[1] if meta_ctx and len(meta_ctx) > 1 else []
+            oi = premium = prev_day_px = None
+            for i, u in enumerate(universe or []):
+                if str(u.get("name", "")).upper() == coin and i < len(ctxs):
+                    c = ctxs[i] or {}
+                    oi = _opt_f(c.get("openInterest"))
+                    premium = _opt_f(c.get("premium"))
+                    prev_day_px = _opt_f(c.get("prevDayPx"))
+                    break
+            return {
+                "open_interest": oi,
+                "premium": premium,
+                "prev_day_px": prev_day_px,
+                "oi_change_pct_1h": None,
+                "oi_change_pct_4h": None,
+            }
+
+        return await self._to_thread(_x)
 
     async def klines(
         self, symbol: str, interval: str, limit_hint: int = 200
