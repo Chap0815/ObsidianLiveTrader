@@ -15,24 +15,55 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-from app.analysis.context import build_tf_slice, _candles_public  # noqa: F401
+from app.analysis.context import (  # noqa: F401
+    build_tf_slice,
+    _candles_public,
+    _fetch_daily_candles,
+    _funding_annualized,
+    _funding_extreme,
+)
 from app.config import Settings
-from app.llm.client import LlmError, compact_tf_for_llm, extract_json_object
+from app.llm.client import (
+    LlmError,
+    compact_daily_for_llm,
+    compact_tf_for_llm,
+    extract_json_object,
+)
 
 SCANNER_SYSTEM_PROMPT = """You are a futures market screener for USDT-M perpetuals.
 You receive compact summaries (indicators, structure, funding) for several coins.
 Select ONLY coins with a clear, tradeable directional edge right now.
 
-Selection method per coin:
-1. Regime: read.ema_stack + price vs EMAs. Skip "mixed" unless a clean range
-   fade at range_high/range_low exists.
-2. Momentum: rsi14 and macd_hist tails must support the direction.
-3. Location: price must be NEAR a actionable level (support/resistance/swing),
-   not in the middle of nowhere. Use read.price_vs_ema20_pct for stretch.
-4. Funding as tiebreaker: crowded funding against the setup lowers the score.
+This screen is the fast first stage before a stricter deep analysis. To stop
+surfacing coins the deep stage will only reject, apply that stage's cheap
+NON-NEGOTIABLE gates here too. REJECT a coin (do not include it) if ANY holds:
+  - No-chase / over-stretch: price has already run far from value —
+    |read.price_vs_ema20_pct| is large (roughly > 1.5x a normal push) with no
+    fresh pullback level nearby. An already-extended breakout is not a fresh
+    entry.
+  - Coarse RRR infeasible: the distance from price to the NEAREST opposing
+    structure level (support for a short, resistance for a long) is smaller
+    than a sane structure+ATR stop on the other side — i.e. reward < risk. If
+    there is no room to a target, skip it.
+  - Against the daily regime: daily_stack (the 1D ema_stack anchor) is firmly
+    opposite the intended bias (e.g. long while daily_stack is bearish). A pick
+    hard against the daily regime is scored down heavily / dropped.
 
-Scoring: 0-10. Only include coins with score >= 5. Maximum 6 results,
-sorted by score descending. It is fine to return an empty list.
+Selection method per coin:
+1. Regime: read.ema_stack + price vs EMAs, cross-checked against daily_stack.
+   Skip "mixed" unless a clean range fade at range_high/range_low exists.
+2. Momentum: rsi14 and macd_hist tails must support the direction.
+3. Location: price must be NEAR an actionable level (support/resistance/swing),
+   not in the middle of nowhere. Use read.price_vs_ema20_pct for stretch.
+4. Funding as tiebreaker: use fundingExtreme ("crowded_long"/"crowded_short"/
+   "neutral") and fundingAnnualized, not just the raw rate — crowded funding
+   against the setup (e.g. crowded_long under a long idea = squeeze risk)
+   lowers the score.
+
+Scoring: 0-10 as an ABSOLUTE quality bar, not a relative ranking. A 6 means
+"a disciplined analyst would actually take this now." Only include coins with
+score >= 6 that clear every gate above. Maximum 6 results, sorted by score
+descending. Returning an empty list is the correct answer in a quiet market.
 
 Output ONLY valid JSON, no markdown, exactly this schema:
 {
@@ -111,8 +142,17 @@ def _salvage_result_objects(text: str) -> list[dict]:
     return objs
 
 
+# Absolute keep gate for the deep-analysis handoff. The scanner score is an
+# absolute quality bar (not a relative top-N rank): a coin below this is one the
+# deep analyzer would reject anyway, so it must not be surfaced (audit B2).
+SCANNER_MIN_SCORE = 6.0
+
+
 def parse_scan_results(
-    text: str, allowed_symbols: set[str] | None = None
+    text: str,
+    allowed_symbols: set[str] | None = None,
+    *,
+    min_score: float = 0.0,
 ) -> list[ScanResult]:
     """Parse + validate the screener output. Invalid rows are dropped.
 
@@ -121,7 +161,11 @@ def parse_scan_results(
 
     F-22: when `allowed_symbols` is given, any result whose symbol isn't in
     that server-side set (the coins actually sent to the LLM) is dropped —
-    the LLM's output isn't trusted to only mention symbols it was given."""
+    the LLM's output isn't trusted to only mention symbols it was given.
+
+    `min_score` is a server-side ABSOLUTE floor (default 0 = keep everything the
+    model returned): rows scoring below it are dropped so the scanner stops
+    handing the deep analyzer marginal coins it will reject (audit B2)."""
     rows: list[dict] = []
     try:
         data = json.loads(extract_json_object(text))
@@ -142,6 +186,8 @@ def parse_scan_results(
             r = ScanResult.model_validate(row)
         except ValidationError:
             continue
+        if r.score < min_score:
+            continue  # below the absolute quality bar — deep stage would reject
         key = r.symbol.upper()
         if allowed_upper is not None and key not in allowed_upper:
             continue  # hallucinated / out-of-scope symbol — never surfaced
@@ -172,6 +218,23 @@ def _mini_tf(slice_obj, tf: str) -> dict[str, Any]:
     return c
 
 
+def _daily_stack(daily: str, daily_candles: list[Any]) -> str:
+    """1D ema_stack anchor label for the screener (bullish/bearish/mixed/
+    unknown). Empty candles (fetch failed / new coin) -> "unknown"."""
+    if not daily_candles:
+        return "unknown"
+    slice_obj = build_tf_slice(daily, daily_candles)
+    slice_dict = {
+        "tf": daily,
+        "candles": _candles_public(slice_obj.candles),
+        "indicators": slice_obj.indicators,
+        "structure": slice_obj.structure,
+    }
+    return (compact_daily_for_llm(slice_dict).get("read") or {}).get(
+        "ema_stack", "unknown"
+    )
+
+
 async def build_scan_contexts(
     client: Any,
     overview: list[dict[str, Any]],
@@ -180,6 +243,7 @@ async def build_scan_contexts(
     *,
     kline_limit: int = 120,
     concurrency: int = 4,
+    daily: str = "1D",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Fetch klines per coin (bounded concurrency) and build mini contexts."""
     sem = asyncio.Semaphore(concurrency)
@@ -191,21 +255,35 @@ async def build_scan_contexts(
             try:
                 ltf_candles = await client.klines(sym, tf, limit_hint=kline_limit)
                 htf_candles = await client.klines(sym, htf, limit_hint=kline_limit)
+                # Daily regime anchor (cached ~5min in context.py; non-fatal:
+                # a failed 1D fetch yields [] -> daily_stack "unknown").
+                daily_candles = await _fetch_daily_candles(
+                    client, sym, daily, kline_limit
+                )
             except Exception as e:  # exchange hiccup on one coin must not kill the scan
                 errors.append(f"{sym}: {e}")
                 return None
         if not ltf_candles:
             errors.append(f"{sym}: no candles")
             return None
-        return {
+        rate = row.get("funding")
+        ctx: dict[str, Any] = {
             "symbol": sym,
             "last_price": row.get("last") or ltf_candles[-1].close,
             "volume24_usd": row.get("volume24"),
-            "funding_rate": row.get("funding"),
+            "funding_rate": rate,
+            # 1D regime anchor so a pick hard against the daily is scored down
+            "daily_stack": _daily_stack(daily, daily_candles),
             # HTF first (regime before LTF timing)
             "htf": _mini_tf(build_tf_slice(htf, htf_candles), htf),
             "ltf": _mini_tf(build_tf_slice(tf, ltf_candles), tf),
         }
+        # Crowdedness context for the funding tiebreaker (audit A9): the raw
+        # rate alone can't show how crowded/costly the trade is.
+        if isinstance(rate, (int, float)):
+            ctx["funding_extreme"] = _funding_extreme(rate)
+            ctx["funding_annualized"] = _funding_annualized(rate, None)
+        return ctx
 
     results = await asyncio.gather(*(_one(r) for r in overview))
     return [r for r in results if r is not None], errors
@@ -317,7 +395,12 @@ async def scan_with_llm(
         str(c.get("symbol") or "").upper() for c in contexts if c.get("symbol")
     }
     try:
-        return parse_scan_results(text, allowed_symbols=allowed_symbols), model
+        return (
+            parse_scan_results(
+                text, allowed_symbols=allowed_symbols, min_score=SCANNER_MIN_SCORE
+            ),
+            model,
+        )
     except json.JSONDecodeError as e:
         preview = (text or "")[:200].replace("\n", " ")
         raise LlmError(
