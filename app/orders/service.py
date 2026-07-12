@@ -17,7 +17,7 @@ from app.mexc.errors import MexcError
 from app.models import ContractMeta, OrderTicket
 from app.orders.tokens import PreviewStore, TokenError
 from app.risk.gates import GateResult, validate_order
-from app.risk.sizing import round_down_to_unit
+from app.risk.sizing import round_down_to_unit, round_trigger_to_unit
 
 ExchangeError = (MexcError, HyperliquidError)
 
@@ -1102,6 +1102,276 @@ class OrderService:
                 error=None if cancel_ok else "per-id cancel error in response",
             )
         return {"ok": cancel_ok, "response": detail}
+
+    # ── Projekt H / Task 1: modify_stop_loss (money-critical) ────────────────
+
+    async def _existing_sl_orders(self, symbol: str, side: str) -> list[Any]:
+        """OIDs of open SL-ish trigger orders for this symbol (TP orders kept).
+
+        Fail-open on lookup error: return [] so modify still places a fresh stop
+        (the old one, if any, simply stays — never unprotected).
+        """
+        try:
+            stops = await self.client.open_stop_orders(symbol)
+        except ExchangeError:
+            return []
+        is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
+        out: list[Any] = []
+        for s in stops or []:
+            if not isinstance(s, dict):
+                continue
+            psym = str(s.get("symbol") or "").upper()
+            if psym and psym != symbol.upper():
+                if not (is_hl and psym.split("_")[0] == symbol.split("_")[0]):
+                    continue
+            kind = str(
+                s.get("orderType") or s.get("tpsl") or s.get("type") or ""
+            ).lower()
+            if "take" in kind or kind in ("tp", "take_profit", "take-profit"):
+                continue  # only SL is being replaced; keep any TP
+            oid = s.get("orderId") or s.get("oid")
+            if oid is None and isinstance(s.get("raw"), dict):
+                oid = s["raw"].get("oid")
+            if oid is not None:
+                out.append(oid)
+        return out
+
+    async def _verify_sl_oid(
+        self, symbol: str, new_oid: Any, expected_sl: float
+    ) -> tuple[bool, str, bool]:
+        """Confirm the concrete new_oid is resting as a stop order on the exchange.
+
+        OID match is the PRIMARY verify condition. A price-only match is unsafe
+        when the SL step is smaller than the price tolerance (~0.15%): the OLD
+        stop alone could satisfy a price check, so we would cancel it while the
+        NEW stop might not rest → unprotected. Gating on the concrete new_oid
+        avoids this. A price match is recorded as optional additional evidence.
+
+        Retries because a freshly placed trigger reflects with a short delay.
+        Returns (verified, detail, checked). `checked` is True iff the stop-order
+        lookup succeeded at least once, so a broken endpoint never yields a false
+        "gone" that would trip a cancel.
+        """
+        attempts = max(1, int(getattr(self.settings, "sl_verify_attempts", 3)))
+        delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
+        checked = False
+        last_detail = f"new SL oid {new_oid} not found among open stop orders"
+        for attempt in range(attempts):
+            try:
+                stops = await self.client.open_stop_orders(symbol)
+                checked = True
+            except ExchangeError as e:
+                last_detail = str(e)
+                stops = None
+            for s in stops or []:
+                if not isinstance(s, dict):
+                    continue
+                oid = s.get("orderId") or s.get("oid")
+                if oid is None and isinstance(s.get("raw"), dict):
+                    oid = s["raw"].get("oid")
+                if oid is None or str(oid) != str(new_oid):
+                    continue
+                price_ok = _sl_matches(
+                    expected_sl,
+                    s.get("triggerPrice") or s.get("trigger_price"),
+                )
+                detail = f"new SL oid {new_oid} resting" + (
+                    " (price matched)" if price_ok else ""
+                )
+                return True, detail, True
+            if attempt < attempts - 1 and delay_s > 0:
+                await asyncio.sleep(delay_s)
+        return False, last_detail, checked
+
+    async def _audit_modify(
+        self, symbol, side, new_sl, response_json, status, error
+    ) -> None:
+        if self.db is None:
+            return
+        try:
+            await self.db.insert_order(
+                symbol=symbol,
+                side=side,
+                request_json={"action": "modify_sl", "new_sl": new_sl},
+                response_json=response_json
+                if isinstance(response_json, (dict, list))
+                else {"data": str(response_json)},
+                status=status,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break the flow
+            pass
+
+    async def modify_stop_loss(
+        self, *, symbol: str, side: str, new_sl: float
+    ) -> dict[str, Any]:
+        async with self._trade_lock:
+            return await self._modify_stop_loss_locked(
+                symbol=symbol, side=side, new_sl=new_sl
+            )
+
+    async def _modify_stop_loss_locked(
+        self, *, symbol: str, side: str, new_sl: float
+    ) -> dict[str, Any]:
+        if not self.settings.trading_enabled:
+            raise OrderError(
+                "DISARMED: TRADING_ENABLED=false — modify-SL blocked. "
+                "Set TRADING_ENABLED=true in .env to arm live trading."
+            )
+        symbol = symbol.upper().strip()
+        side = (side or "").lower()
+        if side not in ("long", "short"):
+            raise OrderError("side must be 'long' or 'short'")
+        new_sl = float(new_sl)
+        if new_sl <= 0:
+            raise OrderError("new_sl must be > 0")
+
+        # Position must exist (and give us the size for the reduce-only stop).
+        hold, _open_type = await self._same_side_hold_vol(symbol, side)
+        if hold <= 0:
+            raise OrderError(f"no open {side} position on {symbol}")
+
+        # Mark price for side geometry.
+        try:
+            ticker = await self.client.ticker(symbol)
+            mark = float(ticker.last_price) if ticker.last_price else None
+        except ExchangeError as e:
+            raise OrderError(f"ticker failed — modify-SL blocked: {e}") from e
+        if mark is None or mark <= 0:
+            raise OrderError(
+                "mark price unavailable — modify-SL blocked (cannot validate geometry)"
+            )
+
+        # Side geometry: long SL below mark, short SL above.
+        if side == "long" and not (new_sl < mark):
+            raise OrderError(f"long SL {new_sl} must be BELOW mark {mark}")
+        if side == "short" and not (new_sl > mark):
+            raise OrderError(f"short SL {new_sl} must be ABOVE mark {mark}")
+
+        # Side-aware conservative tick rounding (no-op on HL price_unit=0; the
+        # client re-rounds via round_hl_price on placement).
+        try:
+            contract = await self.client.contract_meta(symbol)
+            price_unit = float(contract.price_unit or 0)
+        except ExchangeError:
+            price_unit = 0.0
+        rounded_sl = (
+            round_trigger_to_unit(new_sl, price_unit, side=side, kind="sl")
+            if price_unit > 0
+            else new_sl
+        )
+        # Rounding on coarse ticks could cross the mark — re-check.
+        if side == "long" and not (rounded_sl < mark):
+            raise OrderError(f"rounded long SL {rounded_sl} not below mark {mark}")
+        if side == "short" and not (rounded_sl > mark):
+            raise OrderError(f"rounded short SL {rounded_sl} not above mark {mark}")
+
+        old_oids = await self._existing_sl_orders(symbol, side)
+
+        # ── FAIL-SAFE STEP 1: place the NEW stop BEFORE removing the old one ──
+        try:
+            placed = await self.client.place_stop_order(
+                symbol,
+                position_side=side,
+                vol=hold,
+                trigger_px=rounded_sl,
+                tpsl="sl",
+                reduce_only=True,
+            )
+        except ExchangeError as e:
+            await self._audit_modify(
+                symbol, side, rounded_sl, {"error": str(e)},
+                "modify_sl_place_failed", str(e),
+            )
+            raise OrderError(
+                f"new SL placement failed — old SL left in place (still protected): {e}"
+            ) from e
+
+        new_oid = placed.get("orderId") if isinstance(placed, dict) else None
+        place_err = placed.get("error") if isinstance(placed, dict) else "unknown"
+        if new_oid is None:
+            await self._audit_modify(
+                symbol, side, rounded_sl, placed,
+                "modify_sl_place_rejected", str(place_err),
+            )
+            raise OrderError(
+                "new SL rejected by exchange — old SL left in place "
+                f"(still protected): {place_err}"
+            )
+
+        # ── STEP 2: VERIFY the concrete new_oid is really resting (by OID, not
+        # by price — the old, price-close stop must never count as the new). ──
+        verified, detail, checked = await self._verify_sl_oid(
+            symbol, new_oid, rounded_sl
+        )
+
+        warnings: list[str] = []
+        cancelled: list[Any] = []
+        failed: list[Any] = []
+
+        if not verified:
+            # New stop unconfirmed. NEVER cancel the old one on doubt — keeping
+            # both (or old only) is over-protected, never unprotected.
+            warnings.append(
+                f"neuer SL platziert (oid={new_oid}), aber NICHT verifiziert "
+                f"({detail}) — alter SL NICHT entfernt. Beide Stops auf der "
+                "Börse prüfen."
+            )
+            status = (
+                "modify_sl_unverified_old_kept"
+                if checked
+                else "modify_sl_unknown_old_kept"
+            )
+        else:
+            # ── STEP 3: only NOW cancel the old stop(s). ──
+            is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
+            for oid in old_oids:
+                if str(oid) == str(new_oid):
+                    continue
+                try:
+                    if is_hl:
+                        await self.client.cancel_order(
+                            [{"orderId": oid, "symbol": symbol}]
+                        )
+                    else:
+                        await self.client.cancel_order([oid])
+                    cancelled.append(oid)
+                except Exception as e:  # noqa: BLE001 — new stop is live; must not bubble
+                    failed.append(oid)
+                    warnings.append(
+                        f"alter SL {oid} konnte nicht gecancelt werden ({e}) — er "
+                        "bleibt aktiv. Position ist ÜBER-geschützt (zwei Stops), "
+                        "NICHT ungeschützt; alten Stop manuell auf der Börse entfernen."
+                    )
+            status = "modify_sl_ok" if not failed else "modify_sl_ok_old_cancel_failed"
+
+        await self._audit_modify(
+            symbol, side, rounded_sl,
+            {
+                "new_oid": new_oid,
+                "cancelled": cancelled,
+                "failed": failed,
+                "verified": verified,
+                "detail": detail,
+                "place": placed,
+            },
+            status,
+            None if (verified and not failed) else status,
+        )
+
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "side": side,
+            "new_sl": rounded_sl,
+            "new_oid": new_oid,
+            "cancelled_old": cancelled,
+            "failed_cancel": failed,
+            "verified": verified,
+            "detail": detail,
+            "status": status,
+            "warnings": warnings,
+        }
 
 
 def _confirm_summary(

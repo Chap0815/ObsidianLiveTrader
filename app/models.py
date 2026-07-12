@@ -251,3 +251,11 @@ class CancelRequest(BaseModel):
     def resolved_order_id(self) -> str | int | None:
         return self.order_id if self.order_id is not None else self.orderId
 
+
+class ModifySLRequest(BaseModel):
+    """Move/replace the stop-loss of an OPEN position. Requires arming."""
+
+    symbol: str
+    side: OrderSide
+    new_sl: float = Field(..., gt=0, description="New stop-loss price")
+

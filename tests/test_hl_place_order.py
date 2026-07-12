@@ -89,3 +89,26 @@ async def test_order_by_external_oid_recovers_filled_order_via_cloid():
     assert res and res.get("match") == "cloid"
     assert "mlt-xyz" in str(res)  # service.py recovery guard passes
     info.query_order_by_cloid.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_place_stop_order_maps_reduce_only_trigger():
+    c = _client()
+    # long position -> protective stop is a SELL (is_buy False), reduce-only, trigger
+    out = await c.place_stop_order(
+        "BTC", position_side="long", vol=0.01, trigger_px=99_000.0, tpsl="sl"
+    )
+    assert out["orderId"] == 123  # _OK carries filled.oid 123
+    assert out["error"] is None
+    call = c._exchange.order.call_args
+    assert call.args[1] is False                     # is_buy (close of long)
+    ot = call.args[4]                                # order_type dict
+    assert ot["trigger"]["tpsl"] == "sl"
+    assert ot["trigger"]["isMarket"] is True
+    assert call.kwargs["reduce_only"] is True
+
+    # short position -> close is a BUY (is_buy True)
+    await c.place_stop_order(
+        "BTC", position_side="short", vol=0.01, trigger_px=101_000.0, tpsl="sl"
+    )
+    assert c._exchange.order.call_args.args[1] is True

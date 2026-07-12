@@ -26,6 +26,7 @@ from app.models import (
     CancelRequest,
     ClosePositionRequest,
     ConfirmRequest,
+    ModifySLRequest,
     OrderTicket,
     ReevaluateRequest,
 )
@@ -925,6 +926,31 @@ async def orders_close(
         raise HTTPException(
             status_code=400,
             detail={"errors": e.errors, "message": str(e)},
+        ) from e
+    except ExchangeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/orders/modify-sl")
+async def orders_modify_sl(
+    request: Request,
+    body: ModifySLRequest,
+    _: None = Depends(require_local_token),
+):
+    """Move the stop-loss of an open position (place new → verify → cancel old).
+
+    Fail-safe: the position is never unprotected during the move. Requires
+    TRADING_ENABLED.
+    """
+    svc = _order_service(request)
+    symbol = normalize_symbol(body.symbol)
+    try:
+        return await svc.modify_stop_loss(
+            symbol=symbol, side=body.side, new_sl=body.new_sl
+        )
+    except OrderError as e:
+        raise HTTPException(
+            status_code=400, detail={"errors": e.errors, "message": str(e)}
         ) from e
     except ExchangeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

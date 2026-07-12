@@ -648,6 +648,75 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"place_order failed: {e}", raw=str(e)) from e
 
+    async def place_stop_order(
+        self,
+        symbol: str,
+        *,
+        position_side: str,
+        vol: float,
+        trigger_px: float,
+        tpsl: str = "sl",
+        reduce_only: bool = True,
+    ) -> dict[str, Any]:
+        """Place ONE reduce-only trigger (SL/TP) for an ALREADY-OPEN position.
+
+        position_side is the side of the open position; the trigger CLOSES it,
+        so its direction is the opposite. Used by OrderService.modify_stop_loss
+        to add a fresh protective stop BEFORE the old one is cancelled — the
+        position is therefore never unprotected during a SL move.
+        """
+
+        def _place():
+            ex = self._get_exchange()
+            coin = to_hl_coin(symbol)
+            pos = (position_side or "").lower()
+            if pos not in ("long", "short"):
+                raise HyperliquidError(
+                    f"position_side must be long/short, got {position_side!r}"
+                )
+            sz = float(vol or 0)
+            if sz <= 0:
+                raise HyperliquidError("vol must be > 0")
+            # long closes by selling (is_buy False); short closes by buying.
+            is_buy_close = pos == "short"
+            row = self._asset_row(coin)
+            sz_dec = int(row.get("szDecimals") or 0)
+            trg = round_hl_price(float(trigger_px), sz_dec)
+            if trg <= 0:
+                raise HyperliquidError("trigger_px must be > 0")
+            result = ex.order(
+                coin,
+                is_buy_close,
+                sz,
+                trg,
+                {"trigger": {"isMarket": True, "triggerPx": trg, "tpsl": tpsl}},
+                reduce_only=bool(reduce_only),
+            )
+            err = _status_error(result)
+            oid = _extract_oid(result)
+            if err or oid is None:
+                return {
+                    "orderId": None,
+                    "response": result,
+                    "error": err or "no oid in response",
+                    "requestedTrigger": trg,
+                    "symbol": coin,
+                }
+            return {
+                "orderId": oid,
+                "response": result,
+                "error": None,
+                "requestedTrigger": trg,
+                "symbol": coin,
+            }
+
+        try:
+            return await self._to_thread(_place)
+        except HyperliquidError:
+            raise
+        except Exception as e:
+            raise HyperliquidError(f"place_stop_order failed: {e}", raw=str(e)) from e
+
     async def cancel_order(
         self, body: dict[str, Any] | list[Any]
     ) -> dict[str, Any] | list[Any]:
