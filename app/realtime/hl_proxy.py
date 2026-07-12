@@ -163,8 +163,9 @@ def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
         trades = []
         for t in data:
             if str(t.get("coin", "")).upper() not in ("", coin):
-                # still accept if coin missing
-                pass
+                # Wrong coin — skip it, do not forward as this coin's trade
+                # (F-21). Still accept if coin is missing.
+                continue
             try:
                 trades.append(
                     {
