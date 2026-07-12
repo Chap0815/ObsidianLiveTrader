@@ -3946,12 +3946,51 @@
     const items = all.slice(0, 14);
     const leadCount = Math.min(3, items.length);
 
+    // Coins the user actually tracks — every watchlist entry + every open
+    // position — reduced to their base coin (BTC_USDT → BTC). Used to flag
+    // headlines mentioning something the user holds/watches.
+    const watched = [];
+    const pushCoin = function (sym) {
+      const base = String(sym || "").toUpperCase().split("_")[0].trim();
+      if (base && base.length >= 2 && watched.indexOf(base) === -1) watched.push(base);
+    };
+    (state.watchlist || []).forEach(pushCoin);
+    ((state.account && state.account.positions) || []).forEach(function (p) {
+      if (Math.abs(Number(p.hold_vol) || 0) > 0) pushCoin(p.symbol);
+    });
+
+    // Whole-word, case-insensitive watched-coin mentions in a text blob.
+    function coinsMentioned(text) {
+      const t = String(text || "");
+      return watched.filter(function (c) {
+        const esc = c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp("\\b" + esc + "\\b", "i").test(t);
+      });
+    }
+
+    // Source → subtle, distinct token-based color chip.
+    function srcChip(source) {
+      const s = String(source || "");
+      const key = s.toLowerCase().replace(/[^a-z]/g, "");
+      const known = key === "coindesk" || key === "cointelegraph" || key === "decrypt";
+      const cls = known ? "news-src-" + key : "news-src-other";
+      return '<span class="news-src ' + cls + '">' + escapeHtml(s || "—") + "</span>";
+    }
+
     // Build one clickable card. EVERY feed string is escaped (feeds are
     // untrusted); links are http(s)-whitelisted + rel="noopener noreferrer".
     function card(it, kind) {
       const url = String((it && it.url) || "");
       const safe = /^https?:\/\//i.test(url) ? url : "";
-      const cls = kind === "lead" ? "news-lead" : "news-row";
+      const hits = coinsMentioned(
+        String((it && it.title) || "") + " " + String((it && it.summary) || "")
+      );
+      const hit = hits.length > 0;
+      const coinBadge = hit
+        ? '<span class="news-coin">● ' + escapeHtml(hits.slice(0, 2).join(" ")) + "</span>"
+        : "";
+      const cls =
+        (kind === "lead" ? "news-lead" : "news-row") + (hit ? " news-hit" : "");
       const open = safe
         ? '<a class="' + cls + '" href="' + escapeHtml(safe) +
           '" target="_blank" rel="noopener noreferrer">'
@@ -3974,7 +4013,8 @@
         '<span class="' + titleCls + '">' + escapeHtml((it && it.title) || "") + "</span>" +
         teaser +
         '<span class="' + metaCls + '">' +
-        '<span class="news-src">' + escapeHtml((it && it.source) || "") + "</span>" +
+        coinBadge +
+        srcChip((it && it.source) || "") +
         '<span class="news-dot" aria-hidden="true">·</span>' +
         '<span class="news-time">' + escapeHtml(relTime(it && it.published)) + "</span>" +
         "</span>" +

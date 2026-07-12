@@ -1774,6 +1774,43 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-family: var(--mono); font-size: 13.2px; white-space: nowrap;
 }
 .news-src { color: var(--muted); }
+/* Per-source color chips — subtle token-tinted fills, distinct per desk */
+.news-src-coindesk,
+.news-src-cointelegraph,
+.news-src-decrypt,
+.news-src-other {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11.6px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+}
+.news-src-coindesk {
+  color: var(--accent); background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+.news-src-cointelegraph {
+  color: var(--long); background: var(--long-dim);
+  border-color: rgba(70, 192, 138, 0.32);
+}
+.news-src-decrypt {
+  color: var(--violet); background: rgba(183, 156, 255, 0.14);
+  border-color: rgba(183, 156, 255, 0.4);
+}
+.news-src-other {
+  color: var(--muted); background: var(--bg-elevated);
+  border-color: var(--border);
+}
+/* Watched-coin highlight: subtle accent left border + a "● BTC" badge */
+.news-hit { border-left: 2px solid var(--accent); }
+.news-coin {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 11.6px;
+  letter-spacing: 0.03em;
+  margin-right: 2px;
+}
 .news-dot { color: var(--faint); }
 .news-time { color: var(--faint); }
 .news-empty { color: var(--muted); font-size: 13.8px; padding: 14px 4px; }
