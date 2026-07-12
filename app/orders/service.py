@@ -718,6 +718,15 @@ class OrderService:
 
         sl = gate.rounded_stop if gate.rounded_stop is not None else ticket.stop_loss
         tp = gate.rounded_tp if gate.rounded_tp is not None else ticket.take_profit
+        # F-D1 (accepted behavior, documented not changed — the check itself
+        # lives in app/risk/gates.py, out of this file's edit scope): for a
+        # market order, gate.rounded_stop's geometry is validated against
+        # entry_for_risk = last*(1±market_entry_slippage_pct), not raw last.
+        # That makes the geometry check slightly PERMISSIVE (a stop up to
+        # ~slip% on the wrong side of raw `last` can still pass) but the risk
+        # MAGNITUDE (risk_usdt/risk_pct) is computed off that same buffered,
+        # conservative entry — so real risk is always OVER-estimated, never
+        # under-estimated. Money-safe by construction; not tightened here.
         # SL value is mandatory for the risk gate in BOTH modes (it sizes risk),
         # unless unprotected entries are explicitly allowed.
         if (sl is None or float(sl) <= 0) and not self.settings.allow_unprotected_entry:
