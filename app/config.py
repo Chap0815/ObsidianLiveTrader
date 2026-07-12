@@ -148,7 +148,18 @@ class Settings(BaseSettings):
     # ALLOW_UNPROTECTED_ENTRY=false would otherwise let manual bypass the stop.
     allow_manual_trigger: bool = True
     risk_slippage_pct: float = 0.05
-    max_notional_usdt: float = 500.0
+    # WARNING threshold only — NOT a hard cap. A larger order still passes as
+    # long as the equity-relative cap (max_notional_pct_of_equity, the real
+    # hard notional limit) and the other gates allow it. See the "Max
+    # notional" section in risk/gates.py. 0 = off.
+    max_notional_usdt: float = Field(
+        default=500.0,
+        description=(
+            "Warning threshold (USDT) for order notional — NOT a hard cap. "
+            "The hard, equity-scaled notional limit is "
+            "max_notional_pct_of_equity. 0 = off."
+        ),
+    )
     max_price_drift_pct: float = 0.5
     market_entry_slippage_pct: float = 0.15
     allow_cross_margin: bool = False

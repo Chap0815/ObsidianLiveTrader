@@ -86,7 +86,7 @@ Python 3.11+ empfohlen.
 | **`ALLOW_UNPROTECTED_ENTRY`** | **`false`** | **`false`** blockiert Orders ohne Stop-Loss |
 | `ALLOW_MANUAL_TRIGGER` | `true` | Manueller Trigger-Mode (Entry ohne Börsen-SL/TP); `false` = fail-closed blocken |
 | `RISK_SLIPPAGE_PCT` | `0.05` | Slippage-Puffer im Risk-Gate |
-| `MAX_NOTIONAL_USDT` | `500` | Notional-Cap pro Order |
+| `MAX_NOTIONAL_USDT` | `500` | **Warnschwelle** pro Order (kein Hard-Block) — der harte Notional-Cap ist `MAX_NOTIONAL_PCT_OF_EQUITY` |
 | `MAX_PRICE_DRIFT_PCT` | `0.5` | Max. Preisdrift zwischen Preview und Confirm |
 | `MARKET_ENTRY_SLIPPAGE_PCT` | `0.15` | Slippage-Toleranz bei Market-Entries |
 | `ALLOW_CROSS_MARGIN` | `false` | Cross-Margin statt Isolated erlauben |
