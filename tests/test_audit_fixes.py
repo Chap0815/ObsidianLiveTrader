@@ -623,6 +623,25 @@ async def test_manual_mode_places_without_exchange_sl():
 
 
 @pytest.mark.asyncio
+async def test_manual_mode_scale_out_warns_ladder_not_placed():
+    """F-F1: trigger_mode=manual + scale_out=True places NO exchange triggers
+    (TP1/TP2 ladder included) — this must be surfaced as a clear warning, not
+    silently dropped, so the user knows the ladder was never placed."""
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "hyperliquid"  # scale_out is HL-only
+    svc = OrderService(client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore())
+    prev = await svc.preview(
+        _ticket(trigger_mode="manual", scale_out=True, take_profit=102_000.0,
+                tp2=104_000.0, tp1_share=0.5)
+    )
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["status"] == "placed_manual"
+    assert "takeProfitPrice2" not in out["request"]
+    assert any("SCALE-OUT" in w and "IGNORIERT" in w for w in out["warnings"])
+
+
+@pytest.mark.asyncio
 async def test_auto_mode_still_attaches_sl():
     """Default (auto) keeps the exchange SL trigger in the body."""
     client = _happy_client({"orderId": 1, "slTriggerOid": 5})

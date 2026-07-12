@@ -861,6 +861,15 @@ class OrderService:
                 "MANUELL: Kein Börsen-SL/TP platziert — du musst die Position "
                 "selbst schließen. Bei geschlossenem Browser ist sie ungeschützt."
             )
+            # F-F1: scale_out places NO exchange triggers in manual mode either
+            # (attach_triggers=False covers TP1/TP2 too) — surface that the
+            # configured TP ladder was silently skipped, not just the SL.
+            if getattr(ticket, "scale_out", False):
+                warnings.append(
+                    "SCALE-OUT IGNORIERT: trigger_mode=manual platziert keine "
+                    "Börsen-Trigger — die TP-Staffel (TP1/TP2) wurde NICHT "
+                    "gesetzt. Du musst die Teilausstiege selbst verwalten."
+                )
 
         try:
             if (
