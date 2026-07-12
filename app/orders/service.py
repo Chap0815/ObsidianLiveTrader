@@ -83,6 +83,9 @@ def ticket_to_mexc_body(
             body["stopLossPrice"] = float(sl)
         if tp is not None and float(tp) > 0:
             body["takeProfitPrice"] = float(tp)
+        if getattr(ticket, "scale_out", False) and ticket.tp2 and float(ticket.tp2) > 0:
+            body["takeProfitPrice2"] = float(ticket.tp2)
+            body["tp1Share"] = float(getattr(ticket, "tp1_share", 0.5) or 0.5)
 
     return body
 
@@ -209,6 +212,47 @@ def _sl_matches(expected: float, candidate: float | None, tol_pct: float = 0.15)
     return abs(c - expected) / expected * 100.0 <= tol_pct
 
 
+def scale_out_errors(
+    ticket: OrderTicket, entry: float | None, client: Any = None
+) -> list[str]:
+    """Geometry + exchange-support checks for the optional two-rung TP ladder.
+
+    Empty list = ok. Scale-out is HYPERLIQUID-ONLY: the ladder split (two
+    reduce-only TP triggers) is implemented only in HyperliquidClient.place_order.
+    MEXC's create-order API would silently ignore takeProfitPrice2/tp1Share and
+    place only a single TP — a stale half-execution the trader never asked for.
+    """
+    if not getattr(ticket, "scale_out", False):
+        return []
+    if getattr(client, "exchange_id", "") != "hyperliquid":
+        return ["Scale-Out nur auf Hyperliquid verfügbar"]
+    errs: list[str] = []
+    tp1 = ticket.take_profit
+    tp2 = ticket.tp2
+    if tp1 is None or float(tp1) <= 0:
+        errs.append("scale-out requires TP1 (take_profit)")
+    if tp2 is None or float(tp2) <= 0:
+        errs.append("scale-out requires TP2 (tp2)")
+    share = float(getattr(ticket, "tp1_share", 0.5) or 0.0)
+    if not (0.0 < share < 1.0):
+        errs.append("tp1_share must be between 0 and 1")
+    if errs:
+        return errs
+    side = (ticket.side or "").lower()
+    e = float(entry) if entry else None
+    if side == "long":
+        if not (float(tp2) > float(tp1)):
+            errs.append("long scale-out: TP2 must be above TP1")
+        if e is not None and not (float(tp1) > e):
+            errs.append("long scale-out: TP1 must be above entry")
+    elif side == "short":
+        if not (float(tp2) < float(tp1)):
+            errs.append("short scale-out: TP2 must be below TP1")
+        if e is not None and not (float(tp1) < e):
+            errs.append("short scale-out: TP1 must be below entry")
+    return errs
+
+
 class OrderService:
     def __init__(
         self,
@@ -321,6 +365,17 @@ class OrderService:
                 "ok": False,
                 "token": None,
                 "errors": gate.errors,
+                "warnings": gate.warnings,
+                "gate": gate.to_dict(),
+                "summary": summary,
+            }
+
+        so_errs = scale_out_errors(ticket, gate.entry_for_risk, self.client)
+        if so_errs:
+            return {
+                "ok": False,
+                "token": None,
+                "errors": so_errs,
                 "warnings": gate.warnings,
                 "gate": gate.to_dict(),
                 "summary": summary,
@@ -556,6 +611,10 @@ class OrderService:
                 "order failed risk gates on confirm",
                 errors=gate.errors,
             )
+
+        so_errs = scale_out_errors(ticket, gate.entry_for_risk, self.client)
+        if so_errs:
+            raise OrderError("scale-out geometry invalid", errors=so_errs)
 
         # Manual mode: the trader manages the exit; NO exchange SL/TP trigger is
         # attached. The SL value is still required (risk gates), but it is not
@@ -1218,6 +1277,8 @@ class OrderService:
                 "DISARMED: TRADING_ENABLED=false — modify-SL blocked. "
                 "Set TRADING_ENABLED=true in .env to arm live trading."
             )
+        if not hasattr(self.client, "place_stop_order"):
+            raise OrderError("SL nachziehen ist nur auf Hyperliquid verfügbar")
         symbol = symbol.upper().strip()
         side = (side or "").lower()
         if side not in ("long", "short"):

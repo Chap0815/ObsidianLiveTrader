@@ -112,3 +112,18 @@ async def test_place_stop_order_maps_reduce_only_trigger():
         "BTC", position_side="short", vol=0.01, trigger_px=101_000.0, tpsl="sl"
     )
     assert c._exchange.order.call_args.args[1] is True
+
+
+@pytest.mark.asyncio
+async def test_hl_place_order_scale_out_places_two_tp_triggers():
+    c = _client()
+    await c.place_order({
+        "symbol": "BTC", "side": 1, "type": "market", "vol": 0.02,
+        "takeProfitPrice": 110.0, "takeProfitPrice2": 120.0, "tp1Share": 0.5,
+    })
+    # entry (market_open) + two TP triggers via ex.order
+    trig_calls = [call for call in c._exchange.order.call_args_list
+                  if isinstance(call.args[4], dict) and "trigger" in call.args[4]]
+    assert len(trig_calls) == 2
+    sizes = sorted(call.args[2] for call in trig_calls)
+    assert sizes == pytest.approx([0.01, 0.01])

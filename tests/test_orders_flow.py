@@ -8,7 +8,12 @@ import pytest
 
 from app.config import Settings, get_settings
 from app.models import ContractMeta, OrderTicket, Ticker
-from app.orders.service import OrderError, OrderService, ticket_to_mexc_body
+from app.orders.service import (
+    OrderError,
+    OrderService,
+    scale_out_errors,
+    ticket_to_mexc_body,
+)
 from app.orders.tokens import PreviewStore, TokenError
 
 
@@ -590,3 +595,76 @@ def test_api_modify_sl_route(store, tmp_path, monkeypatch):
         assert body["ok"] is True
         assert body["status"] == "modify_sl_ok"
     get_settings.cache_clear()
+
+
+# ── Projekt H / Task 3: scale-out TP ladder ──────────────────────────────────
+
+
+def test_ticket_to_mexc_body_scale_out_sets_tp2():
+    t = _good_ticket(scale_out=True, take_profit=102_000.0, tp2=104_000.0, tp1_share=0.5)
+    body = ticket_to_mexc_body(
+        t,
+        rounded_vol=2.0,
+        rounded_price=100_000.0,
+        external_oid="mlt-so",
+        stop_loss=99_000.0,
+        take_profit=102_000.0,
+    )
+    assert body["takeProfitPrice"] == 102_000.0
+    assert body["takeProfitPrice2"] == 104_000.0
+    assert body["tp1Share"] == 0.5
+
+
+def test_scale_out_errors_rejects_non_hyperliquid_client():
+    c = MagicMock()
+    c.exchange_id = "mexc"
+    ticket = _good_ticket(scale_out=True, take_profit=102_000.0, tp2=104_000.0)
+    errs = scale_out_errors(ticket, 100_000.0, c)
+    assert any("Hyperliquid" in e for e in errs)
+
+
+@pytest.mark.asyncio
+async def test_scale_out_geometry_rejected(client, store):
+    client.exchange_id = "hyperliquid"
+    svc = OrderService(client, _settings(), store)
+    out = await svc.preview(
+        _good_ticket(scale_out=True, take_profit=102_000.0, tp2=101_000.0)
+    )  # TP2 < TP1 for long
+    assert out["ok"] is False
+    assert any("TP2 must be above TP1" in e for e in out["errors"])
+
+
+@pytest.mark.asyncio
+async def test_scale_out_rejected_on_non_hyperliquid_preview(client, store):
+    # client fixture has no exchange_id set -> not "hyperliquid" -> rejected
+    svc = OrderService(client, _settings(), store)
+    out = await svc.preview(
+        _good_ticket(scale_out=True, take_profit=102_000.0, tp2=104_000.0)
+    )
+    assert out["ok"] is False
+    assert any("Hyperliquid" in e for e in out["errors"])
+
+
+@pytest.mark.asyncio
+async def test_scale_out_preview_confirm_places_two_tps(client, store):
+    client.exchange_id = "hyperliquid"
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    prev = await svc.preview(
+        _good_ticket(scale_out=True, take_profit=102_000.0, tp2=104_000.0, tp1_share=0.5)
+    )
+    assert prev["ok"] is True
+    conf = await svc.confirm(prev["token"])
+    assert conf["ok"] is True
+    body = client.place_order.call_args[0][0]
+    assert body["takeProfitPrice2"] == 104_000.0
+
+
+@pytest.mark.asyncio
+async def test_modify_stop_loss_rejected_on_non_hyperliquid(store):
+    from app.mexc.client import MexcClient
+
+    c = MagicMock(spec=MexcClient)
+    svc = OrderService(c, _modify_settings(), store)
+    with pytest.raises(OrderError) as ei:
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
+    assert "nur auf Hyperliquid" in str(ei.value)

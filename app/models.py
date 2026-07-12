@@ -212,6 +212,13 @@ class OrderTicket(BaseModel):
     )
     stop_loss: float | None = None
     take_profit: float | None = Field(None, description="TP1")
+    scale_out: bool = Field(
+        False, description="Two-rung TP ladder: split reduce-only TP across tp1/tp2"
+    )
+    tp2: float | None = Field(None, description="Second take-profit rung (scale-out)")
+    tp1_share: float = Field(
+        0.5, gt=0.0, lt=1.0, description="Fraction of size exiting at tp1"
+    )
     open_type: int = Field(
         1, description="MEXC openType: 1 isolated, 2 cross"
     )

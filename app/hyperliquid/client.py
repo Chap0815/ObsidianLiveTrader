@@ -592,11 +592,11 @@ class HyperliquidClient:
             sl_trigger_oid = None
             tp_trigger_oid = None
 
-            def _place_trigger(trigger_px: float, tpsl: str):
+            def _place_trigger(trigger_px: float, tpsl: str, trig_sz: float):
                 return ex.order(
                     coin,
                     not is_buy,  # close direction
-                    sz,
+                    trig_sz,
                     trigger_px,
                     {
                         "trigger": {
@@ -610,7 +610,7 @@ class HyperliquidClient:
 
             if sl_px is not None:
                 try:
-                    sl_res = _place_trigger(sl_px, "sl")
+                    sl_res = _place_trigger(sl_px, "sl", sz)
                     sl_trigger_oid = _extract_oid(sl_res)
                     err = _status_error(sl_res)
                     if sl_trigger_oid is None or err:
@@ -618,9 +618,30 @@ class HyperliquidClient:
                         sl_trigger_oid = None
                 except Exception as te:
                     trigger_errors.append(f"sl: {te}")
+
+            # Optional TP ladder (scale-out): split the reduce-only TP across two
+            # rungs (tp1 at tp_px, tp2 at tp2_px) instead of one. Falls back to a
+            # single TP if the split would round a rung to zero size.
+            tp2 = body.get("takeProfitPrice2")
+            tp2_px = (
+                round_hl_price(float(tp2), sz_dec) if tp2 and float(tp2) > 0 else None
+            )
+            share = float(body.get("tp1Share") or 0)
+            vol_unit = 10 ** (-sz_dec) if sz_dec > 0 else 1.0
+            do_ladder = tp_px is not None and tp2_px is not None and 0.0 < share < 1.0
+            tp_sz1 = tp_sz2 = None
+            if do_ladder:
+                from app.risk.sizing import round_down_to_unit
+
+                tp_sz1 = round_down_to_unit(sz * share, vol_unit)
+                tp_sz2 = round_down_to_unit(sz - tp_sz1, vol_unit)
+                if tp_sz1 <= 0 or tp_sz2 <= 0:
+                    do_ladder = False  # too small to split -> single TP fallback
+
+            tp_trigger_oid2 = None
             if tp_px is not None:
                 try:
-                    tp_res = _place_trigger(tp_px, "tp")
+                    tp_res = _place_trigger(tp_px, "tp", tp_sz1 if do_ladder else sz)
                     tp_trigger_oid = _extract_oid(tp_res)
                     err = _status_error(tp_res)
                     if tp_trigger_oid is None or err:
@@ -628,15 +649,27 @@ class HyperliquidClient:
                         tp_trigger_oid = None
                 except Exception as te:
                     trigger_errors.append(f"tp: {te}")
+            if do_ladder and tp2_px is not None:
+                try:
+                    tp2_res = _place_trigger(tp2_px, "tp", tp_sz2)
+                    tp_trigger_oid2 = _extract_oid(tp2_res)
+                    err = _status_error(tp2_res)
+                    if tp_trigger_oid2 is None or err:
+                        trigger_errors.append(f"tp2: {err or 'no oid in response'}")
+                        tp_trigger_oid2 = None
+                except Exception as te:
+                    trigger_errors.append(f"tp2: {te}")
 
             return {
                 "orderId": _extract_oid(result),
                 "response": result,
                 "slTriggerOid": sl_trigger_oid,
                 "tpTriggerOid": tp_trigger_oid,
+                "tpTriggerOid2": tp_trigger_oid2,
                 "triggerErrors": trigger_errors,
                 "requestedStopLoss": sl_px,
                 "requestedTakeProfit": tp_px,
+                "requestedTakeProfit2": tp2_px if do_ladder else None,
                 "symbol": coin,
                 "exchange": "hyperliquid",
             }
