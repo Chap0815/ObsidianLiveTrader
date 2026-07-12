@@ -21,14 +21,58 @@ _OK = {
 }
 
 
+def _resp_filled(sz: float, oid: int = 123) -> dict:
+    """An HL order response reporting a FILL of `sz` coins."""
+    return {
+        "status": "ok",
+        "response": {
+            "data": {
+                "statuses": [
+                    {"filled": {"oid": oid, "totalSz": str(sz), "avgPx": "100"}}
+                ]
+            }
+        },
+    }
+
+
+def _resp_resting(oid: int = 777) -> dict:
+    """An HL order response for a RESTING (unfilled) limit order."""
+    return {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}},
+    }
+
+
 def _client() -> HyperliquidClient:
     c = HyperliquidClient(private_key="0x" + "1" * 64, testnet=True)
     # Preload meta so _asset_row() needs no network.
     c._meta_cache = {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]}
     c._exchange = MagicMock()
-    c._exchange.market_open = MagicMock(return_value=_OK)
+    # A real market_open fills the requested size — echo `sz` (call arg #3) as the
+    # reported fill so trigger sizing (now tied to the ACTUAL fill) is faithful.
+    c._exchange.market_open = MagicMock(
+        side_effect=lambda coin, is_buy, sz, *a, **k: _resp_filled(sz)
+    )
     c._exchange.order = MagicMock(return_value=_OK)
     return c
+
+
+def _sl_trigger_calls(c) -> list:
+    return [
+        call
+        for call in c._exchange.order.call_args_list
+        if isinstance(call.args[4], dict)
+        and "trigger" in call.args[4]
+        and call.args[4]["trigger"]["tpsl"] == "sl"
+    ]
+
+
+def _all_trigger_calls(c) -> list:
+    return [
+        call
+        for call in c._exchange.order.call_args_list
+        if isinstance(call.args[4], dict) and "trigger" in call.args[4]
+    ]
 
 
 def test_external_oid_to_cloid_is_valid_16_byte_hex():
@@ -171,6 +215,83 @@ async def test_close_inner_error_raises_not_silent_ok():
     with pytest.raises(HyperliquidError) as ei:
         await c.close_position_market("BTC", side="long", vol=0.5)
     assert "reject" in str(ei.value).lower() or "insufficient" in str(ei.value).lower()
+
+
+# ── F-02: protective triggers must be sized to the ACTUAL entry fill ─────────
+
+
+@pytest.mark.asyncio
+async def test_limit_partial_fill_sizes_sl_to_filled_not_requested():
+    """A limit entry that only PARTIALLY fills must get an SL sized to the
+    filled coins (0.006), not the requested 0.01 — a reduce-only stop sized to
+    the request would over-reduce (and, with a pre-existing same-side position,
+    could attach to the OLD position)."""
+    c = _client()
+    c._exchange.order = MagicMock(return_value=_resp_filled(0.006))
+    out = await c.place_order(
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "limit",
+            "vol": 0.01,
+            "price": 100.0,
+            "stopLossPrice": 99.0,
+        }
+    )
+    trig = _sl_trigger_calls(c)
+    assert len(trig) == 1
+    assert trig[0].args[2] == pytest.approx(0.006)
+    assert out["slTriggerOid"] is not None
+    assert out.get("entryFilledSz") == pytest.approx(0.006)
+
+
+@pytest.mark.asyncio
+async def test_unfilled_limit_places_no_orphan_sl():
+    """A resting (zero-fill) limit entry must place NO protective trigger — there
+    is no position to protect — and must report itself as unfilled/unprotected
+    (slTriggerOid None) so the service surfaces it as pending, never protected."""
+    c = _client()
+    c._exchange.order = MagicMock(return_value=_resp_resting(oid=777))
+    out = await c.place_order(
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "limit",
+            "vol": 0.01,
+            "price": 100.0,
+            "stopLossPrice": 99.0,
+            "takeProfitPrice": 110.0,
+        }
+    )
+    assert _all_trigger_calls(c) == []  # no SL and no TP orphan
+    assert out["slTriggerOid"] is None
+    assert out["tpTriggerOid"] is None
+    assert out.get("entryFilledSz") == 0.0
+    assert out.get("unfilled") is True
+    assert out["orderId"] == 777
+
+
+@pytest.mark.asyncio
+async def test_market_partial_fill_sizes_sl_to_new_fill_only():
+    """Requirement (3): even if a same-side position already exists, the new SL
+    must be sized to the NEW fill only. The client sizes the reduce-only stop to
+    the entry response's reported fill (0.004), never the requested 0.01."""
+    c = _client()
+    c._exchange.market_open = MagicMock(return_value=_resp_filled(0.004))
+    out = await c.place_order(
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "market",
+            "vol": 0.01,
+            "stopLossPrice": 99.0,
+        }
+    )
+    trig = _sl_trigger_calls(c)
+    assert len(trig) == 1
+    assert trig[0].args[2] == pytest.approx(0.004)
+    assert out["slTriggerOid"] is not None
+    assert out.get("entryFilledSz") == pytest.approx(0.004)
 
 
 @pytest.mark.asyncio

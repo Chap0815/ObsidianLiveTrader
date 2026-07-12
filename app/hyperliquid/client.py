@@ -685,6 +685,24 @@ class HyperliquidClient:
             if entry_err:
                 raise HyperliquidError(f"order rejected: {entry_err}", raw=result)
 
+            # ── F-02: size protective triggers to the ACTUAL entry fill ──────
+            # Entry and SL/TP are separate orders. A reduce-only stop sized to
+            # the REQUESTED size is unsafe when the entry did not fully fill:
+            #  - a resting/zero-fill limit → the stop has no position (orphan),
+            #    or, if a same-side position already exists, it attaches to the
+            #    OLD position and could close it at the new stop;
+            #  - a partial fill → the stop over-reduces vs what actually opened.
+            # So we size every trigger to the fill reported by THIS entry order.
+            filled_sz = _extract_filled_sz(result)
+            if filled_sz <= 0 and is_market:
+                # A market IOC that returned ok but carried no parseable fill is
+                # assumed to have filled (fail-safe: protect rather than orphan).
+                # A genuine partial market fill DOES report totalSz, so this only
+                # fires on an unexpected/empty response shape, never on a real
+                # partial. Snap to the requested size to keep the position safe.
+                filled_sz = sz
+            protect_sz = filled_sz
+
             # Attach TP/SL as reduce-only trigger orders.
             # Each result is checked for a real oid — no blind echo.
             trigger_errors: list[str] = []
@@ -707,9 +725,29 @@ class HyperliquidClient:
                     reduce_only=True,
                 )
 
+            # No fill (resting limit entry) → NO triggers. There is no position
+            # to protect; the service surfaces this as unprotected/pending and
+            # cancels the resting entry via its unfilled-entry handling.
+            if protect_sz <= 0:
+                return {
+                    "orderId": _extract_oid(result),
+                    "response": result,
+                    "slTriggerOid": None,
+                    "tpTriggerOid": None,
+                    "tpTriggerOid2": None,
+                    "triggerErrors": [],
+                    "requestedStopLoss": sl_px,
+                    "requestedTakeProfit": tp_px,
+                    "requestedTakeProfit2": None,
+                    "entryFilledSz": 0.0,
+                    "unfilled": True,
+                    "symbol": coin,
+                    "exchange": "hyperliquid",
+                }
+
             if sl_px is not None:
                 try:
-                    sl_res = _place_trigger(sl_px, "sl", sz)
+                    sl_res = _place_trigger(sl_px, "sl", protect_sz)
                     sl_trigger_oid = _extract_oid(sl_res)
                     err = _status_error(sl_res)
                     if sl_trigger_oid is None or err:
@@ -732,15 +770,15 @@ class HyperliquidClient:
             if do_ladder:
                 from app.risk.sizing import round_down_to_unit
 
-                tp_sz1 = round_down_to_unit(sz * share, vol_unit)
-                tp_sz2 = round_down_to_unit(sz - tp_sz1, vol_unit)
+                tp_sz1 = round_down_to_unit(protect_sz * share, vol_unit)
+                tp_sz2 = round_down_to_unit(protect_sz - tp_sz1, vol_unit)
                 if tp_sz1 <= 0 or tp_sz2 <= 0:
                     do_ladder = False  # too small to split -> single TP fallback
 
             tp_trigger_oid2 = None
             if tp_px is not None:
                 try:
-                    tp_res = _place_trigger(tp_px, "tp", tp_sz1 if do_ladder else sz)
+                    tp_res = _place_trigger(tp_px, "tp", tp_sz1 if do_ladder else protect_sz)
                     tp_trigger_oid = _extract_oid(tp_res)
                     err = _status_error(tp_res)
                     if tp_trigger_oid is None or err:
@@ -769,6 +807,7 @@ class HyperliquidClient:
                 "requestedStopLoss": sl_px,
                 "requestedTakeProfit": tp_px,
                 "requestedTakeProfit2": tp2_px if do_ladder else None,
+                "entryFilledSz": filled_sz,
                 "symbol": coin,
                 "exchange": "hyperliquid",
             }
@@ -1106,6 +1145,31 @@ def _status_error(result: Any) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _extract_filled_sz(result: Any) -> float:
+    """Actually-filled size (coins) of an HL entry order from its response.
+
+    Sums ``totalSz`` across all ``filled`` statuses. A resting (unfilled) limit
+    order carries only a ``resting`` status → returns 0.0. Used to size the
+    reduce-only protective triggers to the REAL fill (F-02) so a partial/zero
+    fill never places an oversized or orphan stop that could act on a different
+    (pre-existing) position.
+    """
+    if not isinstance(result, dict):
+        return 0.0
+    try:
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    except AttributeError:
+        return 0.0
+    total = 0.0
+    for st in statuses or []:
+        if isinstance(st, dict) and isinstance(st.get("filled"), dict):
+            try:
+                total += float(st["filled"].get("totalSz") or 0)
+            except (TypeError, ValueError):
+                continue
+    return max(0.0, total)
 
 
 def _extract_oid(result: Any) -> Any:
