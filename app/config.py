@@ -72,6 +72,11 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    # First-run marker. launch.py writes a bootstrap .env with
+    # SETUP_COMPLETE=false so /setup stays open (no secrets exist yet); the
+    # full save flips it true and locks /setup. Fail-safe default False.
+    setup_complete: bool = False
+
     host: str = "127.0.0.1"
     port: int = 8787
 
