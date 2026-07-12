@@ -1417,6 +1417,46 @@
     }
   }
 
+  /** Compact equity breakdown in the side-rail (below the ticket). Pulls from
+   *  the already-fetched /api/account snapshot: equity, aggregate unrealized
+   *  PnL and used margin summed over open positions, plus free margin. */
+  function renderAccounts(data) {
+    const acct = data || state.account || {};
+    const eqEl = $("acct-equity");
+    if (!eqEl) return;
+    const c = ccy();
+    const eq = Number(acct.equity_usdt);
+    eqEl.textContent = Number.isFinite(eq) ? fmt(eq, 2) + " " + c : "—";
+
+    const positions = (acct.positions || []).filter(function (p) {
+      return Math.abs(Number(p.hold_vol) || 0) > 0;
+    });
+    let upnl = 0, haveUpnl = false, used = 0, haveUsed = false;
+    positions.forEach(function (p) {
+      const u = Number(p.unrealized_pnl);
+      if (Number.isFinite(u)) { upnl += u; haveUpnl = true; }
+      const im = Number(p.im != null ? p.im : p.margin);
+      if (Number.isFinite(im)) { used += im; haveUsed = true; }
+    });
+
+    const upnlEl = $("acct-upnl");
+    if (upnlEl) {
+      if (haveUpnl) {
+        upnlEl.textContent = (upnl >= 0 ? "+" : "") + fmt(upnl, 2) + " " + c;
+        upnlEl.className =
+          "acct-val " + (upnl > 0 ? "pnl-pos" : upnl < 0 ? "pnl-neg" : "");
+      } else {
+        upnlEl.textContent = "—";
+        upnlEl.className = "acct-val";
+      }
+    }
+    const free = Number(acct.available_usdt);
+    const freeEl = $("acct-free");
+    if (freeEl) freeEl.textContent = Number.isFinite(free) ? fmt(free, 2) + " " + c : "—";
+    const usedEl = $("acct-used");
+    if (usedEl) usedEl.textContent = haveUsed ? fmt(used, 2) + " " + c : "—";
+  }
+
   function updateEquity(data) {
     const el = $("equity-value");
     if (!el) return;
@@ -2220,6 +2260,7 @@
       updateEquity(data);
       renderPositions(data);
       renderInstrumentRail();
+      renderAccounts(data);
     } catch (e) {
       console.error("account render", e);
     }
