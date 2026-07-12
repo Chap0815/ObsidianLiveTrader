@@ -20,7 +20,7 @@ that already flagged a {bias} {setup} near {key_level} with a 0-10 `score`.
 Treat it ONLY as a hypothesis to CONFIRM or REFUTE against full structure; it
 is never itself a reason to trade, and it cannot relax any gate below. If you
 end on STAY_OUT for a coin the screener flagged, name the specific hard veto
-that failed (see DECISION: <2 confluences / no clean invalidation /
+that failed (see DECISION: <2 confluences / no valid stop-anchor /
 chase-beyond-band / rrr<min_rrr / no-edge) in the rationale, so the
 disagreement between screen and analysis is explainable rather than silent.
 
@@ -93,6 +93,11 @@ METHOD — work through these steps in order:
    (macd_hist/RSI), and funding skew in the trade's favor. This count feeds the
    DECISION block below (>= 2 for BUY/SELL, >= 3 for STRONG_*). Never fabricate
    a confluence the data does not support.
+   A single price COINCIDENCE counts ONCE: an EMA20/VWAP that sits AT a
+   support/resistance is ONE confluence, not two — do NOT count "value location"
+   and "structure level" separately when they are the same co-located price.
+   "Independent" means driven by a DIFFERENT kind of evidence (regime, pattern,
+   value/level, momentum, funding, positioning), never the same level named twice.
 7. Funding: treat |funding| > 0.01% per interval as a meaningful crowded-side
    cost. If it works against the trade direction, note it explicitly in
    funding_alert and cap setup_confidence at "medium" (never "high") for that
@@ -126,6 +131,11 @@ _OI_STEP = """8. Open interest (positioning): market.open_interest is current OI
    At a marked support/resistance, OI divergence separates a real breakout (OI
    rising into the break) from a liquidation spike (OI falling) — factor this
    into setup_confidence and into the break-confirmation logic of step 3.
+   COUNTING: an OI read that CONFIRMS the trade side — price_up_oi_up (real
+   trend) under a long, price_down_oi_up (new shorts) under a short — COUNTS as
+   one independent positioning confluence in the step-6 count. price_up_oi_down
+   (short covering) is NOT a long confluence and DEPRIORITIZES new longs
+   (symmetrically price_down_oi_down deprioritizes new shorts).
    If market.open_interest or the oi_change fields are null (e.g. the exchange
    provides no OI), SKIP this step entirely — never infer or invent an OI reading.
 """
@@ -136,8 +146,11 @@ overrides any looser wording elsewhere in this prompt):
 First count the independent confluences on ONE side (step 6). Then STAY_OUT —
 take NO directional trade — if ANY of these HARD VETOES holds:
   - fewer than 2 independent confluences on that side; OR
-  - no clean invalidation level exists (no structural swing/pattern boundary
-    whose decisive break would objectively kill the idea); OR
+  - no valid stop-anchor exists (no structural swing/pattern boundary the
+    stop-loss can sit beyond). This is about a PLACEABLE stop, and is SEPARATE
+    from Rule 7's `invalidation_price` (a distinct EARLIER level that may
+    legitimately be null): a null `invalidation_price` does NOT trip this veto
+    as long as the stop-loss sits beyond a real swing/pattern boundary; OR
   - the only available entry requires CHASING — last_price has already run more
     than 0.5 x LTF ATR14 beyond the entry in the trade direction and no fresh
     trigger sits closer to price; OR
@@ -145,11 +158,11 @@ take NO directional trade — if ANY of these HARD VETOES holds:
     rrr < risk_policy.min_rrr (sub-min-RRR is a veto, never a "trade it at low"
     factor); OR
   - genuinely no edge: price dead inside the EMA cluster (< 0.5 x ATR14) with
-    flat macd_hist AND no pattern AND no clean invalidation.
+    flat macd_hist AND no pattern AND no valid stop-anchor.
 Otherwise TAKE THE DIRECTIONAL STANCE — do NOT hide in STAY_OUT when a real,
 fully-gated setup exists:
-  - BUY / SELL when >= 2 independent confluences AND rrr >= min_rrr AND a clean
-    invalidation exists;
+  - BUY / SELL when >= 2 independent confluences AND rrr >= min_rrr AND a valid
+    stop-anchor exists;
   - STRONG_BUY / STRONG_SHORT only when >= 3 independent confluences AND
     setup_confidence >= "medium" (never pair a STRONG_* action with "low").
 A setup that clears every hard veto but only earns "low" confidence (against
@@ -180,7 +193,10 @@ Rules:
    not the stop-loss itself) whose decisive break would kill the idea early;
    invalidation_tf: the timeframe that level is read on (e.g. "15m", "1H").
    Set both to null / "" when there is no distinct early-invalidation level
-   beyond the stop-loss.
+   beyond the stop-loss. This early-invalidation level is SEPARATE from the
+   stop-anchor of DECISION veto #2: `invalidation_price = null` does NOT mean
+   the setup lacks a stop-anchor and does NOT by itself force STAY_OUT — a valid
+   stop sitting beyond a swing/pattern boundary is enough.
 8. You are NOT placing orders. Your JSON is a suggestion for a human trader.
 9. setup_confidence reflects how much you'd trust this call, independent of
    pattern_confidence. Default "medium". It is a LABEL on a trade that already

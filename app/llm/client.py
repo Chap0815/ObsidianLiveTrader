@@ -287,11 +287,19 @@ def _price_plausibility_flags(
     htf = context.get("htf") if isinstance(context.get("htf"), dict) else {}
     htf_read = htf.get("read") if isinstance(htf.get("read"), dict) else {}
     htf_atr = htf_read.get("atr14")
-    ref_atr = (
-        float(htf_atr)
-        if isinstance(htf_atr, (int, float)) and htf_atr > ltf_atr
-        else float(ltf_atr)
-    )
+    daily = context.get("daily") if isinstance(context.get("daily"), dict) else {}
+    daily_read = daily.get("read") if isinstance(daily.get("read"), dict) else {}
+    daily_atr = daily_read.get("atr14")
+    # Reference ATR for the FAR-entry / wide-SL hard band is the widest of
+    # LTF / HTF / DAILY ATR. The system anchors entries+stops to daily
+    # structure, so a deep daily-pullback limit measured only against the small
+    # LTF/HTF ATR was being hard-downgraded to STAY_OUT (audit B3/I2). The
+    # tighter checks (<0.3x LTF ATR SL, the LTF-band WARN) still use LTF ATR.
+    ref_atr = float(ltf_atr)
+    if isinstance(htf_atr, (int, float)) and htf_atr > ref_atr:
+        ref_atr = float(htf_atr)
+    if isinstance(daily_atr, (int, float)) and daily_atr > ref_atr:
+        ref_atr = float(daily_atr)
 
     entry = proposal.entry_price
     sl = proposal.stop_loss
@@ -506,6 +514,10 @@ def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
 
     read: dict[str, Any] = {
         "ema_stack": _ema_stack_label(last, last_close),
+        # Daily ATR feeds the plausibility reference band so a legitimate deep
+        # daily-anchored pullback entry/stop isn't auto-nuked to STAY_OUT when
+        # it exceeds the small LTF/HTF ATR band (audit B3/I2).
+        "atr14": last.get("atr14"),
         "rvol": indicators.get("rvol"),
     }
     try:

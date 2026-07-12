@@ -248,3 +248,75 @@ def test_compact_tf_no_longer_emits_indicators_last():
     out = compact_tf_for_llm(_tf(**_BULL))
     assert "indicators_last" not in out
     assert "read" in out and "indicators_tail" in out
+
+
+# --- B3/I2: daily ATR feeds the plausibility reference band ----------------
+
+
+def test_deep_daily_anchored_entry_survives_via_daily_atr():
+    """A deep daily-pullback limit that is far in LTF/HTF ATR terms but well
+    inside the DAILY ATR band must be KEPT (warn + low), not auto-STAY_OUT."""
+    data = {**VALID_BUY, "entry_price": 85.0, "stop_loss": 83.0, "tp1": 120.0}
+    ctx = {
+        "last_price": 100.0,
+        "ltf": {"read": {"atr14": 1.0}},
+        "htf": {"read": {"atr14": 2.0}},
+        "daily": {"read": {"atr14": 8.0}},  # 15 away = 1.9x daily ATR -> ok
+    }
+    out = annotate_proposal(parse_proposal(json.dumps(data)), ctx)
+    assert out.action == "BUY"            # kept, not nuked
+    assert out.entry_price == 85.0
+    assert out.setup_confidence == "low"  # capped, with a warning
+    assert "Warning" in out.rationale
+
+
+def test_same_deep_entry_without_daily_atr_is_hard_stay_out():
+    """Control: identical entry with NO daily ATR (only LTF/HTF) is beyond 3x
+    the reference band and is correctly hard-downgraded to STAY_OUT."""
+    data = {**VALID_BUY, "entry_price": 85.0, "stop_loss": 83.0, "tp1": 120.0}
+    ctx = {
+        "last_price": 100.0,
+        "ltf": {"read": {"atr14": 1.0}},
+        "htf": {"read": {"atr14": 2.0}},
+    }
+    out = annotate_proposal(parse_proposal(json.dumps(data)), ctx)
+    assert out.action == "STAY_OUT"
+
+
+def test_compact_daily_read_includes_atr14():
+    from app.llm.client import compact_daily_for_llm
+
+    slice_dict = {
+        "tf": "1D",
+        "candles": [{"close": 110.0}],
+        "indicators": {"last": {"ema20": 100.0, "ema50": 95.0, "ema200": 90.0, "atr14": 7.5}},
+        "structure": {},
+    }
+    assert compact_daily_for_llm(slice_dict)["read"]["atr14"] == 7.5
+
+
+# --- F2/F3/I4: prompt disambiguation + OI counting confluence --------------
+
+
+def test_prompt_confluence_counts_colocated_signal_once():
+    p = build_system_prompt()
+    assert "counts ONCE" in p and "ONE confluence, not two" in p
+
+
+def test_prompt_uses_stop_anchor_not_overloaded_invalidation():
+    p = build_system_prompt()
+    # DECISION veto #2 is now the disambiguated 'stop-anchor', and the handoff
+    # list matches it — the old overloaded 'no clean invalidation' is gone.
+    assert "no valid stop-anchor" in p
+    assert "no clean invalidation" not in p
+    # and a null early-invalidation must NOT be read as a STAY_OUT trigger
+    assert "does NOT by itself force STAY_OUT" in p
+
+
+def test_oi_step_counts_confirming_oi_as_confluence():
+    p = build_system_prompt({"market": {"open_interest": 123.0}})
+    assert "one independent positioning confluence" in p
+    # ...and stays absent from the null-OI prompt (no wasted instruction)
+    assert "one independent positioning confluence" not in build_system_prompt(
+        {"market": {"open_interest": None}}
+    )
