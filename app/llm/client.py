@@ -235,45 +235,92 @@ def compute_simple_rrr(
     return round(reward / risk, 4)
 
 
-def _price_plausibility_reason(
-    proposal: TradeProposal, context: dict[str, Any] | None
-) -> str | None:
-    """Flag hallucinated entry/SL levels that sit implausibly far from
-    last_price/ATR. Returns a human-readable reason, or None if plausible
-    (or if there isn't enough context to judge).
+_DIRECTIONAL = {"BUY", "STRONG_BUY", "SELL", "STRONG_SHORT"}
 
-    Thresholds: |entry - last_price| <= 3x ATR; SL distance from entry
-    between 0.3x and 5x ATR. ATR/last_price come from the LTF analysis
-    context (the timeframe the LLM sets entry/SL timing from).
+
+def _geometry_inverted(proposal: TradeProposal) -> bool:
+    """True when a directional proposal has entry/SL/TP1 all set but their
+    geometry is inverted for the side (SL/TP on the wrong side of entry), so
+    compute_simple_rrr can't produce a real RRR. Such a call is untradeable
+    and must be downgraded to STAY_OUT, not shipped with rrr=null (audit A4)."""
+    if proposal.action not in _DIRECTIONAL:
+        return False
+    if proposal.entry_price is None or proposal.stop_loss is None or proposal.tp1 is None:
+        return False
+    return (
+        compute_simple_rrr(
+            proposal.entry_price,
+            proposal.stop_loss,
+            proposal.tp1,
+            action=proposal.action,
+        )
+        is None
+    )
+
+
+def _price_plausibility_flags(
+    proposal: TradeProposal, context: dict[str, Any] | None
+) -> tuple[str | None, str | None]:
+    """Return (hard_reason, warn_reason) for entry/SL sanity vs ATR.
+
+    HARD (auto-STAY_OUT) = an implausible/hallucinated level: entry beyond
+    3x the reference ATR from last_price, an unusably tight SL (<0.3x LTF ATR),
+    or an SL beyond 5x the reference ATR.
+
+    WARN (keep the trade, cap confidence, attach a note) = a deep limit entry
+    or wide structural stop that is far in *LTF* ATR terms but still within the
+    *HTF* ATR structure band. Entries/stops are frequently anchored to HTF/
+    daily structure, so measuring them only in small 15m ATR previously nuked
+    good pullback/limit setups (audit A5). The reference ATR scales up to HTF
+    ATR when it is larger.
     """
     if not context or proposal.action == "STAY_OUT":
-        return None
+        return None, None
     last_price = context.get("last_price")
     ltf = context.get("ltf") if isinstance(context.get("ltf"), dict) else {}
-    read = ltf.get("read") if isinstance(ltf.get("read"), dict) else {}
-    atr = read.get("atr14")
-    if not isinstance(last_price, (int, float)) or not isinstance(atr, (int, float)):
-        return None
-    if atr <= 0:
-        return None
+    ltf_read = ltf.get("read") if isinstance(ltf.get("read"), dict) else {}
+    ltf_atr = ltf_read.get("atr14")
+    if not isinstance(last_price, (int, float)) or not isinstance(ltf_atr, (int, float)):
+        return None, None
+    if ltf_atr <= 0:
+        return None, None
+    htf = context.get("htf") if isinstance(context.get("htf"), dict) else {}
+    htf_read = htf.get("read") if isinstance(htf.get("read"), dict) else {}
+    htf_atr = htf_read.get("atr14")
+    ref_atr = (
+        float(htf_atr)
+        if isinstance(htf_atr, (int, float)) and htf_atr > ltf_atr
+        else float(ltf_atr)
+    )
+
     entry = proposal.entry_price
     sl = proposal.stop_loss
-    reasons: list[str] = []
+    hard: list[str] = []
+    warn: list[str] = []
     if entry is not None:
         dist = abs(float(entry) - float(last_price))
-        if dist > 3.0 * atr:
-            reasons.append(
-                f"entry {entry} is {dist / atr:.1f}x ATR from last_price {last_price}"
+        if dist > 3.0 * ref_atr:
+            hard.append(
+                f"entry {entry} is {dist / ltf_atr:.1f}x LTF ATR "
+                f"({dist / ref_atr:.1f}x ref ATR) from last_price {last_price}"
+            )
+        elif dist > 3.0 * ltf_atr:
+            warn.append(
+                f"limit entry {dist / ltf_atr:.1f}x LTF ATR from last_price "
+                f"(within HTF-ATR structure band)"
             )
     if entry is not None and sl is not None:
         sl_dist = abs(float(entry) - float(sl))
-        if sl_dist < 0.3 * atr:
-            reasons.append(f"SL distance {sl_dist:.6g} < 0.3x ATR ({atr:.6g})")
-        elif sl_dist > 5.0 * atr:
-            reasons.append(f"SL distance {sl_dist:.6g} > 5x ATR ({atr:.6g})")
-    if not reasons:
-        return None
-    return "; ".join(reasons)
+        if sl_dist < 0.3 * ltf_atr:
+            hard.append(f"SL distance {sl_dist:.6g} < 0.3x LTF ATR ({ltf_atr:.6g})")
+        elif sl_dist > 5.0 * ref_atr:
+            hard.append(f"SL distance {sl_dist:.6g} > 5x ref ATR ({ref_atr:.6g})")
+        elif sl_dist > 5.0 * ltf_atr:
+            warn.append(
+                f"wide structural SL {sl_dist / ltf_atr:.1f}x LTF ATR "
+                f"(within HTF-ATR band)"
+            )
+    return ("; ".join(hard) or None), ("; ".join(warn) or None)
 
 
 def annotate_proposal(
@@ -286,17 +333,42 @@ def annotate_proposal(
         action=proposal.action,
     )
     if computed is None:
-        # Drop a model-claimed RRR that we cannot recompute from geometry
+        # Inverted geometry on a directional call: the SL/TP sit on the wrong
+        # side of entry, so this is an untradeable proposal — downgrade it to
+        # STAY_OUT instead of shipping a BUY/SELL with rrr=null (audit A4).
+        if _geometry_inverted(proposal):
+            note = (
+                "Auto-downgraded to STAY_OUT: directional proposal has inverted "
+                "SL/TP geometry (stop/target on the wrong side of entry)."
+            )
+            rationale = (
+                f"{proposal.rationale} | {note}" if proposal.rationale else note
+            )
+            return proposal.model_copy(
+                update={
+                    "action": "STAY_OUT",
+                    "setup_confidence": "low",
+                    "entry_price": None,
+                    "tp1": None,
+                    "tp2": None,
+                    "tp3": None,
+                    "stop_loss": None,
+                    "rrr": None,
+                    "rationale": rationale,
+                }
+            )
+        # Otherwise: an incomplete geometry (a missing leg). Drop a
+        # model-claimed RRR we cannot recompute, but leave the action alone.
         if proposal.rrr is not None and proposal.action != "STAY_OUT":
             proposal = proposal.model_copy(update={"rrr": None})
     else:
         proposal = proposal.model_copy(update={"rrr": computed})
 
-    reason = _price_plausibility_reason(proposal, context)
-    if reason:
+    hard, warn = _price_plausibility_flags(proposal, context)
+    if hard:
         note = (
             f"Auto-downgraded to STAY_OUT: entry/SL implausible vs "
-            f"last_price/ATR ({reason})."
+            f"last_price/ATR ({hard})."
         )
         rationale = f"{proposal.rationale} | {note}" if proposal.rationale else note
         proposal = proposal.model_copy(
@@ -311,6 +383,14 @@ def annotate_proposal(
                 "rrr": None,
                 "rationale": rationale,
             }
+        )
+    elif warn:
+        # A good-but-far limit/structural setup: keep it, but surface the
+        # warning and cap confidence at "low" rather than silently deleting it.
+        note = f"Warning: {warn} — verify entry/SL vs current price before acting."
+        rationale = f"{proposal.rationale} | {note}" if proposal.rationale else note
+        proposal = proposal.model_copy(
+            update={"setup_confidence": "low", "rationale": rationale}
         )
     return proposal
 
@@ -399,10 +479,13 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
     except (TypeError, ZeroDivisionError):
         pass
 
+    # `indicators_last` (the full EMA/vwap/atr snapshot) is intentionally NOT
+    # emitted: the prompt only ever reads `read.*`, `indicators_tail` and
+    # `structure`, so shipping the raw last-dict was pure token cost plus a
+    # double-read hazard against the derived `read` labels (audit A8).
     return {
         "tf": slice_dict.get("tf"),
         "recent_candles": tail,
-        "indicators_last": last,
         "indicators_tail": indicators_tail,
         "read": read,
         "structure": struct_out,
@@ -448,30 +531,143 @@ def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _regime_alignment(daily_s: str, htf_s: str, ltf_s: str) -> str:
+    """Coarse daily/htf/ltf ema_stack agreement label.
+
+    "conflict" when the daily and htf regimes are both directional but
+    opposite (a lower-timeframe trade would be against the daily anchor);
+    "aligned_bull"/"aligned_bear" when htf+ltf agree and daily doesn't oppose;
+    "mixed" otherwise.
+    """
+    directional = {"bullish", "bearish"}
+    if daily_s in directional and htf_s in directional and daily_s != htf_s:
+        return "conflict"
+    if htf_s == "bullish" and ltf_s == "bullish" and daily_s != "bearish":
+        return "aligned_bull"
+    if htf_s == "bearish" and ltf_s == "bearish" and daily_s != "bullish":
+        return "aligned_bear"
+    return "mixed"
+
+
+def _coherence_hint(
+    daily_c: dict[str, Any], htf_c: dict[str, Any], ltf_c: dict[str, Any]
+) -> dict[str, Any]:
+    """Server-computed regime-coherence block so the model verifies against
+    precomputed facts instead of re-deriving ema_stack agreement from arrays."""
+    d = (daily_c.get("read") or {}).get("ema_stack", "unknown")
+    h = (htf_c.get("read") or {}).get("ema_stack", "unknown")
+    l = (ltf_c.get("read") or {}).get("ema_stack", "unknown")
+    return {
+        "ema_stack_daily": d,
+        "ema_stack_htf": h,
+        "ema_stack_ltf": l,
+        "regime_alignment": _regime_alignment(d, h, l),
+        "ltf_stretch_pct": (ltf_c.get("read") or {}).get("price_vs_ema20_pct"),
+    }
+
+
+def _price_dir_recent(candles: list[Any] | None, lookback: int) -> str | None:
+    """Direction of the last `lookback` closes: 'up' / 'down' / 'flat'."""
+    if not candles or len(candles) <= lookback:
+        return None
+    try:
+        now = candles[-1].get("close")
+        past = candles[-1 - lookback].get("close")
+    except (AttributeError, TypeError, IndexError):
+        return None
+    if not isinstance(now, (int, float)) or not isinstance(past, (int, float)) or past == 0:
+        return None
+    chg = (now - past) / past
+    if chg > 0.001:
+        return "up"
+    if chg < -0.001:
+        return "down"
+    return "flat"
+
+
+def _oi_read_label(market: dict[str, Any], ltf_candles: list[Any] | None) -> str | None:
+    """Precompute the price<->OI positioning label when OI is present.
+
+    Pairs the ~1h price direction (4x 15m closes) with oi_change_pct_1h so the
+    model consumes a ready signal (audit B5b) instead of re-deriving it. Returns
+    None when OI or the change is absent (MEXC / HL cold-start) or price is flat.
+    """
+    oi = market.get("open_interest")
+    oi_chg = market.get("oi_change_pct_1h")
+    if oi is None or not isinstance(oi_chg, (int, float)):
+        return None
+    price_dir = _price_dir_recent(ltf_candles, 4)
+    if price_dir not in ("up", "down"):
+        return None
+    oi_dir = "up" if oi_chg > 0 else ("down" if oi_chg < 0 else "flat")
+    if oi_dir == "flat":
+        return None
+    table = {
+        ("up", "up"): "price_up_oi_up_real_trend",
+        ("up", "down"): "price_up_oi_down_short_covering",
+        ("down", "up"): "price_down_oi_up_new_shorts",
+        ("down", "down"): "price_down_oi_down_long_liquidation",
+    }
+    return table.get((price_dir, oi_dir))
+
+
+def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
+    """Keep only the fields the analyzer should confirm/refute, coerced to
+    safe types. Returns None when nothing usable is present."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, Any] = {}
+    bias = raw.get("bias")
+    if isinstance(bias, str) and bias.strip().lower() in ("long", "short"):
+        out["bias"] = bias.strip().lower()
+    setup = raw.get("setup") or raw.get("setup_type")
+    if isinstance(setup, str) and setup.strip():
+        out["setup"] = setup.strip()
+    kl = raw.get("key_level")
+    if isinstance(kl, (int, float)):
+        out["key_level"] = kl
+    score = raw.get("score")
+    if isinstance(score, (int, float)):
+        out["score"] = score
+    return out or None
+
+
 def build_llm_context(
     market_api: dict[str, Any],
     account: dict[str, Any] | None,
     settings: Settings,
+    scanner_verdict: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     account = account or {}
     # F-15 (privacy): default to false (opt-in) — a missing attribute must
     # fail closed toward NOT leaking account data, not toward sending it.
     include_acct = bool(getattr(settings, "include_account_in_llm", False))
+    src_market = market_api.get("market") or {}
+    daily_c = compact_daily_for_llm(market_api.get("daily") or {})
+    htf_c = compact_tf_for_llm(market_api.get("htf") or {})
+    ltf_c = compact_tf_for_llm(market_api.get("ltf") or {})
+    market_block: dict[str, Any] = {
+        "open_interest": src_market.get("open_interest"),
+        "oi_change_pct_1h": src_market.get("oi_change_pct_1h"),
+        "oi_change_pct_4h": src_market.get("oi_change_pct_4h"),
+        "premium": src_market.get("premium"),
+    }
+    # Precompute the price<->OI positioning label when OI is actually present
+    # (null on MEXC / HL cold-start -> label omitted, no wasted tokens).
+    oi_read = _oi_read_label(src_market, (market_api.get("ltf") or {}).get("candles"))
+    if oi_read is not None:
+        market_block["oi_read"] = oi_read
     # Order: daily (regime anchor) first, then htf (regime), then ltf (timing)
     ctx: dict[str, Any] = {
         "symbol": market_api.get("symbol"),
         "last_price": market_api.get("last_price"),
         "funding": market_api.get("funding") or {},
-        "market": {
-            "open_interest": (market_api.get("market") or {}).get("open_interest"),
-            "oi_change_pct_1h": (market_api.get("market") or {}).get("oi_change_pct_1h"),
-            "oi_change_pct_4h": (market_api.get("market") or {}).get("oi_change_pct_4h"),
-            "premium": (market_api.get("market") or {}).get("premium"),
-        },
+        "market": market_block,
         "contract": market_api.get("contract") or {},
-        "daily": compact_daily_for_llm(market_api.get("daily") or {}),
-        "htf": compact_tf_for_llm(market_api.get("htf") or {}),
-        "ltf": compact_tf_for_llm(market_api.get("ltf") or {}),
+        "daily": daily_c,
+        "htf": htf_c,
+        "ltf": ltf_c,
+        "coherence": _coherence_hint(daily_c, htf_c, ltf_c),
         "risk_policy": {
             "max_leverage": settings.max_leverage,
             "max_risk_pct": settings.max_risk_pct,
@@ -494,6 +690,14 @@ def build_llm_context(
         }
     else:
         ctx["account"] = {"omitted": True, "reason": "INCLUDE_ACCOUNT_IN_LLM=false"}
+
+    # Close the scanner->analyzer handoff loop (audit B1): thread the fast
+    # screener's verdict into the deep context so the analyzer CONFIRMS or
+    # REFUTES it (and, on STAY_OUT, names the failed gate) instead of
+    # re-deriving cold and silently disagreeing.
+    verdict = _sanitize_scanner_verdict(scanner_verdict)
+    if verdict is not None:
+        ctx["scanner_verdict"] = verdict
     return ctx
 
 
@@ -548,7 +752,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         "Content-Type": "application/json",
     }
     # No temperature: Opus 4.8 rejects the deprecated param entirely
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(context)
     user_prompt = build_user_prompt(context)
 
     # Extended thinking for the deep-analysis call only (the scanner uses a
@@ -659,7 +863,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         "model": settings.xai_model,
         "max_tokens": 1800,
         "messages": [
-            {"role": "system", "content": build_system_prompt()},
+            {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
         "temperature": 0.2,
@@ -708,7 +912,7 @@ async def _call_openai_compat(
         "model": model,
         "max_tokens": 1800,
         "messages": [
-            {"role": "system", "content": build_system_prompt()},
+            {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
         "temperature": 0.2,
