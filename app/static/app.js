@@ -3221,7 +3221,7 @@
     const bodyEl = $("proposal-body");
     if (bodyEl) {
       bodyEl.className = "placeholder";
-      bodyEl.textContent = "Claude analysiert…";
+      bodyEl.textContent = (state.llmLabel || "KI") + " analysiert…";
     }
     state.proposal = null;
     state.proposalSymbol = null;
@@ -3896,6 +3896,9 @@
     if (label && data.provider) {
       label.textContent = llmLabelFor(data, data.provider);
     }
+    // Remember the active provider's label so the analyze spinner names the
+    // real KI (not a hardcoded "Claude") — UB-1.
+    if (data.provider) state.llmLabel = llmLabelFor(data, data.provider);
     const providers = data.providers || [];
     if (sel) {
       providers.forEach(function (p) {
