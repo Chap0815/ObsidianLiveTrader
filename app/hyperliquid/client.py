@@ -451,6 +451,28 @@ class HyperliquidClient:
 
         return await self._to_thread(_k)
 
+    @staticmethod
+    def _validate_user_state(state: Any) -> dict[str, Any]:
+        """M-2 fail-safe: a 200-OK-but-degraded/partial ``user_state`` body
+        (backend hiccup, truncated JSON) must NOT be trusted as a flat account —
+        that would report zero equity / no positions and hide a real position
+        from the risk & auto-flatten logic. A complete ``user_state`` always
+        carries BOTH a margin summary AND an ``assetPositions`` list; if either
+        is absent (or the body is not even a dict), refuse it and raise — mirror
+        MEXC's stop-order lookup which never trusts an unrecognized shape. This
+        surfaces as UNKNOWN/degraded downstream, never as a confident "flat".
+        """
+        if (
+            not isinstance(state, dict)
+            or ("marginSummary" not in state and "crossMarginSummary" not in state)
+            or "assetPositions" not in state
+        ):
+            raise HyperliquidError(
+                "user_state returned an unrecognized/degraded shape "
+                f"({type(state).__name__}); refusing to treat as a flat account"
+            )
+        return state
+
     async def assets(self) -> list[dict[str, Any]]:
         def _a():
             if not self.account_address and not self.private_key:
@@ -463,7 +485,7 @@ class HyperliquidClient:
 
                 addr = Account.from_key(self.private_key).address
                 self.account_address = addr
-            state = info.user_state(addr)
+            state = self._validate_user_state(info.user_state(addr))
             margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
             equity = float(margin.get("accountValue") or 0)
             withdrawable = float(state.get("withdrawable") or 0)
@@ -495,7 +517,7 @@ class HyperliquidClient:
                 from eth_account import Account
 
                 addr = Account.from_key(self.private_key).address
-            state = info.user_state(addr)
+            state = self._validate_user_state(info.user_state(addr))
             rows = []
             coin_f = to_hl_coin(symbol) if symbol else None
             for ap in state.get("assetPositions") or []:

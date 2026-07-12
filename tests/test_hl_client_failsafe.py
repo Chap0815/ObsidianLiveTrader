@@ -71,3 +71,60 @@ async def test_open_stop_orders_returns_triggers_on_recognized_list():
     assert len(out) == 1
     assert out[0]["orderId"] == 5
     assert out[0]["triggerPrice"] == "99000"
+
+
+# ── M-2: a degraded user_state body must NOT be trusted as a flat account ──────
+
+_COMPLETE_STATE = {
+    "marginSummary": {
+        "accountValue": "1000",
+        "totalMarginUsed": "50",
+        "totalNtlPos": "500",
+    },
+    "withdrawable": "950",
+    "assetPositions": [],
+}
+
+# 200-OK-but-degraded/partial shapes: not a proper user_state payload. A
+# complete body always carries BOTH a margin summary AND an assetPositions list;
+# anything missing either must fail-closed (raise), never read as "flat/no
+# positions" which would hide a real position from risk/flatten logic.
+_DEGRADED_STATES = [
+    None,
+    {},
+    [],
+    {"foo": "bar"},
+    {"marginSummary": {"accountValue": "1000"}},  # positions key missing
+    {"assetPositions": []},  # margin summary missing
+]
+
+
+@pytest.mark.parametrize("degraded", _DEGRADED_STATES)
+@pytest.mark.asyncio
+async def test_assets_raises_on_degraded_user_state(degraded):
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=degraded)
+    c = _client(info)
+    with pytest.raises(HyperliquidError):
+        await c.assets()
+
+
+@pytest.mark.parametrize("degraded", _DEGRADED_STATES)
+@pytest.mark.asyncio
+async def test_positions_raises_on_degraded_user_state(degraded):
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=degraded)
+    c = _client(info)
+    with pytest.raises(HyperliquidError):
+        await c.positions()
+
+
+@pytest.mark.asyncio
+async def test_assets_and_positions_ok_on_complete_state():
+    """Positive path: a complete user_state is honoured (equity/flat position)."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    rows = await c.assets()
+    assert rows[0]["equity"] == 1000.0
+    assert await c.positions() == []
