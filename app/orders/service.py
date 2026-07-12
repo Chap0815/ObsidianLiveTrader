@@ -849,6 +849,13 @@ class OrderService:
             )
         sl_verified: bool = True
         sl_checked: bool = True
+        # M1: distinct from sl_verified. sl_verified means "the SL trigger we
+        # placed was accepted"; sl_fully_verified means "that SL covers the WHOLE
+        # intended position size". They diverge for a partially-filled resting
+        # GTC limit: the HL adapter sizes the reduce-only SL to the ACTUAL fill
+        # (F-02), so a resting remainder that fills later is unprotected even
+        # though the placed SL is real.
+        sl_fully_verified: bool = True
         sl_detail = "no SL required"
         flatten_result: dict[str, Any] | None = None
         post_errors: list[str] = []
@@ -922,6 +929,40 @@ class OrderService:
                 "Post-Place-SL-Prüfung abgestürzt — Order IST platziert. "
                 "SL/Position jetzt manuell auf der Börse kontrollieren!"
             )
+
+        # M1: a partially-filled resting GTC limit is only protected up to the
+        # ACTUAL fill. The HL adapter sizes the reduce-only SL to entryFilledSz
+        # (F-02), so the resting remainder is UNPROTECTED if it fills later. We
+        # do NOT watch the fill (no fill-watcher by design) and must NOT flatten
+        # the already-protected filled portion — instead we report honestly:
+        # the position is not fully SL-verified and the trader is warned to
+        # manage the resting remainder. Market orders are IOC (no resting
+        # remainder) and are unaffected.
+        order_type = (getattr(ticket, "order_type", "") or "").lower()
+        if (
+            not manual_sltp
+            and order_type == "limit"
+            and sl is not None
+            and float(sl) > 0
+            and not self.settings.allow_unprotected_entry
+            and isinstance(resp, dict)
+        ):
+            filled = resp.get("entryFilledSz")
+            requested = float(gate.rounded_vol)
+            eps = max(requested * 1e-4, 1e-9)
+            if (
+                filled is not None
+                and float(filled) > 0
+                and float(filled) + eps < requested
+            ):
+                sl_fully_verified = False
+                warnings.append(
+                    "TEILGEFÜLLT: Limit-Order nur teilweise ausgeführt "
+                    f"({float(filled):g} von {requested:g}). Der Börsen-SL deckt "
+                    "NUR den gefüllten Teil — der ruhende Rest ist UNGESCHÜTZT, "
+                    "falls er später ausgeführt wird. Rest manuell überwachen, "
+                    "absichern oder die ruhende Order stornieren."
+                )
 
         # Flatten/cancel is separate so its failures never wipe SL flags.
         # Never auto-flatten a manual-mode order — that IS the point of manual.
@@ -1091,6 +1132,12 @@ class OrderService:
                     isinstance(flatten_result, dict) and flatten_result.get("error")
                 ):
                     status = status + "_flatten_sent"
+        # M1: mark a partially-filled limit whose placed SL only covers the fill.
+        # (sl_verified is True here — the trigger IS real — so the block above is
+        # skipped; append the honest partial marker so the status is not a clean
+        # "placed".)
+        if sl_verified and not sl_fully_verified:
+            status = status + "_partial_fill"
 
         # Audit log must survive its own failures too
         try:
@@ -1102,6 +1149,7 @@ class OrderService:
                     response_json={
                         "place": resp if isinstance(resp, dict) else {"data": resp},
                         "sl_verified": sl_verified,
+                        "sl_fully_verified": sl_fully_verified,
                         "sl_checked": sl_checked,
                         "sl_detail": sl_detail,
                         "flatten": flatten_result,
@@ -1120,6 +1168,7 @@ class OrderService:
             "response": resp,
             "gate": gate.to_dict(),
             "sl_verified": sl_verified,
+            "sl_fully_verified": sl_fully_verified,
             "sl_checked": sl_checked,
             "sl_detail": sl_detail,
             "flatten": flatten_result,

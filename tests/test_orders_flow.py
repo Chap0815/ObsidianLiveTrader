@@ -687,6 +687,56 @@ async def test_modify_stop_loss_rejected_on_non_hyperliquid(store):
     assert "nur auf Hyperliquid" in str(ei.value)
 
 
+# ── M1: partially-filled resting GTC limit → remainder unprotected + unwarned ─
+
+
+@pytest.mark.asyncio
+async def test_partial_limit_fill_warns_and_not_fully_sl_verified(client, store):
+    """A GTC limit that only partially fills has its reduce-only SL sized to the
+    ACTUAL fill (HL adapter, F-02). The resting remainder is UNPROTECTED if it
+    later fills. Confirm must NOT report the position as fully SL-verified and
+    must surface a loud warning — without market-closing the protected fill."""
+    # place_order: real SL trigger for the filled part, but fill (6) < req (10).
+    client.place_order = AsyncMock(
+        return_value={"orderId": 1, "slTriggerOid": 999, "entryFilledSz": 6.0}
+    )
+    svc = OrderService(
+        client,
+        _settings(trading_enabled=True, auto_flatten_if_sl_unverified=True),
+        store,
+    )
+    prev = await svc.preview(_good_ticket(vol=10.0))
+    assert prev["ok"] is True
+    conf = await svc.confirm(prev["token"])
+    assert conf["ok"] is True
+    # The SL for the filled portion is genuinely placed → sl_verified stays True…
+    assert conf["sl_verified"] is True
+    # …but the position is NOT fully protected: the honest full-coverage flag.
+    assert conf["sl_fully_verified"] is False
+    assert "partial" in conf["status"].lower()
+    assert any(
+        "UNGESCHÜTZT" in w or "TEILFÜLLUNG" in w or "TEILGEFÜLLT" in w
+        for w in conf["warnings"]
+    )
+    # Must NOT flatten a partly-protected position (no fill-watcher, honest report).
+    client.close_position_market.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_limit_fill_stays_fully_sl_verified(client, store):
+    """Control: a fully-filled limit (fill == requested) reports fully verified."""
+    client.place_order = AsyncMock(
+        return_value={"orderId": 1, "slTriggerOid": 999, "entryFilledSz": 10.0}
+    )
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    prev = await svc.preview(_good_ticket(vol=10.0))
+    conf = await svc.confirm(prev["token"])
+    assert conf["ok"] is True
+    assert conf["sl_verified"] is True
+    assert conf["sl_fully_verified"] is True
+    assert "partial" not in conf["status"].lower()
+
+
 # ── C-1: an errored trigger-aware stop lookup must yield UNKNOWN, not flatten ─
 
 
