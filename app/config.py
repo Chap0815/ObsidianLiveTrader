@@ -185,6 +185,14 @@ class Settings(BaseSettings):
     require_loopback_when_armed: bool = True
     strict_available_margin: bool = True
 
+    # Journal + feedback-loop (KI shadow book). Advisory/measurement only —
+    # these never affect the order/gate/confirm path. Safe defaults so an
+    # unchanged .env works.
+    journal_enabled: bool = True
+    journal_resolve_interval_s: int = 60
+    journal_window_hours: int = 24
+    journal_min_sample: int = 20
+
     @model_validator(mode="after")
     def _apply_risk_profile(self):
         """Fill preset values for any risk field NOT explicitly set in .env.

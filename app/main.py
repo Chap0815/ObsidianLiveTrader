@@ -907,6 +907,58 @@ def _scanner_verdict_cache_key(raw: dict | None) -> tuple | None:
     return (verdict.get("bias"), verdict.get("setup"), key_level, score)
 
 
+_JOURNAL_LONG_ACTIONS = frozenset({"BUY", "STRONG_BUY"})
+_JOURNAL_SHORT_ACTIONS = frozenset({"SELL", "STRONG_SHORT"})
+
+
+def _journal_direction(action: str | None) -> str | None:
+    """long for BUY/STRONG_BUY, short for SELL/STRONG_SHORT, None for STAY_OUT."""
+    if action in _JOURNAL_LONG_ACTIONS:
+        return "long"
+    if action in _JOURNAL_SHORT_ACTIONS:
+        return "short"
+    return None
+
+
+def _journal_scanner_summary(raw: dict | None) -> str | None:
+    """Compact 'bias/setup/score' string from the sanitized scanner_verdict."""
+    verdict = _sanitize_scanner_verdict(raw)
+    if not verdict:
+        return None
+    parts = [
+        str(verdict.get("bias") or "?"),
+        str(verdict.get("setup") or "?"),
+        str(verdict.get("score")) if verdict.get("score") is not None else "?",
+    ]
+    return "/".join(parts)
+
+
+def _journal_model_for_provider(s: Settings) -> str | None:
+    """Resolve the model string for the effective provider (advisory context)."""
+    provider = (s.llm_provider or "").strip().lower()
+    return {
+        "claude": s.anthropic_model,
+        "anthropic": s.anthropic_model,
+        "xai": s.xai_model,
+        "grok": s.xai_model,
+        "openai": s.openai_model,
+        "codex": s.openai_model,
+        "ollama": s.ollama_model,
+        "local": s.ollama_model,
+    }.get(provider)
+
+
+def _journal_status_for(action: str | None, entry, sl, tp1) -> str:
+    """SKIPPED for STAY_OUT (never resolvable) or a non-STAY_OUT proposal that
+    is missing entry/sl/tp1 (degenerate — cannot be shadow-resolved). Else
+    PENDING (the resolver will pick it up)."""
+    if action == "STAY_OUT":
+        return "SKIPPED"
+    if entry is None or sl is None or tp1 is None:
+        return "SKIPPED"
+    return "PENDING"
+
+
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
@@ -1033,8 +1085,9 @@ async def analyze(
             context_hash = hashlib.sha256(
                 json.dumps(ctx_fingerprint, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()[:16]
+            proposal_id: int | None = None
             try:
-                await db.insert_proposal(
+                proposal_id = await db.insert_proposal(
                     symbol=symbol,
                     proposal_json=proposal_dict,
                     annotations_json=annotations,
@@ -1043,6 +1096,42 @@ async def analyze(
             except Exception:
                 # Do not break advisory analyze if SQLite is unavailable
                 pass
+
+            # Journal (KI shadow book) — SAME soft-fail posture. A journal write
+            # must NEVER break analyze: it is advisory/measurement only and never
+            # touches the order/gate/confirm path. STAY_OUT and level-less rows
+            # are logged as SKIPPED (see _journal_status_for); everything else
+            # starts PENDING for the background resolver.
+            if getattr(s, "journal_enabled", True):
+                try:
+                    action = proposal_dict.get("action")
+                    status = _journal_status_for(
+                        action,
+                        proposal.entry_price,
+                        proposal.stop_loss,
+                        proposal.tp1,
+                    )
+                    await db.insert_journal_entry(
+                        symbol=symbol,
+                        tf=tf,
+                        htf=htf,
+                        action=str(action),
+                        direction=_journal_direction(action),
+                        setup_confidence=str(proposal_dict.get("setup_confidence") or "medium"),
+                        entry_price=proposal.entry_price,
+                        stop_loss=proposal.stop_loss,
+                        tp1=proposal.tp1,
+                        rrr=proposal.rrr,
+                        provider=s.llm_provider,
+                        model=_journal_model_for_provider(s),
+                        scanner_summary=_journal_scanner_summary(body.scanner_verdict),
+                        last_price_t0=market_api.get("last_price"),
+                        status=status,
+                        proposal_id=proposal_id,
+                    )
+                except Exception:
+                    # Journal is advisory — never break analyze on a write error.
+                    pass
 
         response = {
             "symbol": symbol,
