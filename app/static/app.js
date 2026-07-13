@@ -3152,6 +3152,187 @@
     }
   }
 
+  /** One {name -> {wins, losses, sample, win_rate, avg_realized_rrr, low_sample}}
+   *  breakdown as a compact table; "" when there is nothing to show (empty DB). */
+  function renderJournalBreakdown(title, groups) {
+    const keys = Object.keys(groups || {});
+    if (!keys.length) return "";
+    let html = '<div class="journal-breakdown">';
+    html += "<h4>" + escapeHtml(title) + "</h4>";
+    html +=
+      '<table class="journal-breakdown-table"><thead><tr>' +
+      "<th></th><th>n</th><th>Win-Rate</th><th>Ø R</th>" +
+      "</tr></thead><tbody>";
+    for (const k of keys) {
+      const g = groups[k] || {};
+      html +=
+        '<tr class="' + (g.low_sample ? "low-sample" : "") + '">' +
+        "<td>" + escapeHtml(k) + "</td>" +
+        "<td>" + fmt(g.sample, 0) + "</td>" +
+        "<td>" +
+        (g.win_rate != null ? fmt(g.win_rate * 100, 1) + "%" : "—") +
+        "</td>" +
+        "<td>" +
+        (g.avg_realized_rrr != null ? fmt(g.avg_realized_rrr, 2) : "—") +
+        "</td>" +
+        "</tr>";
+    }
+    html += "</tbody></table></div>";
+    return html;
+  }
+
+  /** Journal (KI shadow book) tab: stats block (win rate + Wilson CI + avg
+   *  realized R, STAY_OUT rate, breakdowns, caveats) + a read-only table of
+   *  recent entries with outcome badges. Read-only, no writes — measurement
+   *  only, never touches the order/gate path. */
+  function renderJournal(stats, entries) {
+    const body = $("journal-body");
+    if (!body) return;
+    entries = Array.isArray(entries) ? entries : [];
+    const hasStats = stats && stats.overall;
+
+    if (!hasStats && !entries.length) {
+      body.className = "placeholder";
+      body.textContent = "Noch keine Journal-Einträge.";
+      return;
+    }
+
+    let html = '<div class="journal-content">';
+
+    if (hasStats) {
+      const ov = stats.overall || {};
+      const tot = stats.totals || {};
+      const ci = Array.isArray(ov.win_rate_ci95) ? ov.win_rate_ci95 : null;
+      const sample = ov.sample || 0;
+
+      html += '<div class="journal-stats">';
+      if (!sample) {
+        html +=
+          '<p class="muted journal-empty-stats">Noch keine aufgelösten Einträge — ' +
+          "zu wenig Daten für eine belastbare Trefferquote.</p>";
+      } else {
+        html +=
+          '<div class="journal-overall' +
+          (ov.low_sample ? " low-sample" : "") +
+          '">' +
+          '<span class="journal-stat"><b>Win-Rate:</b> ' +
+          (ov.win_rate != null ? fmt(ov.win_rate * 100, 1) + "%" : "—") +
+          " (n=" + fmt(sample, 0) + ")" +
+          (ci
+            ? " CI95 [" +
+              fmt(ci[0] * 100, 1) +
+              "%–" +
+              fmt(ci[1] * 100, 1) +
+              "%]"
+            : "") +
+          "</span>" +
+          '<span class="journal-stat"><b>Ø realized R:</b> ' +
+          (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
+          "</span>" +
+          (ov.low_sample
+            ? '<span class="journal-lowflag">zu wenig Daten</span>'
+            : "") +
+          "</div>";
+      }
+      html +=
+        '<div class="journal-totals muted">' +
+        "Proposals: " + fmt(tot.proposals, 0) +
+        " · STAY_OUT-Rate: " +
+        (tot.stay_out_rate != null ? fmt(tot.stay_out_rate * 100, 1) + "%" : "—") +
+        " · Pending: " + fmt(tot.pending, 0) +
+        " · Expired: " + fmt(tot.expired, 0) +
+        " · Skipped: " + fmt(tot.skipped, 0) +
+        "</div>";
+
+      html += renderJournalBreakdown("Nach Confidence", stats.by_confidence);
+      html += renderJournalBreakdown("Nach Action", stats.by_action);
+      html += renderJournalBreakdown("Nach Provider", stats.by_provider);
+
+      const caveats = Array.isArray(stats.caveats) ? stats.caveats : [];
+      if (caveats.length) {
+        html += '<ul class="journal-caveats muted">';
+        for (const c of caveats) {
+          html += "<li>" + escapeHtml(String(c)) + "</li>";
+        }
+        html += "</ul>";
+      }
+      html += "</div>";
+    }
+
+    if (entries.length) {
+      html +=
+        '<table class="history-table journal-table"><thead><tr>' +
+        "<th>Zeit</th><th>Symbol</th><th>Action</th><th>Conf</th><th>Entry</th>" +
+        "<th>SL</th><th>TP1</th><th>RRR</th><th>Outcome</th>" +
+        "</tr></thead><tbody>";
+      for (const e of entries) {
+        const st = e.status || "PENDING";
+        html +=
+          "<tr>" +
+          "<td>" + escapeHtml(shortIso(e.created_at)) + "</td>" +
+          "<td>" + escapeHtml(e.symbol || "—") + "</td>" +
+          '<td class="hist-action action-' +
+          escapeHtml(e.action || "") +
+          '">' +
+          escapeHtml(e.action || "—") +
+          "</td>" +
+          "<td>" + escapeHtml(e.setup_confidence || "—") + "</td>" +
+          "<td>" + (e.entry_price != null ? fmt(e.entry_price, 4) : "—") + "</td>" +
+          "<td>" + (e.stop_loss != null ? fmt(e.stop_loss, 4) : "—") + "</td>" +
+          "<td>" + (e.tp1 != null ? fmt(e.tp1, 4) : "—") + "</td>" +
+          "<td>" + (e.rrr != null ? fmt(e.rrr, 2) : "—") + "</td>" +
+          "<td>" +
+          '<span class="journal-badge journal-badge-' +
+          escapeHtml(st) +
+          '">' +
+          escapeHtml(st) +
+          "</span>" +
+          (e.ambiguous
+            ? ' <span class="journal-ambiguous" title="tp1 und SL im selben Candle — pessimistisch als LOSS gewertet">~</span>'
+            : "") +
+          "</td>" +
+          "</tr>";
+      }
+      html += "</tbody></table>";
+    } else {
+      html += '<p class="muted history-empty">Noch keine Journal-Einträge.</p>';
+    }
+
+    html += "</div>";
+    body.className = "journal-body";
+    body.innerHTML = html;
+  }
+
+  /** loadJournal: fetch both /api/journal/stats and /api/journal, then render.
+   *  Mirrors loadHistory's soft-fail: any error shows an inline message in the
+   *  pane and never throws further (journal is measurement-only). */
+  async function loadJournal() {
+    const body = $("journal-body");
+    try {
+      const [statsRes, entriesRes] = await Promise.all([
+        apiFetch("/api/journal/stats"),
+        apiFetch("/api/journal?limit=50"),
+      ]);
+      if (!statsRes.ok) throw new Error("journal stats " + statsRes.status);
+      if (!entriesRes.ok) throw new Error("journal " + entriesRes.status);
+      const stats = await statsRes.json();
+      const data = await entriesRes.json();
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      state.journalStats = stats;
+      state.journalEntries = entries;
+      renderJournal(stats, entries);
+      return { stats: stats, entries: entries };
+    } catch (err) {
+      console.error("loadJournal", err);
+      if (body) {
+        body.className = "placeholder";
+        body.textContent =
+          "Journal-Fehler: " + (err && err.message ? err.message : err);
+      }
+      return null;
+    }
+  }
+
   /** Trades tab: executed fills (state.fills) as a compact ledger. Reuses the
    *  same fill objects that drive the chart markers, newest first. HL-only
    *  today (loadFills no-ops on MEXC) → empty state elsewhere. */
@@ -3222,6 +3403,8 @@
     } else if (name === "trades") {
       try { renderTrades(); } catch (_) {}
       loadFills();
+    } else if (name === "journal") {
+      loadJournal();
     }
   }
 
@@ -5155,6 +5338,13 @@
       histClearBtn.addEventListener("click", () => clearHistory());
     }
 
+    const jrnBtn = $("btn-journal-refresh");
+    if (jrnBtn) {
+      jrnBtn.addEventListener("click", () => {
+        loadJournal();
+      });
+    }
+
     const sugBtn = $("btn-suggest-vol");
     if (sugBtn) {
       sugBtn.addEventListener("click", () => suggestVol());
@@ -5716,6 +5906,8 @@
     loadHealth,
     loadAccount,
     loadHistory,
+    loadJournal,
+    renderJournal,
     runAnalyze,
     applyProposalToTicket,
     renderProposal,

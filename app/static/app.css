@@ -2811,6 +2811,140 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .hist-action.action-STAY_OUT { color: var(--warn); background: none; border: none; }
 
+/* ── Journal (KI shadow book) ───────────────────────────── */
+.journal-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.journal-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.journal-overall {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 13.9px;
+}
+
+.journal-stat b { color: var(--faint); font-weight: 600; }
+
+.journal-lowflag {
+  color: var(--warn);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.journal-overall.low-sample .journal-stat { opacity: 0.75; }
+
+.journal-totals {
+  font-size: 12.5px;
+}
+
+.journal-empty-stats {
+  margin: 0;
+  font-size: 13.9px;
+}
+
+.journal-breakdown h4 {
+  margin: 4px 0 4px;
+  font-family: var(--mono);
+  font-size: 11.2px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.journal-breakdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12.8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.journal-breakdown-table th,
+.journal-breakdown-table td {
+  text-align: left;
+  padding: 2px 8px 2px 0;
+}
+
+.journal-breakdown-table th {
+  color: var(--faint);
+  font-weight: 600;
+  font-size: 10.8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.journal-breakdown-table tr.low-sample td {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.journal-caveats {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.journal-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11.6px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border, #333);
+}
+
+.journal-badge-WIN {
+  border-color: rgba(70, 192, 138, 0.6);
+  background: var(--long-dim);
+  color: var(--long);
+}
+
+.journal-badge-LOSS {
+  border-color: rgba(230, 88, 78, 0.6);
+  background: var(--short-dim);
+  color: var(--short);
+}
+
+.journal-badge-EXPIRED {
+  border-color: var(--hairline);
+  background: none;
+  color: var(--faint);
+}
+
+.journal-badge-PENDING {
+  border-color: rgba(229, 169, 60, 0.6);
+  background: rgba(229, 169, 60, 0.13);
+  color: var(--warn);
+}
+
+.journal-badge-SKIPPED {
+  border-color: var(--hairline);
+  background: none;
+  color: var(--muted);
+}
+
+.journal-ambiguous {
+  color: var(--muted);
+  cursor: help;
+}
+
 /* ── Confirm modal ──────────────────────────────────────── */
 .modal {
   position: fixed;
