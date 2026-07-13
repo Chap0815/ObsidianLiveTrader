@@ -155,6 +155,7 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         "/api/analyze",
         "/api/sizing",
         "/api/history",
+        "/api/journal",
         "/api/llm",
         "/api/setup",
         "/api/settings",

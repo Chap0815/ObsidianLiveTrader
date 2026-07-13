@@ -1422,6 +1422,47 @@ async def history_clear(
         raise HTTPException(status_code=500, detail=f"history clear failed: {e}") from e
 
 
+# ── Journal + feedback-loop (KI shadow book) ────────────────────────────
+# Read-only measurement endpoints. Private (loopback + require_local_token),
+# same posture as /api/history. NEVER touches the order/gate/confirm path.
+
+
+@app.get("/api/journal")
+async def journal_list(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    _: None = Depends(require_local_token),
+):
+    """Recent journal entries (KI shadow book), newest first."""
+    db: Database | None = getattr(request.app.state, "db", None)
+    if db is None:
+        return {"entries": [], "limit": limit, "error": "database not initialized"}
+    try:
+        rows = await db.recent_journal(limit=limit)
+        return {"entries": rows, "limit": limit}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"journal read failed: {e}") from e
+
+
+@app.get("/api/journal/stats")
+async def journal_stats_endpoint(
+    request: Request,
+    _: None = Depends(require_local_token),
+):
+    """Aggregate shadow-outcome stats: win rate + Wilson CI + avg realized R,
+    STAY_OUT rate, and breakdowns by confidence/action/provider."""
+    from app.journal.stats import build_stats_response
+
+    db: Database | None = getattr(request.app.state, "db", None)
+    if db is None:
+        return build_stats_response({}, min_sample=get_settings().journal_min_sample)
+    try:
+        raw = await db.journal_stats()
+        return build_stats_response(raw, min_sample=get_settings().journal_min_sample)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"journal stats failed: {e}") from e
+
+
 @app.post("/api/orders/preview")
 async def orders_preview(
     request: Request,
