@@ -255,7 +255,7 @@ async def build_scan_contexts(
     htf: str,
     *,
     kline_limit: int = 260,
-    concurrency: int = 4,
+    concurrency: int = 2,
     daily: str = "1D",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Fetch klines per coin (bounded concurrency) and build mini contexts.
@@ -271,12 +271,16 @@ async def build_scan_contexts(
         sym = row["symbol"]
         async with sem:
             try:
-                ltf_candles = await client.klines(sym, tf, limit_hint=kline_limit)
-                htf_candles = await client.klines(sym, htf, limit_hint=kline_limit)
-                # Daily regime anchor (cached ~5min in context.py; non-fatal:
-                # a failed 1D fetch yields [] -> daily_stack "unknown").
-                daily_candles = await _fetch_daily_candles(
-                    client, sym, daily, kline_limit
+                # O4: a coin's three timeframe fetches are independent — run them
+                # concurrently so each coin's round-trips overlap. Concurrency was
+                # dropped 4->2 alongside this so the in-flight burst (2 coins x 3 =
+                # 6) stays close to the old 4, still net faster than sequential.
+                # Fail-safe preserved: a failed ltf/htf raises -> handled below;
+                # _fetch_daily_candles never raises (returns [] -> "unknown").
+                ltf_candles, htf_candles, daily_candles = await asyncio.gather(
+                    client.klines(sym, tf, limit_hint=kline_limit),
+                    client.klines(sym, htf, limit_hint=kline_limit),
+                    _fetch_daily_candles(client, sym, daily, kline_limit),
                 )
             except Exception as e:  # exchange hiccup on one coin must not kill the scan
                 errors.append(f"{sym}: {e}")

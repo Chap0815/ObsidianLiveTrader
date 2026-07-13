@@ -215,6 +215,76 @@ async def test_build_scan_contexts_threads_oi_read_when_present():
     assert "oi_read" not in by_sym["NOOI"]  # graceful when OI absent
 
 
+@pytest.mark.asyncio
+async def test_build_scan_contexts_fetches_timeframes_concurrently():
+    """O4: a coin's ltf/htf/daily fetches run concurrently (asyncio.gather),
+    so for a single coin more than one klines call is in flight at once."""
+    import asyncio
+
+    from app.analysis.context import clear_daily_cache
+
+    clear_daily_cache()
+
+    class FakeClient:
+        def __init__(self):
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def klines(self, symbol, interval, limit_hint=120):
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            try:
+                await asyncio.sleep(0.02)  # hold the call open to observe overlap
+                return [
+                    Candle(
+                        time=(1_700_000_000 + i * 900) * 1000,
+                        open=100.0, high=101.0, low=99.0, close=100.5, vol=5,
+                    )
+                    for i in range(60)
+                ]
+            finally:
+                self.inflight -= 1
+
+    client = FakeClient()
+    overview = [{"symbol": "ONE", "volume24": 1e9, "funding": 0.0, "last": 100.5}]
+    contexts, errors = await build_scan_contexts(
+        client, overview, "15m", "1H", concurrency=1
+    )
+    assert errors == []
+    assert contexts[0]["symbol"] == "ONE"
+    # Sequential would peak at 1 in-flight; gather overlaps the 3 fetches.
+    assert client.max_inflight >= 2
+
+
+@pytest.mark.asyncio
+async def test_build_scan_contexts_isolates_error_with_gather():
+    """O4: with the gathered fetches, a failing coin is still isolated (its
+    error is captured, the healthy coins still produce contexts)."""
+    from app.analysis.context import clear_daily_cache
+
+    clear_daily_cache()
+
+    class FakeClient:
+        async def klines(self, symbol, interval, limit_hint=120):
+            if symbol == "BROKEN":
+                raise RuntimeError("exchange down for this coin")
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 900) * 1000,
+                    open=100.0, high=101.0, low=99.0, close=100.5, vol=5,
+                )
+                for i in range(60)
+            ]
+
+    overview = [
+        {"symbol": "OKX", "volume24": 1e9, "funding": 0.0, "last": 100.5},
+        {"symbol": "BROKEN", "volume24": 5e8, "funding": 0.0, "last": 1.0},
+    ]
+    contexts, errors = await build_scan_contexts(FakeClient(), overview, "15m", "1H")
+    assert [c["symbol"] for c in contexts] == ["OKX"]
+    assert len(errors) == 1 and "BROKEN" in errors[0]
+
+
 def test_parse_scan_results_salvages_truncated_json():
     """Model cut off at max_tokens mid-array: keep the complete objects."""
     from app.llm.scanner import parse_scan_results
