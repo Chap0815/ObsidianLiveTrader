@@ -166,11 +166,14 @@ def _order_service(request: Request) -> OrderService:
 
 
 def _llm_settings(request: Request):
-    """Settings with the runtime LLM hot-swap override applied (no restart)."""
+    """Settings with the runtime LLM hot-swap override applied (no restart),
+    else auto-resolved to a CONFIGURED provider — so a 'claude' default with no
+    Anthropic key doesn't fail the analysis when another provider is set up."""
     s = get_settings()
     override = getattr(request.app.state, "llm_override", None)
-    if override and override != s.llm_provider:
-        return s.model_copy(update={"llm_provider": override})
+    provider = override or s.resolved_llm_provider
+    if provider != s.llm_provider:
+        return s.model_copy(update={"llm_provider": provider})
     return s
 
 

@@ -454,6 +454,34 @@ class Settings(BaseSettings):
             return self.ollama_ready
         return False
 
+    @property
+    def resolved_llm_provider(self) -> str:
+        """The configured LLM_PROVIDER if it actually has a key, otherwise the
+        first provider that IS configured. Prevents the hardcoded 'claude'
+        default from failing the analysis when Anthropic has no key but another
+        provider (Grok/Codex/Ollama) is set up. Returns the configured one
+        unchanged when NONE are ready, so the downstream error stays honest."""
+        ready = {
+            "claude": self.claude_ready,
+            "xai": self.xai_ready,
+            "openai": self.openai_ready,
+            "ollama": self.ollama_ready,
+        }
+        aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
+        cur = (self.llm_provider or "claude").strip().lower()
+        cur = aliases.get(cur, cur)
+        if ready.get(cur):
+            return cur
+        # Fall back ONLY to a provider that has a real key (claude/xai/openai).
+        # Ollama is deliberately excluded from the fallback: its base_url always
+        # defaults to loopback so ollama_ready is always True even with no local
+        # server running — auto-jumping to it would mask a genuine "no LLM
+        # configured" state. Ollama is still used when explicitly selected (cur).
+        for p in ("claude", "xai", "openai"):
+            if ready.get(p):
+                return p
+        return cur
+
 
 @lru_cache
 def get_settings() -> Settings:

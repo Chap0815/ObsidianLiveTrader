@@ -199,3 +199,16 @@ def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
     assert r1.status_code != 403 or "cross-origin" not in r1.json().get("detail", "").lower()
     assert r2.status_code != 403 or "cross-origin" not in r2.json().get("detail", "").lower()
     assert r3.status_code == 403 and "cross-origin" in r3.json()["detail"].lower()
+
+
+def test_resolved_llm_provider_falls_back_to_a_configured_one():
+    """LLM_PROVIDER=claude with no Anthropic key must resolve to a provider that
+    IS configured (e.g. xai) instead of failing the analysis on unconfigured
+    Claude."""
+    from app.config import Settings
+
+    s = Settings(llm_provider="claude", anthropic_api_key="", xai_api_key="xai-abc")
+    assert s.resolved_llm_provider == "xai"
+    # a configured provider is left unchanged
+    s2 = Settings(llm_provider="xai", xai_api_key="xai-abc")
+    assert s2.resolved_llm_provider == "xai"
