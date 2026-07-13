@@ -106,7 +106,7 @@ class Settings(BaseSettings):
             "claude_api_key",
         ),
     )
-    anthropic_model: str = "claude-opus-4-8"
+    anthropic_model: str = "claude-sonnet-5"
     anthropic_base_url: str = "https://api.anthropic.com"
     anthropic_version: str = "2023-06-01"
 

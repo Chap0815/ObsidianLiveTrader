@@ -131,7 +131,7 @@ def test_build_full_env_port_is_answer_port_not_8788(tmp_path, monkeypatch):
     assert "PORT=8788" not in content
     assert "SETUP_COMPLETE=true" in content
     assert "ANTHROPIC_API_KEY=sk-ant-test" in content
-    assert "ANTHROPIC_MODEL=claude-opus-4-8" in content
+    assert "ANTHROPIC_MODEL=claude-sonnet-5" in content
     assert "ALLOW_MANUAL_TRIGGER=false" in content
     p = tmp_path / ".env"
     p.write_text(content, encoding="utf-8")

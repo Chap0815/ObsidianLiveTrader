@@ -30,7 +30,7 @@ LLM_KEY_VARS: dict[str, tuple[str | None, str]] = {
 }
 
 DEFAULT_MODELS: dict[str, str] = {
-    "claude": "claude-opus-4-8",  # NOT the stale sonnet id
+    "claude": "claude-sonnet-5",  # NOT the stale sonnet id
     "xai": "grok-4",
     "openai": "gpt-5.1",
     "ollama": "llama3.1",
