@@ -536,6 +536,15 @@ select:focus {
 
 .proposal-panel  { max-height: 74vh; }   /* KI-Analyse alone in the left 40% column */
 
+/* Compact mode: while a position is open in the ACTIVE symbol, tighten the
+   layout (smaller gaps, less-prominent KI-analysis) so the trade + chart need
+   less scrolling (user request). Toggled by body.has-position from JS. */
+body.has-position .layout-main { gap: 6px; }
+body.has-position .left-split { gap: 6px; }
+body.has-position .proposal-panel { max-height: 48vh; }
+body.has-position .chart-panel { min-height: 44vh; }
+body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
+
 .side-rail {
   display: flex;
   flex-direction: column;

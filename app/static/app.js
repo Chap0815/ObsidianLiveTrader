@@ -1681,6 +1681,9 @@
   function renderInstrumentRail() {
     const rail = $("instrument-rail");
     if (!rail) return;
+    // Compact the layout while a position is open in the active symbol — the
+    // panels tighten up so the trade + chart need less scrolling (user request).
+    try { document.body.classList.toggle("has-position", hasActivePosition()); } catch (_) {}
     const h = state.health || {};
     const armed = h.trading_enabled === true;
     const armEl = $("ir-arm");
@@ -4713,8 +4716,11 @@
   async function openCoinAndAnalyze(sym) {
     if (!sym) return;
     highlightScanChip(sym);
+    // A scan-result click only switches to that coin's chart — it does NOT
+    // auto-analyse. The detail analysis is a deliberate second step ("Analysieren"),
+    // so browsing scan hits never spends an LLM call on its own (user request).
     goToSymbol(sym, { newTab: true });
-    runAnalyze();
+    showToast("Chart geladen — 'Analysieren' für die KI-Detailanalyse.", "ok");
   }
 
   function highlightScanChip(sym) {
