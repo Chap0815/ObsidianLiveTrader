@@ -5677,9 +5677,21 @@
     loadHistory();
     loadSymbols();
     loadLlm();
-    setInterval(loadAccount, 30000);
-    setInterval(loadFills, 30000); // same cadence as the account poll
-    setInterval(loadOpenOrders, 30000);
+    // O6: skip the 30s account/fills/orders polls while the tab is hidden
+    // (no point fetching into a page nobody is looking at); refresh immediately
+    // when it becomes visible again so the data is never stale on return.
+    const _whenVisible = function (fn) {
+      return function () { if (!document.hidden) fn(); };
+    };
+    setInterval(_whenVisible(loadAccount), 30000);
+    setInterval(_whenVisible(loadFills), 30000); // same cadence as the account poll
+    setInterval(_whenVisible(loadOpenOrders), 30000);
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) return;
+      loadAccount();
+      loadOpenOrders();
+      loadFills();
+    });
     // Live chart poll, adaptive:
     //  - WS live: ticks stream in real time already; full refresh
     //    (indicators, structure) every 15 s to spare the exchange API.
