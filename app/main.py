@@ -150,9 +150,27 @@ async def lifespan(app: FastAPI):
     multi_worker_warning = _detect_multi_worker_env()
     if multi_worker_warning:
         log.warning(multi_worker_warning)
+
+    # Journal shadow-outcome resolver: single background task, cancelled on
+    # shutdown. Advisory/measurement only — never places/moves/cancels orders.
+    # Guarded so a resolver failure can never break app startup.
+    resolver_task = None
+    if getattr(s, "journal_enabled", True):
+        try:
+            from app.journal.resolver import run_resolver_loop
+
+            resolver_task = _asyncio.create_task(run_resolver_loop(app))
+        except Exception:
+            log.warning("journal resolver failed to start", exc_info=True)
     try:
         yield
     finally:
+        if resolver_task is not None:
+            resolver_task.cancel()
+            try:
+                await resolver_task
+            except (_asyncio.CancelledError, Exception):
+                pass
         aclose = getattr(client, "aclose", None)
         if aclose:
             await aclose()

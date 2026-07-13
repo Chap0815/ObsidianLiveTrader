@@ -18,9 +18,33 @@ slightly UNDERstates the win rate, deliberately, to avoid flattering the KI.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+log = logging.getLogger("app.journal.resolver")
+
+# tf -> seconds. Mirrors app/mexc/client._INTERVAL_SECONDS (kept local so the
+# resolver has no import dependency on an exchange module).
+_TF_SECONDS: dict[str, int] = {
+    "5m": 300,
+    "15m": 900,
+    "1H": 3600,
+    "4H": 14_400,
+    "1D": 86_400,
+    "Min5": 300,
+    "Min15": 900,
+    "Min60": 3600,
+    "Hour4": 14_400,
+    "Day1": 86_400,
+}
+
+# Cap so a tiny tf over a long window never asks for an absurd number of bars.
+_MAX_LIMIT_HINT = 1000
+_DEFAULT_LIMIT_HINT = 500
 
 # Terminal + non-terminal states.
 PENDING = "PENDING"
@@ -152,3 +176,117 @@ def resolve_entry(
     if elapsed >= window_s:
         return Outcome(status=EXPIRED)
     return Outcome(status=PENDING)
+
+
+def _limit_hint_for(tf: str, window_s: float) -> int:
+    """Bars needed to cover the resolution window at this tf, plus buffer."""
+    tf_s = _TF_SECONDS.get(tf)
+    if not tf_s or tf_s <= 0:
+        return _DEFAULT_LIMIT_HINT
+    n = math.ceil(window_s / tf_s) + 5
+    return max(10, min(_MAX_LIMIT_HINT, n))
+
+
+async def resolve_pending_once(
+    db: Any,
+    client: Any,
+    *,
+    window_s: float,
+    now: datetime | None = None,
+) -> None:
+    """One resolver pass over all PENDING journal rows. Fail-safe by design.
+
+    Groups rows by (symbol, tf), fetches klines once per group, applies the
+    pure resolve_entry, and writes terminal outcomes. Any per-symbol error
+    leaves those rows PENDING for the next cycle; a DB-read failure makes the
+    whole pass a no-op. Never raises (except CancelledError propagates).
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        rows = await db.pending_journal_entries()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # DB unavailable -> no-op cycle (same soft-fail posture as analyze).
+        return
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows or []:
+        groups.setdefault((row["symbol"], row["tf"]), []).append(row)
+
+    for (symbol, tf), grp in groups.items():
+        try:
+            limit_hint = _limit_hint_for(tf, window_s)
+            candles = await client.klines(symbol, tf, limit_hint)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Exchange down / bad payload: leave rows PENDING, retry next cycle.
+            log.warning("journal resolver: klines failed for %s %s", symbol, tf)
+            for row in grp:
+                try:
+                    await db.touch_journal_checked(row["id"])
+                except Exception:
+                    pass
+            continue
+
+        for row in grp:
+            try:
+                outcome = resolve_entry(
+                    direction=row.get("direction"),
+                    entry_price=row.get("entry_price"),
+                    stop_loss=row.get("stop_loss"),
+                    tp1=row.get("tp1"),
+                    created_at=row["created_at"],
+                    candles=candles,
+                    now=now,
+                    window_s=window_s,
+                )
+                if outcome.status != PENDING:
+                    await db.update_journal_outcome(
+                        row["id"],
+                        status=outcome.status,
+                        resolved_price=outcome.resolved_price,
+                        realized_r=outcome.realized_r,
+                        ambiguous=outcome.ambiguous,
+                    )
+                else:
+                    await db.touch_journal_checked(row["id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single bad row must not abort the pass.
+                continue
+
+
+async def run_resolver_loop(app: Any) -> None:
+    """Background task: sweep PENDING journal rows on an interval.
+
+    Started in lifespan(), cancelled+awaited on shutdown. Independent of the UI
+    so proposals for coins the user isn't watching still resolve. NEVER crashes
+    the app: every cycle body is wrapped, and it sleeps regardless of outcome.
+    Relies on the single-worker invariant so exactly one resolver runs.
+    """
+    from app.config import get_settings
+
+    try:
+        s = get_settings()
+        interval = max(5, int(getattr(s, "journal_resolve_interval_s", 60)))
+        window_s = float(getattr(s, "journal_window_hours", 24)) * 3600.0
+    except Exception:
+        interval = 60
+        window_s = 24 * 3600.0
+
+    while True:
+        try:
+            db = getattr(app.state, "db", None)
+            client = getattr(app.state, "mexc", None) or getattr(
+                app.state, "exchange", None
+            )
+            if db is not None and client is not None:
+                await resolve_pending_once(db, client, window_s=window_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("journal resolver cycle failed", exc_info=True)
+        await asyncio.sleep(interval)
