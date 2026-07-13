@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.config import get_settings
 from app.llm.client import LlmError
 from app.models import TradeProposal
@@ -244,6 +246,90 @@ def test_analyze_stay_out_is_cached(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_analyze_cache_key_includes_scanner_verdict(monkeypatch):
+    """A verdict-less manual analyze and a scan-triggered analyze (with a
+    scanner_verdict) for the same coin/tf/htf/provider must NOT share a cache
+    entry — otherwise a verdict-mismatched proposal could be served from
+    cache for up to the TTL (re-opening the scanner<->analyzer B1 gap)."""
+    _env(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    analyze_mock = AsyncMock(return_value=_proposal())
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.analyze_cache = {}
+        p1, p2, p3, p4 = _patched(analyze_mock)
+        with p1, p2, p3, p4:
+            r1 = tc.post(
+                "/api/analyze", json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
+            )
+            r2 = tc.post(
+                "/api/analyze",
+                json={
+                    "symbol": "BTC_USDT",
+                    "tf": "15m",
+                    "htf": "1H",
+                    "scanner_verdict": {
+                        "bias": "long",
+                        "setup": "breakout",
+                        "key_level": 100_500.0,
+                        "score": 0.8,
+                    },
+                },
+            )
+
+        assert r1.json()["cached"] is False
+        assert r2.json()["cached"] is False  # NOT served from the verdict-less entry
+        assert analyze_mock.await_count == 2
+
+    get_settings.cache_clear()
+
+
+def test_analyze_cache_key_verdict_hit_when_identical(monkeypatch):
+    """Two identical requests, both WITH the same scanner_verdict, must still
+    hit the cache on the second call (verdict inclusion must not break the
+    normal cache-hit path)."""
+    _env(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    analyze_mock = AsyncMock(return_value=_proposal())
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    verdict = {"bias": "long", "setup": "breakout", "key_level": 100_500.0, "score": 0.8}
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.analyze_cache = {}
+        p1, p2, p3, p4 = _patched(analyze_mock)
+        with p1, p2, p3, p4:
+            r1 = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H", "scanner_verdict": verdict},
+            )
+            r2 = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H", "scanner_verdict": verdict},
+            )
+
+        assert r1.json()["cached"] is False
+        assert r2.json()["cached"] is True
+        assert analyze_mock.await_count == 1
+
+    get_settings.cache_clear()
+
+
 def test_analyze_cache_key_includes_resolved_provider(monkeypatch):
     """Switching the KI provider (hot-swap dropdown) must never serve a
     cached proposal generated for a DIFFERENT provider — the cache key has
@@ -282,5 +368,97 @@ def test_analyze_cache_key_includes_resolved_provider(monkeypatch):
             # session (other test files `from app.main import app` too) — never
             # leave the hot-swap override dirty for a later, unrelated test.
             tc.app.state.llm_override = None
+
+    get_settings.cache_clear()
+
+
+# --- Singleflight on cache MISS (mirrors /api/news's news_lock pattern) -----
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
+    """Two concurrent, identical cache-miss analyze requests must result in
+    ONE real LLM call — the second waits on app.state.analyze_lock, then
+    re-checks the (now-populated) cache instead of firing its own LLM call."""
+    import asyncio as _asyncio
+
+    import httpx
+
+    _env(monkeypatch)
+    from app.main import app
+
+    llm_calls = 0
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def fake_analyze_with_llm(context, settings):
+        nonlocal llm_calls
+        llm_calls += 1
+        started.set()
+        await release.wait()
+        return _proposal()
+
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    app.state.mexc = client
+    app.state.analyze_cache = {}
+    app.state.analyze_lock = _asyncio.Lock()
+
+    p1 = patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock()))
+    p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
+    p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
+    p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+
+    transport = httpx.ASGITransport(app=app)
+    body = {"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
+    with p1, p2, p3, p4:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            t1 = _asyncio.create_task(ac.post("/api/analyze", json=body))
+            await _asyncio.wait_for(started.wait(), timeout=2.0)
+            t2 = _asyncio.create_task(ac.post("/api/analyze", json=body))
+            await _asyncio.sleep(0.1)  # let t2 reach (and block on) analyze_lock
+            release.set()
+            r1 = await t1
+            r2 = await t2
+
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    assert llm_calls == 1
+    # Exactly one of the two got the fresh (non-cached) response, the other the
+    # cache hit — which one wins the race is not the point, only the call count.
+    cached_flags = sorted([r1.json()["cached"], r2.json()["cached"]])
+    assert cached_flags == [False, True]
+
+    get_settings.cache_clear()
+
+
+def test_analyze_cache_size_is_capped(monkeypatch):
+    """The cache must not grow unbounded — once it exceeds the cap, the
+    oldest entry is dropped to bound memory growth."""
+    _env(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.main import ANALYZE_CACHE_MAX_ENTRIES
+
+    analyze_mock = AsyncMock(return_value=_proposal())
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.analyze_cache = {}
+        for i in range(ANALYZE_CACHE_MAX_ENTRIES + 5):
+            sym = f"COIN{i}_USDT"
+            p1, p2, p3, p4 = _patched(analyze_mock, symbol=sym)
+            with p1, p2, p3, p4:
+                r = tc.post("/api/analyze", json={"symbol": sym, "tf": "15m", "htf": "1H"})
+            assert r.status_code == 200, r.text
+
+        assert len(tc.app.state.analyze_cache) <= ANALYZE_CACHE_MAX_ENTRIES
 
     get_settings.cache_clear()

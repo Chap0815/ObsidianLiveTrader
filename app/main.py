@@ -24,7 +24,13 @@ from app.config import Settings, get_settings
 from app.db.repo import Database
 from app.exchange_factory import create_exchange_client, exchange_ready
 from app.hyperliquid.errors import HyperliquidError
-from app.llm.client import LlmError, analyze_with_llm, build_llm_context, reevaluate_with_llm
+from app.llm.client import (
+    LlmError,
+    _sanitize_scanner_verdict,
+    analyze_with_llm,
+    build_llm_context,
+    reevaluate_with_llm,
+)
 
 # Back-compat alias
 GrokError = LlmError
@@ -61,6 +67,10 @@ log = logging.getLogger("app.main")
 # /api/analyze in-memory result cache TTL (LLM-credit saver). Advisory only —
 # never consulted by the order/gate path (see analyze() below).
 ANALYZE_CACHE_TTL_S = 120.0
+# Simple size cap so a long-running process (many symbols/tf/htf/provider/
+# verdict combinations) can't grow this dict unbounded — the oldest entry
+# (by insertion order) is dropped once the cache exceeds this many entries.
+ANALYZE_CACHE_MAX_ENTRIES = 256
 
 # F-16 (deployment/concurrency): env var names some process managers use to
 # announce a multi-worker/multi-process launch. Checked at startup so a
@@ -133,6 +143,10 @@ async def lifespan(app: FastAPI):
     # Singleflight lock for /api/news: concurrent cache-miss callers await
     # one in-flight refresh instead of each firing a full feed-fetch batch.
     app.state.news_lock = _asyncio.Lock()
+    # Singleflight lock for /api/analyze: mirrors news_lock above — two
+    # concurrent identical cache-miss requests must trigger only ONE LLM
+    # call, not two (see analyze() below).
+    app.state.analyze_lock = _asyncio.Lock()
     multi_worker_warning = _detect_multi_worker_env()
     if multi_worker_warning:
         log.warning(multi_worker_warning)
@@ -871,6 +885,28 @@ async def fills(
     return {"fills": rows, "supported": True, "error": None}
 
 
+def _scanner_verdict_cache_key(raw: dict | None) -> tuple | None:
+    """Stable, hashable representation of a scanner_verdict for the analyze
+    cache key. Reuses the same sanitizer the LLM context itself uses
+    (_sanitize_scanner_verdict) so the key reflects exactly what would be
+    sent to the model: absent/unusable verdict -> None (its own cache
+    bucket, distinct from any present verdict); a present verdict -> a
+    tuple of its sanitized (bias, setup, key_level, score), rounded so
+    float jitter doesn't fragment the cache."""
+    verdict = _sanitize_scanner_verdict(raw)
+    if verdict is None:
+        return None
+    try:
+        key_level = round(float(verdict.get("key_level") or 0), 6)
+    except (TypeError, ValueError):
+        key_level = 0.0
+    try:
+        score = round(float(verdict.get("score") or 0), 3)
+    except (TypeError, ValueError):
+        score = 0.0
+    return (verdict.get("bias"), verdict.get("setup"), key_level, score)
+
+
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
@@ -900,115 +936,152 @@ async def analyze(
     htf = body.htf or "1H"
 
     # Analysis caching (LLM-credit saver): key includes the RESOLVED provider
-    # so hot-swapping the KI dropdown never serves a stale other-provider
-    # result. Advisory only — this cache never touches order/gate paths;
-    # confirm always re-runs its own gates on live price. Only SUCCESSFUL
-    # proposals are cached (errors are never cached); STAY_OUT is a valid,
-    # cacheable result.
-    cache_key = (symbol, tf, htf, s.llm_provider)
-    if not body.force:
+    # (so hot-swapping the KI dropdown never serves a stale other-provider
+    # result) AND the sanitized scanner_verdict (so a verdict-less manual
+    # analyze and a scan-triggered analyze for the same coin/tf/htf/provider
+    # never share a cache entry — that would silently serve a
+    # verdict-mismatched proposal for up to the TTL, re-opening the
+    # scanner<->analyzer B1 handoff gap). Advisory only — this cache never
+    # touches order/gate paths; confirm always re-runs its own gates on live
+    # price. Only SUCCESSFUL proposals are cached (errors are never cached);
+    # STAY_OUT is a valid, cacheable result.
+    verdict_key = _scanner_verdict_cache_key(body.scanner_verdict)
+    cache_key = (symbol, tf, htf, s.llm_provider, verdict_key)
+
+    def _cache_lookup() -> dict | None:
         cache: dict = getattr(request.app.state, "analyze_cache", None) or {}
         entry = cache.get(cache_key)
-        if entry is not None:
-            cached_at, cached_response = entry
-            age = _time.monotonic() - cached_at
-            if age < ANALYZE_CACHE_TTL_S:
-                resp = dict(cached_response)
-                resp["cached"] = True
-                resp["cached_age_s"] = int(age)
-                return resp
+        if entry is None:
+            return None
+        cached_at, cached_response = entry
+        age = _time.monotonic() - cached_at
+        if age >= ANALYZE_CACHE_TTL_S:
+            return None
+        resp = dict(cached_response)
+        resp["cached"] = True
+        resp["cached_age_s"] = int(age)
+        return resp
 
-    try:
-        snap = await build_market_snapshot(
-            symbol, tf, htf, client, limit_hint=s.kline_limit_hint
-        )
-    except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
+    if not body.force:
+        hit = _cache_lookup()
+        if hit is not None:
+            return hit
 
-    market_api = snapshot_to_api_dict(snap)
-
-    # Soft account snapshot for context (optional; keys may be missing)
-    if exchange_ready(s) and s.include_account_in_llm:
+    async def _run_analyze() -> dict:
         try:
-            acct = await client.account_snapshot()
+            snap = await build_market_snapshot(
+                symbol, tf, htf, client, limit_hint=s.kline_limit_hint
+            )
         except ExchangeError as e:
-            acct = empty_account(error=str(e))
-    else:
-        acct = empty_account(
-            error=None
-            if not s.include_account_in_llm
-            else "MEXC keys not configured"
-        )
+            raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
 
-    context = build_llm_context(market_api, acct, s, scanner_verdict=body.scanner_verdict)
+        market_api = snapshot_to_api_dict(snap)
 
-    try:
-        proposal = await analyze_with_llm(context, s)
-    except LlmError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-
-    annotations = {
-        "rrr_computed": proposal.rrr,
-        "advisory_only": True,
-        "gates_not_bypassed": True,
-        "tf": tf,
-        "htf": htf,
-    }
-    # Sanity read for the UI: how actionable is the proposal right now?
-    last_px = market_api.get("last_price")
-    ltf_last = ((market_api.get("ltf") or {}).get("indicators") or {}).get("last") or {}
-    atr = ltf_last.get("atr14")
-    try:
-        if proposal.entry_price and last_px:
-            annotations["entry_vs_last_pct"] = round(
-                (float(proposal.entry_price) - float(last_px)) / float(last_px) * 100.0, 3
+        # Soft account snapshot for context (optional; keys may be missing)
+        if exchange_ready(s) and s.include_account_in_llm:
+            try:
+                acct = await client.account_snapshot()
+            except ExchangeError as e:
+                acct = empty_account(error=str(e))
+        else:
+            acct = empty_account(
+                error=None
+                if not s.include_account_in_llm
+                else "MEXC keys not configured"
             )
-        if proposal.entry_price and proposal.stop_loss and atr:
-            annotations["sl_distance_atr"] = round(
-                abs(float(proposal.entry_price) - float(proposal.stop_loss)) / float(atr), 2
-            )
-    except (TypeError, ValueError, ZeroDivisionError):
-        pass
-    proposal_dict = proposal.model_dump()
 
-    # Audit trail (Task 8) — soft-fail so analyze still returns on DB issues
-    db: Database | None = getattr(request.app.state, "db", None)
-    if db is not None:
-        ctx_fingerprint = {
+        context = build_llm_context(market_api, acct, s, scanner_verdict=body.scanner_verdict)
+
+        try:
+            proposal = await analyze_with_llm(context, s)
+        except LlmError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+        annotations = {
+            "rrr_computed": proposal.rrr,
+            "advisory_only": True,
+            "gates_not_bypassed": True,
+            "tf": tf,
+            "htf": htf,
+        }
+        # Sanity read for the UI: how actionable is the proposal right now?
+        last_px = market_api.get("last_price")
+        ltf_last = ((market_api.get("ltf") or {}).get("indicators") or {}).get("last") or {}
+        atr = ltf_last.get("atr14")
+        try:
+            if proposal.entry_price and last_px:
+                annotations["entry_vs_last_pct"] = round(
+                    (float(proposal.entry_price) - float(last_px)) / float(last_px) * 100.0, 3
+                )
+            if proposal.entry_price and proposal.stop_loss and atr:
+                annotations["sl_distance_atr"] = round(
+                    abs(float(proposal.entry_price) - float(proposal.stop_loss)) / float(atr), 2
+                )
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        proposal_dict = proposal.model_dump()
+
+        # Audit trail (Task 8) — soft-fail so analyze still returns on DB issues
+        db: Database | None = getattr(request.app.state, "db", None)
+        if db is not None:
+            ctx_fingerprint = {
+                "symbol": symbol,
+                "tf": tf,
+                "htf": htf,
+                "last_price": market_api.get("last_price"),
+            }
+            context_hash = hashlib.sha256(
+                json.dumps(ctx_fingerprint, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+            try:
+                await db.insert_proposal(
+                    symbol=symbol,
+                    proposal_json=proposal_dict,
+                    annotations_json=annotations,
+                    context_hash=context_hash,
+                )
+            except Exception:
+                # Do not break advisory analyze if SQLite is unavailable
+                pass
+
+        response = {
             "symbol": symbol,
             "tf": tf,
             "htf": htf,
+            "proposal": proposal_dict,
+            "annotations": annotations,
             "last_price": market_api.get("last_price"),
         }
-        context_hash = hashlib.sha256(
-            json.dumps(ctx_fingerprint, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:16]
-        try:
-            await db.insert_proposal(
-                symbol=symbol,
-                proposal_json=proposal_dict,
-                annotations_json=annotations,
-                context_hash=context_hash,
-            )
-        except Exception:
-            # Do not break advisory analyze if SQLite is unavailable
-            pass
+        cache = getattr(request.app.state, "analyze_cache", None)
+        if cache is None:
+            cache = {}
+            request.app.state.analyze_cache = cache
+        cache[cache_key] = (_time.monotonic(), dict(response))
+        # Simple size cap (O-ish growth bound): drop the oldest entry (by
+        # insertion order) once the cache exceeds the cap.
+        if len(cache) > ANALYZE_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(cache))
+            if oldest_key != cache_key:
+                del cache[oldest_key]
+        response["cached"] = False
+        return response
 
-    response = {
-        "symbol": symbol,
-        "tf": tf,
-        "htf": htf,
-        "proposal": proposal_dict,
-        "annotations": annotations,
-        "last_price": market_api.get("last_price"),
-    }
-    cache = getattr(request.app.state, "analyze_cache", None)
-    if cache is None:
-        cache = {}
-        request.app.state.analyze_cache = cache
-    cache[cache_key] = (_time.monotonic(), dict(response))
-    response["cached"] = False
-    return response
+    if body.force:
+        return await _run_analyze()
+
+    # Singleflight on a cache MISS (mirrors /api/news's news_lock): two
+    # concurrent identical requests must trigger only ONE LLM call. Acquire
+    # the lock, then RE-CHECK the cache — another caller may have already
+    # populated it while this one was waiting.
+    lock = getattr(request.app.state, "analyze_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.analyze_lock = lock
+    async with lock:
+        hit = _cache_lookup()
+        if hit is not None:
+            return hit
+        return await _run_analyze()
 
 
 def _classify_unlabeled_trigger(

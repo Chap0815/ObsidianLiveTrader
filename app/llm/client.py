@@ -754,12 +754,19 @@ GrokError = LlmError
 # instead of a raw "Claude HTTP 403: {...}" dump. Only the response BODY is
 # ever inspected here — request headers (which carry the API key) never are,
 # so a raw key/secret can't leak into the message.
+# Tightened (not a bare "credit") so an unrelated substring like "credential"
+# doesn't false-positive; still matches the real credits/billing phrasing
+# providers actually send.
 _CREDIT_ERROR_KEYWORDS = (
-    "credit",
+    "out of credit",
+    "used all available credit",
+    "no credits left",
+    "insufficient credit",
     "spending limit",
     "spending_limit",
     "permission denied",
     "permission_denied",
+    "permission-denied",
     "insufficient_quota",
     "insufficient quota",
 )
@@ -775,15 +782,24 @@ def _categorize_provider_http_error(
     provider_label: str, status_code: int, detail: Any
 ) -> str:
     """Turn a provider HTTP error response into a clean German LlmError
-    message when it looks like a credits/limit or rate-limit condition;
-    otherwise keep the existing detailed "{Provider} HTTP {code}: {detail}"
-    message unchanged."""
+    message when it looks like an auth, credits/limit, or rate-limit
+    condition; otherwise keep the existing detailed
+    "{Provider} HTTP {code}: {detail}" message unchanged.
+
+    401 (auth: bad/missing key) is intentionally split from 403 (billing):
+    conflating them would tell a trader with a broken key to "top up
+    credits" when the fix is actually to check the key."""
     try:
         body_text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
     except (TypeError, ValueError):
         body_text = str(detail)
     low = (body_text or "").lower()
-    if status_code in (401, 403) or any(k in low for k in _CREDIT_ERROR_KEYWORDS):
+    if status_code == 401:
+        return (
+            f"⚠ {provider_label}: API-Key ungültig oder fehlt — "
+            "Key prüfen oder KI wechseln."
+        )
+    if status_code == 403 or any(k in low for k in _CREDIT_ERROR_KEYWORDS):
         return (
             f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
             "KI im Dropdown wechseln oder aufladen."

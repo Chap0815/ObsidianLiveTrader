@@ -1982,6 +1982,9 @@
         runReevaluate(btn.getAttribute("data-sym"));
       });
     });
+    // A cached reevaluate result (from a previous render) may already be a
+    // categorized "⚠" provider error — wire its "KI wechseln" button too.
+    wireKiSwitchButtons(el);
 
     // K4: clicking a position card opens that coin's chart (goToSymbol).
     // Event delegation on the panel so it survives re-renders; ignore clicks
@@ -2033,9 +2036,15 @@
     const entry = key ? state.reevalResults[key] : null;
     if (!entry) return "";
     if (entry.error) {
-      return (
-        '<div class="cp-reeval-out cp-reeval-error">' + escapeHtml(entry.error) + "</div>"
-      );
+      const text = String(entry.error);
+      if (isLlmWarnMessage(text)) {
+        // Categorized provider error (app/llm/client.py) — same clean
+        // warn-banner + "KI wechseln" affordance as showProposalError()
+        // instead of a plain error line. The caller is responsible for
+        // calling wireKiSwitchButtons() once this is attached to the DOM.
+        return '<div class="cp-reeval-out cp-reeval-error-warn">' + llmWarnBannerHtml(text) + "</div>";
+      }
+      return '<div class="cp-reeval-out cp-reeval-error">' + escapeHtml(text) + "</div>";
     }
     const r = entry.reevaluation || {};
     const actionCls = "reeval-action-" + String(r.action || "").toLowerCase();
@@ -2127,7 +2136,10 @@
       // Re-render just this card's result block; a full renderPositions()
       // would be fine too, but this avoids reshuffling the whole panel.
       const out2 = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
-      if (out2) out2.innerHTML = reevalResultHtml(key);
+      if (out2) {
+        out2.innerHTML = reevalResultHtml(key);
+        wireKiSwitchButtons(out2);
+      }
       const btn2 = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
       if (btn2) {
         btn2.disabled = false;
@@ -3501,20 +3513,48 @@
     }
   }
 
+  /** True when a message is a categorized provider error (app/llm/client.py
+   *  ._categorize_provider_http_error — auth/credits/rate-limit), which is
+   *  always prefixed with "⚠" and should get the prominent warn-banner
+   *  treatment instead of a plain error line. */
+  function isLlmWarnMessage(text) {
+    return String(text == null ? "" : text).indexOf("⚠") === 0;
+  }
+
+  /** Shared markup for a categorized "⚠ ..." provider error: the warn banner
+   *  plus a "KI wechseln" button. Callers MUST wire the button themselves via
+   *  wireKiSwitchButtons() once this HTML is attached to the DOM (this
+   *  returns a string, not a live node, so it works both for a direct
+   *  innerHTML assignment and when embedded inside a larger template
+   *  string). Text is escaped here — callers must not escape it again. */
+  function llmWarnBannerHtml(text) {
+    return (
+      '<div class="error-text error-llm-warn">' + escapeHtml(text) + "</div>" +
+      '<button type="button" class="btn-ki-switch">KI wechseln</button>'
+    );
+  }
+
+  /** Wire every ".btn-ki-switch" button inside `container` to focus the KI
+   *  dropdown. Safe to call repeatedly on re-rendered markup (querySelectorAll
+   *  only ever sees the buttons currently in the DOM). */
+  function wireKiSwitchButtons(container) {
+    if (!container) return;
+    container.querySelectorAll(".btn-ki-switch").forEach(function (btn) {
+      btn.addEventListener("click", focusLlmSelect);
+    });
+  }
+
   function showProposalError(msg) {
     const body = $("proposal-body");
     if (!body) return;
     body.className = "proposal-body";
     const text = String(msg == null ? "" : msg);
-    if (text.indexOf("⚠") === 0) {
+    if (isLlmWarnMessage(text)) {
       // Credit/rate-limit style provider error (app/llm/client.py categorizes
       // these) — render prominently with a one-click "KI wechseln" affordance
       // instead of the plain error line.
-      body.innerHTML =
-        '<div class="error-text error-llm-warn">' + escapeHtml(text) + "</div>" +
-        '<button type="button" class="btn-ki-switch">KI wechseln</button>';
-      const switchBtn = body.querySelector(".btn-ki-switch");
-      if (switchBtn) switchBtn.addEventListener("click", focusLlmSelect);
+      body.innerHTML = llmWarnBannerHtml(text);
+      wireKiSwitchButtons(body);
     } else {
       body.innerHTML = '<p class="error-text">' + escapeHtml(text) + "</p>";
     }

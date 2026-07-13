@@ -26,10 +26,14 @@ from app.llm.client import LlmError, _call_claude, _call_xai, _categorize_provid
 # --- Pure helper -------------------------------------------------------
 
 
-def test_categorize_401_is_credits_message():
+def test_categorize_401_is_invalid_key_message():
+    """401 is an AUTH problem (bad/missing key), not a billing one — must NOT
+    say 'Credits erschöpft', which would send the trader looking to top up an
+    account instead of fixing the key."""
     msg = _categorize_provider_http_error("Claude", 401, {"error": {"type": "auth"}})
     assert msg.startswith("⚠ Claude:")
-    assert "Credits erschöpft oder Limit erreicht" in msg
+    assert "API-Key ungültig oder fehlt" in msg
+    assert "Credits erschöpft" not in msg
 
 
 def test_categorize_403_is_credits_message():
@@ -66,6 +70,25 @@ def test_categorize_other_error_keeps_existing_message():
     msg = _categorize_provider_http_error("Claude", 500, {"error": "internal server error"})
     assert not msg.startswith("⚠")
     assert "Claude HTTP 500" in msg
+
+
+def test_categorize_bare_credit_substring_is_not_a_false_positive():
+    """A bare, unrelated 'credit' substring (e.g. inside an unrelated word or
+    generic message) must NOT be categorized as the credits banner — only the
+    real credit/spending-limit phrases should match."""
+    msg = _categorize_provider_http_error(
+        "Claude", 500, {"error": "database credential rotation failed"}
+    )
+    assert not msg.startswith("⚠")
+    assert "Claude HTTP 500" in msg
+
+
+def test_categorize_used_all_credits_phrase_is_credits_message():
+    msg = _categorize_provider_http_error(
+        "Claude", 400, {"error": {"message": "You have used all available credits"}}
+    )
+    assert msg.startswith("⚠ Claude:")
+    assert "Credits erschöpft" in msg
 
 
 def test_categorize_never_leaks_api_key():
