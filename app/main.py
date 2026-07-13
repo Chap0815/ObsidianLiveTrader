@@ -1463,6 +1463,24 @@ async def journal_stats_endpoint(
         raise HTTPException(status_code=500, detail=f"journal stats failed: {e}") from e
 
 
+@app.post("/api/journal/clear")
+async def journal_clear(
+    request: Request,
+    _: None = Depends(require_local_token),
+):
+    """Delete all journal_entries (KI shadow book). Deliberately SEPARATE from
+    /api/history/clear — the journal is the measurement dataset and survives
+    a history reset; this is the explicit opt-in to wipe it."""
+    db: Database | None = getattr(request.app.state, "db", None)
+    if db is None:
+        raise HTTPException(status_code=503, detail="database not initialized")
+    try:
+        deleted = await db.clear_journal()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"journal clear failed: {e}") from e
+
+
 @app.post("/api/orders/preview")
 async def orders_preview(
     request: Request,

@@ -188,9 +188,18 @@
           id="btn-history-clear"
           class="btn btn-ghost btn-reset data-act hidden"
           data-for="history"
-          title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben."
+          title="Reset für sauberen Produktionsstart: löscht lokale Audit-Historie (KI-Vorschläge + Order-Log) UND persistierte Chart-Marker. Börsen-Positionen/-Fills bleiben. Das Journal (Tab „Journal") bleibt davon unberührt — eigener Reset dort."
         >
           🧹 Reset
+        </button>
+        <button
+          type="button"
+          id="btn-journal-clear"
+          class="btn btn-ghost btn-reset data-act hidden"
+          data-for="journal"
+          title="Journal (KI-Shadow-Book) leeren. Überlebt normalerweise den Historie-Reset — nur dieser Button löscht die Journal-Einträge."
+        >
+          🧹 Journal leeren
         </button>
       </div>
     </div>

@@ -3450,6 +3450,45 @@
     }
   }
 
+  /** POST /api/journal/clear: wipes the journal_entries measurement table.
+   *  Deliberately separate from clearHistory()/history-clear — the journal
+   *  survives that reset by design; this is the explicit opt-in. */
+  async function clearJournal() {
+    if (state.journalClearBusy) return;
+    const text =
+      "Journal (KI-Shadow-Book) wirklich leeren?\n\n" +
+      "Löscht alle geloggten Analyse-Einträge samt Win/Loss-Auswertung. " +
+      "Das Journal überlebt normalerweise einen Historie-Reset — nur dieser " +
+      "Button löscht es. Nicht umkehrbar.";
+    if (!window.confirm(text)) return;
+    state.journalClearBusy = true;
+    try {
+      const res = await apiFetch("/api/journal/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok || data.ok === false) {
+        showToast(detailToText(data.detail || data), "err");
+        return;
+      }
+      showToast(
+        "Journal geleert: " + fmt(data.deleted, 0) + " Einträge",
+        "ok"
+      );
+      loadJournal();
+    } catch (err) {
+      showToast(
+        "Journal leeren fehlgeschlagen: " + (err && err.message),
+        "err"
+      );
+    } finally {
+      state.journalClearBusy = false;
+    }
+  }
+
   function setApplyEnabled(enabled) {
     const btn = $("btn-apply-proposal");
     if (!btn) return;
@@ -5343,6 +5382,11 @@
       jrnBtn.addEventListener("click", () => {
         loadJournal();
       });
+    }
+
+    const jrnClearBtn = $("btn-journal-clear");
+    if (jrnClearBtn) {
+      jrnClearBtn.addEventListener("click", () => clearJournal());
     }
 
     const sugBtn = $("btn-suggest-vol");

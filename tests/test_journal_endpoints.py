@@ -134,6 +134,97 @@ def test_journal_stats_empty_db_ok(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+# ── Task 7: POST /api/journal/clear ────────────────────────────────────
+
+
+def test_journal_clear_deletes_only_journal_entries(tmp_path, monkeypatch):
+    """Clearing the journal must not touch proposals/orders (separate reset
+    from /api/history/clear — the journal deliberately survives that one)."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "je_clear.db"))
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        db: Database = tc.app.state.db
+        _seed(db)
+
+        async def seed_history():
+            await db.insert_proposal(
+                symbol="BTC_USDT",
+                proposal_json={"action": "BUY"},
+                annotations_json=None,
+                context_hash="hclear",
+            )
+
+        asyncio.run(seed_history())
+
+        r_before = tc.get("/api/journal?limit=50")
+        assert len(r_before.json()["entries"]) == 3
+
+        r_clear = tc.post("/api/journal/clear")
+        assert r_clear.status_code == 200, r_clear.text
+        body = r_clear.json()
+        assert body["ok"] is True
+        assert body["deleted"] == 3
+
+        r_after = tc.get("/api/journal?limit=50")
+        assert r_after.json()["entries"] == []
+
+        rs = tc.get("/api/journal/stats")
+        assert rs.json()["totals"]["proposals"] == 0
+
+        # proposals/orders (history) untouched by the journal clear
+        hist = tc.get("/api/history")
+        assert len(hist.json()["proposals"]) == 1
+
+    get_settings.cache_clear()
+
+
+def test_journal_clear_empty_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "je_clear_empty.db"))
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        r = tc.post("/api/journal/clear")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"ok": True, "deleted": 0}
+    get_settings.cache_clear()
+
+
+def test_journal_clear_requires_token_when_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "je_clear_auth.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "secret2")
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        r = tc.post("/api/journal/clear")
+        assert r.status_code == 401
+        ok = tc.post("/api/journal/clear", headers={"X-Local-Token": "secret2"})
+        assert ok.status_code == 200
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+
+def test_journal_clear_without_db_returns_503(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "je_clear_nodb.db"))
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        tc.app.state.db = None
+        r = tc.post("/api/journal/clear")
+        assert r.status_code == 503
+    get_settings.cache_clear()
+
+
 def test_journal_requires_token_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "je_auth.db"))
     monkeypatch.setenv("LOCAL_API_TOKEN", "secret")
