@@ -199,6 +199,15 @@ class Database:
     # Advisory/measurement only: NEVER touches the order/gate/confirm path.
     # Every method here is defensive so a journal failure can be swallowed by
     # the caller (soft-fail) without breaking analyze / the resolver / startup.
+    #
+    # journal_entries has NO cap and NO retention/pruning: every /api/analyze
+    # call writes one row and rows are never auto-deleted (only an explicit
+    # POST /api/journal/clear removes them). This is a deliberate choice for
+    # a single-user tool where the full measurement history has value -- the
+    # table may grow unbounded over time. Revisit (retention window / archive
+    # to a separate table) if this ever becomes multi-user or the table size
+    # becomes a real problem; the created_at/status indexes below keep reads
+    # cheap in the meantime.
 
     async def insert_journal_entry(
         self,
@@ -369,6 +378,12 @@ class Database:
             )
 
             async def _groups(column: str) -> dict[str, dict[str, float]]:
+                # `column` is always one of the hardcoded literals passed at
+                # the call sites below ("setup_confidence"/"action"/"provider")
+                # -- NEVER request-derived -- so interpolating it into the SQL
+                # f-string is safe. Guard against a future caller ever passing
+                # a user/request-controlled value here (that would be a SQL
+                # injection foot-gun).
                 cur = await conn.execute(
                     f"""
                     SELECT {column} AS grp,

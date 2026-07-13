@@ -76,11 +76,54 @@ async def test_single_pass_expires_after_window(db_path):
     db = Database(db_path)
     await db.init()
     jid = await _seed_long(db)
-    client = FakeClient({"BTC_USDT": [_candle(10, 100.5, 99.5)]})  # never touches
+    # A candle at t0 itself gives full coverage back to created_at.
+    client = FakeClient({"BTC_USDT": [_candle(0, 100.5, 99.5), _candle(10, 100.5, 99.5)]})
     now = T0 + timedelta(hours=48)  # past window
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
     rows = await db.recent_journal()
     assert rows[0]["status"] == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_single_pass_leaves_pending_when_fetch_misses_t0(db_path):
+    # Regression: a row is much older than window_s (resolver was down a long
+    # time / row was already stale on its first resolve). The klines fetch
+    # from the exchange only ever returns recent candles that don't reach
+    # back to t0 (simulating a fetch sized only to `window_s`). Even though
+    # the window has elapsed and there's no touch in what we got, this must
+    # NOT be silently classified EXPIRED -- a real WIN/LOSS could be hiding
+    # before the earliest fetched candle.
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    now = T0 + timedelta(hours=200)  # far past window_s (24h)
+    # Candles start ~190h after t0 -- well short of covering all the way back.
+    client = FakeClient({
+        "BTC_USDT": [_candle(190 * 60, 100.5, 99.5), _candle(195 * 60, 100.5, 99.5)]
+    })
+    await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_single_pass_sizes_fetch_to_reach_t0(db_path):
+    # The resolver must size its kline request to cover from the row's t0 to
+    # now, not just `window_s` back -- otherwise a stale row can never regain
+    # coverage. Assert the FakeClient was asked for a wider limit_hint than a
+    # window_s-only sizing would produce (15m bars, window_s=24h -> baseline
+    # limit_hint is small; row is 100h old, needing far more bars).
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    now = T0 + timedelta(hours=100)
+    client = FakeClient({"BTC_USDT": [_candle(0, 100.5, 99.5)]})
+    await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+    assert len(client.calls) == 1
+    _, _, limit_hint = client.calls[0]
+    # window_s(24h)-only sizing at 15m bars would be ceil(24h/15m)+5 = 101.
+    # Covering the row's real 100h age needs ceil(100h/15m)+5 = 405.
+    assert limit_hint > 101
 
 
 @pytest.mark.asyncio
@@ -91,6 +134,28 @@ async def test_pending_stays_when_window_open(db_path):
     client = FakeClient({"BTC_USDT": [_candle(10, 100.5, 99.5)]})
     now = T0 + timedelta(hours=1)
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_empty_klines_payload_never_fabricates_outcome(db_path):
+    """client.klines(...) returning an empty list (e.g. delisted symbol /
+    empty payload) must never produce a fabricated WIN/LOSS/EXPIRED -- the
+    row stays PENDING both within the window and past it (no coverage of t0
+    is ever possible with zero candles)."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    client = FakeClient({"BTC_USDT": []})
+
+    # Within window: PENDING (unsurprising).
+    await resolve_pending_once(db, client, window_s=WINDOW, now=T0 + timedelta(hours=1))
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "PENDING"
+
+    # Past window, still empty payload: must stay PENDING, never EXPIRED.
+    await resolve_pending_once(db, client, window_s=WINDOW, now=T0 + timedelta(hours=48))
     rows = await db.recent_journal()
     assert rows[0]["status"] == "PENDING"
 

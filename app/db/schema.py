@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS journal_entries (
 
 CREATE INDEX IF NOT EXISTS idx_journal_created ON journal_entries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_journal_status  ON journal_entries(status);
+
+-- Additive indexes for the journal_stats() GROUP BY columns (action,
+-- setup_confidence, provider) so the stats endpoint's per-group aggregation
+-- (see Database.journal_stats._groups) stays cheap as journal_entries grows
+-- (no cap/retention on that table -- see the comment at insert_journal_entry).
+CREATE INDEX IF NOT EXISTS idx_journal_action     ON journal_entries(action);
+CREATE INDEX IF NOT EXISTS idx_journal_confidence  ON journal_entries(setup_confidence);
+CREATE INDEX IF NOT EXISTS idx_journal_provider    ON journal_entries(provider);
 """
 
 

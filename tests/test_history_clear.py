@@ -167,6 +167,62 @@ def test_api_history_clear_deletes_seeded_rows_and_history_still_works(
     get_settings.cache_clear()
 
 
+def test_api_history_clear_leaves_journal_entries_untouched(tmp_path, monkeypatch):
+    """Mirror of test_journal_clear_deletes_only_journal_entries (opposite
+    direction): /api/history/clear must never touch journal_entries -- the
+    journal has its own separate reset (/api/journal/clear)."""
+    path = str(tmp_path / "hist_clear_journal.db")
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    get_settings.cache_clear()
+
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as tc:
+        db: Database = tc.app.state.db
+
+        async def seed():
+            await db.insert_proposal(
+                symbol="BTC_USDT",
+                proposal_json={"action": "BUY"},
+                annotations_json=None,
+                context_hash="h1",
+            )
+            await db.insert_order(
+                symbol="BTC_USDT",
+                side="long",
+                request_json={"vol": 1},
+                response_json={"ok": True},
+                status="placed",
+                error=None,
+            )
+            await db.insert_journal_entry(
+                symbol="BTC_USDT", tf="15m", htf="1H", action="BUY",
+                direction="long", setup_confidence="high", entry_price=100.0,
+                stop_loss=99.0, tp1=102.0, rrr=2.0, provider="claude",
+                model="m", scanner_summary=None, last_price_t0=100.0,
+            )
+
+        asyncio.run(seed())
+
+        r = tc.get("/api/journal?limit=50")
+        assert len(r.json()["entries"]) == 1
+
+        r_clear = tc.post("/api/history/clear")
+        assert r_clear.status_code == 200, r_clear.text
+        assert r_clear.json()["deleted"] == {"proposals": 1, "orders": 1}
+
+        # journal_entries untouched by the history clear
+        r_after = tc.get("/api/journal?limit=50")
+        assert len(r_after.json()["entries"]) == 1
+
+    get_settings.cache_clear()
+
+
 def test_api_history_clear_without_db_returns_503(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "unused.db"))
     monkeypatch.setenv("TRADING_ENABLED", "false")

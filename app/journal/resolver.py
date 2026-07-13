@@ -148,6 +148,10 @@ def resolve_entry(
     assert direction is not None and entry_price is not None
     assert stop_loss is not None and tp1 is not None
 
+    # Materialize once: `candles` may be a one-shot generator, and we need to
+    # scan it twice below (touch-scan, then coverage check).
+    all_candles = list(candles)
+
     t0_ms = _parse_iso_ms(created_at)
     reward = abs(tp1 - entry_price)
     risk = abs(entry_price - stop_loss)
@@ -156,7 +160,7 @@ def resolve_entry(
 
     # Chronological scan of candles at/after t0.
     ordered = sorted(
-        (c for c in candles if _field(c, "time") >= t0_ms),
+        (c for c in all_candles if _field(c, "time") >= t0_ms),
         key=lambda c: _field(c, "time"),
     )
     for candle in ordered:
@@ -171,10 +175,20 @@ def resolve_entry(
         if sl_hit:
             return Outcome(status=LOSS, resolved_price=stop_loss, realized_r=-1.0)
 
-    # No terminal candle: expire only once the window has elapsed.
+    # No terminal candle found. Expiring is only safe once (a) the window has
+    # genuinely elapsed AND (b) the fetched candle history actually reaches
+    # back to t0 -- otherwise a real WIN/LOSS could be hiding before our
+    # earliest fetched candle, and reporting EXPIRED would silently discard
+    # it. Coverage-less/incomplete data (resolver was down longer than the
+    # fetch window, or an empty/delisted payload) always stays PENDING so the
+    # next cycle (with a wider or fresh fetch) gets another chance.
     elapsed = (now - _created_dt(created_at)).total_seconds()
     if elapsed >= window_s:
-        return Outcome(status=EXPIRED)
+        candle_times = [_field(c, "time") for c in all_candles]
+        earliest = min(candle_times) if candle_times else None
+        covers_t0 = earliest is not None and earliest <= t0_ms
+        if covers_t0:
+            return Outcome(status=EXPIRED)
     return Outcome(status=PENDING)
 
 
@@ -216,7 +230,21 @@ async def resolve_pending_once(
 
     for (symbol, tf), grp in groups.items():
         try:
-            limit_hint = _limit_hint_for(tf, window_s)
+            # Size the fetch to cover from the OLDEST row's t0 to now, not
+            # just `window_s` back from now. If the resolver was down longer
+            # than the window (or a row is older than window_s on its first
+            # resolve), a window_s-only fetch would never reach t0 and the
+            # coverage guard in resolve_entry would (correctly) leave it
+            # PENDING forever. Still capped at _MAX_LIMIT_HINT bars.
+            max_elapsed_s = window_s
+            for row in grp:
+                try:
+                    elapsed_row = (now - _created_dt(row["created_at"])).total_seconds()
+                    if elapsed_row > max_elapsed_s:
+                        max_elapsed_s = elapsed_row
+                except Exception:
+                    continue
+            limit_hint = _limit_hint_for(tf, max_elapsed_s)
             candles = await client.klines(symbol, tf, limit_hint)
         except asyncio.CancelledError:
             raise

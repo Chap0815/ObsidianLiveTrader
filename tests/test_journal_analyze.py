@@ -125,6 +125,52 @@ def test_analyze_stay_out_logs_skipped(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def _degenerate_buy_proposal() -> TradeProposal:
+    # Non-STAY_OUT action but missing levels -> geometrically unresolvable.
+    return TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        setup_confidence="low",
+        entry_price=100_000.0,
+        stop_loss=None,
+        tp1=None,
+        rrr=None,
+        rationale="buy but no clean levels",
+    )
+
+
+def test_analyze_degenerate_buy_missing_levels_logs_skipped(tmp_path, monkeypatch):
+    """A non-STAY_OUT proposal (e.g. BUY) with tp1=None/stop_loss=None cannot
+    be shadow-resolved -- end-to-end through /api/analyze it must land in the
+    journal as SKIPPED, same as STAY_OUT, not PENDING."""
+    _env(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        client = MagicMock()
+        client.account_snapshot = AsyncMock(
+            return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+        )
+        tc.app.state.mexc = client
+        b, snap_p, ctx = _client_ctx()
+        with b, snap_p, ctx, patch(
+            "app.main.analyze_with_llm", new=AsyncMock(return_value=_degenerate_buy_proposal())
+        ):
+            r = tc.post("/api/analyze", json={"symbol": "BTC_USDT"})
+        assert r.status_code == 200, r.text
+
+        import asyncio
+        rows = asyncio.run(tc.app.state.db.recent_journal())
+        assert len(rows) == 1
+        assert rows[0]["action"] == "BUY"
+        assert rows[0]["status"] == "SKIPPED"
+        assert rows[0]["stop_loss"] is None
+        assert rows[0]["tp1"] is None
+    get_settings.cache_clear()
+
+
 def test_analyze_still_200_when_journal_write_raises(tmp_path, monkeypatch):
     _env(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient

@@ -89,7 +89,8 @@ def test_first_terminal_candle_wins():
 
 
 def test_neither_within_window_expired():
-    o = _long(candles=[_candle(5, 100.5, 99.5)])  # never touches
+    # Coverage reaches t0 (candle at offset 0) -> a real EXPIRED is safe to report.
+    o = _long(candles=[_candle(0, 100.5, 99.5), _candle(5, 100.5, 99.5)])  # never touches
     assert o.status == EXPIRED
     assert o.realized_r is None
 
@@ -97,6 +98,29 @@ def test_neither_within_window_expired():
 def test_neither_but_window_open_stays_pending():
     o = _long(candles=[_candle(5, 100.5, 99.5)], now=T0 + timedelta(hours=1))
     assert o.status == PENDING
+
+
+def test_incomplete_coverage_stays_pending_not_expired():
+    # Candle set starts well AFTER t0 (e.g. resolver was down / fetch window too
+    # short to reach back to created_at): even though window_s has elapsed and
+    # no touch is seen in what we DID fetch, we must not fabricate EXPIRED --
+    # a real WIN/LOSS could have happened before our earliest fetched candle.
+    o = _long(candles=[_candle(120, 100.5, 99.5)])  # first candle 2h after t0
+    assert o.status == PENDING
+
+
+def test_incomplete_coverage_stays_pending_even_with_empty_candles():
+    # No candle data at all (e.g. delisted symbol / empty payload): never
+    # fabricate a terminal outcome, regardless of how much time has passed.
+    o = _long(candles=[])
+    assert o.status == PENDING
+
+
+def test_full_coverage_expired_after_window():
+    # Coverage reaches back to (before) t0 explicitly -> EXPIRED as before.
+    pre = _candle(0, 100.5, 99.5)
+    o = _long(candles=[pre, _candle(30, 100.2, 99.8)])
+    assert o.status == EXPIRED
 
 
 def test_candle_before_t0_ignored():
