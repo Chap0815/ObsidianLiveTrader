@@ -1173,7 +1173,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 /* ── Positions & open orders ────────────────────────────── */
 /* ── Position cockpit (active-symbol trade) ─────────────── */
 .pos-cockpit {
-  padding: 12px;
+  padding: 7px 9px;
   border-top: 2px solid var(--long);
   cursor: pointer;
   transition: background 0.12s ease;
@@ -1199,33 +1199,33 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .cp-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 6px;
+  margin-bottom: 4px;
 }
 
 .cp-sym {
   font-family: var(--mono);
-  font-size: 18.5px;
+  font-size: 14px;
   font-weight: 600;
 }
 
 .cp-lev {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 14.5px;
+  font-size: 11.5px;
   color: var(--muted);
 }
 
 .cp-pnl {
   font-family: var(--mono);
-  font-size: 34.3px;
+  font-size: 21px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
-  margin-bottom: 10px;
+  margin-bottom: 5px;
   display: flex;
   align-items: baseline;
-  gap: 10px;
+  gap: 7px;
   flex-wrap: wrap;
 }
 
@@ -1233,7 +1233,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .cp-pnl.pnl-neg { color: var(--short); }
 
 .cp-pnl-sub {
-  font-size: 15.8px;
+  font-size: 12px;
   font-weight: 500;
   opacity: 0.85;
 }
@@ -1246,29 +1246,29 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
   overflow: hidden;
-  margin-bottom: 10px;
+  margin-bottom: 5px;
 }
 
 .cp-cell {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 7px 10px;
+  gap: 1px;
+  padding: 4px 8px;
   background: var(--bg-inset);
 }
 
 .cp-cell-label {
   font-family: var(--mono);
-  font-size: 11.2px;
+  font-size: 9.8px;
   font-weight: 600;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--faint);
 }
 
 .cp-cell-val {
   font-family: var(--mono);
-  font-size: 16.5px;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1297,8 +1297,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 14.5px;
-  padding: 5px 0;
+  font-size: 12px;
+  padding: 4px 0;
   cursor: pointer;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
 }
@@ -1320,7 +1320,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   display: flex;
   align-items: center;
   gap: 5px;
-  margin-top: 6px;
+  margin-top: 4px;
 }
 
 .cp-actions-label {
@@ -1340,8 +1340,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   background: transparent;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 14.5px;
-  padding: 5px 0;
+  font-size: 12px;
+  padding: 4px 0;
   cursor: pointer;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
 }
