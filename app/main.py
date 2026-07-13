@@ -58,6 +58,10 @@ STATIC_DIR = BASE / "static"
 
 log = logging.getLogger("app.main")
 
+# /api/analyze in-memory result cache TTL (LLM-credit saver). Advisory only —
+# never consulted by the order/gate path (see analyze() below).
+ANALYZE_CACHE_TTL_S = 120.0
+
 # F-16 (deployment/concurrency): env var names some process managers use to
 # announce a multi-worker/multi-process launch. Checked at startup so a
 # non-default deployment (this app's own launcher, scripts/launch.py, never
@@ -114,6 +118,9 @@ async def lifespan(app: FastAPI):
     app.state.exchange = client
     app.state.db = db
     app.state.preview_store = store
+    # /api/analyze result cache (see analyze() below) — fresh/empty on every
+    # process start, same as the other in-memory caches on this state object.
+    app.state.analyze_cache = {}
     # App-global lock: a new OrderService is built per request, so the lock
     # that serializes confirm/close must live here, not on the instance.
     # F-16: like PreviewStore above, this asyncio.Lock only serializes
@@ -892,6 +899,25 @@ async def analyze(
     tf = body.tf or "15m"
     htf = body.htf or "1H"
 
+    # Analysis caching (LLM-credit saver): key includes the RESOLVED provider
+    # so hot-swapping the KI dropdown never serves a stale other-provider
+    # result. Advisory only — this cache never touches order/gate paths;
+    # confirm always re-runs its own gates on live price. Only SUCCESSFUL
+    # proposals are cached (errors are never cached); STAY_OUT is a valid,
+    # cacheable result.
+    cache_key = (symbol, tf, htf, s.llm_provider)
+    if not body.force:
+        cache: dict = getattr(request.app.state, "analyze_cache", None) or {}
+        entry = cache.get(cache_key)
+        if entry is not None:
+            cached_at, cached_response = entry
+            age = _time.monotonic() - cached_at
+            if age < ANALYZE_CACHE_TTL_S:
+                resp = dict(cached_response)
+                resp["cached"] = True
+                resp["cached_age_s"] = int(age)
+                return resp
+
     try:
         snap = await build_market_snapshot(
             symbol, tf, htf, client, limit_hint=s.kline_limit_hint
@@ -968,7 +994,7 @@ async def analyze(
             # Do not break advisory analyze if SQLite is unavailable
             pass
 
-    return {
+    response = {
         "symbol": symbol,
         "tf": tf,
         "htf": htf,
@@ -976,6 +1002,13 @@ async def analyze(
         "annotations": annotations,
         "last_price": market_api.get("last_price"),
     }
+    cache = getattr(request.app.state, "analyze_cache", None)
+    if cache is None:
+        cache = {}
+        request.app.state.analyze_cache = cache
+    cache[cache_key] = (_time.monotonic(), dict(response))
+    response["cached"] = False
+    return response
 
 
 def _classify_unlabeled_trigger(

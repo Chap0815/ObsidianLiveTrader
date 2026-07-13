@@ -169,6 +169,10 @@ class AnalyzeRequest(BaseModel):
     # key_level/score). Advisory only — the analyzer confirms or refutes it and
     # it is sanitized server-side; it can never relax a risk gate.
     scanner_verdict: dict[str, Any] | None = None
+    # Bypass the in-memory analyze cache (Feature: analysis caching) and force
+    # a fresh LLM call even if a fresh cached proposal exists for this
+    # (symbol, tf, htf, resolved provider) key.
+    force: bool = False
 
 
 # --- Trade Reevaluation (advisory review of an ALREADY OPEN position) ---

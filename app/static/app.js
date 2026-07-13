@@ -3310,6 +3310,11 @@
       escapeHtml((p.action || "—").replace(/_/g, " ")) + "</span>" +
       '<span class="an-sym">' + escapeHtml(state.proposalSymbol || state.symbol || "") + "</span>" +
       '<span class="an-lev">' + escapeHtml(p.recommended_leverage || "") + "</span>" +
+      (data.cached
+        ? '<span class="an-cache-badge" title="Aus dem Cache — keine erneute KI-Anfrage">' +
+          "gecacht vor " + escapeHtml(String(data.cached_age_s != null ? data.cached_age_s : 0)) + "s" +
+          ' <button type="button" class="an-cache-refresh">neu</button></span>'
+        : "") +
       "</div>";
 
     // Multi-timeframe trend row (inspired by the MTF signal tables)
@@ -3409,6 +3414,12 @@
 
     body.className = "proposal-body analysis-mode";
     body.innerHTML = html;
+    const cacheRefreshBtn = body.querySelector(".an-cache-refresh");
+    if (cacheRefreshBtn) {
+      cacheRefreshBtn.addEventListener("click", function () {
+        runAnalyze(true);
+      });
+    }
   }
 
   function _trendLabel(t) {
@@ -3562,7 +3573,7 @@
     drawTicketLines();
   }
 
-  async function runAnalyze() {
+  async function runAnalyze(force) {
     if (state.analyzeBusy) {
       // Reached when triggered programmatically (e.g. a scan-chip click)
       // while a manual "Analysieren" click is already in flight — the button
@@ -3626,6 +3637,7 @@
           tf: tf,
           htf: htf,
           scanner_verdict: scannerVerdict,
+          force: !!force,
         }),
       });
       let data = null;

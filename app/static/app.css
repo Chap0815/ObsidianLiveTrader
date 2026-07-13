@@ -2193,6 +2193,34 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   margin: 0;
 }
 
+/* Analyze-cache badge (Feature: /api/analyze caching) — subtle, doesn't
+   compete with the action/symbol/leverage badges it sits next to. */
+.an-cache-badge {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--faint);
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.an-cache-refresh {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.an-cache-refresh:hover {
+  border-color: var(--accent-line);
+  color: var(--violet);
+}
+
 .proposal-action {
   display: inline-block;
   font-family: var(--mono);
