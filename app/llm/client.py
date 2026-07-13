@@ -437,6 +437,14 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
     structure = slice_dict.get("structure") or {}
     last = (indicators.get("last") if isinstance(indicators, dict) else None) or {}
     tail = candles[-recent_bars:] if len(candles) > recent_bars else candles
+    # Drop the quote-turnover `amount` from each recent candle (O1): the prompt
+    # reads OHLC + vol only — momentum/volume come from read.rvol / vol_trend /
+    # indicators_tail — so `amount` was the single biggest chunk of pure input-
+    # token waste. OHLCV is preserved unchanged, so analysis quality is unaffected.
+    recent_candles = [
+        {k: v for k, v in c.items() if k != "amount"} if isinstance(c, dict) else c
+        for c in tail
+    ]
     last_close = candles[-1].get("close") if candles else None
 
     struct_out = {
@@ -493,7 +501,7 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
     # double-read hazard against the derived `read` labels (audit A8).
     return {
         "tf": slice_dict.get("tf"),
-        "recent_candles": tail,
+        "recent_candles": recent_candles,
         "indicators_tail": indicators_tail,
         "read": read,
         "structure": struct_out,
@@ -644,6 +652,20 @@ def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
     return out or None
 
 
+# The prompt (app/llm/prompts.py, steps 6-7) references ONLY these funding
+# fields: fundingRate (the raw per-interval rate), fundingAnnualized and
+# fundingExtreme. The rest of the API funding dict (symbol, maxFundingRate,
+# minFundingRate, collectCycle, nextSettleTime, timestamp) is never read by the
+# model, so the LLM copy keeps just these three (O1). The full dict still flows
+# to the UI via snapshot_to_api_dict — this trims only the LLM context.
+_LLM_FUNDING_KEYS = ("fundingRate", "fundingAnnualized", "fundingExtreme")
+
+
+def _compact_funding_for_llm(funding: dict[str, Any] | None) -> dict[str, Any]:
+    src = funding or {}
+    return {k: src[k] for k in _LLM_FUNDING_KEYS if k in src}
+
+
 def build_llm_context(
     market_api: dict[str, Any],
     account: dict[str, Any] | None,
@@ -670,12 +692,15 @@ def build_llm_context(
     if oi_read is not None:
         market_block["oi_read"] = oi_read
     # Order: daily (regime anchor) first, then htf (regime), then ltf (timing)
+    # `contract` is intentionally NOT included (O1): the prompt sets leverage
+    # from risk_policy.max_leverage and never reads contract.*; annotate_proposal
+    # doesn't touch it either. The block flowed to the UI via a separate path
+    # (snapshot_to_api_dict), so dropping it here only trims LLM input tokens.
     ctx: dict[str, Any] = {
         "symbol": market_api.get("symbol"),
         "last_price": market_api.get("last_price"),
-        "funding": market_api.get("funding") or {},
+        "funding": _compact_funding_for_llm(market_api.get("funding")),
         "market": market_block,
-        "contract": market_api.get("contract") or {},
         "daily": daily_c,
         "htf": htf_c,
         "ltf": ltf_c,
