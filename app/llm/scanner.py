@@ -25,6 +25,7 @@ from app.analysis.context import (  # noqa: F401
 from app.config import Settings
 from app.llm.client import (
     LlmError,
+    _categorize_provider_http_error,
     _oi_read_label,
     compact_daily_for_llm,
     compact_tf_for_llm,
@@ -331,7 +332,13 @@ def _scan_user_prompt(contexts: list[dict[str, Any]]) -> str:
 
 
 async def _anthropic_text(
-    system: str, user: str, model: str, settings: Settings, timeout: float = 120.0
+    system: str,
+    user: str,
+    model: str,
+    settings: Settings,
+    timeout: float = 120.0,
+    *,
+    provider_label: str = "Claude",
 ) -> str:
     url = settings.anthropic_base_url.rstrip("/") + "/v1/messages"
     headers = {
@@ -349,9 +356,17 @@ async def _anthropic_text(
         async with httpx.AsyncClient(timeout=timeout) as c:
             r = await c.post(url, headers=headers, json=body)
     except httpx.HTTPError as e:
-        raise LlmError(f"Scanner request failed: {e}") from e
+        raise LlmError(f"Scanner ({provider_label}) request failed: {e}") from e
     if r.status_code >= 400:
-        raise LlmError(f"Scanner HTTP {r.status_code}: {r.text[:400]}")
+        detail: Any = r.text[:400]
+        try:
+            detail = r.json()
+        except Exception:
+            pass
+        raise LlmError(
+            _categorize_provider_http_error(provider_label, r.status_code, detail),
+            raw=detail,
+        )
     payload = r.json()
     parts = [
         str(b.get("text") or "")
@@ -369,6 +384,8 @@ async def _openai_compat_text(
     base_url: str,
     api_key: str,
     timeout: float = 120.0,
+    *,
+    provider_label: str = "Scanner",
 ) -> str:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -384,9 +401,17 @@ async def _openai_compat_text(
         async with httpx.AsyncClient(timeout=timeout) as c:
             r = await c.post(base_url.rstrip("/") + "/chat/completions", headers=headers, json=body)
     except httpx.HTTPError as e:
-        raise LlmError(f"Scanner request failed: {e}") from e
+        raise LlmError(f"Scanner ({provider_label}) request failed: {e}") from e
     if r.status_code >= 400:
-        raise LlmError(f"Scanner HTTP {r.status_code}: {r.text[:400]}")
+        detail: Any = r.text[:400]
+        try:
+            detail = r.json()
+        except Exception:
+            pass
+        raise LlmError(
+            _categorize_provider_http_error(provider_label, r.status_code, detail),
+            raw=detail,
+        )
     try:
         return str(r.json()["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as e:
@@ -404,21 +429,39 @@ async def scan_with_llm(
     # Cheap model first (token split), fall back to whatever is configured
     if settings.claude_ready:
         model = settings.scanner_model
-        text = await _anthropic_text(SCANNER_SYSTEM_PROMPT, user, model, settings)
+        text = await _anthropic_text(
+            SCANNER_SYSTEM_PROMPT, user, model, settings, provider_label="Claude"
+        )
     elif settings.xai_ready:
         model = settings.xai_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT, user, model, settings.xai_base_url, settings.xai_api_key
+            SCANNER_SYSTEM_PROMPT,
+            user,
+            model,
+            settings.xai_base_url,
+            settings.xai_api_key,
+            provider_label="xAI",
         )
     elif settings.openai_ready:
         model = settings.openai_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT, user, model, settings.openai_base_url, settings.openai_api_key
+            SCANNER_SYSTEM_PROMPT,
+            user,
+            model,
+            settings.openai_base_url,
+            settings.openai_api_key,
+            provider_label="Codex",
         )
     elif settings.ollama_ready:
         model = settings.ollama_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT, user, model, settings.ollama_base_url, "", timeout=300.0
+            SCANNER_SYSTEM_PROMPT,
+            user,
+            model,
+            settings.ollama_base_url,
+            "",
+            timeout=300.0,
+            provider_label="Ollama",
         )
     else:
         raise LlmError("No LLM configured for the scanner")

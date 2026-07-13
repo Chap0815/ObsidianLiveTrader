@@ -2193,6 +2193,35 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   margin: 0;
 }
 
+/* Credit/rate-limit provider error (app/llm/client.py categorizes these,
+   marked with a leading "⚠") — rendered prominently, not as a plain line. */
+.error-text.error-llm-warn {
+  display: block;
+  color: var(--warn);
+  font-weight: 600;
+  padding: 10px 12px;
+  margin: 0 0 8px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: rgba(229, 169, 60, 0.1);
+}
+
+.btn-ki-switch {
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--warn);
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.btn-ki-switch:hover {
+  filter: brightness(1.08);
+}
+
 /* Analyze-cache badge (Feature: /api/analyze caching) — subtle, doesn't
    compete with the action/symbol/leverage badges it sits next to. */
 .an-cache-badge {

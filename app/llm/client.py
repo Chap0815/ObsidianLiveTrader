@@ -748,6 +748,51 @@ class LlmError(Exception):
 GrokError = LlmError
 
 
+# --- Provider HTTP error categorization (credit/rate-limit UX) ---
+# Applied on every provider HTTP-error path below (analyze AND reevaluate,
+# all providers) so the frontend can show a clean, actionable German message
+# instead of a raw "Claude HTTP 403: {...}" dump. Only the response BODY is
+# ever inspected here — request headers (which carry the API key) never are,
+# so a raw key/secret can't leak into the message.
+_CREDIT_ERROR_KEYWORDS = (
+    "credit",
+    "spending limit",
+    "spending_limit",
+    "permission denied",
+    "permission_denied",
+    "insufficient_quota",
+    "insufficient quota",
+)
+_RATE_LIMIT_KEYWORDS = (
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+)
+
+
+def _categorize_provider_http_error(
+    provider_label: str, status_code: int, detail: Any
+) -> str:
+    """Turn a provider HTTP error response into a clean German LlmError
+    message when it looks like a credits/limit or rate-limit condition;
+    otherwise keep the existing detailed "{Provider} HTTP {code}: {detail}"
+    message unchanged."""
+    try:
+        body_text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
+    except (TypeError, ValueError):
+        body_text = str(detail)
+    low = (body_text or "").lower()
+    if status_code in (401, 403) or any(k in low for k in _CREDIT_ERROR_KEYWORDS):
+        return (
+            f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
+            "KI im Dropdown wechseln oder aufladen."
+        )
+    if status_code == 429 or any(k in low for k in _RATE_LIMIT_KEYWORDS):
+        return f"⚠ {provider_label}: Rate-Limit — kurz warten oder KI wechseln."
+    return f"{provider_label} HTTP {status_code}: {detail}"
+
+
 def _parse_content_to_proposal(
     content: str, *, provider: str, context: dict[str, Any] | None = None
 ) -> TradeProposal:
@@ -871,7 +916,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"Claude HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error("Claude", r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()
@@ -932,7 +977,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"xAI HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error("xAI", r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()
@@ -982,7 +1027,7 @@ async def _call_openai_compat(
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"{provider_label} HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error(provider_label, r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()
@@ -1083,7 +1128,7 @@ async def _call_claude_reevaluate(
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"Claude HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error("Claude", r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()
@@ -1136,7 +1181,7 @@ async def _call_xai_reevaluate(
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"xAI HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error("xAI", r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()
@@ -1186,7 +1231,7 @@ async def _call_openai_compat_reevaluate(
             detail = r.json()
         except Exception:
             pass
-        raise LlmError(f"{provider_label} HTTP {r.status_code}: {detail}", raw=detail)
+        raise LlmError(_categorize_provider_http_error(provider_label, r.status_code, detail), raw=detail)
 
     try:
         payload = r.json()

@@ -3487,11 +3487,37 @@
       .replace(/'/g, "&#39;");
   }
 
+  /** Focus the KI dropdown so the trader can switch provider in one click
+   *  (used by the "⚠" credit/rate-limit error affordance below). */
+  function focusLlmSelect() {
+    const sel = $("llm-select");
+    if (sel) {
+      sel.focus();
+      if (typeof sel.showPicker === "function") {
+        try {
+          sel.showPicker();
+        } catch (_) {}
+      }
+    }
+  }
+
   function showProposalError(msg) {
     const body = $("proposal-body");
     if (!body) return;
     body.className = "proposal-body";
-    body.innerHTML = '<p class="error-text">' + escapeHtml(msg) + "</p>";
+    const text = String(msg == null ? "" : msg);
+    if (text.indexOf("⚠") === 0) {
+      // Credit/rate-limit style provider error (app/llm/client.py categorizes
+      // these) — render prominently with a one-click "KI wechseln" affordance
+      // instead of the plain error line.
+      body.innerHTML =
+        '<div class="error-text error-llm-warn">' + escapeHtml(text) + "</div>" +
+        '<button type="button" class="btn-ki-switch">KI wechseln</button>';
+      const switchBtn = body.querySelector(".btn-ki-switch");
+      if (switchBtn) switchBtn.addEventListener("click", focusLlmSelect);
+    } else {
+      body.innerHTML = '<p class="error-text">' + escapeHtml(text) + "</p>";
+    }
     state.proposal = null;
     setApplyEnabled(false);
   }

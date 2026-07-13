@@ -98,7 +98,9 @@ async def test_scan_with_llm_restricts_to_context_symbols(monkeypatch):
     import app.llm.scanner as scanner_mod
     from app.config import Settings
 
-    async def fake_anthropic_text(system, user, model, settings, timeout=120.0):
+    async def fake_anthropic_text(
+        system, user, model, settings, timeout=120.0, *, provider_label="Claude"
+    ):
         return (
             '{"results": ['
             '{"symbol": "BTC", "bias": "long", "score": 8},'
