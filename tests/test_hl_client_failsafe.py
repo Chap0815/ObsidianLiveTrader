@@ -144,3 +144,38 @@ async def test_assets_does_not_mislabel_notional_as_unrealized():
     row = (await c.assets())[0]
     assert "unrealized" not in row
     assert row["notional_position"] == 500.0
+
+
+# ── O5: funding_rate reads from the ctx cache, no wasteful all_mids() ──────────
+
+
+@pytest.mark.asyncio
+async def test_funding_rate_reads_from_ctx_without_all_mids():
+    """O5: funding is read straight from meta_and_asset_ctxs (the shared ctx
+    cache), so funding_rate() must NOT trigger the all_mids() round-trip that
+    ticker() used to do just for an unneeded mid price."""
+    info = MagicMock()
+    meta_ctx = (
+        {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+        [{"funding": 0.00012}, {"funding": -0.0003}],
+    )
+    info.meta_and_asset_ctxs = MagicMock(return_value=meta_ctx)
+    info.all_mids = MagicMock(side_effect=AssertionError("all_mids must not be called"))
+    c = _client(info)
+    fr = await c.funding_rate("BTC_USDT")
+    assert fr.symbol == "BTC"
+    assert fr.funding_rate == 0.00012
+    info.all_mids.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_funding_rate_falls_back_to_zero_when_ctx_missing_coin():
+    """If the ctx doesn't carry the coin (or funding), fall back safely to 0.0
+    with the same return shape rather than raising."""
+    info = MagicMock()
+    meta_ctx = ({"universe": [{"name": "SOL"}]}, [{"funding": 0.001}])
+    info.meta_and_asset_ctxs = MagicMock(return_value=meta_ctx)
+    c = _client(info)
+    fr = await c.funding_rate("BTC_USDT")
+    assert fr.symbol == "BTC"
+    assert fr.funding_rate == 0.0

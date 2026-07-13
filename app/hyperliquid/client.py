@@ -363,12 +363,36 @@ class HyperliquidClient:
         return await self._to_thread(_t)
 
     async def funding_rate(self, symbol: str) -> FundingRate:
-        t = await self.ticker(symbol)
-        return FundingRate(
-            symbol=to_hl_coin(symbol),
-            funding_rate=float(t.funding_rate or 0),
-            timestamp=t.timestamp,
-        )
+        """Funding read straight from the shared meta_and_asset_ctxs cache.
+
+        O5: previously this routed through ticker(), which calls all_mids() (a
+        full-universe price fetch) purely for a mid price funding doesn't need —
+        so build_market_snapshot triggered all_mids() twice per HL snapshot. The
+        funding value already lives in the SAME 2s ctx cache market_extras() and
+        ticker() use, so read it there directly and skip the extra round-trip.
+        Falls back to 0.0 if the ctx doesn't carry funding for the coin.
+        """
+
+        def _f():
+            coin = to_hl_coin(symbol)
+            funding = 0.0
+            try:
+                meta_ctx = self._meta_ctxs_sync()
+                universe = meta_ctx[0].get("universe") if meta_ctx else []
+                ctxs = meta_ctx[1] if meta_ctx and len(meta_ctx) > 1 else []
+                for i, u in enumerate(universe or []):
+                    if str(u.get("name", "")).upper() == coin and i < len(ctxs):
+                        funding = float(ctxs[i].get("funding") or 0)
+                        break
+            except Exception:
+                funding = 0.0
+            return FundingRate(
+                symbol=coin,
+                funding_rate=funding,
+                timestamp=int(time.time() * 1000),
+            )
+
+        return await self._to_thread(_f)
 
     async def market_extras(self, symbol: str) -> dict[str, Any]:
         """Open interest / premium context from meta_and_asset_ctxs.
