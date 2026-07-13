@@ -809,10 +809,23 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     # LlmError instead of a usable proposal. 16000 gives adaptive thinking
     # real headroom while still comfortably inside this non-streaming
     # request's 120s httpx timeout for these models.
+    # O2: wrap the large static analyze system prompt as a cacheable block so
+    # repeat analyzes within the 5-min TTL reuse cached input tokens (Anthropic
+    # only; cache_control is GA, no beta header needed). The volatile per-coin
+    # JSON context lives in the user turn AFTER this breakpoint, so ordering is
+    # correct. Graceful by design: if the prompt is below the cache minimum the
+    # API simply doesn't cache it — no error. Content is unchanged.
+    system_block = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
     body: dict[str, Any] = {
         "model": settings.anthropic_model,
         "max_tokens": 16000,
-        "system": system_prompt,
+        "system": system_block,
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": "medium"},
         "messages": [
@@ -841,7 +854,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             fallback_body: dict[str, Any] = {
                 "model": settings.anthropic_model,
                 "max_tokens": 1800,
-                "system": system_prompt,
+                "system": system_block,
                 "messages": [
                     {"role": "user", "content": user_prompt},
                 ],
