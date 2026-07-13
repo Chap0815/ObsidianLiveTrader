@@ -195,6 +195,237 @@ class Database:
             "orders": await self.recent_orders(limit),
         }
 
+    # ── Journal + feedback-loop (KI shadow book) ────────────────────────
+    # Advisory/measurement only: NEVER touches the order/gate/confirm path.
+    # Every method here is defensive so a journal failure can be swallowed by
+    # the caller (soft-fail) without breaking analyze / the resolver / startup.
+
+    async def insert_journal_entry(
+        self,
+        *,
+        symbol: str,
+        tf: str,
+        htf: str,
+        action: str,
+        direction: str | None,
+        setup_confidence: str,
+        entry_price: float | None,
+        stop_loss: float | None,
+        tp1: float | None,
+        rrr: float | None,
+        provider: str | None,
+        model: str | None,
+        scanner_summary: str | None,
+        last_price_t0: float | None,
+        status: str = "PENDING",
+        proposal_id: int | None = None,
+        created_at: str | None = None,
+    ) -> int:
+        async with self._connect() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO journal_entries
+                  (created_at, symbol, tf, htf, action, direction,
+                   setup_confidence, entry_price, stop_loss, tp1, rrr,
+                   provider, model, scanner_summary, last_price_t0,
+                   status, proposal_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at or _utc_now_iso(),
+                    symbol,
+                    tf,
+                    htf,
+                    action,
+                    direction,
+                    setup_confidence,
+                    entry_price,
+                    stop_loss,
+                    tp1,
+                    rrr,
+                    provider,
+                    model,
+                    scanner_summary,
+                    last_price_t0,
+                    status,
+                    proposal_id,
+                ),
+            )
+            await conn.commit()
+            return int(cur.lastrowid or 0)
+
+    async def pending_journal_entries(self) -> list[dict[str, Any]]:
+        """All rows still PENDING (the resolver's work queue), oldest first."""
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, symbol, tf, htf, action, direction,
+                       entry_price, stop_loss, tp1, rrr, status
+                FROM journal_entries
+                WHERE status = 'PENDING'
+                ORDER BY id ASC
+                """
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def update_journal_outcome(
+        self,
+        entry_id: int,
+        *,
+        status: str,
+        resolved_at: str | None = None,
+        resolved_price: float | None = None,
+        realized_r: float | None = None,
+        ambiguous: int = 0,
+    ) -> None:
+        """Transition a PENDING row to a terminal state (WIN|LOSS|EXPIRED|SKIPPED).
+
+        Guarded by `status='PENDING'` in the WHERE clause so the resolver is
+        idempotent: a row that already resolved is never revisited/overwritten.
+        """
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                UPDATE journal_entries
+                SET status = ?, resolved_at = ?, resolved_price = ?,
+                    realized_r = ?, ambiguous = ?, last_checked_at = ?
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (
+                    status,
+                    resolved_at or _utc_now_iso(),
+                    resolved_price,
+                    realized_r,
+                    1 if ambiguous else 0,
+                    _utc_now_iso(),
+                    entry_id,
+                ),
+            )
+            await conn.commit()
+
+    async def touch_journal_checked(self, entry_id: int) -> None:
+        """Record a resolver pass that left the row PENDING (debug/backoff)."""
+        async with self._connect() as conn:
+            await conn.execute(
+                "UPDATE journal_entries SET last_checked_at = ? WHERE id = ?",
+                (_utc_now_iso(), entry_id),
+            )
+            await conn.commit()
+
+    async def recent_journal(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Recent journal entries, newest first (read-only UI/endpoint feed)."""
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, symbol, tf, htf, action, direction,
+                       setup_confidence, entry_price, stop_loss, tp1, rrr,
+                       provider, model, scanner_summary, last_price_t0,
+                       status, resolved_at, resolved_price, realized_r, ambiguous
+                FROM journal_entries
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def journal_stats(self) -> dict[str, Any]:
+        """Aggregate counts + per-group win/loss/rrr for the stats endpoint.
+
+        Returns raw counts and per-group {wins, losses, sample, sum_r} tuples;
+        the Wilson CI / rate math lives in the endpoint helper (pure Python,
+        unit-tested) so this stays a thin SQL layer.
+        """
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+
+            async def _scalar(sql: str, params: tuple = ()) -> int:
+                cur = await conn.execute(sql, params)
+                row = await cur.fetchone()
+                return int((row[0] if row and row[0] is not None else 0))
+
+            total = await _scalar("SELECT COUNT(*) FROM journal_entries")
+            stay_out = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE action = 'STAY_OUT'"
+            )
+            pending = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE status = 'PENDING'"
+            )
+            expired = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE status = 'EXPIRED'"
+            )
+            skipped = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE status = 'SKIPPED'"
+            )
+            wins = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE status = 'WIN'"
+            )
+            losses = await _scalar(
+                "SELECT COUNT(*) FROM journal_entries WHERE status = 'LOSS'"
+            )
+
+            async def _groups(column: str) -> dict[str, dict[str, float]]:
+                cur = await conn.execute(
+                    f"""
+                    SELECT {column} AS grp,
+                           SUM(CASE WHEN status='WIN'  THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) AS losses,
+                           SUM(CASE WHEN status IN ('WIN','LOSS')
+                                    THEN realized_r ELSE 0 END) AS sum_r
+                    FROM journal_entries
+                    WHERE status IN ('WIN','LOSS') AND {column} IS NOT NULL
+                    GROUP BY {column}
+                    """
+                )
+                out: dict[str, dict[str, float]] = {}
+                for r in await cur.fetchall():
+                    grp = r["grp"]
+                    if grp is None:
+                        continue
+                    out[str(grp)] = {
+                        "wins": int(r["wins"] or 0),
+                        "losses": int(r["losses"] or 0),
+                        "sum_r": float(r["sum_r"] or 0.0),
+                    }
+                return out
+
+            # Overall sum of realized_r over resolved (WIN|LOSS) rows.
+            sum_r = await conn.execute(
+                """
+                SELECT SUM(realized_r) FROM journal_entries
+                WHERE status IN ('WIN','LOSS')
+                """
+            )
+            sr = await sum_r.fetchone()
+            overall_sum_r = float(sr[0]) if sr and sr[0] is not None else 0.0
+
+            return {
+                "total": total,
+                "stay_out": stay_out,
+                "pending": pending,
+                "expired": expired,
+                "skipped": skipped,
+                "wins": wins,
+                "losses": losses,
+                "overall_sum_r": overall_sum_r,
+                "by_confidence": await _groups("setup_confidence"),
+                "by_action": await _groups("action"),
+                "by_provider": await _groups("provider"),
+            }
+
+    async def clear_journal(self) -> int:
+        """Delete all journal_entries. Separate from clear_history on purpose
+        (the journal is the measurement dataset and survives history-clear)."""
+        async with self._connect() as conn:
+            cur = await conn.execute("DELETE FROM journal_entries")
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            await conn.commit()
+            return max(0, deleted)
+
     async def clear_history(self) -> dict[str, int]:
         """Delete all rows from the audit history tables (proposals + orders).
 

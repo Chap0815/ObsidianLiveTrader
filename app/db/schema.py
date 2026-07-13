@@ -34,6 +34,41 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_proposals_created ON proposals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_previews_expires ON order_previews(expires_at);
+
+-- Journal + feedback-loop: the KI's SHADOW book. Advisory/measurement only —
+-- it never touches the order/gate/confirm path. A dedicated table (NOT an
+-- extension of proposals) because proposals is wiped by /api/history/clear
+-- while the journal is the measurement dataset and must survive it, and stats
+-- need typed/indexed columns to aggregate on (not a JSON blob).
+CREATE TABLE IF NOT EXISTS journal_entries (
+  id            INTEGER PRIMARY KEY,
+  created_at    TEXT    NOT NULL,          -- UTC ISO, proposal timestamp (t0)
+  symbol        TEXT    NOT NULL,
+  tf            TEXT    NOT NULL,
+  htf           TEXT    NOT NULL,
+  action        TEXT    NOT NULL,          -- STRONG_BUY|BUY|STAY_OUT|SELL|STRONG_SHORT
+  direction     TEXT,                      -- 'long'|'short'|NULL (NULL for STAY_OUT)
+  setup_confidence TEXT NOT NULL,          -- low|medium|high
+  entry_price   REAL,                      -- NULL for STAY_OUT
+  stop_loss     REAL,
+  tp1           REAL,
+  rrr           REAL,                      -- planned rrr from the proposal
+  provider      TEXT,                      -- s.llm_provider at analyze time
+  model         TEXT,                      -- resolved model string
+  scanner_summary TEXT,                    -- compact "bias/setup/score" string or NULL
+  last_price_t0 REAL,                      -- market last_price when logged (context)
+  -- shadow-outcome resolver fields --
+  status        TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING|WIN|LOSS|EXPIRED|SKIPPED
+  resolved_at   TEXT,                      -- UTC ISO when status left PENDING
+  resolved_price REAL,                     -- tp1 or sl level that triggered (for WIN/LOSS)
+  realized_r    REAL,                      -- +reward/risk on WIN, -1.0 on LOSS, NULL otherwise
+  ambiguous     INTEGER NOT NULL DEFAULT 0,-- 1 = tp1 & sl inside the same candle
+  last_checked_at TEXT,                    -- UTC ISO of last resolver pass (debug/backoff)
+  proposal_id   INTEGER                    -- FK-ish link to proposals.id (best-effort, nullable)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_created ON journal_entries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_journal_status  ON journal_entries(status);
 """
 
 
