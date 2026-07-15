@@ -174,6 +174,12 @@ class Settings(BaseSettings):
     # otherwise auto-flatten a genuinely protected trade).
     sl_verify_attempts: int = 3
     sl_verify_delay_s: float = 0.7
+    # Post-close position re-read: Hyperliquid may not reflect a fill the instant
+    # we re-read, which can mislabel a clean full close as "partial". Re-read a
+    # few times with a short settle delay. Defaults preserve the old single-read
+    # behaviour (1 attempt, no delay) so nothing changes unless configured.
+    close_verify_attempts: int = 1
+    close_verify_delay_s: float = 0.0
     # F-15 (privacy): opt-IN, not opt-out. When true, equity, available
     # margin and the full open-positions list are sent to the external LLM
     # provider as part of the analysis context (see build_llm_context() in

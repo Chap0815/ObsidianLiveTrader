@@ -151,6 +151,24 @@ async def lifespan(app: FastAPI):
     if multi_worker_warning:
         log.warning(multi_worker_warning)
 
+    # Loud startup notice when the CONFIGURED analysis provider isn't usable and
+    # a different one is silently doing the work (e.g. LLM_PROVIDER=claude with no
+    # ANTHROPIC_API_KEY → analysis actually runs on xai/Grok). Without this the
+    # user believes they are on the configured model when they are not.
+    try:
+        resolved = s.resolved_llm_provider
+        if resolved != s.llm_provider:
+            log.warning(
+                "LLM-FALLBACK AKTIV: LLM_PROVIDER=%s ist nicht einsatzbereit "
+                "(kein API-Key / nicht konfiguriert) — die KI-Analyse läuft "
+                "stattdessen auf '%s'. Trage den passenden API-Key in die .env "
+                "ein, um den gewünschten Provider (z.B. Sonnet) zu nutzen.",
+                s.llm_provider,
+                resolved,
+            )
+    except Exception:  # noqa: BLE001 — a notice must never break startup
+        pass
+
     # Journal shadow-outcome resolver: single background task, cancelled on
     # shutdown. Advisory/measurement only — never places/moves/cancels orders.
     # Guarded so a resolver failure can never break app startup.
@@ -236,6 +254,12 @@ async def health(request: Request):
         "mexc_configured": s.mexc_ready,
         "hl_configured": s.hl_ready,
         "llm_provider": eff.llm_provider,
+        # Surface a silent fallback: the user CONFIGURED one provider (e.g.
+        # claude) but it has no key, so analysis actually runs on another
+        # (resolved) provider. Without this the dashboard would imply the
+        # configured model is in use when it is not.
+        "llm_provider_configured": s.llm_provider,
+        "llm_fallback_active": eff.llm_provider != s.llm_provider,
         "llm_configured": eff.llm_ready,
         "claude_configured": s.claude_ready,
         "xai_configured": s.xai_ready,
@@ -253,6 +277,8 @@ def _llm_status(request: Request) -> dict:
     eff = _llm_settings(request)
     return {
         "provider": eff.llm_provider,
+        "provider_configured": s.llm_provider,
+        "fallback_active": eff.llm_provider != s.llm_provider,
         "providers": [
             {"id": "claude", "label": "Claude Opus", "configured": s.claude_ready},
             {"id": "xai", "label": "Grok", "configured": s.xai_ready},

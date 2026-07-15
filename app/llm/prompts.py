@@ -145,14 +145,16 @@ _PROMPT_TAIL = """DECISION — action vs STAY_OUT (this is the single, authorita
 overrides any looser wording elsewhere in this prompt):
 First count the independent confluences on ONE side (step 6). Then STAY_OUT —
 take NO directional trade — if ANY of these HARD VETOES holds:
-  - fewer than 2 independent confluences on that side; OR
+  - no independent confluence at all on that side (zero) — a SINGLE valid
+    confluence is enough to consider a directional trade; do NOT demand a
+    second one; OR
   - no valid stop-anchor exists (no structural swing/pattern boundary the
     stop-loss can sit beyond). This is about a PLACEABLE stop, and is SEPARATE
     from Rule 7's `invalidation_price` (a distinct EARLIER level that may
     legitimately be null): a null `invalidation_price` does NOT trip this veto
     as long as the stop-loss sits beyond a real swing/pattern boundary; OR
   - the only available entry requires CHASING — last_price has already run more
-    than 0.5 x LTF ATR14 beyond the entry in the trade direction and no fresh
+    than 0.85 x LTF ATR14 beyond the entry in the trade direction and no fresh
     trigger sits closer to price; OR
   - the most structurally honest stop/target geometry still yields
     rrr < risk_policy.min_rrr (sub-min-RRR is a veto, never a "trade it at low"
@@ -161,9 +163,9 @@ take NO directional trade — if ANY of these HARD VETOES holds:
     flat macd_hist AND no pattern AND no valid stop-anchor.
 Otherwise TAKE THE DIRECTIONAL STANCE — do NOT hide in STAY_OUT when a real,
 fully-gated setup exists:
-  - BUY / SELL when >= 2 independent confluences AND rrr >= min_rrr AND a valid
+  - BUY / SELL when >= 1 independent confluence AND rrr >= min_rrr AND a valid
     stop-anchor exists;
-  - STRONG_BUY / STRONG_SHORT only when >= 3 independent confluences AND
+  - STRONG_BUY / STRONG_SHORT only when >= 2 independent confluences AND
     setup_confidence >= "medium" (never pair a STRONG_* action with "low").
 A setup that clears every hard veto but only earns "low" confidence (against
 HTF, momentum softening, funding headwind) is STILL a trade — take it at

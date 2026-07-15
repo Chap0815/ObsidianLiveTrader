@@ -386,12 +386,19 @@ async def _openai_compat_text(
     timeout: float = 120.0,
     *,
     provider_label: str = "Scanner",
+    max_tokens: int = 8000,
 ) -> str:
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # max_tokens + temperature MUST be set: without an explicit output budget a
+    # reasoning model (e.g. Grok-4) can spend the default budget on reasoning
+    # tokens and return an EMPTY content string, which then fails JSON parsing
+    # ("Modell … lieferte: ''"). Mirrors the working analyze call in client.py.
     body = {
         "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -413,9 +420,19 @@ async def _openai_compat_text(
             raw=detail,
         )
     try:
-        return str(r.json()["choices"][0]["message"]["content"])
+        choice = r.json()["choices"][0]
+        content = str(choice["message"].get("content") or "")
     except (KeyError, IndexError, TypeError) as e:
         raise LlmError("Scanner response missing content") from e
+    if not content.strip():
+        finish = choice.get("finish_reason") or "?"
+        raise LlmError(
+            f"Scanner ({provider_label}, {model}) returned EMPTY content "
+            f"(finish_reason={finish}). For a reasoning model this usually means "
+            "the token budget was exhausted before any answer — raise max_tokens "
+            "or use a non-reasoning scanner model."
+        )
+    return content
 
 
 async def scan_with_llm(

@@ -33,6 +33,11 @@ def _settings(**kwargs) -> Settings:
         preview_token_ttl_seconds=60,
         sl_verify_attempts=1,
         sl_verify_delay_s=0.0,
+        # Pin post-close reread to a single attempt so tests are deterministic
+        # regardless of the developer's real .env (CLOSE_VERIFY_ATTEMPTS there).
+        # Retry-specific tests override these explicitly.
+        close_verify_attempts=1,
+        close_verify_delay_s=0.0,
         local_api_token="test-token",
     )
     base.update(kwargs)
@@ -102,6 +107,35 @@ def test_limit_entry_spoof_ignored_for_risk():
 def test_strict_rrr_requires_tp():
     g = validate_order(
         _ticket(take_profit=None),
+        _contract(),
+        10_000.0,
+        _settings(strict_rrr=True),
+        last_price=100_000.0,
+    )
+    assert g.ok is False
+    assert any("take_profit" in e.lower() or "STRICT_RRR" in e for e in g.errors)
+
+
+def test_manual_mode_without_tp_not_hard_blocked():
+    """CFG-04: manual SL/TP mode places no exchange TP, so STRICT_RRR must NOT
+    hard-block a manual entry that omits take_profit — it warns instead."""
+    g = validate_order(
+        _ticket(trigger_mode="manual", take_profit=None),
+        _contract(),
+        10_000.0,
+        _settings(strict_rrr=True),
+        last_price=100_000.0,
+    )
+    assert not any("take_profit required" in e.lower() for e in g.errors)
+    assert any("manuell ohne tp" in w.lower() for w in g.warnings)
+    assert g.ok is True
+
+
+def test_auto_mode_without_tp_still_blocked():
+    """Guard: the manual exemption must NOT leak into auto mode — an auto ticket
+    without TP under STRICT_RRR still hard-fails."""
+    g = validate_order(
+        _ticket(trigger_mode="auto", take_profit=None),
         _contract(),
         10_000.0,
         _settings(strict_rrr=True),
@@ -353,6 +387,41 @@ async def test_flatten_unfilled_cancels_resting_not_prefill():
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_awaited()
     assert out["flatten"] and out["flatten"].get("action") == "cancel_resting"
+
+
+@pytest.mark.asyncio
+async def test_unfilled_resting_limit_not_flattened_or_cancelled():
+    """REGRESSION: a non-marketable LIMIT entry that HL RESTS reports
+    unfilled=True with no SL by design (F-02). It must NOT be treated as an SL
+    failure, must NOT auto-flatten, and must NOT cancel the valid resting order —
+    it just rests unprotected (warned) until it fills."""
+    client = _happy_client(
+        {
+            "orderId": 777,
+            "unfilled": True,
+            "entryFilledSz": 0.0,
+            "slTriggerOid": None,
+        }
+    )
+    svc = OrderService(
+        client,
+        _settings(auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["status"] == "placed_unfilled_resting"
+    # The valid resting order and any pre-existing position stay untouched.
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+    assert out["flatten"] is None
+    # No false SL-failure; instead an honest resting-limit warning. The exact
+    # regression signatures are the English "SL not verified" warning and any
+    # *_sl_unverified / *_flatten_sent status — all must be absent.
+    assert any("LIMIT RUHT" in w for w in out.get("warnings", []))
+    assert not any("not verified" in w.lower() for w in out.get("warnings", []))
+    assert "unverified" not in out["status"] and "flatten" not in out["status"]
 
 
 @pytest.mark.asyncio
@@ -1154,6 +1223,55 @@ async def test_close_reread_failure_is_uncertain_not_closed():
     assert out["status"] == "close_unverified"
     assert out.get("residual_vol") is None
     assert db.insert_order.await_args.kwargs["status"] != "closed"
+
+
+@pytest.mark.asyncio
+async def test_close_verify_retry_lets_fill_settle_before_partial():
+    """M-A: with CLOSE_VERIFY_ATTEMPTS>1 a not-yet-settled reread (position still
+    fully shows) is retried; once the exchange reflects the fill the close reports
+    ok (closed), not a false partial. Default attempts=1 keeps old behaviour."""
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
+    # pre-close hold, reread#1 (unsettled: still 5), reread#2 (settled: empty)
+    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(5.0), []])
+    client.close_position_market = AsyncMock(return_value={"orderId": 9, "dealVol": 5.0})
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(
+        client,
+        _settings(close_verify_attempts=3, close_verify_delay_s=0.0),
+        PreviewStore(),
+        db=db,
+    )
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+    assert out["ok"] is True
+    assert out["status"] == "closed"
+    assert db.insert_order.await_args.kwargs["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_close_verify_retry_still_reports_genuine_partial():
+    """M-A guard: if the residual never settles (genuine partial fill), the retry
+    must still end up reporting partial, not a false closed."""
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
+    # hold 5, close 5, but reread keeps showing 2 open across all attempts.
+    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(2.0), _pos(2.0), _pos(2.0)])
+    client.close_position_market = AsyncMock(return_value={"orderId": 9, "dealVol": 3.0})
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(
+        client,
+        _settings(close_verify_attempts=3, close_verify_delay_s=0.0),
+        PreviewStore(),
+        db=db,
+    )
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+    assert out["ok"] is False
+    assert out["status"] in ("partial", "close_incomplete")
+    assert out["residual_vol"] == 2.0
 
 
 # ── F-04: unguarded r.json() after 2xx must not crash — treat as uncertain ───

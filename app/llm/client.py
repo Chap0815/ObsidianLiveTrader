@@ -715,7 +715,9 @@ def build_llm_context(
         "note": (
             "Advisory only. Read daily (regime anchor), then htf (regime), then "
             "ltf (timing). Human must apply and pass risk gates before any order. "
-            "Prefer STAY_OUT over forced trades."
+            "When a real, fully-gated setup exists (>=1 confluence, valid stop, "
+            "rrr>=min_rrr), TAKE the directional stance — do not hide in STAY_OUT; "
+            "reserve STAY_OUT for the hard vetoes only."
         ),
     }
     if include_acct:
@@ -977,7 +979,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
             {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
-        "temperature": 0.2,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
     }
 
@@ -1026,7 +1028,7 @@ async def _call_openai_compat(
             {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
-        "temperature": 0.2,
+        "temperature": 0.0,
     }
     if json_response_format:
         body["response_format"] = {"type": "json_object"}
@@ -1181,7 +1183,7 @@ async def _call_xai_reevaluate(
             {"role": "system", "content": build_reevaluate_system_prompt()},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
-        "temperature": 0.2,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
     }
 
@@ -1230,7 +1232,7 @@ async def _call_openai_compat_reevaluate(
             {"role": "system", "content": build_reevaluate_system_prompt()},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
-        "temperature": 0.2,
+        "temperature": 0.0,
     }
     if json_response_format:
         body["response_format"] = {"type": "json_object"}

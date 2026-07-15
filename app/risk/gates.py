@@ -93,6 +93,11 @@ def validate_order(
     if order_type not in ("market", "limit"):
         errors.append("order_type must be 'market' or 'limit'")
 
+    # Manual SL/TP mode places NO exchange triggers (the trader manages exits),
+    # so a missing take_profit is not a gate failure — the RRR check below warns
+    # instead of hard-blocking (STRICT_RRR still applies to auto mode).
+    manual_sltp = (getattr(ticket, "trigger_mode", "auto") or "auto").lower() == "manual"
+
     open_type = int(ticket.open_type or 1)
     if open_type not in (1, 2):
         errors.append("open_type must be 1 (isolated) or 2 (cross)")
@@ -159,16 +164,17 @@ def validate_order(
     if order_type == "market":
         if last_price is not None and last_price > 0:
             entry_for_risk = float(last_price)
-            # Adverse fill buffer (% of price) for market risk/RRR
-            slip = float(getattr(settings, "market_entry_slippage_pct", 0.0) or 0.0)
-            if slip > 0 and side in ("long", "short"):
-                if side == "long":
-                    entry_for_risk = entry_for_risk * (1.0 + slip / 100.0)
-                else:
-                    entry_for_risk = entry_for_risk * (1.0 - slip / 100.0)
-                warnings.append(
-                    f"market risk entry uses {slip}% adverse slip buffer vs last"
-                )
+            # (M-B) The market_entry_slippage adverse-entry shift used to be
+            # applied here for risk/RRR. For a tight stop it inflated the
+            # entry→SL distance disproportionately (worst case ~2.5×), wrongly
+            # pushing legitimate scalps over MAX_RISK_PCT. Risk now uses the raw
+            # last price. Trade-off (deliberate): the remaining distance buffer is
+            # RISK_SLIPPAGE_PCT inside risk_usdt(), which is smaller than the old
+            # entry shift — so an adverse fill (up to market_entry_slippage_pct)
+            # can push the REALISED risk slightly over the computed MAX_RISK_PCT.
+            # This is bounded by the exchange-side slippage cap on the ACTUAL
+            # order (see exchange_factory / hyperliquid client), which limits how
+            # far the fill can move from last.
         elif ticket.entry is not None and float(ticket.entry) > 0:
             entry_for_risk = float(ticket.entry)
             warnings.append("market order risk uses ticket.entry (no last_price)")
@@ -317,11 +323,18 @@ def validate_order(
                     warnings.append(msg)
         except ValueError as e:
             errors.append(f"invalid RRR geometry: {e}")
-    elif settings.strict_rrr and sl_f is not None and (
+    elif settings.strict_rrr and not manual_sltp and sl_f is not None and (
         rounded_tp is None or float(rounded_tp) <= 0
     ):
         errors.append(
             "take_profit required when STRICT_RRR=true (cannot enforce min RRR without TP)"
+        )
+    elif settings.strict_rrr and manual_sltp and sl_f is not None and (
+        rounded_tp is None or float(rounded_tp) <= 0
+    ):
+        warnings.append(
+            "MANUELL ohne TP: STRICT_RRR kann RRR nicht prüfen — kein Börsen-TP, "
+            "du verwaltest den Ausstieg selbst."
         )
 
     # ── Max notional ───────────────────────────────────────────────────

@@ -718,15 +718,13 @@ class OrderService:
 
         sl = gate.rounded_stop if gate.rounded_stop is not None else ticket.stop_loss
         tp = gate.rounded_tp if gate.rounded_tp is not None else ticket.take_profit
-        # F-D1 (accepted behavior, documented not changed — the check itself
-        # lives in app/risk/gates.py, out of this file's edit scope): for a
-        # market order, gate.rounded_stop's geometry is validated against
-        # entry_for_risk = last*(1±market_entry_slippage_pct), not raw last.
-        # That makes the geometry check slightly PERMISSIVE (a stop up to
-        # ~slip% on the wrong side of raw `last` can still pass) but the risk
-        # MAGNITUDE (risk_usdt/risk_pct) is computed off that same buffered,
-        # conservative entry — so real risk is always OVER-estimated, never
-        # under-estimated. Money-safe by construction; not tightened here.
+        # (Updated after M-B) For a market order the gate now validates
+        # gate.rounded_stop's geometry and the risk MAGNITUDE against raw `last`
+        # (the market_entry_slippage entry-shift was removed from risk in
+        # app/risk/gates.py). The realised risk at an adverse fill can therefore
+        # be slightly ABOVE the computed MAX_RISK_PCT (bounded by the exchange
+        # slippage cap on the actual order) — a deliberate trade-off so tight-stop
+        # scalps are not wrongly rejected. See the M-B note in gates.py.
         # SL value is mandatory for the risk gate in BOTH modes (it sizes risk),
         # unless unprotected entries are explicitly allowed.
         if (sl is None or float(sl) <= 0) and not self.settings.allow_unprotected_entry:
@@ -878,9 +876,26 @@ class OrderService:
                     "gesetzt. Du musst die Teilausstiege selbst verwalten."
                 )
 
+        # A non-marketable LIMIT entry that Hyperliquid RESTS carries no filled
+        # position to protect: the HL adapter places NO SL by design (F-02) and
+        # returns unfilled=True / entryFilledSz=0. That is NOT an SL failure — we
+        # must not "verify" a stop that cannot exist yet, and must not
+        # auto-flatten/cancel a perfectly valid resting order. (Regression fix:
+        # before F-02 the SL trigger rested unconditionally with an oid, so this
+        # path never mislabelled a resting limit as "SL nicht verifiziert".)
+        unfilled_resting = isinstance(resp, dict) and resp.get("unfilled") is True
+        if unfilled_resting and not manual_sltp:
+            sl_detail = "resting limit entry not filled — no SL until it fills"
+            warnings.append(
+                "LIMIT RUHT: Einstieg noch nicht ausgeführt — es ist KEIN "
+                "Börsen-SL gesetzt, bis die Order füllt (kein Fill-Watcher). "
+                "Nach dem Fill selbst absichern oder die ruhende Order stornieren."
+            )
+
         try:
             if (
                 not manual_sltp
+                and not unfilled_resting
                 and sl is not None
                 and float(sl) > 0
                 and not self.settings.allow_unprotected_entry
@@ -968,6 +983,7 @@ class OrderService:
         # Never auto-flatten a manual-mode order — that IS the point of manual.
         if (
             not manual_sltp
+            and not unfilled_resting
             and sl is not None
             and float(sl) > 0
             and not self.settings.allow_unprotected_entry
@@ -1115,6 +1131,12 @@ class OrderService:
         status = "recovered_placed" if recovered_from_timeout else "placed"
         if manual_sltp:
             status = "placed_manual"
+        elif unfilled_resting:
+            status = (
+                "recovered_placed_unfilled_resting"
+                if recovered_from_timeout
+                else "placed_unfilled_resting"
+            )
         elif sl is not None and float(sl) > 0 and not sl_verified:
             if not sl_checked:
                 status = (
@@ -1306,10 +1328,27 @@ class OrderService:
         # open. Re-read the live position and confirm the residual is what we
         # intended to leave (0 for a full close, hold-close_vol for a partial).
         expected_residual = max(0.0, hold - close_vol)
-        residual, _rot, reread_ok = await self._same_side_hold_vol_ok(symbol, side)
         # Dust tolerance: one lot step, else a tiny relative epsilon (HL sizes
         # can be stepless). Never flags a genuine full close (residual ~0).
         epsilon = max(vol_unit, hold * 1e-4, 1e-9)
+        # M-A: a correct close can read back as still-open if the exchange
+        # (Hyperliquid) has not reflected the fill the instant we re-read,
+        # mislabelling a clean close as "partial". Re-read up to
+        # CLOSE_VERIFY_ATTEMPTS times with a short settle delay, stopping as soon
+        # as the residual has settled to what we intended to leave. Defaults to a
+        # single attempt with no delay, so behaviour is unchanged unless the user
+        # opts in via config.
+        attempts = max(1, int(getattr(self.settings, "close_verify_attempts", 1) or 1))
+        delay = max(0.0, float(getattr(self.settings, "close_verify_delay_s", 0.0) or 0.0))
+        residual, _rot, reread_ok = await self._same_side_hold_vol_ok(symbol, side)
+        for _ in range(attempts - 1):
+            # Only keep polling while the position still looks unsettled; a good
+            # read (settled residual) or a failed query ends the loop immediately.
+            if not reread_ok or residual - expected_residual <= epsilon:
+                break
+            if delay > 0:
+                await asyncio.sleep(delay)
+            residual, _rot, reread_ok = await self._same_side_hold_vol_ok(symbol, side)
 
         if not reread_ok:
             # Fail-safe: the verification query failed. Do NOT claim fully
