@@ -34,6 +34,7 @@
     wsStatus: "off",
     liveBar: null, // { time, open, high, low, close } chart seconds
     lastPx: null,
+    _lastTickTs: null, // ms timestamp of the last live price update (U-02 stale-feed banner)
     // Chart line groups (KI-Analyse, echte Positionen, offene Orders/Trigger)
     proposalLines: [],
     positionLines: [],
@@ -138,10 +139,13 @@
     return t > 1e12 ? Math.floor(t / 1000) : Math.floor(t);
   }
 
+  // U-06: `ok` is normally boolean, but `null`/`undefined` (status not yet
+  // known, e.g. before the first /api/health response) resets the dot to
+  // the neutral "unknown" look instead of forcing a false "bad" red.
   function setDot(el, ok) {
     if (!el) return;
     el.classList.remove("ok", "bad", "unknown");
-    el.classList.add(ok ? "ok" : "bad");
+    el.classList.add(ok == null ? "unknown" : ok ? "ok" : "bad");
   }
 
   function initChart() {
@@ -793,7 +797,15 @@
     state.fundingNextSettle =
       Number.isFinite(nst) && nst > 0 ? (nst > 1e12 ? nst : nst * 1000) : null;
     updateFundingCountdown();
-    if (cd && !state._fundingCdTimer) {
+    if (state.fundingNextSettle == null) {
+      // U-07: exchange (or symbol) doesn't report a settle time anymore
+      // (e.g. switched to Hyperliquid) — stop the 1s tick, it would just
+      // spin forever writing "" into a hidden countdown span.
+      if (state._fundingCdTimer) {
+        clearInterval(state._fundingCdTimer);
+        state._fundingCdTimer = null;
+      }
+    } else if (cd && !state._fundingCdTimer) {
       state._fundingCdTimer = setInterval(updateFundingCountdown, 1000);
     }
 
@@ -863,6 +875,26 @@
     cd.textContent = " · " + (h > 0 ? h + ":" + mm + ":" + ss : mm + ":" + ss);
   }
 
+  const STALE_PRICE_MS = 15000; // U-02: no price tick for this long + WS down => feed considered stale
+
+  /** U-02: manual-SL protection (checkManualSlAlarm) only ever fires from a
+   *  live price tick — so if the feed goes dark, nothing re-evaluates and the
+   *  trader is never told their SL is now unmonitored. Surface a banner once
+   *  the feed has been silent for STALE_PRICE_MS *and* the WS is down
+   *  (error/off); a healthy WS or REST fallback still ticking counts as
+   *  "not stale" even while reconnecting. Called from setLivePrice (clears it
+   *  the instant a fresh tick lands), setChartMeta and the 5s background poll
+   *  (so it also FIRES when no tick arrives at all, not only on the next one). */
+  function updateStaleBanner() {
+    const el = $("stale-banner");
+    const priceEl = $("ctx-price");
+    const wsDown = state.wsStatus === "error" || state.wsStatus === "off";
+    const age = state._lastTickTs != null ? Date.now() - state._lastTickTs : null;
+    const stale = wsDown && age != null && age > STALE_PRICE_MS;
+    if (el) el.classList.toggle("hidden", !stale);
+    if (priceEl) priceEl.classList.toggle("price-stale", stale);
+  }
+
   function setChartMeta(symbol, tf, htf, n) {
     const el = $("chart-meta");
     if (el) {
@@ -877,6 +909,7 @@
       el.textContent =
         symbol + " · LTF " + tf + " · HTF " + htf + " · " + n + " bars" + live;
     }
+    updateStaleBanner(); // U-02: WS status changes here too, so re-check
   }
 
   function tfSeconds(tf) {
@@ -906,6 +939,7 @@
    *  SL zone, warn LOUDLY — but only while the browser is open. Dedup per
    *  symbol so it fires once per breach, not on every tick. */
   function checkManualSlAlarm(px) {
+    updateStaleBanner(); // U-02: re-check on every tick so the banner clears immediately
     if (px == null || !Number.isFinite(Number(px))) return;
     px = Number(px);
     const positions = (state.account && state.account.positions) || [];
@@ -941,6 +975,7 @@
 
   function setLivePrice(px) {
     if (px == null || !Number.isFinite(Number(px))) return;
+    state._lastTickTs = Date.now(); // U-02: feed is alive — feeds the stale-banner check
     const prev = state.lastPx;
     state.lastPx = Number(px);
     const priceEl = $("ctx-price");
@@ -1396,28 +1431,12 @@
     return data;
   }
 
-  /** Unmissable environment strip under the topbar. Testnet → amber "no real
-   *  funds"; mainnet + armed (live_trading) → red "LIVE"; otherwise a neutral
-   *  mainnet/disarmed note. Guards a real-money switch from ever being mistaken
-   *  for testnet. */
-  function renderEnvBanner(h) {
-    const el = $("env-banner");
-    if (!el) return;
-    h = h || state.health || {};
-    // Env banner removed per user request (they know they're on testnet/what
-    // they're doing). Kept as a no-op so callers don't need changing; the
-    // #env-banner element is gone from the template.
-    el.classList.add("hidden");
-    el.textContent = "";
-  }
-
   async function loadHealth() {
     try {
       const res = await fetch("/api/health");
       if (!res.ok) throw new Error("health " + res.status);
       const h = await res.json();
       state.health = h;
-      try { renderEnvBanner(h); } catch (_) {}
 
       const arm = $("arm-status");
       if (arm) {
@@ -2251,7 +2270,7 @@
         return data;
       }
       el.className = "orders-body";
-      el.innerHTML = orders
+      const ordersHtml = orders
         .map(function (o) {
           const oid = o.orderId != null ? o.orderId : o.order_id;
           // A non-reduce limit order is a resting ENTRY that only fills when the
@@ -2279,7 +2298,7 @@
         })
         .join("");
       // Active SL/TP triggers (protective orders on the exchange)
-      el.innerHTML += stops
+      const stopsHtml = stops
         .map(function (s) {
           const slPx = Number(s.stopLossPrice);
           const tpPx = Number(s.takeProfitPrice);
@@ -2302,7 +2321,10 @@
         })
         .join("");
       // Cross-coin overview: resting orders / stops on OTHER coins.
-      el.innerHTML += otherHtml;
+      // U-04: build the full fragment in memory and assign innerHTML ONCE —
+      // three separate `+=` assignments each re-parse and re-render the
+      // entire (already-inserted) HTML, which thrashes the DOM for no reason.
+      el.innerHTML = ordersHtml + stopsHtml + otherHtml;
       el.querySelectorAll(".btn-cancel-order").forEach(function (btn) {
         btn.addEventListener("click", function () {
           cancelOrder(btn.getAttribute("data-oid"));
@@ -5774,6 +5796,14 @@
 
   async function runPreview() {
     if (state.orderBusy) return;
+    // U-03: the send button is disabled via updateOrderButtonsEnabled() when
+    // apiAllowed===false, but a focused form field still submits on Enter,
+    // bypassing that disabled state. Guard here too so Enter can't slip an
+    // order through on a symbol where API orders are locked.
+    if (state.apiAllowed === false) {
+      setTicketError("apiAllowed=false — API-Orders für dieses Symbol gesperrt");
+      return;
+    }
     setTicketError("");
     const ticket = readTicket();
     if (ticket.vol == null || ticket.vol <= 0) {
@@ -6035,6 +6065,10 @@
     //  - WS down/error: full reload every 5 s so the chart stays live.
     let pollTick = 0;
     setInterval(function () {
+      // U-02: independent of the early-returns below — this is the ONLY hook
+      // that re-checks staleness when NO tick arrives at all (a dead feed
+      // never calls setLivePrice/checkManualSlAlarm again to notice itself).
+      updateStaleBanner();
       if (!state.symbol) return;
       if (state.activeView !== "chart") return; // chart hidden (overview active) → skip background loads
       if (!state._chartKey) return; // overview start: no chart loaded yet → no market polling
