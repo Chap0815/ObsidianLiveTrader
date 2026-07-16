@@ -42,13 +42,16 @@ RISK_PROFILES: dict[str, dict[str, object]] = {
         min_rrr=2.0,
         strict_rrr=True,
         strict_available_margin=True,
+        strict_aggregate_risk=True,
     ),
-    # Default: freer size, moderate risk, RRR as warning only.
+    # Default: freer size, moderate risk, RRR as warning only. Deliberately
+    # does NOT set max_price_drift_pct — that field's own default (1.0) IS
+    # the balanced value, so a config read never lies about what applies.
     "balanced": dict(
         max_risk_pct=5.0,
         max_leverage=50,
         max_notional_pct_of_equity=5000.0,  # 50× equity — only catches fat-finger
-        min_rrr=2.0,
+        min_rrr=1.5,
         strict_rrr=False,
         strict_available_margin=True,
     ),
@@ -139,8 +142,14 @@ class Settings(BaseSettings):
     risk_profile: str = "balanced"
     max_leverage: int = 50
     max_risk_pct: float = 5.0
-    min_rrr: float = 2.0
+    min_rrr: float = 1.5
     strict_rrr: bool = False
+    # R-07: aggregate (portfolio-wide) risk cap toggle + cap %. Off by default
+    # (balanced/free) so existing single-position gates keep behaving as
+    # before; conservative opts in. Consumed by the risk gates (Task 8), not
+    # this settings module — see aggregate_pos_risk_cap_pct_ok validator below.
+    strict_aggregate_risk: bool = False
+    aggregate_pos_risk_cap_pct: float = 2.0
     # Equity-relative position-size cap (hard): notional must stay under
     # equity × pct/100. 0 = off. Scales with the account (unlike a fixed USDT
     # cap) and stays fail-closed to known equity. Fat-finger guard, not a
@@ -169,7 +178,7 @@ class Settings(BaseSettings):
             "max_notional_pct_of_equity. 0 = off."
         ),
     )
-    max_price_drift_pct: float = 0.5
+    max_price_drift_pct: float = 1.0
     market_entry_slippage_pct: float = 0.15
     allow_cross_margin: bool = False
     auto_flatten_if_sl_unverified: bool = True
@@ -355,6 +364,16 @@ class Settings(BaseSettings):
         if not math.isfinite(v) or not (0 <= v <= 1000):
             raise ValueError(
                 f"MIN_RRR must be a finite number in [0, 1000] (got {v!r})"
+            )
+        return v
+
+    @field_validator("aggregate_pos_risk_cap_pct")
+    @classmethod
+    def aggregate_pos_risk_cap_pct_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 < v <= 100):
+            raise ValueError(
+                "AGGREGATE_POS_RISK_CAP_PCT must be a finite number in "
+                f"(0, 100] (got {v!r})"
             )
         return v
 
