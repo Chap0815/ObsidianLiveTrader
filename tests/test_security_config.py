@@ -212,3 +212,18 @@ def test_resolved_llm_provider_falls_back_to_a_configured_one():
     # a configured provider is left unchanged
     s2 = Settings(llm_provider="xai", xai_api_key="xai-abc")
     assert s2.resolved_llm_provider == "xai"
+
+
+def test_api_responses_have_no_store_and_nosniff():
+    """B-01: every /api/* JSON response must be non-cacheable, non-sniffable
+    and must not leak the path via Referer — private data (balances,
+    proposals, journal) must never end up in a browser/proxy disk cache."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as tc:
+        r = tc.get("/api/health")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-store"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["referrer-policy"] == "no-referrer"

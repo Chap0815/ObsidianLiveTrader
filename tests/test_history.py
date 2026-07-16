@@ -219,4 +219,41 @@ def test_analyze_persists_proposal(tmp_path, monkeypatch):
         assert hist["proposals"][0]["proposal"]["action"] == "BUY"
         assert hist["proposals"][0]["annotations"]["advisory_only"] is True
 
+
+def test_500_body_hides_internal_detail(tmp_path, monkeypatch):
+    """B-03: a DB failure in history/journal/journal_stats/journal_clear must
+    return a generic message — the raw exception (can contain file paths,
+    SQL, secrets) must never reach the client, only the server log."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "boom.db"))
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    get_settings.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    secret_detail = "sqlite3.OperationalError: /etc/secret-path/boom.db is locked"
+
+    with TestClient(app) as tc:
+        tc.app.state.db.history = AsyncMock(side_effect=RuntimeError(secret_detail))
+        tc.app.state.db.clear_history = AsyncMock(side_effect=RuntimeError(secret_detail))
+        tc.app.state.db.recent_journal = AsyncMock(side_effect=RuntimeError(secret_detail))
+        tc.app.state.db.journal_stats = AsyncMock(side_effect=RuntimeError(secret_detail))
+        tc.app.state.db.clear_journal = AsyncMock(side_effect=RuntimeError(secret_detail))
+
+        for method, path in (
+            ("get", "/api/history"),
+            ("post", "/api/history/clear"),
+            ("get", "/api/journal"),
+            ("get", "/api/journal/stats"),
+            ("post", "/api/journal/clear"),
+        ):
+            r = getattr(tc, method)(path)
+            assert r.status_code == 500, (path, r.text)
+            body_text = r.text
+            assert secret_detail not in body_text
+            assert "secret-path" not in body_text
+            detail = r.json().get("detail")
+            assert detail == "internal error"
+
     get_settings.cache_clear()

@@ -111,11 +111,128 @@ def _detect_multi_worker_env(env: dict[str, str] | None = None) -> str | None:
     return None
 
 
+# Q-02: exclusive startup lock on the data directory. This is a runtime
+# check (rather than the env-var heuristic above) so it also catches a bare
+# `--workers N` / `gunicorn -w N` launch, which sets none of those vars.
+# Implemented as a PID lockfile created with O_CREAT|O_EXCL (atomic
+# create-if-absent on both POSIX and Windows via Python's os.open) instead
+# of an OS advisory lock, specifically so a lock left behind by a process
+# that was killed (SIGKILL/taskkill, no chance to run the `finally` below)
+# can be told apart from one held by a still-running instance and reclaimed
+# instead of blocking every future start — see _pid_is_alive() below.
+_INSTANCE_LOCK_FILENAME = "instance.lock"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort cross-platform liveness check for a PID read from a
+    lockfile. os.kill(pid, 0) (the usual POSIX idiom) is not meaningful on
+    Windows, so branch on platform."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, just owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_instance_lock(data_dir: Path) -> Path | None:
+    """Try to take the exclusive startup lock in data_dir.
+
+    Returns the lockfile Path if THIS process now holds it, or None if a
+    still-live process already holds it. A lock left behind by a dead PID
+    (crashed process) is treated as orphaned/stale and silently reclaimed —
+    it must never permanently block a normal single-instance start.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / _INSTANCE_LOCK_FILENAME
+    my_pid = os.getpid()
+
+    if lock_path.exists():
+        other_pid = -1
+        try:
+            raw = lock_path.read_text(encoding="utf-8").strip()
+            if raw:
+                other_pid = int(raw)
+        except (OSError, ValueError):
+            other_pid = -1
+        if other_pid > 0 and other_pid != my_pid and _pid_is_alive(other_pid):
+            return None  # held by another live process
+        # Orphaned (dead PID) or unreadable content: reclaim it.
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+    except FileExistsError:
+        # Lost a race right after the staleness check above.
+        return None
+    try:
+        os.write(fd, str(my_pid).encode("ascii"))
+    finally:
+        os.close(fd)
+    return lock_path
+
+
+def _release_instance_lock(lock_path: Path) -> None:
+    """Release a lock THIS process holds. Verifies the PID recorded inside
+    still matches ours before deleting, so a lock some other process may
+    have reclaimed is never deleted out from under it."""
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+        if raw and int(raw) == os.getpid():
+            lock_path.unlink()
+    except (OSError, ValueError):
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
     client = create_exchange_client(s)
     db = Database(s.database_path)
+
+    # Q-02: exclusive startup lock, independent of the env-var heuristic
+    # further down (_detect_multi_worker_env) — this also catches a bare
+    # `--workers N` / `gunicorn -w N` launch, which sets none of those env
+    # vars. A second LIVE instance gets a loud WARNING; if THIS instance is
+    # armed (TRADING_ENABLED=true) it aborts fail-closed instead of quietly
+    # running two copies of the in-process preview_store/trade_lock state
+    # described below. The existing env-var guard stays in place too.
+    instance_lock_path = _acquire_instance_lock(db.path.parent)
+    if instance_lock_path is None:
+        log.warning(
+            "MULTI-INSTANCE DETECTED: another live process already holds "
+            "the startup lock in %s (in-process preview-token store and "
+            "confirm/close trade_lock are NOT shared across processes — "
+            "see the single-worker note on _detect_multi_worker_env() "
+            "above). Running two live instances against the same data/ is "
+            "unsafe.",
+            db.path.parent,
+        )
+        if s.trading_enabled:
+            raise RuntimeError(
+                "Refusing to start: TRADING_ENABLED=true and another live "
+                f"instance already holds the startup lock in {db.path.parent}."
+            )
+
     await db.init()
     # F-16: PreviewStore is an in-process, in-memory TTL store (see
     # app/orders/tokens.py) — it is NOT shared across worker processes.
@@ -192,6 +309,8 @@ async def lifespan(app: FastAPI):
         aclose = getattr(client, "aclose", None)
         if aclose:
             await aclose()
+        if instance_lock_path is not None:
+            _release_instance_lock(instance_lock_path)
 
 
 app = FastAPI(title="Obsidian Live Trader", version="0.3.0", lifespan=lifespan)
@@ -202,16 +321,49 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost", "::1", "testserver"],
 )
 
+# B-01: private JSON responses must never be cached (browser/proxy disk
+# cache), MIME-sniffed, or leak the request path via Referer to a
+# downstream link. Appended AFTER the auth/CSRF and TrustedHost middleware
+# above (nothing reordered) — this only sets headers on the way out and
+# never influences an auth/origin decision. HTML pages keep their own CSP
+# (see index()/setup_page() below) — untouched here.
+_API_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def api_response_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        for name, value in _API_NO_STORE_HEADERS.items():
+            response.headers[name] = value
+    return response
+
+
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def _order_service(request: Request) -> OrderService:
-    s = get_settings()
-    # Prefer app.state.mexc (tests monkeypatch this); exchange is alias
-    client = getattr(request.app.state, "mexc", None) or getattr(
+def _exchange_client(request: Request):
+    """Q-07: single resolution of the active exchange client.
+
+    Some call-sites only checked app.state.mexc while others fell back to
+    app.state.exchange (the same object under lifespan's legacy alias, see
+    lifespan() above) — harmless today, but a divergence waiting to bite the
+    day those two are ever set differently. Every call-site now goes through
+    this one helper.
+    """
+    return getattr(request.app.state, "mexc", None) or getattr(
         request.app.state, "exchange", None
     )
+
+
+def _order_service(request: Request) -> OrderService:
+    s = get_settings()
+    client = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="Exchange client not initialized")
     store = getattr(request.app.state, "preview_store", None)
@@ -393,7 +545,7 @@ async def setup_save(request: Request, body: dict):
     # Hot-apply: fresh settings + fresh exchange client, no restart needed
     get_settings.cache_clear()
     s = get_settings()
-    old = getattr(request.app.state, "mexc", None)
+    old = _exchange_client(request)
     client = create_exchange_client(s)
     request.app.state.mexc = client
     request.app.state.exchange = client
@@ -588,7 +740,7 @@ async def symbols(request: Request):
     On exchange outage: serve the stale cache, else a majors fallback —
     the dropdown must never be empty.
     """
-    client = getattr(request.app.state, "mexc", None)
+    client = _exchange_client(request)
     if client is None:
         return {"symbols": _fallback_symbols(), "error": "Exchange client not initialized"}
     import time as _time
@@ -617,7 +769,7 @@ async def market(
 ):
     """Public market snapshot: klines, indicators, structure, funding, contract."""
     symbol = normalize_symbol(symbol)
-    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
     s = get_settings()
@@ -660,9 +812,7 @@ async def mini(
     if not syms:
         return {"results": [], "errors": invalid_errors}
 
-    client = getattr(request.app.state, "mexc", None) or getattr(
-        request.app.state, "exchange", None
-    )
+    client = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="Exchange client not initialized")
 
@@ -890,9 +1040,7 @@ async def account(request: Request, _: None = Depends(require_local_token)):
             error="Exchange keys not configured (MEXC API or HL_PRIVATE_KEY)"
         )
 
-    client = getattr(request.app.state, "mexc", None) or getattr(
-        request.app.state, "exchange", None
-    )
+    client = _exchange_client(request)
     if client is None:
         return empty_account(error="Exchange client not initialized")
 
@@ -915,9 +1063,7 @@ async def fills(
     userFills); others report supported=False and the UI hides the markers.
     Soft errors (rate limit etc.) return 200 with an error string.
     """
-    client = getattr(request.app.state, "mexc", None) or getattr(
-        request.app.state, "exchange", None
-    )
+    client = _exchange_client(request)
     if client is None or not hasattr(client, "user_fills"):
         return {"fills": [], "supported": False, "error": None}
     if symbol:
@@ -1023,7 +1169,7 @@ async def analyze(
             ),
         )
 
-    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
 
@@ -1318,7 +1464,7 @@ async def reevaluate(
             ),
         )
 
-    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
 
@@ -1428,8 +1574,11 @@ async def history(
         data = await db.history(limit=limit)
         data["limit"] = limit
         return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"history read failed: {e}") from e
+    except Exception:
+        # B-03: never leak the raw exception (can contain file paths/SQL) to
+        # the client; the detail goes to the server log only.
+        log.exception("history read failed")
+        raise HTTPException(status_code=500, detail="internal error") from None
 
 
 @app.post("/api/history/clear")
@@ -1444,8 +1593,9 @@ async def history_clear(
     try:
         deleted = await db.clear_history()
         return {"ok": True, "deleted": deleted}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"history clear failed: {e}") from e
+    except Exception:
+        log.exception("history clear failed")
+        raise HTTPException(status_code=500, detail="internal error") from None
 
 
 # ── Journal + feedback-loop (KI shadow book) ────────────────────────────
@@ -1466,8 +1616,9 @@ async def journal_list(
     try:
         rows = await db.recent_journal(limit=limit)
         return {"entries": rows, "limit": limit}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"journal read failed: {e}") from e
+    except Exception:
+        log.exception("journal read failed")
+        raise HTTPException(status_code=500, detail="internal error") from None
 
 
 @app.get("/api/journal/stats")
@@ -1485,8 +1636,9 @@ async def journal_stats_endpoint(
     try:
         raw = await db.journal_stats()
         return build_stats_response(raw, min_sample=get_settings().journal_min_sample)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"journal stats failed: {e}") from e
+    except Exception:
+        log.exception("journal stats failed")
+        raise HTTPException(status_code=500, detail="internal error") from None
 
 
 @app.post("/api/journal/clear")
@@ -1503,8 +1655,9 @@ async def journal_clear(
     try:
         deleted = await db.clear_journal()
         return {"ok": True, "deleted": deleted}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"journal clear failed: {e}") from e
+    except Exception:
+        log.exception("journal clear failed")
+        raise HTTPException(status_code=500, detail="internal error") from None
 
 
 @app.post("/api/orders/preview")
@@ -1620,7 +1773,7 @@ async def orders_open(
     s = get_settings()
     if not exchange_ready(s):
         return {"orders": [], "stop_orders": [], "error": "Exchange keys not configured"}
-    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    client: MexcClient | None = _exchange_client(request)
     if client is None:
         return {"orders": [], "stop_orders": [], "error": "Exchange client not initialized"}
     if symbol:
@@ -1664,7 +1817,7 @@ async def sizing_suggest(
     app/risk/sizing.py for the shared clamp math.
     """
     s = get_settings()
-    client: MexcClient | None = getattr(request.app.state, "mexc", None)
+    client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
     symbol = normalize_symbol(ticket.symbol)
@@ -1869,7 +2022,7 @@ async def market_scan(
     from app.llm.scanner import build_scan_contexts, scan_with_llm
 
     s = get_settings()
-    client = getattr(request.app.state, "mexc", None)
+    client = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="Exchange client not initialized")
     body = body or {}
