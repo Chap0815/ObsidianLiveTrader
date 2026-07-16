@@ -424,6 +424,121 @@ async def test_unfilled_resting_limit_not_flattened_or_cancelled():
     assert "unverified" not in out["status"] and "flatten" not in out["status"]
 
 
+# ── O-01 + O-02: MEXC auto-flatten must not fire on a correctly protected trade ─
+#
+# On MEXC the SL is attached position-bound in the create body (stopLossPrice)
+# and usually does NOT surface as a separate plan order, so open_stop_orders is
+# [] on EVERY normal trade. The old code read that empty (but valid) list as
+# checked=True → "SL MISSING" → market-closed a freshly protected position.
+# Fixes: (O-01) an empty MEXC stop list is NOT proof of a missing SL → UNKNOWN,
+# never MISSING; a POSITIVE verify path (filled entry whose body carried
+# stopLossPrice>0 ⟹ SL atomically accepted) keeps the normal trade quiet;
+# (O-02) a resting MEXC limit with no fill is exempt from cancel/flatten.
+
+
+def _mexc_client(place_response, *, post_hold: float = 1.0):
+    client = _happy_client(place_response, post_hold=post_hold)
+    client.exchange_id = "mexc"
+    # MEXC: the position-bound SL is not a separate plan order → empty list.
+    client.open_stop_orders = AsyncMock(return_value=[])
+    return client
+
+
+@pytest.mark.asyncio
+async def test_mexc_empty_stop_list_not_flattened():
+    """O-01: empty open_stop_orders on MEXC (position-bound SL) must NOT cause a
+    market-close. A filled entry whose create body carried stopLossPrice counts
+    as verified via the positive path (here fill is reported in the response)."""
+    client = _mexc_client({"data": 1, "dealVol": 1.0})  # reported fill
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is True
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_position_level_sl_verified_via_fill_delta():
+    """O-01 positive path via HOLD DELTA (production shape: MEXC create returns
+    only an orderId, no fill field). pre_hold=0, post-place hold=1 ⟹ filled ⟹
+    the position-bound SL is active. No flatten."""
+    client = _mexc_client({"data": 1})  # no reported fill → hold-delta fallback
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is True
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_resting_limit_not_cancelled():
+    """O-02: a MEXC limit that has not filled (hold unchanged, no reported fill)
+    must be treated like an HL resting entry — warned, NOT cancelled/closed."""
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(return_value=[])  # hold stays 0 → no fill ever
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["status"] == "placed_unfilled_resting"
+    client.cancel_order.assert_not_awaited()
+    client.close_position_market.assert_not_awaited()
+    assert out["flatten"] is None
+    assert any("LIMIT RUHT" in w for w in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_mexc_filled_entry_with_sl_is_verified_quietly():
+    """AUFLAGE positive path: a filled MEXC entry whose body carried
+    stopLossPrice>0 is VERIFIED (not UNKNOWN) — a quiet info note, NOT the loud
+    'UNBEKANNT'/'not verified' alarm that would fire on every MEXC trade."""
+    client = _mexc_client({"data": 1})
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is True
+    assert out["sl_checked"] is True
+    assert "unverified" not in out["status"] and "unknown" not in out["status"]
+    assert not any("UNBEKANNT" in w for w in out["warnings"])
+    assert not any("not verified" in w.lower() for w in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_unconfirmable_fill_is_unknown_not_verified():
+    """AUFLAGE fail-safe: without fill evidence the SL must NOT be silently marked
+    verified. It resolves to UNKNOWN (loud manual-check warning), never a blind
+    flatten — evidence, not optimism."""
+    client = _mexc_client({"data": 1})
+    # preview-risk, confirm-risk, pre_hold (ok=empty), then the post-place fill
+    # query FAILS (unreliable), then the verify positions query.
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], MexcError("positions 503"), []]
+    )
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNBEKANNT" in w for w in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_same_side_without_liq_price_blocks_preview():
     """Open same-side without liquidate_price must fail-closed (not risk=0)."""

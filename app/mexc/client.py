@@ -184,6 +184,10 @@ def parse_contract_meta(row: dict[str, Any]) -> ContractMeta:
 
 
 class MexcClient:
+    # Exchange identity — used by the order service to gate MEXC-specific SL
+    # verification (O-01/O-02: position-bound SL, empty plan list ≠ missing SL).
+    exchange_id = "mexc"
+
     def __init__(self, base_url: str, api_key: str = "", api_secret: str = ""):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key

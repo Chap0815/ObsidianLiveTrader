@@ -500,6 +500,13 @@ class OrderService:
             "sl_price",
         )
         stops_ever_ok = False
+        # O-01: on MEXC the SL is position-bound in the create body and usually
+        # does NOT surface as a separate plan order, so an empty stop list is the
+        # NORMAL answer and is NOT proof the SL is missing. `saw_sl_field` records
+        # whether any stop/position object actually CARRIED an SL-ish field — only
+        # then is a non-match trustworthy enough to count as `checked` on MEXC.
+        is_mexc = getattr(self.client, "exchange_id", "") == "mexc"
+        saw_sl_field = False
         last_detail = ""
         attempts = max(1, int(getattr(self.settings, "sl_verify_attempts", 3)))
         delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
@@ -534,6 +541,10 @@ class OrderService:
                             "stop" in kind or "sl" in kind or kind in ("", "plan")
                         ):
                             continue
+                        # A stop object that actually carries an SL-ish field is
+                        # real evidence the endpoint reports SLs — a non-match here
+                        # is then trustworthy (even on MEXC).
+                        saw_sl_field = True
                         if _sl_matches(expected_sl, s.get(key)):
                             if pre_existing_same_side:
                                 ambiguous_price_match = True
@@ -564,6 +575,8 @@ class OrderService:
                             val = raw.get(key)
                         elif key in p:
                             val = p.get(key)
+                        if val is not None:
+                            saw_sl_field = True
                         if _sl_matches(expected_sl, val):
                             if pre_existing_same_side:
                                 ambiguous_price_match = True
@@ -588,10 +601,16 @@ class OrderService:
             if attempt < attempts - 1 and delay_s > 0:
                 await asyncio.sleep(delay_s)
 
+        # O-01: on MEXC an empty/absent SL field is NOT proof of a missing SL
+        # (the SL is position-bound in the create body). Only treat the check as
+        # conclusive (`checked=True`) when a stop/position object actually carried
+        # an SL field; otherwise return UNKNOWN so the confirm flow can resolve it
+        # via fill evidence (positive verify) instead of a false MISSING → flatten.
+        checked = saw_sl_field if is_mexc else stops_ever_ok
         return (
             False,
             last_detail or "no matching stop found on exchange",
-            stops_ever_ok,
+            checked,
         )
 
     async def _same_side_hold_vol_ok(
@@ -884,6 +903,40 @@ class OrderService:
         # before F-02 the SL trigger rested unconditionally with an oid, so this
         # path never mislabelled a resting limit as "SL nicht verifiziert".)
         unfilled_resting = isinstance(resp, dict) and resp.get("unfilled") is True
+
+        # ── MEXC fill evidence (O-01 positive verify + O-02 resting) ──────────
+        # MEXC never returns an slTriggerOid and the SL is position-bound in the
+        # create body, so `open_stop_orders` is [] on every normal trade (→
+        # _verify_sl_attached now yields UNKNOWN there, not MISSING). The ONLY
+        # reliable positive signal is whether the entry actually FILLED: MEXC
+        # accepts the create body with stopLossPrice atomically (fill ⟹ SL
+        # accepted). We derive the fill from the response, else from the hold
+        # delta against the reliable pre-trade quantity.
+        is_mexc = getattr(self.client, "exchange_id", "") == "mexc"
+        mexc_new_fill: float | None = None
+        mexc_fill_known = False
+        if is_mexc and not manual_sltp and not unfilled_resting:
+            reported = _extract_filled_vol(resp)
+            if reported is not None:
+                mexc_new_fill = reported
+                mexc_fill_known = True
+            elif pre_hold_ok:
+                hold_now, _mot, hold_ok = await self._same_side_hold_vol_ok(
+                    symbol, ticket.side
+                )
+                if hold_ok:
+                    mexc_new_fill = max(0.0, hold_now - pre_hold)
+                    mexc_fill_known = True
+            fill_eps = max(float(gate.rounded_vol) * 1e-4, 1e-9)
+            if (
+                mexc_fill_known
+                and mexc_new_fill is not None
+                and mexc_new_fill <= fill_eps
+            ):
+                # O-02: the entry rests unfilled — no position to protect yet.
+                # Exempt from flatten/cancel exactly like the HL resting branch.
+                unfilled_resting = True
+
         if unfilled_resting and not manual_sltp:
             sl_detail = "resting limit entry not filled — no SL until it fills"
             warnings.append(
@@ -922,6 +975,35 @@ class OrderService:
                     if trigger_errors:
                         sl_detail += (
                             f"; trigger errors: {'; '.join(map(str, trigger_errors))}"
+                        )
+
+                # AUFLAGE — positive MEXC verify. The stop-order lookup is UNKNOWN
+                # on a normal MEXC trade (position-bound SL, empty plan list). Do
+                # NOT warn on every trade: a FILLED entry whose create body carried
+                # stopLossPrice>0 is protected, because MEXC accepts that body
+                # atomically (fill ⟹ SL accepted). Requires fill evidence — never
+                # mark a genuinely unconfirmable case as verified.
+                if is_mexc and not sl_verified:
+                    body_had_sl = float(
+                        (body.get("stopLossPrice") if isinstance(body, dict) else 0)
+                        or 0
+                    ) > 0
+                    if (
+                        body_had_sl
+                        and mexc_fill_known
+                        and mexc_new_fill is not None
+                        and mexc_new_fill > max(float(gate.rounded_vol) * 1e-4, 1e-9)
+                    ):
+                        sl_verified = True
+                        sl_checked = True
+                        sl_detail = (
+                            "MEXC SL positionsgebunden — im Create-Body atomar "
+                            f"akzeptiert und beim gefüllten Entry aktiv (fill≈"
+                            f"{mexc_new_fill:g}); kein separater Plan-Order sichtbar"
+                        )
+                        warnings.append(
+                            "INFO: MEXC-SL ist positionsgebunden (kein separater "
+                            "Plan-Order) und beim gefüllten Entry aktiv."
                         )
 
                 if not sl_verified and not sl_checked:
