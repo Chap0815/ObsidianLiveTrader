@@ -786,9 +786,9 @@ _CREDIT_ERROR_KEYWORDS = (
     "insufficient credit",
     "spending limit",
     "spending_limit",
-    "permission denied",
-    "permission_denied",
-    "permission-denied",
+    # NICHT "permission denied": das ist die typische Key-Berechtigungs-/
+    # Region-Phrase (L-11) — Aufladen wuerde daran nichts aendern; sie muss
+    # in die generische 403-Meldung laufen, nicht in "Credits erschoepft".
     "insufficient_quota",
     "insufficient quota",
 )
