@@ -235,7 +235,9 @@ class HyperliquidClient:
         if self._info is None:
             from hyperliquid.info import Info
 
-            info = Info(self.base_url, skip_ws=True)
+            # timeout= muss schon in den Konstruktor: Info.__init__ macht selbst
+            # HTTP-POSTs (spot_meta/meta), bevor _apply_http_timeout greifen kann.
+            info = Info(self.base_url, skip_ws=True, timeout=self._http_timeout_s)
             self._apply_http_timeout(info)
             self._info = info
         return self._info
@@ -250,7 +252,9 @@ class HyperliquidClient:
             wallet = Account.from_key(self.private_key)
             addr = self.account_address or wallet.address
             self.account_address = addr
-            exchange = Exchange(wallet, self.base_url, account_address=addr)
+            exchange = Exchange(
+                wallet, self.base_url, account_address=addr, timeout=self._http_timeout_s
+            )
             self._apply_http_timeout(exchange)
             self._exchange = exchange
         return self._exchange
