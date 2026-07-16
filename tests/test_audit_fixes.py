@@ -703,8 +703,16 @@ async def test_positions_api_error_blocks_preview_token():
 
 
 def test_sl_rounds_onto_entry_blocked():
-    """A stop that rounds onto the wrong side of entry must be rejected."""
-    # long entry 100000, sl 99999.96 with price_unit 0.1 → rounds to 100000.0
+    """R-02: the gate now rounds SL/TP conservatively (round_trigger_to_unit,
+    side-aware floor/ceil) instead of nearest/half-even. A long SL can
+    therefore no longer round UP onto entry — it only ever rounds further
+    away (more protective). What used to trip the onto-entry guard under the
+    old nearest rounding (99999.96 -> 100000.0 == entry) now safely floors to
+    99999.9 and passes. The onto-/above-entry guard itself remains in the
+    gate as a second line of defense (see gates.py), it is just no longer
+    reachable via legitimate long/short rounding; a raw stop already on the
+    wrong side of entry is still caught by the earlier raw-value check
+    (see test_limit_entry_spoof_ignored_for_risk)."""
     g = validate_order(
         _ticket(price=100_000.0, entry=100_000.0, stop_loss=99_999.96, take_profit=102_000.0),
         _contract(price_unit=0.1),
@@ -712,8 +720,9 @@ def test_sl_rounds_onto_entry_blocked():
         _settings(),
         last_price=100_000.0,
     )
-    assert g.ok is False
-    assert any("tick size" in e for e in g.errors)
+    assert g.ok is True, g.errors
+    assert g.rounded_stop == pytest.approx(99_999.9)
+    assert g.rounded_stop < 100_000.0
 
 
 @pytest.mark.asyncio
@@ -1093,21 +1102,49 @@ def test_armed_requires_local_token():
 
 @pytest.mark.asyncio
 async def test_manual_blocked_when_flag_off():
+    """R-04: the ALLOW_MANUAL_TRIGGER check now lives in the GATE, so a manual
+    ticket is rejected already at PREVIEW — no one-shot token is issued for a
+    ticket that confirm would refuse anyway (was: blocked only on confirm)."""
     client = _happy_client({"orderId": 1})
     svc = OrderService(client, _settings(allow_manual_trigger=False), PreviewStore())
     prev = await svc.preview(_ticket(trigger_mode="manual"))
-    assert prev["ok"]
-    with pytest.raises(OrderError) as ei:
-        await svc.confirm(prev["token"])
-    assert "manual" in str(ei.value).lower()
+    assert prev["ok"] is False
+    assert prev["token"] is None
+    assert any("manual" in e.lower() for e in prev["errors"])
     client.place_order.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_manual_allowed_by_default_flag_on():
     client = _happy_client({"orderId": 1})
-    svc = OrderService(client, _settings(), PreviewStore())  # default True
+    svc = OrderService(client, _settings(), PreviewStore())  # _settings() opts in True
     prev = await svc.preview(_ticket(trigger_mode="manual"))
+    out = await svc.confirm(prev["token"])
+    assert out["status"] == "placed_manual"
+    client.place_order.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trigger_mode_case_insensitive(monkeypatch):
+    """R-06: service.py's manual_sltp detection must use the same
+    ``.lower()``-normalized comparison as gates.py:100, so a capitalized
+    trigger_mode value that reaches confirm() (e.g. from a non-HTTP caller
+    bypassing OrderTicket's Literal validator) is still treated as manual —
+    otherwise the gate and the confirm path could disagree on whether an
+    exchange SL/TP trigger gets attached."""
+    client = _happy_client({"orderId": 1})
+    svc = OrderService(client, _settings(allow_manual_trigger=True), PreviewStore())
+    prev = await svc.preview(_ticket(trigger_mode="manual"))
+    assert prev["ok"]
+
+    orig_validate = OrderTicket.model_validate
+
+    def _force_capitalized(cls, data, *a, **kw):
+        ticket = orig_validate(data, *a, **kw)
+        return ticket.model_copy(update={"trigger_mode": "Manual"})
+
+    monkeypatch.setattr(OrderTicket, "model_validate", classmethod(_force_capitalized))
+
     out = await svc.confirm(prev["token"])
     assert out["status"] == "placed_manual"
     client.place_order.assert_awaited()

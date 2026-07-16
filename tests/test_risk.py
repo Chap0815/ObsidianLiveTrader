@@ -290,3 +290,35 @@ def test_happy_path_gate_ok():
     assert g.rounded_vol == 1.0
     assert g.rrr == pytest.approx(2.0)
     assert g.risk_usdt > 0
+
+
+def test_gate_uses_conservative_trigger_rounding():
+    """R-02: nearest/half-even rounding a long stop-loss to the tick size can
+    shift it up to half a tick TOWARD entry (round(99000.6) == 99001),
+    understating risk. The gate must use round_trigger_to_unit's side-aware
+    floor instead, so the long SL only ever rounds AWAY from entry (99000.0)."""
+    g = validate_order(
+        _ticket(stop_loss=99_000.6, take_profit=102_000.0),
+        _contract(price_unit=1.0),
+        equity=10_000,
+        settings=_settings(),
+        last_price=100_000,
+    )
+    assert g.ok is True, g.errors
+    assert g.rounded_stop == pytest.approx(99_000.0)
+
+
+def test_manual_trigger_blocked_in_gate_when_disabled():
+    """R-04: ALLOW_MANUAL_TRIGGER must be enforced already in the gate — a
+    manual ticket fails in the PREVIEW (for_confirm=False) when the flag is
+    off, so no one-shot token is ever wasted on a ticket confirm will reject."""
+    g = validate_order(
+        _ticket(trigger_mode="manual"),
+        _contract(),
+        equity=10_000,
+        settings=_settings(allow_manual_trigger=False),
+        last_price=100_000,
+        for_confirm=False,
+    )
+    assert g.ok is False
+    assert any("ALLOW_MANUAL_TRIGGER" in e for e in g.errors)

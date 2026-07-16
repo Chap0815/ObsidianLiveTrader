@@ -11,7 +11,13 @@ from typing import Any
 
 from app.config import Settings
 from app.models import ContractMeta, OrderTicket
-from app.risk.sizing import calc_rrr, risk_usdt, round_down_to_unit, round_to_unit
+from app.risk.sizing import (
+    calc_rrr,
+    risk_usdt,
+    round_down_to_unit,
+    round_to_unit,
+    round_trigger_to_unit,
+)
 
 
 @dataclass
@@ -98,6 +104,18 @@ def validate_order(
     # so a missing take_profit is not a gate failure — the RRR check below warns
     # instead of hard-blocking (STRICT_RRR still applies to auto mode).
     manual_sltp = (getattr(ticket, "trigger_mode", "auto") or "auto").lower() == "manual"
+
+    # R-04: block manual trigger_mode already in the GATE (preview + confirm),
+    # not just at confirm time — a preview that will be refused on confirm
+    # anyway must not issue a one-shot token. getattr default False is
+    # fail-closed and mirrors the config.py default (see service.py's
+    # confirm-time re-check, kept as defense-in-depth).
+    if manual_sltp and not getattr(settings, "allow_manual_trigger", False):
+        errors.append(
+            "manual trigger_mode blocked (ALLOW_MANUAL_TRIGGER=false) — "
+            "manual mode places no exchange SL/TP; use auto mode or enable "
+            "ALLOW_MANUAL_TRIGGER to permit it."
+        )
 
     open_type = int(ticket.open_type or 1)
     if open_type not in (1, 2):
@@ -238,7 +256,12 @@ def validate_order(
             if side == "short" and sl_f <= entry_for_risk:
                 errors.append("short stop_loss must be above entry")
         if price_unit > 0:
-            sl_f = round_to_unit(sl_f, price_unit)
+            # R-02: side-aware conservative rounding (long SL floors, short SL
+            # ceils) so tick rounding never nudges the stop TOWARD entry —
+            # nearest/half-even rounding could shift it up to 0.5 tick closer,
+            # understating risk. The onto-/above-entry guard below still
+            # stands as a second line of defense.
+            sl_f = round_trigger_to_unit(sl_f, price_unit, side=side, kind="sl")
             # Tick rounding can flip a razor-thin stop onto the wrong side
             if entry_for_risk is not None and side in ("long", "short"):
                 if side == "long" and sl_f >= entry_for_risk:
@@ -256,7 +279,10 @@ def validate_order(
     if tp is not None and float(tp) > 0:
         rounded_tp = float(tp)
         if price_unit > 0:
-            rounded_tp = round_to_unit(rounded_tp, price_unit)
+            # R-02: same conservative side-aware rounding for TP (long floors
+            # toward entry, short ceils toward entry) so RRR is never
+            # overstated by a nearest-rounding drift away from entry.
+            rounded_tp = round_trigger_to_unit(rounded_tp, price_unit, side=side, kind="tp")
 
     # ── Equity fail-closed (G3 requires known equity) ──────────────────
     if equity is None or float(equity) <= 0:

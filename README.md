@@ -84,7 +84,7 @@ Python 3.11+ empfohlen.
 | **`TRADING_ENABLED`** | **`false`** | **`false` = DISARMED** — kein Place/Confirm. `true` erfordert `LOCAL_API_TOKEN` gesetzt (sonst Startfehler) |
 | **`LOCAL_API_TOKEN`** | leer | **Pflicht**, sobald `TRADING_ENABLED=true` — Auth-Token für die lokale API |
 | **`ALLOW_UNPROTECTED_ENTRY`** | **`false`** | **`false`** blockiert Orders ohne Stop-Loss |
-| `ALLOW_MANUAL_TRIGGER` | `true` | Manueller Trigger-Mode (Entry ohne Börsen-SL/TP); `false` = fail-closed blocken |
+| `ALLOW_MANUAL_TRIGGER` | `false` | Manueller Trigger-Mode (Entry ohne Börsen-SL/TP); `false` = fail-closed blocken (bereits im Preview-Gate, R-04) |
 | `RISK_SLIPPAGE_PCT` | `0.05` | Slippage-Puffer im Risk-Gate |
 | `MAX_NOTIONAL_USDT` | `500` | **Warnschwelle** pro Order (kein Hard-Block) — der harte Notional-Cap ist `MAX_NOTIONAL_PCT_OF_EQUITY` |
 | `MAX_PRICE_DRIFT_PCT` | `0.5` | Max. Preisdrift zwischen Preview und Confirm |

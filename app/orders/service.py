@@ -810,12 +810,19 @@ class OrderService:
         # attached. The SL value is still required (risk gates), but it is not
         # sent to the exchange, and the SL-verify / auto-flatten paths below are
         # deliberately skipped for this order only.
-        manual_sltp = getattr(ticket, "trigger_mode", "auto") == "manual"
+        # R-06: .lower() for consistency with gates.py:100 — a capitalized
+        # trigger_mode (e.g. from a non-HTTP caller bypassing the Literal
+        # validator) must be treated identically here and in the gate,
+        # otherwise SL/TP-attach decisions could diverge from the gate's view.
+        manual_sltp = (getattr(ticket, "trigger_mode", "auto") or "auto").lower() == "manual"
 
         # Fail-closed option: manual mode places NO exchange stop, so it bypasses
         # the exchange-side protection even when ALLOW_UNPROTECTED_ENTRY=false.
         # When ALLOW_MANUAL_TRIGGER=false, refuse manual orders entirely.
-        if manual_sltp and not getattr(self.settings, "allow_manual_trigger", True):
+        # (R-04: the gate above already blocks this in preview + here on
+        # confirm; this is defense-in-depth, kept in sync — same fail-closed
+        # getattr default.)
+        if manual_sltp and not getattr(self.settings, "allow_manual_trigger", False):
             raise OrderError(
                 "manual trigger_mode blocked (ALLOW_MANUAL_TRIGGER=false) — "
                 "manual mode places no exchange SL/TP; use auto mode or enable "
