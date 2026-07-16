@@ -1981,9 +1981,10 @@ async def ws_market(
         except WebSocketDisconnect:
             pass
         except Exception as e:
+            log.warning("ws_market HL proxy failed for %s: %s", symbol, e)
             try:
                 await websocket.send_json(
-                    {"type": "status", "status": "error", "error": str(e)}
+                    {"type": "status", "status": "error", "error": "interner Fehler"}
                 )
             except Exception:
                 pass
@@ -2014,9 +2015,10 @@ async def ws_market(
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        log.warning("ws_market MEXC poll failed for %s: %s", symbol, e)
         try:
             await websocket.send_json(
-                {"type": "status", "status": "error", "error": str(e)}
+                {"type": "status", "status": "error", "error": "interner Fehler"}
             )
         except Exception:
             pass
@@ -2065,7 +2067,14 @@ async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None
                 }
                 delay = MEXC_POLL_BASE_DELAY_S
             except Exception as e:
-                err_message = {"type": "status", "status": "error", "error": str(e)}
+                # Detail nur ins Server-Log (B-03-Muster) — der Client bekommt
+                # eine generische Meldung, keine rohen Provider-/Stacktexte.
+                log.warning("MEXC-Poll ticker error for %s: %s", symbol, e)
+                err_message = {
+                    "type": "status",
+                    "status": "error",
+                    "error": "Ticker nicht erreichbar — neuer Versuch folgt",
+                }
                 delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
             await websocket.send_json(mid_message if mid_message else err_message)
             await asyncio.sleep(delay)
