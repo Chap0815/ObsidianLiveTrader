@@ -915,11 +915,18 @@ class OrderService:
         is_mexc = getattr(self.client, "exchange_id", "") == "mexc"
         mexc_new_fill: float | None = None
         mexc_fill_known = False
+        # Provenance of the fill evidence. `reported` comes from the order
+        # response and is bot-safe (counts ONLY this order's volume). The hold
+        # delta is NOT: a concurrent same-side position increase by another bot
+        # can inflate it, so hold-delta evidence needs the attribution guard in
+        # the positive-verify block below before it may fully verify.
+        mexc_fill_from_report = False
         if is_mexc and not manual_sltp and not unfilled_resting:
             reported = _extract_filled_vol(resp)
             if reported is not None:
                 mexc_new_fill = reported
                 mexc_fill_known = True
+                mexc_fill_from_report = True
             elif pre_hold_ok:
                 hold_now, _mot, hold_ok = await self._same_side_hold_vol_ok(
                     symbol, ticket.side
@@ -980,20 +987,40 @@ class OrderService:
                 # AUFLAGE — positive MEXC verify. The stop-order lookup is UNKNOWN
                 # on a normal MEXC trade (position-bound SL, empty plan list). Do
                 # NOT warn on every trade: a FILLED entry whose create body carried
-                # stopLossPrice>0 is protected, because MEXC accepts that body
-                # atomically (fill ⟹ SL accepted). Requires fill evidence — never
-                # mark a genuinely unconfirmable case as verified.
+                # stopLossPrice>0 is treated as protected because MEXC accepts the
+                # body's stopLossPrice ATOMICALLY and geometry-validated (fill ⟹
+                # SL accepted). A divergent explicit stop object seen elsewhere is
+                # therefore treated as phantom, not authoritative, here. Requires
+                # fill evidence — never mark a genuinely unconfirmable case as
+                # verified. NOTE: unlike Hyperliquid (which auto-flattens a filled
+                # entry whose reduce-only SL trigger is genuinely missing), MEXC by
+                # design has no genuine-missing-SL detection for a filled entry
+                # without body SL — it resolves to UNKNOWN (loud), never a blind
+                # flatten. Intentional divergence.
                 if is_mexc and not sl_verified:
                     body_had_sl = float(
                         (body.get("stopLossPrice") if isinstance(body, dict) else 0)
                         or 0
                     ) > 0
-                    if (
-                        body_had_sl
-                        and mexc_fill_known
-                        and mexc_new_fill is not None
-                        and mexc_new_fill > max(float(gate.rounded_vol) * 1e-4, 1e-9)
-                    ):
+                    rounded_vol = float(gate.rounded_vol)
+                    vol_eps = max(rounded_vol * 1e-4, 1e-9)
+                    # ATTRIBUTION GUARD (money-critical): a positive reported fill
+                    # is bot-safe and needs only to be non-trivial. A hold-delta,
+                    # however, can be an external same-side bump on a resting
+                    # (unfilled) limit; crediting it would silently verify an
+                    # UNPROTECTED resting order. So hold-delta evidence may verify
+                    # only when the delta plausibly is OUR OWN fill — within
+                    # tolerance of the ordered volume (mirrors the flatten gate's
+                    # min(rounded_vol, …) cap). When in doubt → keep UNKNOWN (loud),
+                    # never silently verify.
+                    fill_is_ours = mexc_new_fill is not None and (
+                        (mexc_fill_from_report and mexc_new_fill > vol_eps)
+                        or (
+                            not mexc_fill_from_report
+                            and mexc_new_fill >= rounded_vol - vol_eps
+                        )
+                    )
+                    if body_had_sl and mexc_fill_known and fill_is_ours:
                         sl_verified = True
                         sl_checked = True
                         sl_detail = (

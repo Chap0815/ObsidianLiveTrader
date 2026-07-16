@@ -540,6 +540,38 @@ async def test_mexc_unconfirmable_fill_is_unknown_not_verified():
 
 
 @pytest.mark.asyncio
+async def test_mexc_resting_limit_external_hold_bump_not_silently_verified():
+    """ATTRIBUTION GUARD: a MEXC limit that RESTS (no reported fill) while a
+    concurrent same-side bot bumps holdVol within the confirm window must NOT be
+    credited as OUR fill. The hold delta (0.5) is < the ordered volume (1.0), so
+    it cannot plausibly be our own fill — the positive-verify path must refuse to
+    verify. State stays UNKNOWN (loud manual-check warning), never a silent
+    verify of an unprotected resting order, and never a flatten."""
+    client = _mexc_client({"data": 1})  # no reported fill → hold-delta fallback
+    # preview-risk, confirm-risk, pre_hold (=0), then the post-place fill query
+    # shows a same-side bump of 0.5 (external bot), then the verify positions.
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], _filled_pos(0.5), _filled_pos(0.5)]
+    )
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())  # vol=1.0
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    # NOT silently verified — the external bump is not our fill.
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    # Loud warning stays (this fix produces UNBEKANNT, not LIMIT RUHT, because
+    # the bump exceeds the resting eps and so is not classified as resting).
+    assert any("UNBEKANNT" in w for w in out["warnings"])
+    # Fail-safe: never flatten / close on an unverified, unattributed fill.
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_same_side_without_liq_price_blocks_preview():
     """Open same-side without liquidate_price must fail-closed (not risk=0)."""
     client = _happy_client({"orderId": 1})
