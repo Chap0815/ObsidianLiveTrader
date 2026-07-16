@@ -234,6 +234,25 @@ def _close_response_error(resp: Any) -> str | None:
     return None
 
 
+def _recovery_is_match(recovered: Any, external_oid: str) -> bool:
+    """True if `recovered` is trustworthy evidence our order is already live.
+
+    O-05: accepts either an exchange-client MATCH MARKER — a dict carrying a
+    truthy ``match`` field, which the client sets only after matching OUR
+    oid/cloid (MEXC ``history``/``open`` are field-filtered, MEXC ``direct`` and
+    HL ``cloid`` require the oid/cloid in the raw payload) — or, lacking a
+    marker, a literal substring echo of our externalOid (covers the HL
+    list-of-hits fallback and any legacy shape). Fail-closed: falsy input
+    (``{}`` / ``[]`` / ``None``) returns False so the caller raises a hard error
+    instead of blindly re-placing a possibly-live order.
+    """
+    if not recovered:
+        return False
+    if isinstance(recovered, dict) and recovered.get("match"):
+        return True
+    return str(external_oid) in str(recovered)
+
+
 def _sl_matches(expected: float, candidate: float | None, tol_pct: float = 0.15) -> bool:
     if candidate is None or expected <= 0:
         return False
@@ -823,8 +842,13 @@ class OrderService:
                     )
                 except ExchangeError:
                     recovered = None
-                # Only count as recovered if OUR oid actually appears in the data
-                if recovered and external_oid not in str(recovered):
+                # O-05: trust the exchange client's MATCH MARKER as the recovery
+                # signal (MEXC "direct"/"history"/"open"; HL "cloid") — the client
+                # sets it only after matching OUR oid/cloid, so a genuine fill is
+                # not discarded merely because the raw provider payload omits the
+                # oid string. Absent a marker, fall back to the literal-echo check;
+                # a falsy result ({} / None) stays fail-closed (hard error below).
+                if not _recovery_is_match(recovered, external_oid):
                     recovered = None
             if not recovered:
                 if self.db is not None:
@@ -1395,6 +1419,27 @@ class OrderService:
                 f"close amount {close_vol} below exchange minimum {min_vol} — "
                 "choose a larger share or close the full position"
             )
+
+        # O-09 TOCTOU: the positions() read above happened BEFORE the
+        # contract_meta() yield, so the live side could have flipped or closed in
+        # that window. Unlike Hyperliquid (whose client re-verifies the live side
+        # itself), MEXC's close_position_market sends whatever side we pass — so
+        # re-read the live same-side hold immediately before sending and refuse on
+        # flip/disappearance rather than market-close the wrong side.
+        if not is_hl:
+            live_hold, _lot, live_ok = await self._same_side_hold_vol_ok(symbol, side)
+            if not live_ok:
+                raise OrderError(
+                    f"close aborted: could not re-verify the live {side} position "
+                    f"on {symbol} before sending (positions lookup failed) — verify "
+                    "on the exchange before retrying"
+                )
+            if live_hold <= 0:
+                raise OrderError(
+                    f"close aborted: the {side} position on {symbol} disappeared or "
+                    "flipped between check and send — refusing to close the wrong "
+                    "side"
+                )
 
         try:
             resp = await self.client.close_position_market(

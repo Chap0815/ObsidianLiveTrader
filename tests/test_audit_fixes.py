@@ -1323,7 +1323,9 @@ def _close_client(*, first_hold, reread, close_resp=None):
     client = MagicMock()
     client.exchange_id = "mexc"
     client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
-    client.positions = AsyncMock(side_effect=[first_hold, reread])
+    # Sequence: initial read, O-09 pre-send re-read (same side/hold → passes),
+    # then the post-close reread.
+    client.positions = AsyncMock(side_effect=[first_hold, first_hold, reread])
     client.close_position_market = AsyncMock(
         return_value=close_resp if close_resp is not None else {"orderId": 9, "dealVol": 3.0}
     )
@@ -1387,8 +1389,9 @@ async def test_close_verify_retry_lets_fill_settle_before_partial():
     client = MagicMock()
     client.exchange_id = "mexc"
     client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
-    # pre-close hold, reread#1 (unsettled: still 5), reread#2 (settled: empty)
-    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(5.0), []])
+    # pre-close hold, O-09 re-read (still 5), reread#1 (unsettled: still 5),
+    # reread#2 (settled: empty)
+    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(5.0), _pos(5.0), []])
     client.close_position_market = AsyncMock(return_value={"orderId": 9, "dealVol": 5.0})
     db = MagicMock()
     db.insert_order = AsyncMock()
@@ -1411,8 +1414,11 @@ async def test_close_verify_retry_still_reports_genuine_partial():
     client = MagicMock()
     client.exchange_id = "mexc"
     client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
-    # hold 5, close 5, but reread keeps showing 2 open across all attempts.
-    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(2.0), _pos(2.0), _pos(2.0)])
+    # hold 5, O-09 re-read still 5 (close proceeds), close 5, but reread keeps
+    # showing 2 open across all attempts.
+    client.positions = AsyncMock(
+        side_effect=[_pos(5.0), _pos(5.0), _pos(2.0), _pos(2.0), _pos(2.0)]
+    )
     client.close_position_market = AsyncMock(return_value={"orderId": 9, "dealVol": 3.0})
     db = MagicMock()
     db.insert_order = AsyncMock()
@@ -1426,6 +1432,79 @@ async def test_close_verify_retry_still_reports_genuine_partial():
     assert out["ok"] is False
     assert out["status"] in ("partial", "close_incomplete")
     assert out["residual_vol"] == 2.0
+
+
+# ── O-05 / O-09: timeout-recovery marker trust + MEXC close TOCTOU re-read ───
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_accepts_marked_match_without_oid_echo():
+    """O-05: a MEXC-client MATCH MARKER ("history"/"open"/"direct") is trusted
+    as recovery evidence even when the raw provider payload does NOT literally
+    echo our externalOid — the marker, not a substring, is the signal. Under the
+    old substring-only guard this recovered fill was discarded (→ hard error →
+    user re-previews → double position)."""
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "mexc"
+
+    async def _place(_body):
+        raise MexcError("timeout connecting to upstream")
+
+    client.place_order = AsyncMock(side_effect=_place)
+    # Marker present, but the raw payload does NOT contain our oid string.
+    client.order_by_external_oid = AsyncMock(
+        return_value={"match": "history", "order": {"orderId": 77, "state": 3}}
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    out = await svc.confirm(prev["token"])
+    assert out["ok"] is True
+    assert "recovered_placed" in out["status"]
+    # Fail-closed integrity: exactly ONE place attempt, never a blind re-place.
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_no_match_still_fail_closed():
+    """O-05 fail-closed: no recovery match ({}) → hard error and NO second
+    place_order (never a blind re-place of a possibly-live order)."""
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "mexc"
+
+    async def _place(_body):
+        raise MexcError("timeout connecting to upstream")
+
+    client.place_order = AsyncMock(side_effect=_place)
+    client.order_by_external_oid = AsyncMock(return_value={})
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    with pytest.raises(OrderError) as ei:
+        await svc.confirm(prev["token"])
+    assert "externalOid" in str(ei.value)
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_close_rechecks_side_before_send():
+    """O-09 TOCTOU: the long position flips to short between the initial
+    positions() read and the pre-send re-read → close must refuse, and must NOT
+    send close_position_market against the flipped side."""
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
+    # read#1: long 5 (passes side/hold gate); re-read: position flipped to short.
+    client.positions = AsyncMock(
+        side_effect=[_pos(5.0, side_type=1), _pos(5.0, side_type=2)]
+    )
+    client.close_position_market = AsyncMock(return_value={"orderId": 9})
+    db = MagicMock()
+    db.insert_order = AsyncMock()
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    with pytest.raises(OrderError) as ei:
+        await svc.close_position(symbol="BTC_USDT", side="long")
+    msg = str(ei.value).lower()
+    assert "flip" in msg or "disappear" in msg
+    client.close_position_market.assert_not_awaited()
 
 
 # ── F-04: unguarded r.json() after 2xx must not crash — treat as uncertain ───
