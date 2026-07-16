@@ -298,6 +298,50 @@ async def test_market_partial_fill_sizes_sl_to_new_fill_only():
     assert out.get("entryFilledSz") == pytest.approx(0.004)
 
 
+# ── O-06 / O-08: side-aware SL/TP rounding + close cloid ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_hl_sl_rounds_away_from_entry():
+    """O-06: a long SL's exchange-tick rounding must never move it closer to
+    entry. At szDecimals=5 (max 1 decimal), nearest-rounding of 99.95 goes UP
+    to 100.0 (round_hl_price(99.95, 5) == 100.0) — side-aware rounding must
+    floor it to 99.9 instead, so the placed trigger is never less protective
+    than what was risk-approved."""
+    c = _client()
+    await c.place_order(
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "market",
+            "vol": 0.01,
+            "stopLossPrice": 99.95,
+        }
+    )
+    trig = _sl_trigger_calls(c)
+    assert len(trig) == 1
+    assert trig[0].args[3] == pytest.approx(99.9)  # floor, never the nearest 100.0
+    assert trig[0].args[3] <= 99.95  # never closer to entry than requested
+
+
+@pytest.mark.asyncio
+async def test_hl_close_stamps_cloid():
+    """O-08: close_position_market stamps a deterministic Cloid (derived from
+    external_oid, same derivation as the entry path) onto the SDK's
+    market_close call, so a transport timeout during a close can be recovered
+    unambiguously via order_by_external_oid instead of guessing."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)  # live LONG matches requested close
+    c._exchange.market_close = MagicMock(return_value=_OK)
+    await c.close_position_market(
+        "BTC", side="long", vol=0.5, external_oid="mlt-close-1"
+    )
+    c._exchange.market_close.assert_called_once()
+    passed = c._exchange.market_close.call_args.kwargs["cloid"]
+    assert passed.to_raw() == external_oid_to_cloid("mlt-close-1").to_raw()
+
+
 @pytest.mark.asyncio
 async def test_hl_place_order_scale_out_places_two_tp_triggers():
     c = _client()

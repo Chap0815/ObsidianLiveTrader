@@ -11,6 +11,7 @@ import functools
 import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from app.hyperliquid.errors import HyperliquidError
@@ -66,6 +67,40 @@ def round_hl_price(px: float, sz_decimals: int) -> float:
         return float(round(px))
     rounded_sig = float(f"{px:.5g}")
     return round(rounded_sig, max_dec)
+
+
+def round_hl_price_side_aware(px: float, sz_decimals: int, *, is_buy: bool) -> float:
+    """Side-aware variant of ``round_hl_price`` for SL/TP trigger prices (O-06).
+
+    Same precision grid as ``round_hl_price`` (5 significant figures AND max
+    ``6 - szDecimals`` decimals), but rounds DIRECTIONALLY instead of nearest:
+
+      is_buy True  (long position)  -> floor (rounds away from entry, never
+                                        closer/above it)
+      is_buy False (short position) -> ceil  (rounds away from entry, never
+                                        closer/below it)
+
+    Mirrors the side mapping in app/risk/sizing.py round_trigger_to_unit
+    (long -> down, short -> up, for both SL and TP) so a trigger's mandatory
+    exchange-tick rounding can never move it toward entry beyond what was
+    already risk-approved — only ever the conservative away-from-entry
+    direction. Uses Decimal so the grid step (a power of ten) divides exactly,
+    avoiding the float dust nearest-rounding's ``round()`` has to shrug off.
+    """
+    if px is None or px <= 0:
+        return px
+    max_dec = max(0, 6 - int(sz_decimals or 0))
+    rounding = ROUND_FLOOR if is_buy else ROUND_CEILING
+    d = Decimal(str(px))
+    if px >= 100_000:
+        # 6+ integer digits: integer prices always allowed (mirrors round_hl_price).
+        return float(d.to_integral_value(rounding=rounding))
+    exp = d.adjusted()  # floor(log10(px)) for a normalized Decimal
+    sig_step = Decimal(1).scaleb(exp - 4)  # 10^(exp-4): 5-sig-fig grid
+    dec_step = Decimal(1).scaleb(-max_dec)  # 10^-max_dec: max-decimals grid
+    step = max(sig_step, dec_step)  # coarser of the two wins, same as chained round_hl_price
+    steps = (d / step).to_integral_value(rounding=rounding)
+    return float(steps * step)
 
 
 def external_oid_to_cloid(external_oid: str):
@@ -779,8 +814,19 @@ class HyperliquidClient:
 
             sl = body.get("stopLossPrice")
             tp = body.get("takeProfitPrice")
-            sl_px = round_hl_price(float(sl), sz_dec) if sl and float(sl) > 0 else None
-            tp_px = round_hl_price(float(tp), sz_dec) if tp and float(tp) > 0 else None
+            # O-06: side-aware rounding (never toward/past entry) so the
+            # exchange-tick precision cut can never make the real trigger
+            # riskier than the already risk-approved SL/TP.
+            sl_px = (
+                round_hl_price_side_aware(float(sl), sz_dec, is_buy=is_buy)
+                if sl and float(sl) > 0
+                else None
+            )
+            tp_px = (
+                round_hl_price_side_aware(float(tp), sz_dec, is_buy=is_buy)
+                if tp and float(tp) > 0
+                else None
+            )
 
             # Stamp OUR externalOid onto the exchange order as a Cloid so a
             # transport timeout can recover the real (possibly filled) order and
@@ -895,7 +941,9 @@ class HyperliquidClient:
             # single TP if the split would round a rung to zero size.
             tp2 = body.get("takeProfitPrice2")
             tp2_px = (
-                round_hl_price(float(tp2), sz_dec) if tp2 and float(tp2) > 0 else None
+                round_hl_price_side_aware(float(tp2), sz_dec, is_buy=is_buy)
+                if tp2 and float(tp2) > 0
+                else None
             )
             share = float(body.get("tp1Share") or 0)
             vol_unit = 10 ** (-sz_dec) if sz_dec > 0 else 1.0
@@ -986,7 +1034,10 @@ class HyperliquidClient:
             is_buy_close = pos == "short"
             row = self._asset_row(coin)
             sz_dec = int(row.get("szDecimals") or 0)
-            trg = round_hl_price(float(trigger_px), sz_dec)
+            # O-06: side-aware — position_side (not the close order's is_buy_close)
+            # decides direction, since the trigger must stay conservative
+            # relative to the OPEN position, not the closing leg.
+            trg = round_hl_price_side_aware(float(trigger_px), sz_dec, is_buy=(pos == "long"))
             if trg <= 0:
                 raise HyperliquidError("trigger_px must be > 0")
             result = ex.order(
@@ -1153,7 +1204,14 @@ class HyperliquidClient:
         side: str,
         vol: float,
         open_type: int = 1,
+        external_oid: str | None = None,
     ) -> dict[str, Any]:
+        # O-08: optional deterministic cloid (mirrors the entry path's
+        # externalOid -> Cloid stamping) so a timeout during a close can be
+        # recovered/looked-up unambiguously via order_by_external_oid instead
+        # of guessing whether the close actually went through.
+        close_cloid = external_oid_to_cloid(str(external_oid or ""))
+
         def _cl():
             ex = self._get_exchange()
             coin = to_hl_coin(symbol)
@@ -1198,7 +1256,9 @@ class HyperliquidClient:
             # Emergency close: allow wider slippage so the flatten actually fills.
             slippage = max(0.01, self.market_slippage)
             # market_close is a reduce-only IOC close of the (now-verified) side.
-            result = ex.market_close(coin, sz=close_sz, slippage=slippage)
+            result = ex.market_close(
+                coin, sz=close_sz, slippage=slippage, cloid=close_cloid
+            )
             # ── F-03: HL returns order rejections INSIDE an outwardly-ok
             # response. Treat an inner error as a FAILED close so the service
             # never logs `closed` / answers ok while the position is still open.
