@@ -36,10 +36,25 @@ def test_categorize_401_is_invalid_key_message():
     assert "Credits erschöpft" not in msg
 
 
-def test_categorize_403_is_credits_message():
-    msg = _categorize_provider_http_error("xAI", 403, {"error": "forbidden"})
+def test_categorize_403_with_credit_keyword_is_credits_message():
+    """L-11: a 403 body that actually carries a credits/billing signal is
+    still reported as the credits-exhausted banner."""
+    msg = _categorize_provider_http_error(
+        "xAI", 403, {"error": "insufficient quota for this request"}
+    )
     assert msg.startswith("⚠ xAI:")
     assert "Credits erschöpft oder Limit erreicht" in msg
+
+
+def test_categorize_403_without_credit_keyword_is_generic():
+    """L-11: a bare 403 with no credits/billing signal in the body must NOT
+    be reported as 'Credits erschöpft' — that misleads a trader whose key
+    lacks permissions or is region-locked into topping up a balance that
+    isn't the problem. It gets a generic access-denied message instead."""
+    msg = _categorize_provider_http_error("xAI", 403, {"error": "forbidden"})
+    assert msg.startswith("⚠ xAI:")
+    assert "Credits erschöpft" not in msg
+    assert "Zugriff verweigert" in msg
 
 
 def test_categorize_429_is_rate_limit_message():
@@ -150,12 +165,28 @@ def _settings(**kw):
 
 @pytest.mark.asyncio
 async def test_call_claude_403_credits_raises_categorized_error(monkeypatch):
-    fake = _FakeErrorClient(403, {"error": {"type": "permission_error", "message": "forbidden"}})
+    fake = _FakeErrorClient(
+        403, {"error": {"type": "permission_error", "message": "insufficient quota"}}
+    )
     monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
     with pytest.raises(LlmError) as ei:
         await _call_claude({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ Claude:")
     assert "Credits erschöpft" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_403_without_credit_keyword_is_generic(monkeypatch):
+    """L-11: a bare 403 (no credits/billing signal in the body) from the real
+    Claude call site surfaces the generic access-denied message, not the
+    misleading credits banner."""
+    fake = _FakeErrorClient(403, {"error": {"type": "permission_error", "message": "forbidden"}})
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+    with pytest.raises(LlmError) as ei:
+        await _call_claude({"symbol": "BTC"}, _settings())
+    assert str(ei.value).startswith("⚠ Claude:")
+    assert "Credits erschöpft" not in str(ei.value)
+    assert "Zugriff verweigert" in str(ei.value)
 
 
 @pytest.mark.asyncio
@@ -166,6 +197,87 @@ async def test_call_xai_429_rate_limit_raises_categorized_error(monkeypatch):
         await _call_xai({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ xAI:")
     assert "Rate-Limit" in str(ei.value)
+
+
+# --- L-09: single retry on transient provider failure -------------------
+
+
+class _FlakyClient:
+    """httpx.AsyncClient stand-in whose first post() returns a transient
+    error status, and whose second (retried) post() succeeds. Used to verify
+    `_post_with_retry` retries exactly once and recovers."""
+
+    def __init__(self, first_status, first_payload, second_payload):
+        self._first_status = first_status
+        self._first_payload = first_payload
+        self._second_payload = second_payload
+        self.calls = 0
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        self.calls += 1
+        if self.calls == 1:
+            return _FakeResp(self._first_status, self._first_payload)
+        return _FakeResp(200, self._second_payload)
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_llm_retries_once_on_transient(monkeypatch):
+    """L-09: a transient 503 on the first attempt is retried exactly once
+    (after a short backoff) and a 200 on the retry succeeds -- the advisory
+    call is not lost to a one-off provider hiccup."""
+    from unittest.mock import AsyncMock
+
+    claude_payload = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                ),
+            }
+        ]
+    }
+    fake = _FlakyClient(503, {"error": "service unavailable"}, claude_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+
+    result = await _call_claude({"symbol": "BTC"}, _settings())
+
+    assert result.action == "STAY_OUT"
+    assert fake.calls == 2  # exactly one retry, no more
+
+
+@pytest.mark.asyncio
+async def test_llm_does_not_retry_twice_on_persistent_transient_failure(monkeypatch):
+    """L-09: a provider that stays down (503 on every call) must fail after
+    exactly one retry (two total attempts), not loop indefinitely."""
+    from unittest.mock import AsyncMock
+
+    class _AlwaysDownClient(_FlakyClient):
+        async def post(self, url, headers=None, json=None):
+            self.calls += 1
+            return _FakeResp(503, {"error": "service unavailable"})
+
+    fake = _AlwaysDownClient(503, {"error": "down"}, {})
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(LlmError):
+        await _call_claude({"symbol": "BTC"}, _settings())
+
+    assert fake.calls == 2  # first attempt + exactly one retry
 
 
 # --- Full /api/analyze wiring (fake provider transport, no network) ----
@@ -200,7 +312,7 @@ def test_analyze_endpoint_returns_credits_message_on_403(monkeypatch):
 
     from app.main import app
 
-    fake = _FakeErrorClient(403, {"error": {"type": "permission_error"}})
+    fake = _FakeErrorClient(403, {"error": {"type": "permission_error", "message": "insufficient quota"}})
     monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
 
     mexc_client = MagicMock()

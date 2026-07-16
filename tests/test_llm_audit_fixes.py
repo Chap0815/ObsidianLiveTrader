@@ -160,25 +160,46 @@ def test_price_plausibility_entry_far_from_last_price_downgrades():
     assert "Auto-downgraded" in out.rationale
 
 
-def test_price_plausibility_sl_too_tight_downgrades():
-    # entry 65100, sl 64100 -> distance 1000; ATR huge so 1000 < 0.3*ATR
+def test_price_plausibility_sl_too_tight_is_warn_not_stayout():
+    # L-04: entry 65100, sl 64100 -> distance 1000; ATR huge so 1000 <
+    # 0.3*ATR. An unusably tight SL is as often a legitimate tight scalp as a
+    # hallucination, so this is now a WARN (kept, confidence capped at
+    # "medium"), not a hard STAY_OUT.
     p = parse_proposal(json.dumps(VALID_BUY))
     out = annotate_proposal(p, _ctx(last_price=65100.0, atr=10000.0))
-    assert out.action == "STAY_OUT"
-    assert out.setup_confidence == "low"
+    assert out.action == "BUY"
+    assert out.entry_price == 65100.0
+    assert out.setup_confidence == "medium"
+    assert "Warning" in out.rationale
 
 
 def test_price_plausibility_sl_too_wide_downgrades():
-    # entry 65100, sl 64100 -> distance 1000; tiny ATR so 1000 > 5*ATR
+    # entry 65100, sl 64100 -> distance 1000; tiny ATR so 1000 > 8*ATR (L-04
+    # raised the hard wide-SL cutoff from 5x to 8x ref ATR) -- still a real
+    # STAY_OUT at this magnitude.
     p = parse_proposal(json.dumps(VALID_BUY))
     out = annotate_proposal(p, _ctx(last_price=65100.0, atr=10.0))
     assert out.action == "STAY_OUT"
     assert out.setup_confidence == "low"
 
 
+def test_tight_sl_is_warn_not_stayout():
+    """L-04 (task-11 brief): sl_dist just under 0.3x LTF ATR keeps the
+    proposal directional (WARN), confidence capped at <= 'medium', not a
+    hard STAY_OUT."""
+    data = {**VALID_BUY, "stop_loss": 64810.0}  # |65100-64810|=290 < 0.3*1000
+    p = parse_proposal(json.dumps(data))
+    out = annotate_proposal(p, _ctx(last_price=65100.0, atr=1000.0))
+    assert out.action == "BUY"
+    assert out.entry_price == 65100.0
+    assert out.stop_loss == 64810.0
+    assert out.setup_confidence in ("low", "medium")
+    assert "Warning" in out.rationale
+
+
 def test_price_plausibility_within_thresholds_not_downgraded():
     # entry 65100 vs last_price 65000 (100 away), sl distance 1000; ATR 300 ->
-    # entry dist 100 < 3*300=900 OK; sl dist 1000 within [0.3*300=90, 5*300=1500]
+    # entry dist 100 < 3*300=900 OK; sl dist 1000 within [0.3*300=90, 8*300=2400]
     p = parse_proposal(json.dumps(VALID_BUY))
     out = annotate_proposal(p, _ctx(last_price=65000.0, atr=300.0))
     assert out.action == "BUY"

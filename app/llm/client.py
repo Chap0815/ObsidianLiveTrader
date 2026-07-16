@@ -5,9 +5,11 @@ Never places orders. User must apply → preview → confirm; gates re-validate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -263,16 +265,20 @@ def _price_plausibility_flags(
 ) -> tuple[str | None, str | None]:
     """Return (hard_reason, warn_reason) for entry/SL sanity vs ATR.
 
-    HARD (auto-STAY_OUT) = an implausible/hallucinated level: entry beyond
-    3x the reference ATR from last_price, an unusably tight SL (<0.3x LTF ATR),
-    or an SL beyond 5x the reference ATR.
+    HARD (auto-STAY_OUT) = a genuinely implausible/hallucinated level: entry
+    beyond 8x the reference ATR from last_price, or an SL beyond 8x the
+    reference ATR. (SL on the wrong side of entry is a separate, unrelated
+    hard check — see `_geometry_inverted` — and is untouched.)
 
-    WARN (keep the trade, cap confidence, attach a note) = a deep limit entry
-    or wide structural stop that is far in *LTF* ATR terms but still within the
-    *HTF* ATR structure band. Entries/stops are frequently anchored to HTF/
-    daily structure, so measuring them only in small 15m ATR previously nuked
-    good pullback/limit setups (audit A5). The reference ATR scales up to HTF
-    ATR when it is larger.
+    WARN (keep the trade, cap confidence at "medium", attach a note) = an
+    unusually tight SL (<0.3x LTF ATR — a legitimate tight scalp stop, not
+    necessarily a hallucination), a moderately far entry (within the (3x, 8x]
+    ref-ATR band), or a deep limit entry / wide structural stop that is far in
+    *LTF* ATR terms but still within the *HTF* ATR structure band. Entries/
+    stops are frequently anchored to HTF/daily structure or to a tight scalp
+    thesis, so nuking them straight to STAY_OUT previously killed good
+    pullback/limit/scalp setups (audit A5, L-04). The reference ATR scales up
+    to HTF/daily ATR when it is larger.
     """
     if not context or proposal.action == "STAY_OUT":
         return None, None
@@ -307,10 +313,17 @@ def _price_plausibility_flags(
     warn: list[str] = []
     if entry is not None:
         dist = abs(float(entry) - float(last_price))
-        if dist > 3.0 * ref_atr:
+        if dist > 8.0 * ref_atr:
             hard.append(
                 f"entry {entry} is {dist / ltf_atr:.1f}x LTF ATR "
                 f"({dist / ref_atr:.1f}x ref ATR) from last_price {last_price}"
+            )
+        elif dist > 3.0 * ref_atr:
+            # Moderately far entry (L-04): within the (3x, 8x] ref-ATR band —
+            # keep it, warn, don't nuke a legitimate deep pullback/limit.
+            warn.append(
+                f"entry {dist / ref_atr:.1f}x ref ATR from last_price "
+                f"(moderate deviation)"
             )
         elif dist > 3.0 * ltf_atr:
             warn.append(
@@ -320,9 +333,11 @@ def _price_plausibility_flags(
     if entry is not None and sl is not None:
         sl_dist = abs(float(entry) - float(sl))
         if sl_dist < 0.3 * ltf_atr:
-            hard.append(f"SL distance {sl_dist:.6g} < 0.3x LTF ATR ({ltf_atr:.6g})")
-        elif sl_dist > 5.0 * ref_atr:
-            hard.append(f"SL distance {sl_dist:.6g} > 5x ref ATR ({ref_atr:.6g})")
+            # L-04: an unusably tight SL is a legitimate tight-scalp stop as
+            # often as a hallucination — warn instead of hard-nuking it.
+            warn.append(f"tight SL distance {sl_dist:.6g} < 0.3x LTF ATR ({ltf_atr:.6g})")
+        elif sl_dist > 8.0 * ref_atr:
+            hard.append(f"SL distance {sl_dist:.6g} > 8x ref ATR ({ref_atr:.6g})")
         elif sl_dist > 5.0 * ltf_atr:
             warn.append(
                 f"wide structural SL {sl_dist / ltf_atr:.1f}x LTF ATR "
@@ -393,12 +408,17 @@ def annotate_proposal(
             }
         )
     elif warn:
-        # A good-but-far limit/structural setup: keep it, but surface the
-        # warning and cap confidence at "low" rather than silently deleting it.
+        # A good-but-far/tight limit/structural/scalp setup: keep it, but
+        # surface the warning and cap confidence at "medium" (L-04) rather
+        # than either silently deleting it or hard-flooring it to "low" — a
+        # cap only ever lowers confidence, never raises it.
         note = f"Warning: {warn} — verify entry/SL vs current price before acting."
         rationale = f"{proposal.rationale} | {note}" if proposal.rationale else note
+        capped_confidence = (
+            "low" if proposal.setup_confidence == "low" else "medium"
+        )
         proposal = proposal.model_copy(
-            update={"setup_confidence": "low", "rationale": rationale}
+            update={"setup_confidence": capped_confidence, "rationale": rationale}
         )
     return proposal
 
@@ -790,7 +810,14 @@ def _categorize_provider_http_error(
 
     401 (auth: bad/missing key) is intentionally split from 403 (billing):
     conflating them would tell a trader with a broken key to "top up
-    credits" when the fix is actually to check the key."""
+    credits" when the fix is actually to check the key.
+
+    L-11: 403 alone is NOT sufficient evidence of "credits erschöpft" — some
+    providers/proxies return 403 for key-permission or region-lockout
+    problems that topping up credits won't fix. Only report the credits
+    message for a 403 when the body actually carries a
+    `_CREDIT_ERROR_KEYWORDS` signal; otherwise report a generic
+    "Zugriff verweigert" message pointing at key permissions/region."""
     try:
         body_text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
     except (TypeError, ValueError):
@@ -801,7 +828,17 @@ def _categorize_provider_http_error(
             f"⚠ {provider_label}: API-Key ungültig oder fehlt — "
             "Key prüfen oder KI wechseln."
         )
-    if status_code == 403 or any(k in low for k in _CREDIT_ERROR_KEYWORDS):
+    if status_code == 403:
+        if any(k in low for k in _CREDIT_ERROR_KEYWORDS):
+            return (
+                f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
+                "KI im Dropdown wechseln oder aufladen."
+            )
+        return (
+            f"⚠ {provider_label}: Zugriff verweigert — "
+            "Key-Berechtigungen/Region prüfen."
+        )
+    if any(k in low for k in _CREDIT_ERROR_KEYWORDS):
         return (
             f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
             "KI im Dropdown wechseln oder aufladen."
@@ -838,6 +875,36 @@ def _parse_content_to_reevaluation(content: str, *, provider: str) -> Reevaluate
         raise LlmError(
             f"{provider} JSON failed schema validation: {e}", raw=content
         ) from e
+
+
+# L-09: transient-failure retry for the advisory provider POST. These calls
+# are read-only/advisory (never place, move or close anything), so a single
+# retry is safe and can't double-act. Only truly transient conditions retry —
+# a substantive failure (4xx auth/schema, non-timeout connection errors)
+# raises straight through on the first attempt, and even a transient one
+# retries at most ONCE, so a persistently-down provider still fails in
+# bounded time instead of silently doubling the caller's timeout budget.
+_RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+_RETRY_BACKOFF_SECONDS = 0.5
+
+
+async def _post_with_retry(
+    post: Callable[[], Awaitable[httpx.Response]],
+) -> httpx.Response:
+    """Call `post()`; on a transient failure (429/502/503/504 response, or a
+    client-side httpx.TimeoutException) wait a short backoff and retry
+    exactly once. Any other outcome (a non-transient status code, or a
+    non-timeout httpx error) is returned/raised immediately from the first
+    attempt without retrying."""
+    try:
+        response = await post()
+    except httpx.TimeoutException:
+        await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+        return await post()
+    if response.status_code in _RETRYABLE_STATUS_CODES:
+        await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+        return await post()
+    return response
 
 
 async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProposal:
@@ -902,7 +969,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
 
     sent_body = body
     try:
-        r = await _post(body)
+        r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
         raise LlmError(f"Claude request failed: {e}") from e
 
@@ -924,7 +991,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             }
             sent_body = fallback_body
             try:
-                r = await _post(fallback_body)
+                r = await _post_with_retry(lambda: _post(fallback_body))
             except httpx.HTTPError as e:
                 raise LlmError(f"Claude request failed: {e}") from e
 
@@ -983,9 +1050,12 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         "response_format": {"type": "json_object"},
     }
 
-    try:
+    async def _post() -> httpx.Response:
         async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=body)
+
+    try:
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"xAI request failed: {e}") from e
 
@@ -1033,9 +1103,12 @@ async def _call_openai_compat(
     if json_response_format:
         body["response_format"] = {"type": "json_object"}
 
-    try:
+    async def _post() -> httpx.Response:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=body)
+
+    try:
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"{provider_label} request failed: {e}") from e
 
@@ -1134,9 +1207,12 @@ async def _call_claude_reevaluate(
         ],
     }
 
-    try:
+    async def _post() -> httpx.Response:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=body)
+
+    try:
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"Claude request failed: {e}") from e
 
@@ -1187,9 +1263,12 @@ async def _call_xai_reevaluate(
         "response_format": {"type": "json_object"},
     }
 
-    try:
+    async def _post() -> httpx.Response:
         async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=body)
+
+    try:
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"xAI request failed: {e}") from e
 
@@ -1237,9 +1316,12 @@ async def _call_openai_compat_reevaluate(
     if json_response_format:
         body["response_format"] = {"type": "json_object"}
 
-    try:
+    async def _post() -> httpx.Response:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=body)
+
+    try:
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"{provider_label} request failed: {e}") from e
 

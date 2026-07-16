@@ -237,14 +237,18 @@ def _ctx(last, ltf_atr, htf_atr=None):
 def test_deep_limit_entry_within_htf_atr_warns_not_stay_out():
     data = {**VALID_BUY, "entry_price": 95.0, "stop_loss": 93.0, "tp1": 105.0}
     out = annotate_proposal(parse_proposal(json.dumps(data)), _ctx(100.0, 1.0, htf_atr=10.0))
-    assert out.action == "BUY"            # kept, not deleted
+    assert out.action == "BUY"               # kept, not deleted
     assert out.entry_price == 95.0
-    assert out.setup_confidence == "low"  # confidence capped
+    assert out.setup_confidence == "medium"  # L-04: warn caps at "medium", not "low"
     assert "Warning" in out.rationale
 
 
 def test_far_limit_entry_without_htf_atr_still_hard_stay_out():
-    data = {**VALID_BUY, "entry_price": 95.0, "stop_loss": 93.0, "tp1": 105.0}
+    # L-04 raised the hard entry cutoff from 3x to 8x ref ATR, so the old
+    # 5x-away entry here now falls in the (3x, 8x] WARN band -- push it out
+    # to 10x ref ATR (no htf/daily -> ref ATR == ltf ATR == 1.0) to keep
+    # demonstrating a genuine hard STAY_OUT without wider-ATR scaling.
+    data = {**VALID_BUY, "entry_price": 90.0, "stop_loss": 88.0, "tp1": 105.0}
     out = annotate_proposal(parse_proposal(json.dumps(data)), _ctx(100.0, 1.0))
     assert out.action == "STAY_OUT"
 
@@ -279,16 +283,17 @@ def test_deep_daily_anchored_entry_survives_via_daily_atr():
         "daily": {"read": {"atr14": 8.0}},  # 15 away = 1.9x daily ATR -> ok
     }
     out = annotate_proposal(parse_proposal(json.dumps(data)), ctx)
-    assert out.action == "BUY"            # kept, not nuked
+    assert out.action == "BUY"               # kept, not nuked
     assert out.entry_price == 85.0
-    assert out.setup_confidence == "low"  # capped, with a warning
+    assert out.setup_confidence == "medium"  # L-04: capped at "medium", with a warning
     assert "Warning" in out.rationale
 
 
 def test_same_deep_entry_without_daily_atr_is_hard_stay_out():
-    """Control: identical entry with NO daily ATR (only LTF/HTF) is beyond 3x
-    the reference band and is correctly hard-downgraded to STAY_OUT."""
-    data = {**VALID_BUY, "entry_price": 85.0, "stop_loss": 83.0, "tp1": 120.0}
+    """Control: identical shape with NO daily ATR (only LTF/HTF, ref ATR=2)
+    but pushed to 20 away (10x ref ATR) -- beyond the L-04 8x hard cutoff --
+    is correctly hard-downgraded to STAY_OUT."""
+    data = {**VALID_BUY, "entry_price": 80.0, "stop_loss": 78.0, "tp1": 120.0}
     ctx = {
         "last_price": 100.0,
         "ltf": {"read": {"atr14": 1.0}},
