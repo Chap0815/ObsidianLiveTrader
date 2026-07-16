@@ -2006,6 +2006,24 @@ async def ws_market(
     client = getattr(websocket.app.state, "mexc", None) or getattr(
         websocket.app.state, "exchange", None
     )
+    await _mexc_poll_fallback(websocket, client, symbol)
+
+
+# Q-06(a): MEXC has no native public WS wired yet, so /ws/market falls back
+# to REST polling. A flat 1s cadence would hammer the exchange (and spam
+# our own logs) if the ticker call starts failing repeatedly — e.g. rate
+# limit or a transient outage. Back off exponentially on consecutive
+# errors, capped, and reset to the fast cadence the moment a poll succeeds
+# again. No separate idle-/session-cap: the loop already exits cleanly on
+# WebSocketDisconnect the instant the browser tab closes/navigates away, so
+# an additional cap would add complexity without a clear failure mode it
+# guards against.
+MEXC_POLL_BASE_DELAY_S = 1.0
+MEXC_POLL_MAX_DELAY_S = 30.0
+
+
+async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None:
+    delay = MEXC_POLL_BASE_DELAY_S
     try:
         while True:
             if client is None:
@@ -2023,11 +2041,13 @@ async def ws_market(
                         "time": t.timestamp,
                     }
                 )
+                delay = MEXC_POLL_BASE_DELAY_S
             except Exception as e:
                 await websocket.send_json(
                     {"type": "status", "status": "error", "error": str(e)}
                 )
-            await asyncio.sleep(1.0)
+                delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
+            await asyncio.sleep(delay)
     except WebSocketDisconnect:
         pass
 

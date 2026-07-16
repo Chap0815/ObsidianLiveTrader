@@ -50,6 +50,28 @@ def to_coin(symbol: str) -> str:
     return s.split("_")[0] if s else "BTC"
 
 
+async def _pump_client(client_ws: WebSocket) -> None:
+    """Read client control frames (ping/resubscribe) until disconnect.
+
+    O-10/Q-06(b): the browser side of this socket is not fully trusted to
+    only ever send well-formed JSON. Uses ``receive_text`` + tolerant
+    ``json.loads`` and *ignores* any frame that fails to parse, instead of
+    letting the previous ``receive_json`` raise ``JSONDecodeError`` — which
+    would complete this task and (via the caller's FIRST_COMPLETED wait)
+    tear down the whole proxy, including the healthy upstream pump, over a
+    single garbage frame. A genuine disconnect still propagates
+    ``WebSocketDisconnect`` so the caller ends the proxy cleanly.
+    """
+    while True:
+        raw = await client_ws.receive_text()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "ping":
+            await client_ws.send_json({"type": "pong"})
+
+
 async def proxy_hyperliquid_market(
     client_ws: WebSocket,
     settings: Settings,
@@ -122,15 +144,8 @@ async def proxy_hyperliquid_market(
                         continue
                     await client_ws.send_json(out)
 
-            async def pump_client() -> None:
-                while True:
-                    data = await client_ws.receive_json()
-                    # optional resubscribe
-                    if isinstance(data, dict) and data.get("type") == "ping":
-                        await client_ws.send_json({"type": "pong"})
-
             t1 = asyncio.create_task(pump_upstream())
-            t2 = asyncio.create_task(pump_client())
+            t2 = asyncio.create_task(_pump_client(client_ws))
             done, pending = await asyncio.wait(
                 {t1, t2}, return_when=asyncio.FIRST_COMPLETED
             )
