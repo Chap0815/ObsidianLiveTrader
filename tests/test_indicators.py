@@ -106,17 +106,45 @@ def test_rvol_constant_volume_is_one():
 
 
 def test_rvol_spike_is_above_one():
+    # Adapted for L-05: the denominator is now the mean of the 20 PRIOR bars
+    # only (excludes the current/breakout bar), so we need period+1 = 21
+    # candles total. Prior 20 bars at vol=5.0 → avg=5.0; current bar=50.0
+    # → rvol = 50/5 = 10.0 (previously this pinned the old inclusive
+    # semantics: (19*5 + 50)/20 = 7.25 → ~6.9x, which understated the spike
+    # because the breakout bar inflated its own average).
     candles = [
-        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(19)
-    ] + [Candle(time=19, open=10, high=11, low=9, close=10, vol=50.0)]
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(20)
+    ] + [Candle(time=20, open=10, high=11, low=9, close=10, vol=50.0)]
     rvol, vol_trend = compute_rvol(candles)
-    # last bar (50) vs mean of last 20 bars (19*5 + 50)/20 = 7.25 → ~6.9x
-    assert rvol > 1.5
+    assert rvol == pytest.approx(10.0)
     assert vol_trend == "rising"
 
 
 def test_rvol_short_series_fallback_neutral():
     candles = [Candle(time=i, open=1, high=2, low=1, close=1.5, vol=3.0) for i in range(5)]
+    rvol, vol_trend = compute_rvol(candles)
+    assert rvol == pytest.approx(1.0)
+    assert vol_trend == "flat"
+
+
+def test_rvol_excludes_current_bar():
+    # 20 prior bars at vol=5.0 (period=20), current (breakout) bar at 3x =
+    # 15.0. Denominator must be the mean of the 20 PRIOR bars only (5.0),
+    # not including the breakout bar itself, so rvol == 15/5 == 3.0 exactly.
+    candles = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(20)
+    ] + [Candle(time=20, open=10, high=11, low=9, close=10, vol=15.0)]
+    rvol, _ = compute_rvol(candles)
+    assert rvol == pytest.approx(3.0)
+
+
+def test_rvol_short_history_fallback():
+    # n == period (20 candles) is NOT enough anymore: the denominator needs
+    # `period` bars EXCLUDING the current one, i.e. period+1 candles total.
+    # With exactly `period` candles there's no valid prior window → fallback.
+    candles = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(20)
+    ]
     rvol, vol_trend = compute_rvol(candles)
     assert rvol == pytest.approx(1.0)
     assert vol_trend == "flat"

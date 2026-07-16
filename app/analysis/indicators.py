@@ -151,13 +151,15 @@ def compute_vwap(candles: list[Candle]) -> list[float | None]:
 
 
 def compute_rvol(candles: list[Candle], period: int = 20) -> tuple[float, str]:
-    """Relative volume: last bar's vol vs the mean of the last `period` bars
-    (the last bar is included in its own average, matching the simple "how
-    hot is this bar vs its recent norm" read the LLM prompt needs).
+    """Relative volume: last bar's vol vs the mean of the previous `period`
+    bars, excluding the current bar. Excluding the current bar matters
+    because a breakout candle would otherwise inflate its own average,
+    systematically understating rvol for the exact bars it's meant to flag.
 
     Falls back to a neutral 1.0 when there isn't enough history yet (< period
-    candles) or the window average is zero, so the field is always a usable
-    number for the LLM context rather than a null that needs special-casing.
+    + 1 candles, since `period` prior bars plus the current bar are needed)
+    or the window average is zero, so the field is always a usable number
+    for the LLM context rather than a null that needs special-casing.
 
     `vol_trend` compares the mean of the last 3 bars vs the previous 3 bars
     (a small +/-5% band avoids flip-flopping on noise) for a coarse
@@ -165,10 +167,10 @@ def compute_rvol(candles: list[Candle], period: int = 20) -> tuple[float, str]:
     """
     vols = [c.vol for c in candles]
     n = len(vols)
-    if n < period:
+    if n < period + 1:
         rvol = 1.0
     else:
-        window = vols[-period:]
+        window = vols[-period - 1 : -1]
         avg = sum(window) / period
         rvol = vols[-1] / avg if avg > 0 else 1.0
 
