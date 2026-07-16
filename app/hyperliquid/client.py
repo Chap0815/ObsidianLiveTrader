@@ -1210,7 +1210,12 @@ class HyperliquidClient:
         # externalOid -> Cloid stamping) so a timeout during a close can be
         # recovered/looked-up unambiguously via order_by_external_oid instead
         # of guessing whether the close actually went through.
-        close_cloid = external_oid_to_cloid(str(external_oid or ""))
+        # "close:"-Namespace: selbst wenn ein Aufrufer die Entry-externalOid
+        # durchreicht, kollidiert der Close-Cloid nie mit dem Entry-Cloid
+        # (gleiche OID => gleicher Hash => ambiger Lookup waere die Folge).
+        close_cloid = (
+            external_oid_to_cloid(f"close:{external_oid}") if external_oid else None
+        )
 
         def _cl():
             ex = self._get_exchange()

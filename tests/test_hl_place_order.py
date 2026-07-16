@@ -326,10 +326,11 @@ async def test_hl_sl_rounds_away_from_entry():
 
 @pytest.mark.asyncio
 async def test_hl_close_stamps_cloid():
-    """O-08: close_position_market stamps a deterministic Cloid (derived from
-    external_oid, same derivation as the entry path) onto the SDK's
+    """O-08: close_position_market stamps a deterministic Cloid onto the SDK's
     market_close call, so a transport timeout during a close can be recovered
-    unambiguously via order_by_external_oid instead of guessing."""
+    unambiguously via order_by_external_oid instead of guessing. Derived from
+    "close:"+external_oid — namespaced so a caller reusing the ENTRY oid can
+    never produce a cloid collision between entry and close order."""
     c = _client()
     c.account_address = "0x" + "a" * 40
     c._info = _fake_info("BTC", 0.5)  # live LONG matches requested close
@@ -339,7 +340,9 @@ async def test_hl_close_stamps_cloid():
     )
     c._exchange.market_close.assert_called_once()
     passed = c._exchange.market_close.call_args.kwargs["cloid"]
-    assert passed.to_raw() == external_oid_to_cloid("mlt-close-1").to_raw()
+    assert passed.to_raw() == external_oid_to_cloid("close:mlt-close-1").to_raw()
+    # Namespace-Garantie: nie identisch mit dem Entry-Cloid derselben OID.
+    assert passed.to_raw() != external_oid_to_cloid("mlt-close-1").to_raw()
 
 
 @pytest.mark.asyncio
