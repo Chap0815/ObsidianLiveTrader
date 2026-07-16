@@ -1784,7 +1784,9 @@ class OrderService:
             kind = str(
                 s.get("orderType") or s.get("tpsl") or s.get("type") or ""
             ).lower()
-            if "take" in kind or kind in ("tp", "take_profit", "take-profit"):
+            # Q-05: gleiche Label-Regel wie Verify/Reevaluate (protection.py) —
+            # drittes Inline-Duplikat entfernt, damit die Stellen nie driften.
+            if classify_order_label(kind) == "tp":
                 continue  # only SL is being replaced; keep any TP
             oid = s.get("orderId") or s.get("oid")
             if oid is None and isinstance(s.get("raw"), dict):

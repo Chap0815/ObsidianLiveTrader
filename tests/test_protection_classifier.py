@@ -86,3 +86,35 @@ async def test_reevaluate_and_verify_agree():
     )
     assert verified is True
     assert checked is True
+
+
+@pytest.mark.asyncio
+async def test_mexc_tpsl_combined_order_is_sl_not_tp():
+    """Regression-Pin fuer DIE Divergenz, die Task 19 motiviert hat (Q-05):
+
+    MEXC "tpsl" (kombinierte Order mit echtem Stop) MUSS als SL klassifiziert
+    werden. Die alte Reevaluate-Regel (startswith("tp")) haette sie als TP
+    fehlklassifiziert -> Verify haette FAELSCHLICH "SL fehlt" gemeldet ->
+    Auto-Flatten einer geschuetzten Position. Wer classify_order_label je
+    wieder auf ein startswith("tp")-Muster "vereinfacht", macht diesen Test rot.
+    """
+    stops = [{"symbol": "BTC_USDT", "orderType": "tpsl", "triggerPrice": 95_000.0}]
+
+    # (a) Klassifizierer direkt
+    sl, tp = classify_protection(stops, side="long", entry=100_000.0)
+    assert sl == 95_000.0
+    assert tp is None
+
+    # (b) Verify-Pfad: tpsl-Stop wird als SL erkannt -> verified
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(return_value=stops)
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+    verified, detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+    assert verified is True
+    assert checked is True
