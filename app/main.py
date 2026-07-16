@@ -2006,7 +2006,25 @@ async def ws_market(
     client = getattr(websocket.app.state, "mexc", None) or getattr(
         websocket.app.state, "exchange", None
     )
-    await _mexc_poll_fallback(websocket, client, symbol)
+    # Symmetrie zum HL-Zweig oben: unerwartete Fehler melden (best-effort)
+    # und den Socket immer schliessen, statt die Exception zum Framework
+    # durchschlagen zu lassen.
+    try:
+        await _mexc_poll_fallback(websocket, client, symbol)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json(
+                {"type": "status", "status": "error", "error": str(e)}
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # Q-06(a): MEXC has no native public WS wired yet, so /ws/market falls back
@@ -2031,22 +2049,25 @@ async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None
                     {"type": "status", "status": "error", "error": "no client"}
                 )
                 break
+            # Backoff gilt NUR fuer Ticker-Fehler. Sends an den Browser stehen
+            # bewusst AUSSERHALB des try: ein Send-Fehler (Client weg) muss
+            # sofort propagieren (-> WebSocketDisconnect beendet die Schleife),
+            # statt als "Ticker-Fehler" einen Backoff-Schlaf zu verursachen.
+            mid_message: dict | None = None
+            err_message: dict | None = None
             try:
                 t = await client.ticker(symbol)
-                await websocket.send_json(
-                    {
-                        "type": "mid",
-                        "coin": symbol,
-                        "px": float(t.last_price),
-                        "time": t.timestamp,
-                    }
-                )
+                mid_message = {
+                    "type": "mid",
+                    "coin": symbol,
+                    "px": float(t.last_price),
+                    "time": t.timestamp,
+                }
                 delay = MEXC_POLL_BASE_DELAY_S
             except Exception as e:
-                await websocket.send_json(
-                    {"type": "status", "status": "error", "error": str(e)}
-                )
+                err_message = {"type": "status", "status": "error", "error": str(e)}
                 delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
+            await websocket.send_json(mid_message if mid_message else err_message)
             await asyncio.sleep(delay)
     except WebSocketDisconnect:
         pass
