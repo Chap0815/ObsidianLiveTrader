@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.env_builder import build_minimal_env  # noqa: E402
+from app.env_builder import build_minimal_env, restrict_env_permissions  # noqa: E402
 
 ENV_PATH = ROOT / ".env"
 
@@ -32,6 +32,7 @@ def main() -> None:
     ENV_PATH.write_text(
         build_minimal_env(port=args.port), encoding="utf-8", newline="\n"
     )
+    restrict_env_permissions(ENV_PATH)  # B-08: never world-/group-readable
     print(
         f"Bootstrap-.env geschrieben. Setup im Browser abschließen: "
         f"http://127.0.0.1:{args.port}/setup"

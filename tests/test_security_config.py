@@ -227,3 +227,39 @@ def test_api_responses_have_no_store_and_nosniff():
     assert r.headers["cache-control"] == "no-store"
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["referrer-policy"] == "no-referrer"
+
+
+def test_env_file_written_restrictive_perms(tmp_path):
+    """B-08: .env carries exchange API secrets and the local auth token, so it
+    must not be group-/world-readable after an atomic write. POSIX: chmod
+    0600 (owner-only). Windows has no POSIX mode bits; the icacls best-effort
+    branch must actually tighten the ACL down to the current user (Full
+    Control) with inherited ACEs stripped — not just avoid raising."""
+    import os as _os
+    import stat
+
+    from app.env_builder import SETTINGS_LLM_WRITABLE, patch_env_vars
+
+    p = tmp_path / ".env"
+    p.write_text("TRADING_ENABLED=false\nXAI_API_KEY=\n", encoding="utf-8")
+    patch_env_vars(p, {"XAI_API_KEY": "secret-value"}, allowed=set(SETTINGS_LLM_WRITABLE))
+
+    if _os.name == "nt":
+        import subprocess
+
+        out = subprocess.run(
+            ["icacls", str(p)], capture_output=True, text=True, check=False
+        ).stdout
+        user = _os.environ.get("USERNAME", "")
+        assert user, "USERNAME env var must be set to assert the ACL narrowing"
+        low = out.lower()
+        assert user.lower() in low
+        # Windows grants SYSTEM + BUILTIN\Administrators on new files by
+        # default (inherited from the parent dir) — real evidence the
+        # hardening ran is that /inheritance:r stripped exactly those
+        # inherited ACEs, leaving only the current user's grant.
+        assert "nt authority\\system" not in low
+        assert "builtin\\administrators" not in low
+    else:
+        mode = stat.S_IMODE(p.stat().st_mode)
+        assert mode == 0o600

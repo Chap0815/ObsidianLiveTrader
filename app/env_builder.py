@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import subprocess
 from pathlib import Path
 
 # ── Whitelists ──────────────────────────────────────────────────────────────
@@ -314,6 +315,40 @@ def build_full_env(answers: dict) -> str:
     return "\n".join(lines)
 
 
+# ── File-permission hardening (B-08) ────────────────────────────────────────
+def restrict_env_permissions(path: Path) -> None:
+    """Best-effort: lock a just-written ``.env`` down to the current user.
+
+    ``.env`` holds exchange API secrets and the local auth token, so it must
+    not be group-/world-readable. POSIX: ``chmod 0600`` (owner read/write
+    only). Windows has no POSIX mode bits, so ``icacls`` is used instead to
+    strip inherited ACEs and grant Full Control to only the current user.
+
+    Both branches are deliberately best-effort: any failure (unsupported
+    filesystem, no ``icacls`` on PATH, insufficient privilege to change ACLs,
+    ...) is swallowed. The ``.env`` content has already been written
+    correctly at this point — a permission-tightening failure must never be
+    reported as (or turn into) a failed config write.
+    """
+    p = Path(path)
+    try:
+        if os.name == "nt":
+            user = os.environ.get("USERNAME", "")
+            domain = os.environ.get("USERDOMAIN", "")
+            account = f"{domain}\\{user}" if domain and user else user
+            if account:
+                subprocess.run(
+                    ["icacls", str(p), "/inheritance:r", "/grant:r", f"{account}:F"],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+        else:
+            os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
 # ── Atomic patcher (post-setup key writes) ──────────────────────────────────
 def patch_env_vars(
     env_path: Path, updates: dict[str, str], *, allowed: set[str]
@@ -356,3 +391,4 @@ def patch_env_vars(
     tmp = env_path.with_suffix(env_path.suffix + ".tmp")
     tmp.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     os.replace(tmp, env_path)
+    restrict_env_permissions(env_path)  # B-08: never world-/group-readable

@@ -2088,6 +2088,21 @@ async def index(request: Request):
     # instead of the page DOM. Same-origin fetch/WebSocket send it
     # automatically; the X-Local-Token header stays a valid fallback. Secure
     # is not required on plain-http 127.0.0.1.
+    #
+    # B-05 (audit, LOW): browser cookies are NOT port-scoped — this cookie is
+    # sent by the browser to ANY server on 127.0.0.1, not just this app's
+    # port, so a malicious local process listening on another loopback port
+    # could also receive it. HttpOnly + SameSite=Strict already block the
+    # realistic remote/XSS-exfil and cross-site-request vectors; the
+    # residual risk needs a co-resident malicious LOCAL process, which could
+    # typically read LOCAL_API_TOKEN out of .env directly anyway — hence LOW,
+    # and deliberately not "fixed" by swapping in a separate session token
+    # (that would touch the whole auth flow — cookie + header preflight +
+    # SameSite=Strict — for a low-severity, already-mitigated risk; see
+    # docs/superpowers/reviews/2026-07-16-audit-backend.md B-05). API/script
+    # clients that don't need the browser convenience should prefer sending
+    # X-Local-Token explicitly rather than relying on this cookie — the
+    # header IS scoped to exactly the request the caller intends.
     token = (s.local_api_token or "").strip()
     if token:
         resp.set_cookie(

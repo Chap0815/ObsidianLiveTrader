@@ -24,6 +24,7 @@ from app.env_builder import (  # noqa: E402
     DEFAULT_MODELS,
     build_full_env,
     normalize_answers,
+    restrict_env_permissions,
 )
 
 ENV_PATH = ROOT / ".env"
@@ -163,6 +164,7 @@ def _write_full_env(content: str) -> None:
     tmp = ENV_PATH.with_name(".env.setup-tmp")
     tmp.write_text(content, encoding="utf-8", newline="\n")
     os.replace(tmp, ENV_PATH)
+    restrict_env_permissions(ENV_PATH)  # B-08: never world-/group-readable
     print(f"\nGespeichert: {ENV_PATH}")
 
 
