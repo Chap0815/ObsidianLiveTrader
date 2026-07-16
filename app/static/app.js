@@ -1453,6 +1453,20 @@
         $("symbol-input").value = h.default_symbol;
         state.symbol = h.default_symbol;
       }
+
+      // Keep the sizing-suggestion button's label/tooltip in lockstep with
+      // the backend's actual risk cap (U-01): never let the button promise
+      // a % it doesn't deliver.
+      const sugBtn = $("btn-suggest-vol");
+      if (sugBtn) {
+        const rp = maxRiskPct();
+        sugBtn.textContent = fmt(rp, 2) + " % Risiko";
+        sugBtn.setAttribute(
+          "data-tip",
+          "Berechnet die Größe so, dass der Stop-Loss genau " + fmt(rp, 2) +
+            " % deines Equity riskiert (Stop-Loss vorher eintragen)."
+        );
+      }
       return h;
     } catch (err) {
       console.error("loadHealth", err);
@@ -2695,6 +2709,14 @@
     return txt === "USDC" || txt === "USDT" ? txt : "USDT";
   }
 
+  /** Effective sizing risk %: mirrors the backend's gate cap (main.py
+   *  suggest_vol handler) so the "X % Risiko" button label, its request
+   *  and the success toast can never disagree. Falls back to 1.0 (never
+   *  above the backend cap) before /health has resolved. */
+  function maxRiskPct() {
+    return Number(state.health && state.health.max_risk_pct) || 1.0;
+  }
+
   /** Modus-abhängiger Readout unter dem Größe-Feld: zeigt Coin-Menge plus den
    *  jeweils ANDEREN Wert (Position-Modus → Margin, Margin-Modus → Position). */
   function updateSizeHint() {
@@ -2965,11 +2987,12 @@
       setTicketError("Erst Stop-Loss-Kurs eintragen — dann kann die Größe berechnet werden.");
       return;
     }
+    const rp = maxRiskPct();
     try {
       const res = await apiFetch("/api/sizing/suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({}, ticket, { risk_pct: 2.0 })),
+        body: JSON.stringify(Object.assign({}, ticket, { risk_pct: rp })),
       });
       const data = await res.json().catch(function () {
         return {};
@@ -3004,7 +3027,7 @@
       }
       updateRiskReadout();
       showToast(
-        "Größe für 2 % Risiko: " +
+        "Größe für " + fmt(rp, 2) + " % Risiko: " +
           fmt(data.notional_usdt, 2) + " " + ccy() +
           " ≈ " + fmt(data.base_amount, 6) + " " + (state.symbol || ""),
         "ok"
