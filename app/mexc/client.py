@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -106,6 +107,8 @@ def _fmt_price(v: Any, scale: int | None = None) -> str:
     contract's ``priceScale`` (or one derived from ``priceUnit``); when
     unknown, a conservative fixed fallback is used instead.
     """
+    if not math.isfinite(float(v)):
+        raise MexcError(f"Nicht-endlicher Preiswert: {v!r}")
     d = Decimal(str(v))
     decimals = scale if scale is not None else _DEFAULT_PRICE_DECIMALS
     if decimals < 0:

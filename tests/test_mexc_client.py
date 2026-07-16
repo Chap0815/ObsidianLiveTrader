@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from app.mexc.client import MexcClient, _fmt_price
+from app.mexc.errors import MexcError
 
 # Scientific notation looks like "2e-05" / "1.2E+10" — a digit directly
 # followed by e/E and an exponent. Field names like "leverage" also contain
@@ -56,6 +57,15 @@ async def test_mexc_price_no_scientific_notation():
     assert '"takeProfitPrice":"0.0000215"' in sent
     # Non-price fields stay untouched (still bare JSON numbers).
     assert '"vol":1000' in sent
+
+
+def test_fmt_price_rejects_non_finite():
+    # Infinity/NaN must not reach Decimal.quantize (raises InvalidOperation,
+    # which is not a MexcError and would bypass order-error handling).
+    with pytest.raises(MexcError):
+        _fmt_price(float("inf"))
+    with pytest.raises(MexcError):
+        _fmt_price(float("nan"))
 
 
 @pytest.mark.asyncio
