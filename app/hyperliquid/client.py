@@ -7,8 +7,10 @@ vol * abs(entry - stop) in USDC terms for linear perps.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from app.hyperliquid.errors import HyperliquidError
@@ -94,10 +96,27 @@ class HyperliquidClient:
         testnet: bool = True,
         base_url: str | None = None,
         market_slippage_pct: float = 0.5,
+        http_timeout_s: float = 10.0,
     ):
         from hyperliquid.utils import constants
 
         self.testnet = testnet
+        # Q-01: hard upstream timeout for every SDK HTTP call. asyncio.wait_for
+        # around to_thread does NOT abort a blocked requests call, so the only
+        # real stall bound is a request-level timeout on the SDK's session.
+        self._http_timeout_s = float(http_timeout_s)
+        # Q-01: SEPARATED, size-bounded executors. A single bounded pool would
+        # still let a scanner fan-out of hanging HL calls fill it and starve
+        # confirm/close. So the money path (place/cancel/close/modify) gets its
+        # OWN reserved executor that data/scanner calls can never consume. The
+        # hard timeout above bounds stall duration; this split guarantees the
+        # money path always has free workers regardless of data-side load.
+        self._executor_trade = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="hl-trade"
+        )
+        self._executor_data = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="hl-data"
+        )
         # Max adverse fill for market orders (fraction for SDK)
         self.market_slippage = max(0.0005, float(market_slippage_pct) / 100.0)
         self.base_url = (
@@ -179,11 +198,46 @@ class HyperliquidClient:
             return None
         return round((cur - ref_val) / ref_val * 100.0, 3)
 
+    def _apply_http_timeout(self, inst: Any) -> None:
+        """Force a hard request timeout onto the SDK instance's HTTP session.
+
+        The SDK's ``API.post`` calls ``self.session.post(..., timeout=self.timeout)``
+        — with ``self.timeout`` defaulting to ``None`` (no timeout at all). We set
+        ``inst.timeout`` so every call carries our bound, AND wrap the session's
+        ``request`` so any path that omits/None's the timeout still gets one.
+
+        If the SDK ever stops exposing a usable ``session`` (internals changed),
+        we RAISE at construction rather than silently run without a timeout — a
+        no-op here would re-open exactly the unbounded-stall hole Q-01 closes.
+        """
+        session = getattr(inst, "session", None)
+        if session is None or not callable(getattr(session, "request", None)):
+            raise HyperliquidError(
+                "Hyperliquid SDK instance exposes no usable 'session.request' to "
+                "apply an HTTP timeout to (SDK internals changed?); refusing to "
+                "run without a hard upstream timeout"
+            )
+        inst.timeout = self._http_timeout_s
+        if not getattr(session, "_mlt_timeout_wrapped", False):
+            orig_request = session.request
+            timeout_s = self._http_timeout_s
+
+            @functools.wraps(orig_request)
+            def _request(method, url, **kwargs):
+                if kwargs.get("timeout") is None:
+                    kwargs["timeout"] = timeout_s
+                return orig_request(method, url, **kwargs)
+
+            session.request = _request
+            session._mlt_timeout_wrapped = True
+
     def _get_info(self):
         if self._info is None:
             from hyperliquid.info import Info
 
-            self._info = Info(self.base_url, skip_ws=True)
+            info = Info(self.base_url, skip_ws=True)
+            self._apply_http_timeout(info)
+            self._info = info
         return self._info
 
     def _get_exchange(self):
@@ -196,9 +250,9 @@ class HyperliquidClient:
             wallet = Account.from_key(self.private_key)
             addr = self.account_address or wallet.address
             self.account_address = addr
-            self._exchange = Exchange(
-                wallet, self.base_url, account_address=addr
-            )
+            exchange = Exchange(wallet, self.base_url, account_address=addr)
+            self._apply_http_timeout(exchange)
+            self._exchange = exchange
         return self._exchange
 
     def _resolve_address(self) -> str:
@@ -213,15 +267,29 @@ class HyperliquidClient:
     async def aclose(self) -> None:
         self._info = None
         self._exchange = None
+        # Q-01: shut down BOTH dedicated executors so their worker threads don't
+        # outlive the client. cancel_futures drops still-queued work.
+        self._executor_trade.shutdown(wait=False, cancel_futures=True)
+        self._executor_data.shutdown(wait=False, cancel_futures=True)
 
-    async def _to_thread(self, fn, *args, **kwargs):
-        """Run SDK call in a thread; ALL failures become HyperliquidError.
+    async def _to_thread(self, fn, *args, money_path: bool = False, **kwargs):
+        """Run SDK call on a dedicated, size-bounded executor.
 
-        The SDK raises its own ServerError/ClientError (e.g. testnet 502) —
-        without this wrap they escape the ExchangeError handlers as HTTP 500.
+        Q-01: money-path calls (place/cancel/close/modify) route to the RESERVED
+        ``_executor_trade`` so a scanner/data fan-out that fills ``_executor_data``
+        can never starve confirm/close. Using our own bounded executors (instead
+        of ``asyncio.to_thread``'s shared default pool) also means one stalled HL
+        endpoint can't exhaust the process-wide thread pool.
+
+        ALL failures become HyperliquidError — the SDK raises its own
+        ServerError/ClientError (e.g. testnet 502) which would otherwise escape
+        the ExchangeError handlers as HTTP 500.
         """
+        loop = asyncio.get_running_loop()
+        executor = self._executor_trade if money_path else self._executor_data
+        call = functools.partial(fn, *args, **kwargs) if (args or kwargs) else fn
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await loop.run_in_executor(executor, call)
         except HyperliquidError:
             raise
         except Exception as e:
@@ -669,7 +737,7 @@ class HyperliquidClient:
             return ex.update_leverage(int(leverage), coin, is_cross)
 
         try:
-            return await self._to_thread(_l)
+            return await self._to_thread(_l, money_path=True)
         except Exception as e:
             raise HyperliquidError(f"set_leverage failed: {e}") from e
 
@@ -875,7 +943,7 @@ class HyperliquidClient:
             }
 
         try:
-            return await self._to_thread(_place)
+            return await self._to_thread(_place, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
@@ -944,7 +1012,7 @@ class HyperliquidClient:
             }
 
         try:
-            return await self._to_thread(_place)
+            return await self._to_thread(_place, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
@@ -974,7 +1042,7 @@ class HyperliquidClient:
             return ex.cancel(coin, oid)
 
         try:
-            return await self._to_thread(_c)
+            return await self._to_thread(_c, money_path=True)
         except Exception as e:
             raise HyperliquidError(f"cancel failed: {e}") from e
 
@@ -1136,7 +1204,7 @@ class HyperliquidClient:
             return result
 
         try:
-            return await self._to_thread(_cl)
+            return await self._to_thread(_cl, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
@@ -1165,7 +1233,7 @@ class HyperliquidClient:
                 return self._get_info().query_order_by_cloid(addr, cloid)
 
             try:
-                status = await self._to_thread(_q)
+                status = await self._to_thread(_q, money_path=True)
             except HyperliquidError:
                 status = None
             if isinstance(status, dict) and str(status.get("status")).lower() == "order":

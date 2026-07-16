@@ -18,6 +18,7 @@ def create_exchange_client(settings: Settings) -> Any:
             testnet=settings.hl_testnet,
             base_url=settings.hl_base_url or None,
             market_slippage_pct=settings.market_entry_slippage_pct,
+            http_timeout_s=settings.hl_http_timeout_s,
         )
     from app.mexc.client import MexcClient
 

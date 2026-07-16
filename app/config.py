@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     hl_account_address: str = ""  # main wallet address if using agent key
     hl_testnet: bool = True
     hl_base_url: str = ""  # empty → SDK default from testnet flag
+    # Q-01: hard per-request timeout (seconds) for every Hyperliquid SDK HTTP
+    # call. The SDK defaults to NO timeout, so a hung endpoint would block a
+    # worker forever; this bounds every call. Finite, 0.5..120s.
+    hl_http_timeout_s: float = 10.0
 
     # claude | xai | openai (Codex) | ollama (lokal)  — default: Claude
     llm_provider: str = "claude"
@@ -383,6 +387,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"{info.field_name.upper()} must be a finite number in "
                 f"[0, 100] (got {v!r})"
+            )
+        return v
+
+    @field_validator("hl_http_timeout_s")
+    @classmethod
+    def hl_http_timeout_s_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0.5 <= v <= 120):
+            raise ValueError(
+                f"HL_HTTP_TIMEOUT_S must be a finite number in [0.5, 120] "
+                f"(got {v!r})"
             )
         return v
 
