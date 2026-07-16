@@ -75,7 +75,7 @@ Selection method per coin:
 
 Scoring: 0-10 as an ABSOLUTE quality bar, not a relative ranking. A 6 means
 "a disciplined analyst would actually take this now." Only include coins with
-score >= 6 that clear both hard rejects above (against-daily is a score cap, not
+score >= 5 that clear both hard rejects above (against-daily is a score cap, not
 a reject). Maximum 6 results, sorted by score descending. Returning an empty
 list is the correct answer in a quiet market.
 
@@ -159,7 +159,17 @@ def _salvage_result_objects(text: str) -> list[dict]:
 # Absolute keep gate for the deep-analysis handoff. The scanner score is an
 # absolute quality bar (not a relative top-N rank): a coin below this is one the
 # deep analyzer would reject anyway, so it must not be surfaced (audit B2).
-SCANNER_MIN_SCORE = 6.0
+#
+# L-02: kept BELOW the prompt's against-daily score cap (6, see
+# SCANNER_SYSTEM_PROMPT above) on purpose. When both were 6.0, an against-daily
+# setup capped at exactly 6 only survived if the model scored it at PRECISELY
+# 6.0 -- one epsilon under and the floor dropped it, starving the whole 5-6
+# band the cap was designed to let through. Left as a module constant (not a
+# Settings field): it's read from exactly one call site (scan_with_llm below)
+# together with the prompt's hard-coded "6" cap, so the two must change in
+# lockstep -- a config knob here would let them drift out of sync without
+# actually buying any deployment-time flexibility.
+SCANNER_MIN_SCORE = 5.0
 
 
 def parse_scan_results(
@@ -294,15 +304,17 @@ async def build_scan_contexts(
             "symbol": sym,
             "last_price": row.get("last") or ltf_candles[-1].close,
             "volume24_usd": row.get("volume24"),
-            "funding_rate": rate,
             # 1D regime anchor so a pick hard against the daily is scored down
             "daily_stack": _daily_stack(daily, daily_candles),
             # HTF first (regime before LTF timing)
             "htf": _mini_tf(build_tf_slice(htf, htf_candles), htf),
             "ltf": _mini_tf(build_tf_slice(tf, ltf_candles), tf),
         }
-        # Crowdedness context for the funding tiebreaker (audit A9): the raw
-        # rate alone can't show how crowded/costly the trade is.
+        # Crowdedness context for the funding tiebreaker (audit A9). L-08: the
+        # RAW rate is intentionally omitted here -- the prompt only ever reads
+        # fundingExtreme/fundingAnnualized (see SCANNER_SYSTEM_PROMPT point 4),
+        # so shipping the raw number too was pure token ballast repeated across
+        # up to scanner_max_coins (20) coins per scan.
         if isinstance(rate, (int, float)):
             ctx["funding_extreme"] = _funding_extreme(rate)
             ctx["funding_annualized"] = _funding_annualized(rate, None)

@@ -60,7 +60,7 @@ async def test_build_scan_contexts_survives_single_coin_failure():
     ctx = contexts[0]
     assert "recent_candles" not in ctx["ltf"]  # compact: no candle arrays
     assert "read" in ctx["ltf"] and "structure" in ctx["ltf"]
-    assert ctx["funding_rate"] == 0.0001
+    assert "funding_rate" not in ctx  # L-08: raw rate dropped, extreme/annualized suffice
 
 
 # --- F-22: results must be restricted to the actually-scanned symbol set ---
@@ -136,6 +136,46 @@ def test_parse_scan_results_default_has_no_floor():
     assert [r.symbol for r in parse_scan_results(text)] == ["B"]
 
 
+def test_scanner_min_score_is_five():
+    """L-02: the floor is decoupled from the against-daily score cap (6) so
+    the 5-6 band actually survives instead of being starved out."""
+    from app.llm.scanner import SCANNER_MIN_SCORE
+
+    assert SCANNER_MIN_SCORE == 5.0
+    text = '{"results": [{"symbol": "MID", "bias": "long", "score": 5.5}]}'
+    out = parse_scan_results(text, min_score=SCANNER_MIN_SCORE)
+    assert [r.symbol for r in out] == ["MID"]
+
+
+@pytest.mark.asyncio
+async def test_scanner_context_omits_raw_funding_rate():
+    """L-08: the raw funding rate is token ballast the prompt never reads —
+    only funding_extreme/funding_annualized (the actual tiebreaker inputs)
+    belong in the per-coin context sent to the LLM."""
+    from app.analysis.context import clear_daily_cache
+
+    clear_daily_cache()
+
+    class FakeClient:
+        async def klines(self, symbol, interval, limit_hint=120):
+            base = 100.0
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 900) * 1000,
+                    open=base, high=base + 1, low=base - 1, close=base + 0.5, vol=5,
+                )
+                for i in range(60)
+            ]
+
+    overview = [{"symbol": "NOFUND", "volume24": 1e9, "funding": 0.0005, "last": 100.5}]
+    contexts, errors = await build_scan_contexts(FakeClient(), overview, "15m", "1H")
+    assert errors == []
+    ctx = contexts[0]
+    assert "funding_rate" not in ctx
+    assert "funding_extreme" in ctx
+    assert "funding_annualized" in ctx
+
+
 @pytest.mark.asyncio
 async def test_build_scan_contexts_adds_funding_extreme_and_daily_regime():
     from app.analysis.context import clear_daily_cache
@@ -169,7 +209,7 @@ def test_scanner_prompt_carries_analyzer_non_negotiables():
     assert "No-chase" in p or "over-stretch" in p
     assert "RRR" in p
     assert "daily_stack" in p
-    assert "score >= 6" in p  # absolute bar raised from 5 -> 6
+    assert "score >= 5" in p  # L-02: floor decoupled from the against-daily cap (6)
 
 
 def test_scanner_prompt_treats_against_daily_as_cap_not_reject():
