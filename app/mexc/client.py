@@ -189,6 +189,10 @@ class MexcClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
+        # O-04: remembers which open_stop_orders candidate path last answered
+        # with a recognized schema, so the next call tries it first (fallback
+        # order is unchanged — this is purely an ordering hint).
+        self._stop_path_cache: str | None = None
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -542,15 +546,26 @@ class MexcClient:
         if symbol:
             params["symbol"] = symbol
         last_err: MexcError | None = None
-        for path in self._STOP_ORDER_PATHS:
+
+        # O-04: try the last-known-working path first (pure ordering hint —
+        # the fallback order over the remaining candidates is unchanged).
+        ordered_paths = list(self._STOP_ORDER_PATHS)
+        cached = self._stop_path_cache
+        if cached is not None and cached in ordered_paths:
+            ordered_paths.remove(cached)
+            ordered_paths.insert(0, cached)
+
+        for path in ordered_paths:
             try:
                 data = await self._request("GET", path, params=params, private=True)
             except MexcError as e:
                 last_err = e
                 continue
             if isinstance(data, dict) and "resultList" in data:
+                self._stop_path_cache = path
                 return list(data.get("resultList") or [])
             if isinstance(data, list):
+                self._stop_path_cache = path
                 return data
             # Unrecognized schema — do not trust as "no stop orders"; the
             # endpoint may be stale/deprecated. Keep trying other candidates.
@@ -581,47 +596,96 @@ class MexcClient:
         }
         return await self.place_order(body)
 
-    async def order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
-        """Lookup order by client externalOid (idempotency / timeout recovery).
+    # O-09: history fallback window — widened from the old page_size=20 and
+    # paged up to a cap, so a fill that lands past the first 20 rows (e.g.
+    # after other activity on the account) is still found.
+    _HISTORY_PAGE_SIZE = 100
+    _HISTORY_MAX_PAGES = 3
 
-        The dedicated external-oid endpoint is preferred. The history fallback
-        returns a full list, so it MUST be filtered by externalOid before it is
-        returned — otherwise timeout recovery could match an unrelated order and
-        wrongly treat a failed place as live.
-        """
-        # Path name varies slightly across doc revisions; try common form
-        try:
-            return await self._request(
-                "GET",
-                "/api/v1/private/order/external/" + external_oid,
-                params={"symbol": symbol},
-                private=True,
-            )
-        except MexcError:
-            data = await self._request(
-                "GET",
-                "/api/v1/private/order/list/history_orders",
-                params={
-                    "symbol": symbol,
-                    "page_num": 1,
-                    "page_size": 20,
-                },
-                private=True,
-            )
+    async def _history_row_by_external_oid(
+        self, symbol: str, external_oid: str
+    ) -> dict[str, Any] | None:
+        """Page through history_orders looking for external_oid. Fail-closed:
+        any request error just stops the scan (never raises) — the caller
+        still has the open_orders fallback."""
+        for page_num in range(1, self._HISTORY_MAX_PAGES + 1):
+            try:
+                data = await self._request(
+                    "GET",
+                    "/api/v1/private/order/list/history_orders",
+                    params={
+                        "symbol": symbol,
+                        "page_num": page_num,
+                        "page_size": self._HISTORY_PAGE_SIZE,
+                    },
+                    private=True,
+                )
+            except MexcError:
+                break
             if isinstance(data, dict) and "resultList" in data:
                 rows = data.get("resultList") or []
             elif isinstance(data, list):
                 rows = data
             else:
                 rows = [data] if data else []
-            matched = [
-                r
-                for r in rows
-                if isinstance(r, dict)
-                and str(r.get("externalOid") or r.get("external_oid") or "")
-                == str(external_oid)
-            ]
-            return matched
+            for r in rows:
+                if isinstance(r, dict) and str(
+                    r.get("externalOid") or r.get("external_oid") or ""
+                ) == str(external_oid):
+                    return r
+            if len(rows) < self._HISTORY_PAGE_SIZE:
+                break  # short page — no more data to page through
+        return None
+
+    async def order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
+        """Lookup order by client externalOid (idempotency / timeout recovery).
+
+        Tries, in order:
+        1. A guessed direct external-oid endpoint (path varies across MEXC
+           doc revisions — a 404 here is routine/expected and must NOT
+           propagate as an error; fall through to the fallbacks instead).
+        2. The history-orders list, widened + paged (see
+           `_history_row_by_external_oid`) — catches fills that a single
+           page_size=20 call could miss.
+        3. The open-orders list — catches an order that is live but not (yet)
+           in history.
+
+        Every match is tagged with a marker so a later reconciliation step
+        can tell WHERE the order was found:
+            {"match": "history"|"open", "externalOid": external_oid, "order": <raw>}
+        No match anywhere -> `{}` (fail-closed: never a fabricated match).
+        """
+        try:
+            direct = await self._request(
+                "GET",
+                "/api/v1/private/order/external/" + external_oid,
+                params={"symbol": symbol},
+                private=True,
+            )
+        except MexcError:
+            direct = None
+        # Fail-closed: only trust the direct answer if OUR oid actually appears
+        # in the raw payload — the wrapper below injects externalOid itself, so
+        # without this check a garbage/unrelated 2xx response would fabricate a
+        # "match" that the caller can no longer detect as bogus.
+        if direct and str(external_oid) in str(direct):
+            return {"match": "history", "externalOid": external_oid, "order": direct}
+
+        hist_row = await self._history_row_by_external_oid(symbol, external_oid)
+        if hist_row is not None:
+            return {"match": "history", "externalOid": external_oid, "order": hist_row}
+
+        try:
+            open_rows = await self.open_orders(symbol)
+        except MexcError:
+            open_rows = []
+        for r in open_rows:
+            if isinstance(r, dict) and str(
+                r.get("externalOid") or r.get("external_oid") or ""
+            ) == str(external_oid):
+                return {"match": "open", "externalOid": external_oid, "order": r}
+
+        return {}
 
 
 def _opt_float(v: Any) -> float | None:

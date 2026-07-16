@@ -986,7 +986,14 @@ async def test_order_by_external_oid_filters_history():
 
     c._request = fake_request  # type: ignore[assignment]
     out = await c.order_by_external_oid("BTC_USDT", "mine-123")
-    assert out == [{"orderId": 2, "externalOid": "mine-123"}]
+    # Task 4 (O-05/O-09): return shape is now a match-marker dict, not a bare
+    # list, so a later reconciliation step can tell history vs. open matches
+    # apart.
+    assert out == {
+        "match": "history",
+        "externalOid": "mine-123",
+        "order": {"orderId": 2, "externalOid": "mine-123"},
+    }
 
 
 @pytest.mark.asyncio
