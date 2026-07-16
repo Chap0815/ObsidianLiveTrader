@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import time
+from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 import httpx
@@ -68,6 +69,64 @@ def sorted_query(params: dict[str, Any] | None) -> str:
             continue
         items.append(f"{k}={quote(str(v), safe='')}")
     return "&".join(items)
+
+
+# Body keys that carry an absolute price and go straight into the signed
+# POST body — every one of them must be formatted decimal (never `e`
+# notation) before json.dumps, or a low-price coin (SHIB/PEPE-style
+# sub-cent price) can be rejected/misinterpreted by the exchange parser.
+_PRICE_FIELDS = (
+    "price",
+    "stopLossPrice",
+    "takeProfitPrice",
+    "takeProfitPrice2",
+    "triggerPrice",
+)
+
+# Fallback decimal places when no exchange priceScale/priceUnit is known for
+# the symbol. Generous enough to preserve any realistic contract price while
+# still guaranteeing a plain fixed-point string (trailing zeros are trimmed).
+_DEFAULT_PRICE_DECIMALS = 8
+
+
+def _fmt_price(v: Any, scale: int | None = None) -> str:
+    """Format a price as a fixed-point decimal string, never scientific notation.
+
+    The MEXC POST signature is computed over the raw JSON text of the body
+    (see module docstring), and Python's default float formatting switches
+    to scientific notation for small magnitudes (``json.dumps(0.00002)`` ->
+    ``"2e-05"``). That is still a *consistent* string for signing purposes,
+    but MEXC's exchange-side JSON parser can reject or misread it for
+    low-price coins. Converting the value to a quoted decimal string before
+    ``json.dumps`` keeps the exact same sign-then-send flow (the string
+    itself is what gets signed) while guaranteeing the wire format MEXC
+    expects.
+
+    ``scale`` is the number of decimal places to keep, normally the
+    contract's ``priceScale`` (or one derived from ``priceUnit``); when
+    unknown, a conservative fixed fallback is used instead.
+    """
+    d = Decimal(str(v))
+    decimals = scale if scale is not None else _DEFAULT_PRICE_DECIMALS
+    if decimals < 0:
+        decimals = 0
+    quant = Decimal(1).scaleb(-decimals)
+    d = d.quantize(quant, rounding=ROUND_DOWN)
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _format_price_fields(body: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``body`` with every known price key formatted via
+    :func:`_fmt_price`. Non-price keys (vol, leverage, side, ...) are left
+    untouched so they stay bare JSON numbers."""
+    out = dict(body)
+    for key in _PRICE_FIELDS:
+        if key in out and out[key] is not None:
+            out[key] = _fmt_price(out[key])
+    return out
 
 
 def _to_ms(ts: int | float) -> int:
@@ -149,7 +208,10 @@ class MexcClient:
         if method_u in ("GET", "DELETE"):
             param_string = sorted_query(params)
         elif json_body is not None:
-            content = json.dumps(json_body, separators=(",", ":"))
+            body_to_send: Any = json_body
+            if isinstance(json_body, dict):
+                body_to_send = _format_price_fields(json_body)
+            content = json.dumps(body_to_send, separators=(",", ":"))
             param_string = content
 
         if private:
