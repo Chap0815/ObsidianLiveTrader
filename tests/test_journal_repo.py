@@ -163,6 +163,80 @@ async def test_stats_counts_and_groups(db_path):
 
 
 @pytest.mark.asyncio
+async def test_journal_stats_single_status_groupby(db_path):
+    """Q-04: the collapsed GROUP BY status must be bit-identical to the old
+    seven-COUNT implementation across a mix of every status + STAY_OUT."""
+    db = Database(db_path)
+    await db.init()
+    w = await db.insert_journal_entry(**_base_kwargs(setup_confidence="high"))
+    l = await db.insert_journal_entry(
+        **_base_kwargs(setup_confidence="low", direction="short", action="SELL")
+    )
+    e = await db.insert_journal_entry(**_base_kwargs(setup_confidence="mid"))
+    await db.insert_journal_entry(**_base_kwargs())  # stays PENDING
+    await db.insert_journal_entry(
+        **_base_kwargs(action="STAY_OUT", direction=None, entry_price=None,
+                       stop_loss=None, tp1=None, rrr=None, status="SKIPPED")
+    )
+    await db.update_journal_outcome(w, status="WIN", realized_r=2.0)
+    await db.update_journal_outcome(l, status="LOSS", realized_r=-1.0)
+    await db.update_journal_outcome(e, status="EXPIRED")
+
+    stats = await db.journal_stats()
+    # one row in each of the five statuses; STAY_OUT overlaps the SKIPPED row
+    assert stats["total"] == 5
+    assert stats["pending"] == 1
+    assert stats["wins"] == 1
+    assert stats["losses"] == 1
+    assert stats["expired"] == 1
+    assert stats["skipped"] == 1
+    assert stats["stay_out"] == 1  # via action, independent of status buckets
+    # total is exactly the sum of the mutually-exclusive status groups
+    assert stats["total"] == (
+        stats["pending"] + stats["wins"] + stats["losses"]
+        + stats["expired"] + stats["skipped"]
+    )
+    assert stats["overall_sum_r"] == pytest.approx(2.0 - 1.0)
+    assert stats["by_confidence"]["high"]["wins"] == 1
+    assert stats["by_confidence"]["low"]["losses"] == 1
+
+
+@pytest.mark.asyncio
+async def test_db_shared_connection_reused(db_path):
+    """Q-03: after open() the same aiosqlite connection is reused for every
+    operation (no per-call reconnect), and close() restores lazy fallback."""
+    db = Database(db_path)
+    await db.init()
+    await db.open()
+
+    calls = {"n": 0}
+    orig_connect = db._connect
+
+    def counting_connect():
+        calls["n"] += 1
+        return orig_connect()
+
+    db._connect = counting_connect
+    shared = db._shared
+    assert shared is not None
+
+    await db.insert_journal_entry(**_base_kwargs())
+    await db.recent_journal()
+    await db.journal_stats()
+    await db.pending_journal_entries()
+    # No fresh connection opened while the shared one is live.
+    assert calls["n"] == 0
+    assert db._shared is shared
+
+    await db.close()
+    assert db._shared is None
+    # Lazy fallback: methods still work by opening a per-call connection.
+    rows = await db.recent_journal()
+    assert len(rows) == 1
+    assert calls["n"] >= 1
+
+
+@pytest.mark.asyncio
 async def test_init_idempotent_and_indexes(db_path):
     db = Database(db_path)
     await db.init()

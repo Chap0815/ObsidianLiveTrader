@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,13 +43,67 @@ def _loads(raw: str | None) -> Any:
 
 
 class Database:
+    # ── Connection lifecycle (Q-03) ──────────────────────────────────────
+    # ONE long-lived aiosqlite connection is held on the instance for the
+    # lifetime of the process (opened in lifespan after init(), closed on
+    # shutdown). The single-worker invariant (see main.lifespan / F-16) means
+    # exactly one process + one event loop touches this DB, so a single shared
+    # connection is safe: aiosqlite serializes every command onto that
+    # connection's own background thread, so the request handlers AND the
+    # background journal resolver funnel through one writer — WAL single-writer
+    # semantics are preserved, not weakened.
+    #
+    # LAZY FALLBACK (important): the shared connection is OPTIONAL. Every method
+    # goes through `_acquire()`, which yields the shared connection when one is
+    # open and otherwise opens a throwaway per-call connection (the old
+    # behaviour). This keeps the dozens of tests that build a Database and call
+    # methods directly — WITHOUT open()/lifespan — working unchanged, and keeps
+    # init() (which runs before open()) self-contained.
+
     def __init__(self, db_path: str):
         self.path = _resolve_path(db_path)
+        self._shared: aiosqlite.Connection | None = None
 
     def _connect(self):
         # timeout is sqlite3's busy handler window (seconds): wait for a
         # concurrent writer instead of raising "database is locked" at once.
         return aiosqlite.connect(str(self.path), timeout=30.0)
+
+    async def open(self) -> None:
+        """Open the long-lived shared connection. Called once from lifespan
+        AFTER init(). Idempotent; safe to call when already open."""
+        if self._shared is not None:
+            return
+        conn = await self._connect()
+        # Match init()'s per-connection pragma (WAL itself is a persistent DB
+        # property, but busy_timeout is per-connection).
+        await conn.execute("PRAGMA busy_timeout=30000;")
+        self._shared = conn
+
+    async def close(self) -> None:
+        """Close the shared connection (called from lifespan on shutdown).
+        After this, methods fall back to per-call connections again."""
+        conn, self._shared = self._shared, None
+        if conn is not None:
+            await conn.close()
+
+    @asynccontextmanager
+    async def _acquire(self):
+        """Yield the shared connection if open, else a throwaway per-call one.
+
+        The shared connection is NEVER closed here (its lifecycle is open/close);
+        the fallback path opens and closes a fresh connection exactly like the
+        original per-call implementation. row_factory is set per query by the
+        callers that need aiosqlite.Row — writers rely only on cursor.lastrowid
+        / .rowcount, which are row_factory-independent, so a factory left over
+        on the shared connection from a prior read is harmless.
+        """
+        shared = self._shared
+        if shared is not None:
+            yield shared
+        else:
+            async with self._connect() as conn:
+                yield conn
 
     async def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,7 +122,7 @@ class Database:
         annotations_json: Any | None = None,
         context_hash: str | None = None,
     ) -> int:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             cur = await conn.execute(
                 """
                 INSERT INTO proposals
@@ -93,7 +148,7 @@ class Database:
         expires_at: str,
     ) -> None:
         payload = _dumps(payload_json) or "{}"
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO order_previews
@@ -105,7 +160,7 @@ class Database:
             await conn.commit()
 
     async def mark_preview_used(self, token_hash: str) -> None:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 """
                 UPDATE order_previews
@@ -126,7 +181,7 @@ class Database:
         status: str,
         error: str | None,
     ) -> int:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             cur = await conn.execute(
                 """
                 INSERT INTO orders
@@ -147,7 +202,7 @@ class Database:
             return int(cur.lastrowid or 0)
 
     async def recent_proposals(self, limit: int = 20) -> list[dict[str, Any]]:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
@@ -168,7 +223,7 @@ class Database:
             return out
 
     async def recent_orders(self, limit: int = 20) -> list[dict[str, Any]]:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
@@ -230,7 +285,7 @@ class Database:
         proposal_id: int | None = None,
         created_at: str | None = None,
     ) -> int:
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             cur = await conn.execute(
                 """
                 INSERT INTO journal_entries
@@ -265,7 +320,7 @@ class Database:
 
     async def pending_journal_entries(self) -> list[dict[str, Any]]:
         """All rows still PENDING (the resolver's work queue), oldest first."""
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
@@ -294,7 +349,7 @@ class Database:
         Guarded by `status='PENDING'` in the WHERE clause so the resolver is
         idempotent: a row that already resolved is never revisited/overwritten.
         """
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 """
                 UPDATE journal_entries
@@ -316,7 +371,7 @@ class Database:
 
     async def touch_journal_checked(self, entry_id: int) -> None:
         """Record a resolver pass that left the row PENDING (debug/backoff)."""
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE journal_entries SET last_checked_at = ? WHERE id = ?",
                 (_utc_now_iso(), entry_id),
@@ -325,7 +380,7 @@ class Database:
 
     async def recent_journal(self, limit: int = 50) -> list[dict[str, Any]]:
         """Recent journal entries, newest first (read-only UI/endpoint feed)."""
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
@@ -349,7 +404,7 @@ class Database:
         the Wilson CI / rate math lives in the endpoint helper (pure Python,
         unit-tested) so this stays a thin SQL layer.
         """
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
 
             async def _scalar(sql: str, params: tuple = ()) -> int:
@@ -357,24 +412,29 @@ class Database:
                 row = await cur.fetchone()
                 return int((row[0] if row and row[0] is not None else 0))
 
-            total = await _scalar("SELECT COUNT(*) FROM journal_entries")
+            # Q-04: one GROUP BY status instead of seven separate COUNT(*)
+            # scans. `total` is the sum of the (mutually-exclusive) status
+            # buckets — identical to the old standalone COUNT(*). Statuses
+            # absent from the table simply have no row, so .get(..., 0) yields
+            # the same 0 the old per-status COUNT returned. `stay_out` stays a
+            # separate scan because it keys off `action`, which is orthogonal
+            # to `status` (a STAY_OUT row is typically also SKIPPED — the two
+            # counts intentionally overlap, exactly as before).
+            cur = await conn.execute(
+                "SELECT status, COUNT(*) AS n FROM journal_entries GROUP BY status"
+            )
+            status_counts: dict[str, int] = {}
+            for r in await cur.fetchall():
+                status_counts[str(r["status"])] = int(r["n"] or 0)
+
+            pending = status_counts.get("PENDING", 0)
+            expired = status_counts.get("EXPIRED", 0)
+            skipped = status_counts.get("SKIPPED", 0)
+            wins = status_counts.get("WIN", 0)
+            losses = status_counts.get("LOSS", 0)
+            total = sum(status_counts.values())
             stay_out = await _scalar(
                 "SELECT COUNT(*) FROM journal_entries WHERE action = 'STAY_OUT'"
-            )
-            pending = await _scalar(
-                "SELECT COUNT(*) FROM journal_entries WHERE status = 'PENDING'"
-            )
-            expired = await _scalar(
-                "SELECT COUNT(*) FROM journal_entries WHERE status = 'EXPIRED'"
-            )
-            skipped = await _scalar(
-                "SELECT COUNT(*) FROM journal_entries WHERE status = 'SKIPPED'"
-            )
-            wins = await _scalar(
-                "SELECT COUNT(*) FROM journal_entries WHERE status = 'WIN'"
-            )
-            losses = await _scalar(
-                "SELECT COUNT(*) FROM journal_entries WHERE status = 'LOSS'"
             )
 
             async def _groups(column: str) -> dict[str, dict[str, float]]:
@@ -435,7 +495,7 @@ class Database:
     async def clear_journal(self) -> int:
         """Delete all journal_entries. Separate from clear_history on purpose
         (the journal is the measurement dataset and survives history-clear)."""
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             cur = await conn.execute("DELETE FROM journal_entries")
             deleted = cur.rowcount if cur.rowcount is not None else 0
             await conn.commit()
@@ -447,7 +507,7 @@ class Database:
         Does NOT touch order_previews (short-lived one-time confirm tokens,
         not audit history) or any other table.
         """
-        async with self._connect() as conn:
+        async with self._acquire() as conn:
             cur = await conn.execute("DELETE FROM proposals")
             proposals_deleted = cur.rowcount if cur.rowcount is not None else 0
             cur = await conn.execute("DELETE FROM orders")

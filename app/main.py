@@ -239,7 +239,13 @@ async def lifespan(app: FastAPI):
     # Staleness-Reclaim-Heilung beim naechsten Start.
     try:
         await db.init()
+        # Q-03: open the long-lived shared aiosqlite connection AFTER init and
+        # under the same lock-release guard. Single-worker invariant makes one
+        # shared connection safe; methods fall back to per-call connections if
+        # this is ever skipped (see Database._acquire). Closed in the finally.
+        await db.open()
     except BaseException:
+        await db.close()
         if instance_lock_path is not None:
             _release_instance_lock(instance_lock_path)
         raise
@@ -318,6 +324,8 @@ async def lifespan(app: FastAPI):
         aclose = getattr(client, "aclose", None)
         if aclose:
             await aclose()
+        # Q-03: close the shared DB connection opened above.
+        await db.close()
         if instance_lock_path is not None:
             _release_instance_lock(instance_lock_path)
 
