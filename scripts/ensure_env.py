@@ -89,6 +89,16 @@ def ensure_env(*, merge: bool = True, auto_token: bool = True) -> dict[str, str]
                 ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8", newline="\n")
                 current = _parse_env(_read(ENV_PATH))
 
+    # B-08: .env traegt echte Secrets (auto-generierter LOCAL_API_TOKEN) —
+    # ACL wie bei allen anderen Schreibpfaden verengen (best-effort).
+    try:
+        sys.path.insert(0, str(ROOT))
+        from app.env_builder import restrict_env_permissions
+
+        restrict_env_permissions(ENV_PATH)
+    except Exception:
+        pass
+
     # Status (never print secret values)
     current = _parse_env(_read(ENV_PATH))
     checks = [
