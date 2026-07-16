@@ -542,6 +542,11 @@ async def setup_save(request: Request, body: dict):
     # Validate by parsing before it becomes the real .env
     tmp = ENV_PATH.with_name(".env.setup-tmp")
     tmp.write_text(content, encoding="utf-8")
+    # B-08: schon die tmp-Datei traegt Secrets — Rechte VOR dem Validieren
+    # einschraenken, dann atomar ersetzen (replace erhaelt die ACL der Quelle).
+    from app.env_builder import restrict_env_permissions
+
+    restrict_env_permissions(tmp)
     try:
         Settings(_env_file=str(tmp))
     except Exception as e:
@@ -550,6 +555,7 @@ async def setup_save(request: Request, body: dict):
     import os as _os
 
     _os.replace(tmp, ENV_PATH)
+    restrict_env_permissions(ENV_PATH)
 
     # Hot-apply: fresh settings + fresh exchange client, no restart needed
     get_settings.cache_clear()
