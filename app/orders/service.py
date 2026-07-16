@@ -16,6 +16,7 @@ from app.hyperliquid.errors import HyperliquidError
 from app.mexc.client import MexcClient, map_position, usdt_balances
 from app.mexc.errors import MexcError
 from app.models import ContractMeta, OrderTicket
+from app.orders.protection import classify_order_label
 from app.orders.tokens import PreviewStore, TokenError
 from app.risk.gates import GateResult, validate_order
 from app.risk.sizing import round_down_to_unit, round_trigger_to_unit
@@ -609,7 +610,13 @@ class OrderService:
                     kind = str(
                         s.get("orderType") or s.get("tpsl") or s.get("type") or ""
                     ).lower()
-                    if "take" in kind or kind in ("tp", "take_profit", "take-profit"):
+                    # Shared backend classifier (Q-05): the SAME SL/TP label rule
+                    # the reevaluate extractor uses, so the two money-path sites
+                    # cannot drift. `classify_order_label` returns 'tp' only on an
+                    # unambiguous take-profit marker (never bare "tpsl"), keeping
+                    # this verifier bit-identical to its prior inline rule.
+                    label = classify_order_label(kind)
+                    if label == "tp":
                         continue
                     for key in (
                         "stopLossPrice",
@@ -624,7 +631,7 @@ class OrderService:
                         # A bare triggerPrice can be a TP; only accept it as SL
                         # proof when the order kind is SL-ish (or unmarked/plan).
                         if key.startswith("trigger") and not (
-                            "stop" in kind or "sl" in kind or kind in ("", "plan")
+                            label == "sl" or kind in ("", "plan")
                         ):
                             continue
                         # A stop object that actually carries an SL-ish field is

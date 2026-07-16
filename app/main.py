@@ -45,6 +45,7 @@ from app.models import (
     OrderTicket,
     ReevaluateRequest,
 )
+from app.orders.protection import classify_protection
 from app.orders.service import OrderError, OrderService, estimate_same_side_risk_usdt
 from app.orders.tokens import PreviewStore
 from app.risk.sizing import suggest_vol
@@ -1386,82 +1387,17 @@ async def analyze(
         return await _run_analyze()
 
 
-def _classify_unlabeled_trigger(
-    trigger_price: float, side: str | None, entry_price: float | None
-) -> str | None:
-    """Classify an unlabeled trigger order as 'sl' or 'tp' by position side +
-    entry: a stop sits on the loss side of entry, a take-profit on the profit
-    side. Returns None ("unknown") when side/entry aren't known or the
-    trigger sits exactly on entry — callers must NEVER default to SL in that
-    case (F-12: a fabricated SL can mask an actually-unprotected position)."""
-    side_n = (side or "").strip().lower()
-    if side_n not in ("long", "short"):
-        return None
-    try:
-        entry = float(entry_price)
-    except (TypeError, ValueError):
-        return None
-    if entry <= 0:
-        return None
-    if trigger_price == entry:
-        return None
-    if side_n == "long":
-        return "sl" if trigger_price < entry else "tp"
-    return "sl" if trigger_price > entry else "tp"
-
-
 def _extract_position_sl_tp(
     stops: list[dict], *, side: str | None = None, entry_price: float | None = None
 ) -> tuple[float | None, float | None]:
     """Best-effort current SL/TP from open trigger orders for one symbol.
 
-    Mirrors the frontend's `findPositionProtection` heuristic (app.js): an
-    explicit stopLossPrice/takeProfitPrice field wins; otherwise fall back to
-    triggerPrice/price + an orderType label. An unlabeled trigger is
-    classified by position side + entry (loss side = SL, profit side = TP);
-    if that can't be determined it counts as neither (unknown), never a
-    fabricated SL. Read-only — never places/cancels anything.
+    Thin wrapper over the shared backend classifier
+    (`app.orders.protection.classify_protection`) — the single source of truth
+    both this reevaluate path and the auto-flatten verifier
+    (`OrderService._verify_sl_attached`) share (Q-05). Read-only.
     """
-    sl: float | None = None
-    tp: float | None = None
-    for row in stops or []:
-        try:
-            sl_field = float(row.get("stopLossPrice"))
-        except (TypeError, ValueError):
-            sl_field = None
-        if sl_field and sl_field > 0:
-            sl = sl_field
-            continue
-        try:
-            tp_field = float(row.get("takeProfitPrice"))
-        except (TypeError, ValueError):
-            tp_field = None
-        if tp_field and tp_field > 0:
-            tp = tp_field
-            continue
-        raw_trg = row.get("triggerPrice")
-        if raw_trg is None:
-            raw_trg = row.get("price")
-        try:
-            trg = float(raw_trg)
-        except (TypeError, ValueError):
-            trg = None
-        if not trg or trg <= 0:
-            continue
-        label = str(row.get("orderType") or "").lower()
-        if label.startswith("tp") or "take" in label:
-            tp = trg
-        elif label.startswith("sl") or "stop" in label:
-            sl = trg
-        else:
-            # Unlabeled trigger: never assume SL. Classify by side + entry;
-            # if that's not resolvable, it's unknown protection (neither).
-            kind = _classify_unlabeled_trigger(trg, side, entry_price)
-            if kind == "sl":
-                sl = trg
-            elif kind == "tp":
-                tp = trg
-    return sl, tp
+    return classify_protection(stops, side=side, entry=entry_price)
 
 
 @app.post("/api/reevaluate")
