@@ -162,12 +162,27 @@ def test_prompt_has_single_decision_block():
     assert "DECISION — action vs STAY_OUT" in p
 
 
-def test_prompt_submin_rrr_is_a_veto_not_a_low_confidence_factor():
+def test_prompt_submin_rrr_no_longer_forces_stay_out():
     p = build_system_prompt()
-    # sub-min-RRR must map to STAY_OUT, never to "trade it at low"
-    assert "rrr < risk_policy.min_rrr" in p
     # the old contradictory low-confidence trigger (c) is gone
     assert "the achievable rrr is below" not in p
+    # the old absolute "sub-min-RRR is a veto" framing is gone (L-01)
+    assert "sub-min-RRR is a veto" not in p
+
+
+def test_prompt_rrr_is_confidence_cap_not_veto():
+    p = build_system_prompt()
+    # only the 1.2 floor is a hard veto now
+    assert "rrr < 1.2" in p
+    # the 1.2..min_rrr band is a confidence cap, not a veto
+    assert "is NOT a veto" in p
+
+
+def test_prompt_confluence_counts_consistent():
+    p = build_system_prompt()
+    assert ">= 1 for BUY/SELL" in p
+    assert ">= 2 for STRONG_*" in p
+    assert ">= 2 for BUY" not in p
 
 
 def test_prompt_strong_action_requires_medium_confidence():
