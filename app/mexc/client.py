@@ -652,7 +652,9 @@ class MexcClient:
 
         Every match is tagged with a marker so a later reconciliation step
         can tell WHERE the order was found:
-            {"match": "history"|"open", "externalOid": external_oid, "order": <raw>}
+            {"match": "direct"|"history"|"open", "externalOid": external_oid, "order": <raw>}
+        ("direct" = guessed direct-lookup endpoint — weaker, substring-based
+        evidence than the paged/field-filtered history list.)
         No match anywhere -> `{}` (fail-closed: never a fabricated match).
         """
         try:
@@ -669,7 +671,7 @@ class MexcClient:
         # without this check a garbage/unrelated 2xx response would fabricate a
         # "match" that the caller can no longer detect as bogus.
         if direct and str(external_oid) in str(direct):
-            return {"match": "history", "externalOid": external_oid, "order": direct}
+            return {"match": "direct", "externalOid": external_oid, "order": direct}
 
         hist_row = await self._history_row_by_external_oid(symbol, external_oid)
         if hist_row is not None:
