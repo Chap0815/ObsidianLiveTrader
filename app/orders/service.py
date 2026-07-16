@@ -249,7 +249,12 @@ def _recovery_is_match(recovered: Any, external_oid: str) -> bool:
     if not recovered:
         return False
     if isinstance(recovered, dict) and recovered.get("match"):
-        return True
+        # Defense-in-depth: ein Marker mit FALSCHER externalOid (Client-Bug /
+        # stale Cache) darf keine fremde Order als "recovered" ausgeben.
+        # Valide Marker setzen externalOid=oid per Konstruktion; None bleibt
+        # erlaubt (Marker-Shapes ohne das Feld).
+        marker_oid = recovered.get("externalOid")
+        return marker_oid is None or str(marker_oid) == str(external_oid)
     return str(external_oid) in str(recovered)
 
 
