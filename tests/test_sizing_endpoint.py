@@ -262,3 +262,47 @@ def test_sizing_suggest_clamped_by_existing_same_side_risk(monkeypatch):
 
     new_risk = body["vol"] * CONTRACT_SIZE * abs(ENTRY - STOP)
     assert new_risk + existing_risk_usdt <= EQUITY * 0.02 + 1e-6
+
+
+def test_sizing_suggest_missing_liq_non_strict_no_400(monkeypatch):
+    """R-01: a same-side position without liquidate_price must NOT hard-block
+    sizing when strict_aggregate_risk is off (the default). A conservative
+    fallback risk + a warning is used instead of a 400.
+    """
+    existing_position = {
+        "symbol": "BTC_USDT",
+        "side": "long",
+        "hold_vol": 2,
+        "entry_price": ENTRY,
+        "liquidate_price": None,  # missing → used to be a hard 400
+    }
+    mock = _mock_client(positions=[existing_position])
+    r = _post(monkeypatch, {"risk_pct": 2.0}, max_risk_pct=10.0, mock=mock)
+    assert r.status_code == 200
+    body = r.json()
+    # Fallback exposure is applied (not silently 0) …
+    assert body["existing_same_side_risk_usdt"] > 0
+    # … and the user is warned about the fallback.
+    assert any("liquidate_price" in w for w in body.get("warnings", []))
+
+
+def test_sizing_suggest_missing_liq_strict_still_400(monkeypatch):
+    """R-01: with strict_aggregate_risk=True the fail-closed behaviour is kept
+    — a missing liquidate_price still yields a 400.
+    """
+    existing_position = {
+        "symbol": "BTC_USDT",
+        "side": "long",
+        "hold_vol": 2,
+        "entry_price": ENTRY,
+        "liquidate_price": None,
+    }
+    mock = _mock_client(positions=[existing_position])
+    r = _post(
+        monkeypatch,
+        {"risk_pct": 2.0},
+        max_risk_pct=10.0,
+        mock=mock,
+        settings_kwargs={"strict_aggregate_risk": True},
+    )
+    assert r.status_code == 400

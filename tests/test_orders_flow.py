@@ -363,11 +363,15 @@ def test_estimate_same_side_risk_aggregates_multiple():
         {"symbol": "ETH_USDT", "side": "long", "hold_vol": 9.0,
          "entry_price": 100.0, "liquidate_price": 90.0},   # other symbol ignored
     ]
-    total = estimate_same_side_risk_usdt(
-        positions, symbol="BTC_USDT", side="long", contract_size=1.0
+    # pos_risk_cap_pct high enough that the liq-distance cap never binds, so
+    # this stays a pure aggregation test.
+    total, warnings = estimate_same_side_risk_usdt(
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+        strict=False, pos_risk_cap_pct=100.0,
     )
     # |100-90|*1*2 + |100-80|*1*1 = 20 + 20 = 40
     assert total == pytest.approx(40.0)
+    assert warnings == []
 
 
 def test_estimate_same_side_risk_fail_closed_without_liq():
@@ -379,7 +383,76 @@ def test_estimate_same_side_risk_fail_closed_without_liq():
     ]
     with pytest.raises(ValueError):
         estimate_same_side_risk_usdt(
-            positions, symbol="BTC_USDT", side="long", contract_size=1.0
+            positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+            strict=True, pos_risk_cap_pct=2.0,
+        )
+
+
+# ── T8 (R-01): SL-distance / cap / non-strict fallback ──────────────────────
+
+
+def test_aggregate_uses_sl_distance_when_present():
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    # SL is much nearer than liq → risk must come from SL distance, not liq.
+    positions = [
+        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 2.0,
+         "entry_price": 100.0, "liquidate_price": 90.0, "stop_loss": 95.0},
+    ]
+    total, warnings = estimate_same_side_risk_usdt(
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+        strict=False, pos_risk_cap_pct=100.0,
+    )
+    # |100-95|*1*2 = 10  (liq distance would have been |100-90|*1*2 = 20)
+    assert total == pytest.approx(10.0)
+    assert warnings == []
+
+
+def test_aggregate_caps_liq_distance():
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    # No SL, very wide liq distance → capped at entry * cap_pct/100.
+    positions = [
+        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
+         "entry_price": 100.0, "liquidate_price": 50.0},
+    ]
+    total, warnings = estimate_same_side_risk_usdt(
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+        strict=False, pos_risk_cap_pct=2.0,
+    )
+    # min(|100-50|=50, 100*2/100=2) * 1 * 1 = 2
+    assert total == pytest.approx(2.0)
+    assert warnings == []
+
+
+def test_missing_liq_non_strict_warns_not_raises():
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    positions = [
+        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
+         "entry_price": 100.0, "liquidate_price": None},
+    ]
+    total, warnings = estimate_same_side_risk_usdt(
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+        strict=False, pos_risk_cap_pct=2.0,
+    )
+    # fallback = 100 * 2/100 * 1 * 1 = 2
+    assert total == pytest.approx(2.0)
+    assert len(warnings) == 1
+    assert "liquidate_price" in warnings[0]
+
+
+def test_missing_liq_strict_still_raises():
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    positions = [
+        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
+         "entry_price": 100.0, "liquidate_price": None},
+    ]
+    with pytest.raises(ValueError):
+        estimate_same_side_risk_usdt(
+            positions, symbol="BTC_USDT", side="long", contract_size=1.0,
+            strict=True, pos_risk_cap_pct=2.0,
         )
 
 

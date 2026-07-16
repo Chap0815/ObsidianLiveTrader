@@ -571,26 +571,45 @@ async def test_mexc_resting_limit_external_hold_bump_not_silently_verified():
     client.cancel_order.assert_not_awaited()
 
 
+def _pos_without_liq():
+    return [
+        {
+            "symbol": "BTC_USDT",
+            "positionType": 1,
+            "holdVol": 10.0,
+            "holdAvgPrice": 100_000.0,
+            # no liquidatePrice
+        }
+    ]
+
+
 @pytest.mark.asyncio
-async def test_same_side_without_liq_price_blocks_preview():
-    """Open same-side without liquidate_price must fail-closed (not risk=0)."""
+async def test_same_side_without_liq_price_blocks_preview_strict():
+    """R-01: with STRICT_AGGREGATE_RISK the missing liq price is fail-closed
+    (not risk=0) — preview is blocked exactly like before.
+    """
     client = _happy_client({"orderId": 1})
-    client.positions = AsyncMock(
-        return_value=[
-            {
-                "symbol": "BTC_USDT",
-                "positionType": 1,
-                "holdVol": 10.0,
-                "holdAvgPrice": 100_000.0,
-                # no liquidatePrice
-            }
-        ]
-    )
-    svc = OrderService(client, _settings(), PreviewStore())
+    client.positions = AsyncMock(return_value=_pos_without_liq())
+    svc = OrderService(client, _settings(strict_aggregate_risk=True), PreviewStore())
     prev = await svc.preview(_ticket())
     assert prev["ok"] is False
     assert prev["token"] is None
     assert any("liquidate" in e.lower() or "aggregate" in e.lower() for e in prev["errors"])
+
+
+@pytest.mark.asyncio
+async def test_same_side_without_liq_price_warns_preview_non_strict():
+    """R-01: default (non-strict) no longer hard-blocks on a missing liq price
+    — a conservative fallback risk + a warning is used so add-on/second
+    positions are not falsely blocked.
+    """
+    client = _happy_client({"orderId": 1})
+    client.positions = AsyncMock(return_value=_pos_without_liq())
+    svc = OrderService(client, _settings(), PreviewStore())  # strict False by default
+    prev = await svc.preview(_ticket())
+    assert prev["ok"] is True, prev.get("errors")
+    assert any("liquidate_price" in w for w in prev["warnings"])
+    assert prev["summary"]["existing_same_side_risk_usdt"] > 0
 
 
 @pytest.mark.asyncio

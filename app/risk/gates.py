@@ -55,6 +55,7 @@ def validate_order(
     last_price: float | None = None,
     for_confirm: bool = False,
     existing_same_side_risk_usdt: float = 0.0,
+    existing_same_side_warnings: list[str] | None = None,
     available_usdt: float | None = None,
     preview_last_price: float | None = None,
 ) -> GateResult:
@@ -287,8 +288,13 @@ def validate_order(
                 warnings.append(
                     f"includes existing same-side risk ~"
                     f"{existing_same_side_risk_usdt:.4f} USDT "
-                    "(conservative estimate from liquidation distance, not SL)"
+                    "(loss to each position's stop where known, else "
+                    "capped liquidation distance)"
                 )
+            # Surface any per-position fallback notes (e.g. missing liq price
+            # in non-strict mode) authored by estimate_same_side_risk_usdt.
+            if existing_same_side_warnings:
+                warnings.extend(existing_same_side_warnings)
             # Defense-in-depth: config.py already rejects non-finite
             # max_risk_pct, but guard here too so a NaN/Infinity that
             # somehow slips through can't silently fail this gate open

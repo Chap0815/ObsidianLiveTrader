@@ -6,6 +6,7 @@ No place without unused, unexpired preview token AND TRADING_ENABLED=true.
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -102,19 +103,51 @@ def _utc_now_iso_from_ts(ts: float) -> str:
     )
 
 
+def _position_sl_price(p: dict[str, Any]) -> float | None:
+    """Own stop-loss of an open position, if it carries one (R-01).
+
+    Position rows from different adapters/lookups may expose the SL under
+    different keys; take the first finite, positive value.
+    """
+    for key in ("stop_loss", "sl_price", "sl", "stopLossPrice", "stop_price"):
+        v = _coerce_float(p.get(key))
+        if v is not None and math.isfinite(v) and v > 0:
+            return v
+    return None
+
+
 def estimate_same_side_risk_usdt(
     positions: list[dict[str, Any]],
     *,
     symbol: str,
     side: str,
     contract_size: float,
-) -> float:
-    """Rough open same-side risk using entry vs liquidate_price if present.
+    strict: bool = True,
+    pos_risk_cap_pct: float = 2.0,
+) -> tuple[float, list[str]]:
+    """Open same-side risk (USDT), realistic per R-01.
 
-    Fail-closed: an open same-side position without a usable liquidate_price
-    raises ValueError — treating unknown exposure as 0 would understate MAX_RISK_PCT.
+    Per position, prefer the loss to its OWN stop-loss when present
+    (``abs(entry - sl) * contract_size * vol``) — the loss-to-liquidation
+    over-states risk massively and used to starve the aggregate MAX_RISK_PCT
+    budget so nearly every add-on/second position got blocked. Without an SL,
+    fall back to the liquidation distance but cap it at ``entry *
+    pos_risk_cap_pct/100`` so an extremely wide liq can't dominate the budget.
+
+    Missing ``liquidate_price``:
+      * ``strict=False`` (default wiring): use a conservative fallback
+        (``entry * pos_risk_cap_pct/100 * contract_size * vol``) and return a
+        warning instead of hard-blocking every same-side trade.
+      * ``strict=True``: fail-closed — raise ValueError (unknown exposure must
+        never be treated as 0, which would understate MAX_RISK_PCT).
+
+    Returns ``(total_risk_usdt, warnings)``. The function authors the warning
+    itself because only it knows which position (symbol/side) triggered the
+    fallback; call-sites just surface the returned messages.
     """
     total = 0.0
+    warnings: list[str] = []
+    cap_frac = max(0.0, pos_risk_cap_pct) / 100.0
     for raw in positions:
         p = raw if "hold_vol" in raw else map_position(raw)
         if str(p.get("symbol") or "").upper() != symbol.upper():
@@ -123,17 +156,32 @@ def estimate_same_side_risk_usdt(
             continue
         vol = float(p.get("hold_vol") or 0)
         entry = float(p.get("entry_price") or 0)
-        liq = p.get("liquidate_price")
         if vol <= 0 or entry <= 0 or contract_size <= 0:
             continue
+        sl = _position_sl_price(p)
+        if sl is not None:
+            # Loss to this position's own stop — the realistic exposure.
+            total += abs(entry - sl) * contract_size * vol
+            continue
+        liq = p.get("liquidate_price")
         if liq is not None and float(liq) > 0:
-            total += abs(entry - float(liq)) * contract_size * vol
-        else:
+            dist = min(abs(entry - float(liq)), entry * cap_frac)
+            total += dist * contract_size * vol
+        elif strict:
             raise ValueError(
                 f"open {side} position on {symbol} has no liquidate_price — "
                 "cannot enforce aggregate MAX_RISK_PCT (close or wait for liq data)"
             )
-    return total
+        else:
+            # Non-strict: conservative fallback + warning instead of a block.
+            total += entry * cap_frac * contract_size * vol
+            warnings.append(
+                f"open {side} position on {symbol} has no liquidate_price — "
+                f"using conservative fallback risk (~{pos_risk_cap_pct:.2f}% "
+                "of entry notional); set a stop or enable STRICT_AGGREGATE_RISK "
+                "to hard-block instead."
+            )
+    return total, warnings
 
 
 def _coerce_float(v: Any) -> float | None:
@@ -341,8 +389,14 @@ class OrderService:
             )
         return float(equity), float(available)
 
-    async def _existing_risk(self, symbol: str, side: str, contract_size: float) -> float:
-        """Same-side open risk. Positions API failure is fail-closed (not 0)."""
+    async def _existing_risk(
+        self, symbol: str, side: str, contract_size: float
+    ) -> tuple[float, list[str]]:
+        """Same-side open risk + warnings. Positions API failure is fail-closed.
+
+        `strict`/`pos_risk_cap_pct` flow from settings so Preview, Confirm and
+        the sizing endpoint all use identical aggregate semantics (R-01).
+        """
         try:
             positions = await self.client.positions(symbol)
         except ExchangeError as e:
@@ -352,7 +406,14 @@ class OrderService:
             ) from e
         try:
             return estimate_same_side_risk_usdt(
-                positions, symbol=symbol, side=side, contract_size=contract_size
+                positions,
+                symbol=symbol,
+                side=side,
+                contract_size=contract_size,
+                strict=bool(getattr(self.settings, "strict_aggregate_risk", False)),
+                pos_risk_cap_pct=float(
+                    getattr(self.settings, "aggregate_pos_risk_cap_pct", 2.0)
+                ),
             )
         except ValueError as e:
             raise OrderError(str(e)) from e
@@ -388,7 +449,7 @@ class OrderService:
             }
 
         try:
-            existing = await self._existing_risk(
+            existing, existing_warnings = await self._existing_risk(
                 symbol, ticket.side, contract.contract_size
             )
         except OrderError as e:
@@ -408,6 +469,7 @@ class OrderService:
             last_price=last_price,
             for_confirm=False,
             existing_same_side_risk_usdt=existing,
+            existing_same_side_warnings=existing_warnings,
             available_usdt=available,
         )
 
@@ -718,7 +780,7 @@ class OrderService:
             raise OrderError(f"ticker failed on confirm: {e}") from e
 
         equity, available = await self._balances()
-        existing = await self._existing_risk(
+        existing, existing_warnings = await self._existing_risk(
             symbol, ticket.side, contract.contract_size
         )
 
@@ -730,6 +792,7 @@ class OrderService:
             last_price=last_price,
             for_confirm=True,
             existing_same_side_risk_usdt=existing,
+            existing_same_side_warnings=existing_warnings,
             available_usdt=available,
             preview_last_price=preview_last,
         )

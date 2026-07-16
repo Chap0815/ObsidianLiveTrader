@@ -1695,6 +1695,7 @@ async def sizing_suggest(
     equity = 0.0
     available = 0.0
     existing_risk = 0.0
+    existing_risk_warnings: list[str] = []
     if exchange_ready(s):
         try:
             snap = await client.account_snapshot()
@@ -1705,15 +1706,20 @@ async def sizing_suggest(
             available = 0.0
         if equity > 0 and side_l in ("long", "short"):
             try:
-                existing_risk = estimate_same_side_risk_usdt(
+                existing_risk, existing_risk_warnings = estimate_same_side_risk_usdt(
                     snap.get("positions") or [],
                     symbol=symbol,
                     side=side_l,
                     contract_size=contract.contract_size,
+                    strict=bool(getattr(s, "strict_aggregate_risk", False)),
+                    pos_risk_cap_pct=float(
+                        getattr(s, "aggregate_pos_risk_cap_pct", 2.0)
+                    ),
                 )
             except ValueError as e:
-                # Fail-closed, same as preview/confirm: unknown same-side
-                # exposure must never be silently treated as 0 risk.
+                # Fail-closed (strict only): unknown same-side exposure must
+                # never be silently treated as 0 risk. In non-strict mode a
+                # conservative fallback + warning is used instead (R-01).
                 raise HTTPException(status_code=400, detail=str(e)) from e
     if equity <= 0:
         raise HTTPException(status_code=400, detail="equity unavailable for sizing")
@@ -1756,6 +1762,7 @@ async def sizing_suggest(
         "existing_same_side_risk_usdt": existing_risk,
         "risk_pct": effective_risk,
         "max_risk_pct": s.max_risk_pct,
+        "warnings": existing_risk_warnings,
     }
 
 
