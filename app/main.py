@@ -233,7 +233,16 @@ async def lifespan(app: FastAPI):
                 f"instance already holds the startup lock in {db.path.parent}."
             )
 
-    await db.init()
+    # Ab hier haelt dieser Prozess ggf. den Instanz-Lock: jede Exception vor
+    # dem yield (z.B. db.init()) erreicht das finally unten nie und muss den
+    # Lock explizit freigeben — sonst bleibt nur die implizite
+    # Staleness-Reclaim-Heilung beim naechsten Start.
+    try:
+        await db.init()
+    except BaseException:
+        if instance_lock_path is not None:
+            _release_instance_lock(instance_lock_path)
+        raise
     # F-16: PreviewStore is an in-process, in-memory TTL store (see
     # app/orders/tokens.py) — it is NOT shared across worker processes.
     # This app MUST run with a single uvicorn worker (the launcher,
