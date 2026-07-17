@@ -15,11 +15,15 @@ Design goals:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
 import subprocess
+import tempfile
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # ── Whitelists ──────────────────────────────────────────────────────────────
 # Provider -> (api_key_var, model_var). Ollama has no key.
@@ -337,16 +341,31 @@ def restrict_env_permissions(path: Path) -> None:
             domain = os.environ.get("USERDOMAIN", "")
             account = f"{domain}\\{user}" if domain and user else user
             if account:
-                subprocess.run(
+                result = subprocess.run(
                     ["icacls", str(p), "/inheritance:r", "/grant:r", f"{account}:F"],
                     capture_output=True,
                     timeout=10,
                     check=False,
                 )
+                # B3-03: a non-zero rc (e.g. a poisoned/empty USERNAME, no
+                # icacls on PATH, insufficient privilege) must never be
+                # swallowed silently — best-effort stays, but visibly.
+                if result.returncode != 0:
+                    log.warning(
+                        "icacls-Haertung fuer %s fehlgeschlagen (rc=%s): %s",
+                        p,
+                        result.returncode,
+                        (result.stderr or b"").decode("utf-8", "replace").strip(),
+                    )
+            else:
+                log.warning(
+                    "icacls-Haertung fuer %s uebersprungen: USERNAME/USERDOMAIN leer",
+                    p,
+                )
         else:
             os.chmod(p, 0o600)
     except Exception:
-        pass
+        log.warning("Permission-Haertung fuer %s fehlgeschlagen", p, exc_info=True)
 
 
 # ── Atomic patcher (post-setup key writes) ──────────────────────────────────
@@ -388,7 +407,25 @@ def patch_env_vars(
             lines.append(f"{k}={v}")
         lines.append("")
 
-    tmp = env_path.with_suffix(env_path.suffix + ".tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8", newline="\n")
-    os.replace(tmp, env_path)
-    restrict_env_permissions(env_path)  # B-08: never world-/group-readable
+    # B3-04: mkstemp (O_EXCL, unpredictable name) instead of a fixed
+    # ``.env.tmp`` path — a local process could otherwise pre-create or
+    # symlink a predictable tmp name before the write lands. Same directory
+    # as the real .env so the following os.replace stays atomic.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(env_path.parent), prefix=f"{env_path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines))
+        # B3-02: harden the tmp file's ACL BEFORE the atomic replace — os.replace
+        # preserves the *source* file's ACL on Windows, so hardening after the
+        # replace would leave a window where the new .env briefly carries the
+        # broad, inherited permissions of the directory while already holding
+        # secrets.
+        restrict_env_permissions(tmp)
+        os.replace(tmp, env_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    restrict_env_permissions(env_path)  # belt-and-suspenders: re-assert post-replace

@@ -308,3 +308,73 @@ def test_env_file_written_restrictive_perms(tmp_path):
     else:
         mode = stat.S_IMODE(p.stat().st_mode)
         assert mode == 0o600
+
+
+def test_patch_env_hardens_tmp_before_replace(tmp_path, monkeypatch):
+    """B3-02: restrict_env_permissions must run on the tmp file BEFORE
+    os.replace swaps it onto the real .env — otherwise there is a window
+    where the freshly-written .env briefly carries broad inherited ACLs
+    while already holding secrets."""
+    import os as _os
+
+    import app.env_builder as env_builder
+
+    p = tmp_path / ".env"
+    p.write_text("TRADING_ENABLED=false\nXAI_API_KEY=\n", encoding="utf-8")
+
+    calls: list[str] = []
+    real_restrict = env_builder.restrict_env_permissions
+    real_replace = _os.replace
+
+    def spy_restrict(path):
+        calls.append("restrict")
+        return real_restrict(path)
+
+    def spy_replace(src, dst):
+        calls.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", spy_restrict)
+    monkeypatch.setattr(env_builder.os, "replace", spy_replace)
+
+    from app.env_builder import SETTINGS_LLM_WRITABLE, patch_env_vars
+
+    patch_env_vars(p, {"XAI_API_KEY": "secret-value"}, allowed=set(SETTINGS_LLM_WRITABLE))
+
+    assert "restrict" in calls and "replace" in calls
+    assert calls.index("restrict") < calls.index("replace"), (
+        "hardening must happen before the atomic replace, not after"
+    )
+
+
+def test_env_tmp_uses_mkstemp_not_fixed_name(tmp_path, monkeypatch):
+    """B3-04: a fixed tmp filename (``.env.tmp``) lets a local process
+    pre-create or symlink that path before the write lands. The tmp file
+    must come from tempfile.mkstemp (O_EXCL, unpredictable name) in the
+    same directory as the real .env, so os.replace stays atomic."""
+    import os as _os
+    from pathlib import Path
+
+    import app.env_builder as env_builder
+
+    p = tmp_path / ".env"
+    p.write_text("TRADING_ENABLED=false\nXAI_API_KEY=\n", encoding="utf-8")
+
+    seen: list[Path] = []
+    real_replace = _os.replace
+
+    def spy_replace(src, dst):
+        seen.append(Path(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(env_builder.os, "replace", spy_replace)
+
+    from app.env_builder import SETTINGS_LLM_WRITABLE, patch_env_vars
+
+    patch_env_vars(p, {"XAI_API_KEY": "s1"}, allowed=set(SETTINGS_LLM_WRITABLE))
+    patch_env_vars(p, {"XAI_API_KEY": "s2"}, allowed=set(SETTINGS_LLM_WRITABLE))
+
+    assert len(seen) == 2
+    assert seen[0].name != ".env.tmp", "must not use the old fixed tmp name"
+    assert seen[0].parent == p.parent, "tmp file must live next to .env (atomic replace)"
+    assert seen[0].name != seen[1].name, "tmp name must be unpredictable, not reused"

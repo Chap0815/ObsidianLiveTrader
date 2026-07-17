@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re as _re
+import tempfile
 import time as _time
 import defusedxml.ElementTree as _ET  # hardened parser: news feeds are untrusted
 from contextlib import asynccontextmanager
@@ -577,22 +578,35 @@ async def setup_save(request: Request, body: dict):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Validate by parsing before it becomes the real .env
-    tmp = ENV_PATH.with_name(".env.setup-tmp")
-    tmp.write_text(content, encoding="utf-8")
-    # B-08: schon die tmp-Datei traegt Secrets — Rechte VOR dem Validieren
-    # einschraenken, dann atomar ersetzen (replace erhaelt die ACL der Quelle).
+    # B3-04: mkstemp (O_EXCL, unvorhersehbarer Name) statt fixem
+    # ".env.setup-tmp" — sonst koennte ein lokaler Prozess den Pfad vorher
+    # anlegen/symlinken. Gleiches Verzeichnis wie ENV_PATH, damit der
+    # abschliessende os.replace atomar bleibt.
     from app.env_builder import restrict_env_permissions
 
-    restrict_env_permissions(tmp)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(ENV_PATH.parent), prefix=f"{ENV_PATH.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
     try:
-        Settings(_env_file=str(tmp))
-    except Exception as e:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        # B3-02: schon die tmp-Datei traegt Secrets — Rechte VOR dem Validieren
+        # und dem Replace einschraenken (replace erhaelt die ACL der Quelle;
+        # nach dem Replace haerten waere ein Secret-Fenster mit geerbten Rechten).
+        restrict_env_permissions(tmp)
+        try:
+            Settings(_env_file=str(tmp))
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Konfiguration ungültig: {e}") from e
+        os.replace(tmp, ENV_PATH)
+    except HTTPException:
+        raise
+    except Exception:
         tmp.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Konfiguration ungültig: {e}") from e
-    import os as _os
-
-    _os.replace(tmp, ENV_PATH)
-    restrict_env_permissions(ENV_PATH)
+        raise
+    restrict_env_permissions(ENV_PATH)  # belt-and-suspenders: nach dem Replace erneut haerten
 
     # Hot-apply: fresh settings + fresh exchange client, no restart needed
     get_settings.cache_clear()
