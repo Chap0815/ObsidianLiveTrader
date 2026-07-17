@@ -423,7 +423,7 @@
       // Fallback for MANUAL mode (no exchange trigger): the SL/TP the trader
       // set at entry, remembered on confirm. This is the ONE place the manual
       // trader still gets a visual SL/TP zone.
-      const mk = state.tradeMarkers && state.tradeMarkers[String(p.symbol || "").toUpperCase()];
+      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
       if (mk) {
         if (sl == null && mk.sl) sl = mk.sl;
         if (tp == null && mk.tp) tp = mk.tp;
@@ -643,6 +643,26 @@
       return ca !== "" && ca === cb;
     }
     return na === nb;
+  }
+
+  /** Canonical key for state.tradeMarkers (A3-01). MUST resolve to the same
+   *  form the backend/exchange reports for positions & confirm summaries —
+   *  otherwise an exact-key read (position zones, mini-tiles, the manual-SL
+   *  alarm) can silently miss a marker written under a different form. Mirrors
+   *  symMatch's own HL normalization (and the backend's normalize_symbol in
+   *  security.py): MEXC always uses the full "COIN_QUOTE" pair, Hyperliquid
+   *  canonicalizes to the bare coin. ONE place all tradeMarkers reads/writes
+   *  route through, so there is exactly one key schema. */
+  function markerKey(sym) {
+    const s = String(sym || "").toUpperCase().trim();
+    if (!s) return "";
+    let ex = state.health && state.health.exchange;
+    if (!ex) {
+      // /api/health not loaded yet: same DOM fallback as symMatch (audit F4).
+      const lbl = $("exchange-label");
+      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
+    }
+    return ex === "hyperliquid" ? s.split("_")[0] : s;
   }
 
   function drawProposalLines() {
@@ -958,7 +978,7 @@
     px = Number(px);
     const positions = (state.account && state.account.positions) || [];
     positions.forEach(function (p) {
-      const key = String(p.symbol || "").toUpperCase();
+      const key = markerKey(p.symbol); // A3-01: same schema the marker was written under
       if (!symMatch(p.symbol, state.symbol)) return; // only compare live price against the active symbol's SL
       const mk = state.tradeMarkers && state.tradeMarkers[key];
       if (!mk || !mk.manual || !mk.sl) { state.slAlarm[key] = false; return; }
@@ -1733,7 +1753,7 @@
       if (short ? !below : below) sl = trg;
       else tp = trg;
     });
-    const mk = state.tradeMarkers && state.tradeMarkers[String(p.symbol || "").toUpperCase()];
+    const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
     let manual = false;
     if (mk) {
       if (sl == null && mk.sl) { sl = mk.sl; manual = !!mk.manual; }
@@ -2914,6 +2934,28 @@
     }
   }
 
+  /** Fold tradeMarkers persisted under a non-canonical key (e.g. a full pair
+   *  typed on Hyperliquid, where positions/the manual-SL alarm canonically key
+   *  by bare coin) into markerKey() form, so a marker saved under the old key
+   *  isn't orphaned (A3-01). Idempotent — once every key is already canonical
+   *  this is a no-op. On a collision (old + new key both present) the newer
+   *  `ts` wins, same tie-break saveTradeMarkers() uses for cross-tab merges. */
+  function migrateTradeMarkerKeys(raw) {
+    const out = {};
+    let changed = false;
+    Object.keys(raw || {}).forEach(function (rawKey) {
+      const canon = markerKey(rawKey);
+      if (!canon) return;
+      if (canon !== rawKey) changed = true;
+      const incoming = raw[rawKey];
+      const existing = out[canon];
+      if (!existing || Number((incoming && incoming.ts) || 0) >= Number(existing.ts || 0)) {
+        out[canon] = incoming;
+      }
+    });
+    return { markers: out, changed: changed };
+  }
+
   /** Merge our in-memory markers with whatever another tab persisted, keeping
    *  the newer entry per symbol (by ts), so concurrent tabs don't clobber each
    *  other's manual-SL markers (audit F3). A key we deleted locally (e.g. via
@@ -2921,7 +2963,7 @@
    *  newer version of it since our last sync; otherwise their write wins. */
   function saveTradeMarkers() {
     try {
-      const stored = _readMarkersRaw();
+      const stored = migrateTradeMarkerKeys(_readMarkersRaw()).markers;
       const mine = state.tradeMarkers || {};
       const merged = {};
       const keys = new Set(
@@ -2949,8 +2991,14 @@
   }
 
   function loadTradeMarkers() {
-    state.tradeMarkers = _readMarkersRaw();
+    const migrated = migrateTradeMarkerKeys(_readMarkersRaw());
+    state.tradeMarkers = migrated.markers;
     _tradeMarkersSynced = Object.assign({}, state.tradeMarkers);
+    if (migrated.changed) {
+      try {
+        localStorage.setItem(TRADE_MARKERS_KEY, JSON.stringify(migrated.markers));
+      } catch (_) {}
+    }
   }
 
   /** Wipe all persisted manual trade markers (localStorage + in-memory) for a
@@ -2973,7 +3021,9 @@
     const positions = (state.account && state.account.positions) || [];
     let changed = false;
     Object.keys(state.tradeMarkers || {}).forEach(function (key) {
-      const hasPos = positions.some(function (p) { return symMatch(p.symbol, key); });
+      // A3-01: keys are canonical markerKey() form now, so compare on that
+      // (not symMatch) — a bare-key equality check is exact and cheaper.
+      const hasPos = positions.some(function (p) { return markerKey(p.symbol) === key; });
       if (hasPos) return;
       const mk = state.tradeMarkers[key] || {};
       const fresh = Number(mk.ts) > 0 && Date.now() - Number(mk.ts) < 5 * 60 * 1000;
@@ -4766,7 +4816,11 @@
       const cv = tile.querySelector(".mini-canvas");
       const marks = [];
       if (pos) {
-        const mk = state.tradeMarkers && state.tradeMarkers[key];
+        // A3-01: `key` is the tile's own display/watchlist symbol, which on
+        // Hyperliquid may still be a typed full pair even though `pos` (found
+        // via the HL-aware symMatch) canonically keys tradeMarkers by bare
+        // coin — route through markerKey() so a manual SL/TP still draws.
+        const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
         marks.push({ price: Number(pos.entry_price), color: "#9d9ab6" });
         if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: "#e35349" });
         if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: "#4fbe8e" });
@@ -6101,7 +6155,9 @@
         if (state.liveBar && state.liveBar.time) {
           state.tradeEntryTimes[key] = state.liveBar.time;
         }
-        state.tradeMarkers[key] = {
+        // A3-01: write under the canonical key so every read site (position
+        // zones, mini-tiles, the manual-SL alarm) can find it again.
+        state.tradeMarkers[markerKey(key)] = {
           sl: Number(sm.stop_loss) || null,
           tp: Number(sm.take_profit) || null,
           side: sm.side,
