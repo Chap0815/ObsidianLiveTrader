@@ -8,13 +8,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r22') }}" />
 </head>
 <body>
-  <div class="live-banner" role="note">
-    <span class="live-dot" aria-hidden="true"></span>
-    <span class="live-text">ERSTEINRICHTUNG</span>
-    <span class="banner-chip chip-disarmed">DISARMED</span>
+  <div class="setup-banner" role="note">
+    <span class="arm-status" data-tip="Ersteinrichtung: Trading ist gesperrt, bis TRADING_ENABLED bewusst aktiviert wird.">
+      <span class="arm-dot" aria-hidden="true"></span>
+      <span class="arm-text">ERSTEINRICHTUNG · DISARMED</span>
+    </span>
   </div>
 
   <main class="setup-wrap">

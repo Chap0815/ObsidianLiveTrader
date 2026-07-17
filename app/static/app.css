@@ -3176,6 +3176,19 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 /* ── First-run setup wizard ─────────────────────────────── */
+/* Safety banner: reuses the topbar .arm-status chip (S3-01) instead of the
+   dead .live-banner/.live-dot/.live-text/.chip-disarmed classes so the
+   ERSTEINRICHTUNG/DISARMED state actually renders styled. */
+.setup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-inset);
+  border-bottom: 1px solid var(--border);
+}
+
 .setup-wrap {
   max-width: 620px;
   margin: 0 auto;
