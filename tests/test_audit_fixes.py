@@ -441,6 +441,10 @@ def _mexc_client(place_response, *, post_hold: float = 1.0):
     client.exchange_id = "mexc"
     # MEXC: the position-bound SL is not a separate plan order → empty list.
     client.open_stop_orders = AsyncMock(return_value=[])
+    # X2-01: order-own fill evidence for LIMIT orders. Default is fail-closed
+    # (no match → not our fill) so a hold-delta bump can never silently verify a
+    # resting limit; tests that model a genuinely filled limit override this.
+    client.order_by_external_oid = AsyncMock(return_value={})
     return client
 
 
@@ -463,10 +467,15 @@ async def test_mexc_empty_stop_list_not_flattened():
 
 @pytest.mark.asyncio
 async def test_mexc_position_level_sl_verified_via_fill_delta():
-    """O-01 positive path via HOLD DELTA (production shape: MEXC create returns
-    only an orderId, no fill field). pre_hold=0, post-place hold=1 ⟹ filled ⟹
-    the position-bound SL is active. No flatten."""
-    client = _mexc_client({"data": 1})  # no reported fill → hold-delta fallback
+    """O-01 positive path (production shape: MEXC create returns only an orderId,
+    no fill field). X2-01: for a LIMIT the fill is proven by ORDER-OWN evidence
+    (order_by_external_oid → dealVol at/above ordered size), NOT by the hold
+    delta (which an external same-side bump could forge). Filled ⟹ the
+    position-bound SL is active. No flatten."""
+    client = _mexc_client({"data": 1})  # no reported fill → order-own evidence
+    client.order_by_external_oid = AsyncMock(
+        return_value={"match": "history", "order": {"dealVol": 1.0, "state": 3}}
+    )
     svc = OrderService(
         client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
     )
@@ -502,6 +511,10 @@ async def test_mexc_filled_entry_with_sl_is_verified_quietly():
     stopLossPrice>0 is VERIFIED (not UNKNOWN) — a quiet info note, NOT the loud
     'UNBEKANNT'/'not verified' alarm that would fire on every MEXC trade."""
     client = _mexc_client({"data": 1})
+    # LIMIT fill proven by order-own evidence (X2-01), not the hold delta.
+    client.order_by_external_oid = AsyncMock(
+        return_value={"match": "history", "order": {"dealVol": 1.0, "state": 3}}
+    )
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
     assert prev["ok"], prev.get("errors")
@@ -567,6 +580,92 @@ async def test_mexc_resting_limit_external_hold_bump_not_silently_verified():
     # the bump exceeds the resting eps and so is not classified as resting).
     assert any("UNBEKANNT" in w for w in out["warnings"])
     # Fail-safe: never flatten / close on an unverified, unattributed fill.
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_resting_limit_external_bump_not_verified():
+    """X2-01 (HOCH): a RESTING MEXC limit (order-own evidence says NOT filled)
+    must NEVER be verified by a hold-delta bump — even a bump of the FULL ordered
+    size (which the old attribution guard credited as our own fill). The external
+    same-side bump could be another bot; the resting limit is genuinely
+    UNPROTECTED. Result must be UNKNOWN (loud), never a silent verify, never a
+    flatten."""
+    client = _mexc_client({"data": 1})  # no reported fill
+    # Post-place hold shows a full-size same-side bump (external bot). Order-own
+    # lookup, however, proves OUR limit is still resting (dealVol 0, state open).
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        return_value={"match": "open", "order": {"dealVol": 0.0, "state": 2}}
+    )
+    svc = OrderService(
+        client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
+    )
+    prev = await svc.preview(_ticket())  # LIMIT, vol=1.0
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNBEKANNT" in w for w in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_fast_market_fill_retries_hold_read():
+    """X2-02: a fast MARKET fill can beat a slow positions endpoint. The first
+    hold read shows 0 (looks resting), the retry shows the full fill → the entry
+    is VERIFIED and NOT mislabelled 'LIMIT RUHT'."""
+    client = _mexc_client({"data": 1})  # no reported fill → hold-delta (market)
+    # preview, confirm, pre_hold, fill-read #1 (empty→0), fill-read #2 (full),
+    # then the _verify_sl_attached positions reads (attempts=2). Filled from
+    # #2 onward so the retry proves the fill and verify sees the position.
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    svc = OrderService(
+        client,
+        _settings(
+            auto_flatten_if_sl_unverified=True,
+            sl_verify_attempts=2,
+            sl_verify_delay_s=0.0,
+        ),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket(order_type="market", price=None))
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is True
+    assert not any("LIMIT RUHT" in w for w in out["warnings"])
+    assert out["status"] != "placed_unfilled_resting"
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_market_still_unfilled_after_retries():
+    """X2-02 fail-safe: if EVERY retry still shows no fill, the entry is honestly
+    reported as resting/unfilled (no SL yet) — the retry must not invent a fill."""
+    client = _mexc_client({"data": 1})
+    # preview, confirm, pre_hold, fill-read #1 and #2 both empty → no fill.
+    client.positions = AsyncMock(side_effect=[[], [], [], [], []])
+    svc = OrderService(
+        client,
+        _settings(
+            auto_flatten_if_sl_unverified=True,
+            sl_verify_attempts=2,
+            sl_verify_delay_s=0.0,
+        ),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket(order_type="market", price=None))
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["status"] == "placed_unfilled_resting"
+    assert any("LIMIT RUHT" in w for w in out["warnings"])
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
 

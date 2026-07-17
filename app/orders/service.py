@@ -706,6 +706,76 @@ class OrderService:
             checked,
         )
 
+    async def _mexc_market_fill_delta(
+        self, symbol: str, side: str, pre_hold: float, fill_eps: float
+    ) -> tuple[float | None, bool]:
+        """Settle-loop same-side hold read for a MEXC MARKET fill (X2-02).
+
+        A fast market fill can beat a slow positions endpoint: a single-shot read
+        then measures delta≈0 and misreports the filled entry as ``unfilled_resting``
+        ("LIMIT RUHT — kein SL"), which is false info. Retry with the SAME cadence
+        as ``_verify_sl_attached`` (``sl_verify_attempts``/``sl_verify_delay_s``)
+        until a non-trivial fill delta appears. Returns ``(delta, known)`` — ``known``
+        is True once ANY read succeeded, so an all-zero result is still trusted as
+        genuinely resting (never invents a fill). LIMIT orders do NOT use this: a
+        resting limit is the normal state and its hold-delta must never verify (X2-01).
+        """
+        attempts = max(1, int(getattr(self.settings, "sl_verify_attempts", 3)))
+        delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
+        delta: float | None = None
+        known = False
+        for attempt in range(attempts):
+            hold_now, _mot, hold_ok = await self._same_side_hold_vol_ok(symbol, side)
+            if hold_ok:
+                delta = max(0.0, hold_now - pre_hold)
+                known = True
+                if delta > fill_eps:
+                    break
+            if attempt < attempts - 1 and delay_s > 0:
+                await asyncio.sleep(delay_s)
+        return delta, known
+
+    async def _mexc_order_fill_confirmed(
+        self, symbol: str, external_oid: str, rounded_vol: float, vol_eps: float
+    ) -> bool:
+        """Order-own fill evidence for a MEXC LIMIT without a reported fill (X2-01).
+
+        A hold-delta can be an EXTERNAL same-side bump on a still-resting limit, so
+        it must NEVER verify a limit (that is exactly the class of unprotected order
+        the positive verify was built to guard). Instead ask the exchange about OUR
+        order by ``externalOid``: only a ``dealVol`` at/above the ordered size — or a
+        smaller dealVol paired with an explicit fully-filled state — counts as OUR
+        fill. Any lookup failure / ambiguity returns False → the caller keeps UNKNOWN
+        (loud), never a silent verify and never a new flatten path.
+        """
+        try:
+            found = await self.client.order_by_external_oid(symbol, external_oid)
+        except Exception:  # noqa: BLE001 — any lookup failure → UNKNOWN, fail-closed
+            return False
+        if not isinstance(found, dict) or not found:
+            return False
+        order = found.get("order")
+        if not isinstance(order, dict):
+            return False
+        deal = _coerce_float(
+            order.get("dealVol")
+            if order.get("dealVol") is not None
+            else order.get("deal_vol")
+            if order.get("deal_vol") is not None
+            else order.get("dealVolume")
+        )
+        if deal is None:
+            return False
+        # Primary signal: our order filled at/above the ordered size.
+        if deal >= rounded_vol - vol_eps:
+            return True
+        # Corroborated signal: a partial dealVol PLUS an explicit fully-filled
+        # state (MEXC futures state 3 = completed/filled).
+        state = str(order.get("state") or order.get("orderState") or "").lower()
+        if deal > vol_eps and state in ("3", "filled", "completed", "done"):
+            return True
+        return False
+
     async def _same_side_hold_vol_ok(
         self, symbol: str, side: str
     ) -> tuple[float, int, bool]:
@@ -1019,6 +1089,7 @@ class OrderService:
         # accepted). We derive the fill from the response, else from the hold
         # delta against the reliable pre-trade quantity.
         is_mexc = getattr(self.client, "exchange_id", "") == "mexc"
+        entry_order_type = (getattr(ticket, "order_type", "") or "").lower()
         mexc_new_fill: float | None = None
         mexc_fill_known = False
         # Provenance of the fill evidence. `reported` comes from the order
@@ -1029,18 +1100,31 @@ class OrderService:
         mexc_fill_from_report = False
         if is_mexc and not manual_sltp and not unfilled_resting:
             reported = _extract_filled_vol(resp)
+            fill_eps = max(float(gate.rounded_vol) * 1e-4, 1e-9)
             if reported is not None:
                 mexc_new_fill = reported
                 mexc_fill_known = True
                 mexc_fill_from_report = True
+            elif entry_order_type == "market" and pre_hold_ok:
+                # X2-02: a fast MARKET fill can beat a slow positions endpoint;
+                # a single-shot read then misreports it as resting. Retry with
+                # the SL-verify settle cadence before trusting delta≈0.
+                mexc_new_fill, mexc_fill_known = await self._mexc_market_fill_delta(
+                    symbol, ticket.side, pre_hold, fill_eps
+                )
             elif pre_hold_ok:
+                # LIMIT without reported fill: a single hold read still CLASSIFIES
+                # a resting entry (delta≈0), but this hold-delta must NEVER become
+                # positive fill evidence for a limit (X2-01) — an external same-side
+                # bump could otherwise verify a genuinely unprotected resting order.
+                # Positive verify for a limit uses order-own evidence
+                # (order_by_external_oid) in the verify block below.
                 hold_now, _mot, hold_ok = await self._same_side_hold_vol_ok(
                     symbol, ticket.side
                 )
                 if hold_ok:
                     mexc_new_fill = max(0.0, hold_now - pre_hold)
                     mexc_fill_known = True
-            fill_eps = max(float(gate.rounded_vol) * 1e-4, 1e-9)
             if (
                 mexc_fill_known
                 and mexc_new_fill is not None
@@ -1110,29 +1194,45 @@ class OrderService:
                     ) > 0
                     rounded_vol = float(gate.rounded_vol)
                     vol_eps = max(rounded_vol * 1e-4, 1e-9)
-                    # ATTRIBUTION GUARD (money-critical): a positive reported fill
-                    # is bot-safe and needs only to be non-trivial. A hold-delta,
-                    # however, can be an external same-side bump on a resting
-                    # (unfilled) limit; crediting it would silently verify an
-                    # UNPROTECTED resting order. So hold-delta evidence may verify
-                    # only when the delta plausibly is OUR OWN fill — within
-                    # tolerance of the ordered volume (mirrors the flatten gate's
-                    # min(rounded_vol, …) cap). When in doubt → keep UNKNOWN (loud),
-                    # never silently verify.
-                    fill_is_ours = mexc_new_fill is not None and (
-                        (mexc_fill_from_report and mexc_new_fill > vol_eps)
-                        or (
-                            not mexc_fill_from_report
+                    # ATTRIBUTION GUARD (money-critical). Evidence source decides:
+                    #  • reported fill (order response): bot-safe (counts ONLY this
+                    #    order) → needs only to be non-trivial.
+                    #  • MARKET-IOC hold-delta: no resting remainder, so the delta
+                    #    plausibly is OUR OWN fill when it reaches the ordered volume
+                    #    (path UNCHANGED — the X2-02 retry only feeds it a settled read).
+                    #  • LIMIT hold-delta: FORBIDDEN as positive evidence (X2-01). An
+                    #    external same-side bump on a RESTING limit could otherwise
+                    #    verify a genuinely unprotected order — the exact class this
+                    #    verify was built to catch. Use order-own evidence instead
+                    #    (order_by_external_oid → dealVol/state); any ambiguity → False.
+                    # When in doubt → keep UNKNOWN (loud), never silently verify.
+                    fill_desc = ""
+                    if mexc_fill_from_report:
+                        fill_is_ours = (
+                            mexc_new_fill is not None and mexc_new_fill > vol_eps
+                        )
+                        if mexc_new_fill is not None:
+                            fill_desc = f"fill≈{mexc_new_fill:g}"
+                    elif entry_order_type == "market":
+                        fill_is_ours = (
+                            mexc_new_fill is not None
                             and mexc_new_fill >= rounded_vol - vol_eps
                         )
-                    )
-                    if body_had_sl and mexc_fill_known and fill_is_ours:
+                        if mexc_new_fill is not None:
+                            fill_desc = f"fill≈{mexc_new_fill:g}"
+                    else:
+                        # LIMIT: order-own evidence only — never the hold delta.
+                        fill_is_ours = await self._mexc_order_fill_confirmed(
+                            symbol, external_oid, rounded_vol, vol_eps
+                        )
+                        fill_desc = "Order-Fill per externalOid bestätigt"
+                    if body_had_sl and fill_is_ours:
                         sl_verified = True
                         sl_checked = True
                         sl_detail = (
                             "MEXC SL positionsgebunden — im Create-Body atomar "
-                            f"akzeptiert und beim gefüllten Entry aktiv (fill≈"
-                            f"{mexc_new_fill:g}); kein separater Plan-Order sichtbar"
+                            "akzeptiert und beim gefüllten Entry aktiv "
+                            f"({fill_desc}); kein separater Plan-Order sichtbar"
                         )
                         warnings.append(
                             "INFO: MEXC-SL ist positionsgebunden (kein separater "
