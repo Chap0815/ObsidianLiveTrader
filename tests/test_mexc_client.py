@@ -168,6 +168,77 @@ async def test_mexc_order_by_external_oid_checks_open_orders():
 
 
 @pytest.mark.asyncio
+async def test_mexc_recovery_retries_before_giving_up():
+    """X2-03: a just-filled order can be absent from BOTH history and open during
+    MEXC index-lag. order_by_external_oid must SETTLE-RETRY history+open a few
+    times (short delay) before returning {} — so the fill is found once the index
+    catches up, instead of a premature {} → hard error → user re-preview →
+    double position."""
+    target_oid = "cli-retry-1"
+    calls = {"open": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/private/order/external/" + target_oid:
+            return httpx.Response(404, json={"code": 404, "msg": "not found"})
+        if path == "/api/v1/private/order/list/history_orders":
+            return httpx.Response(200, json={"resultList": []})
+        if path == "/api/v1/private/order/list/open_orders":
+            calls["open"] += 1
+            # Absent on the first two polls (index-lag), appears on the third.
+            if calls["open"] >= 3:
+                return httpx.Response(
+                    200,
+                    json={
+                        "resultList": [
+                            {"externalOid": target_oid, "orderId": 7, "state": 2}
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"resultList": []})
+        return httpx.Response(404, json={"code": 404, "msg": "not found"})
+
+    c = _client_with_handler(handler)
+    c._RECOVERY_RETRY_DELAY_S = 0.0  # keep the test fast — no real 1s sleeps
+    result = await c.order_by_external_oid("BTC_USDT", target_oid)
+
+    assert calls["open"] == 3, "must retry history+open before giving up"
+    assert result["match"] == "open"
+    assert result["externalOid"] == target_oid
+    assert result["order"]["orderId"] == 7
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_rejects_cancelled_state():
+    """X2-04: a match whose MEXC state is cancelled(4)/invalid(5) is NOT live and
+    must NOT be reported as recovered → order_by_external_oid returns {} (so the
+    caller fail-closes instead of claiming a cancelled order is live)."""
+    target_oid = "cli-cancel-1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/private/order/external/" + target_oid:
+            return httpx.Response(404, json={"code": 404, "msg": "not found"})
+        if path == "/api/v1/private/order/list/history_orders":
+            # Our oid IS present, but the order was cancelled (state 4).
+            return httpx.Response(
+                200,
+                json={
+                    "resultList": [
+                        {"externalOid": target_oid, "orderId": 9, "state": 4}
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"code": 404, "msg": "not found"})
+
+    c = _client_with_handler(handler)
+    c._RECOVERY_RETRY_DELAY_S = 0.0
+    result = await c.order_by_external_oid("BTC_USDT", target_oid)
+
+    assert result == {}, "cancelled order must never be reported recovered/live"
+
+
+@pytest.mark.asyncio
 async def test_mexc_open_stop_orders_caches_working_path():
     """After the first successful call establishes which stop-order-list path
     actually works, the second call must try that cached path FIRST (fewer

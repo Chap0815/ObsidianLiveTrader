@@ -10,6 +10,7 @@ Older docs still list /submit as under maintenance — code uses /create.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -606,6 +607,13 @@ class MexcClient:
     _HISTORY_PAGE_SIZE = 100
     _HISTORY_MAX_PAGES = 3
 
+    # X2-03 settle-retry: a just-filled order can be absent from BOTH history and
+    # open during MEXC index-lag. Re-poll history+open a few times (short delay)
+    # before giving up ({} → caller fail-closes to a hard error). Instance-level
+    # so tests can zero the delay.
+    _RECOVERY_ATTEMPTS = 3
+    _RECOVERY_RETRY_DELAY_S = 1.0
+
     async def _history_row_by_external_oid(
         self, symbol: str, external_oid: str
     ) -> dict[str, Any] | None:
@@ -654,12 +662,22 @@ class MexcClient:
         3. The open-orders list — catches an order that is live but not (yet)
            in history.
 
-        Every match is tagged with a marker so a later reconciliation step
+        X2-03 SETTLE-RETRY: steps 2+3 are re-polled `_RECOVERY_ATTEMPTS` times
+        (~`_RECOVERY_RETRY_DELAY_S` apart) because a just-filled order can be
+        absent from BOTH lists during MEXC's index-lag window; a premature `{}`
+        would send the caller to a hard error → re-preview → double position.
+
+        X2-04 STATE-FILTER: a match is only reported LIVE when its MEXC order
+        `state` is not terminal-dead — cancelled(4)/invalid(5) → `{}`, so a
+        cancelled order is never reported "recovered". Unknown/missing state is
+        NOT treated as dead (over-rejecting a genuine fill would reopen X2-03).
+
+        Every live match is tagged with a marker so a later reconciliation step
         can tell WHERE the order was found:
             {"match": "direct"|"history"|"open", "externalOid": external_oid, "order": <raw>}
         ("direct" = guessed direct-lookup endpoint — weaker, substring-based
         evidence than the paged/field-filtered history list.)
-        No match anywhere -> `{}` (fail-closed: never a fabricated match).
+        No live match anywhere -> `{}` (fail-closed: never a fabricated match).
         """
         try:
             direct = await self._request(
@@ -675,23 +693,63 @@ class MexcClient:
         # without this check a garbage/unrelated 2xx response would fabricate a
         # "match" that the caller can no longer detect as bogus.
         if direct and str(external_oid) in str(direct):
+            if _mexc_state_is_dead(direct):
+                return {}  # X2-04: cancelled/invalid — not live
             return {"match": "direct", "externalOid": external_oid, "order": direct}
 
-        hist_row = await self._history_row_by_external_oid(symbol, external_oid)
-        if hist_row is not None:
-            return {"match": "history", "externalOid": external_oid, "order": hist_row}
+        attempts = max(1, int(getattr(self, "_RECOVERY_ATTEMPTS", 3)))
+        delay_s = max(0.0, float(getattr(self, "_RECOVERY_RETRY_DELAY_S", 1.0)))
+        for attempt in range(attempts):
+            hist_row = await self._history_row_by_external_oid(symbol, external_oid)
+            if hist_row is not None:
+                if _mexc_state_is_dead(hist_row):
+                    return {}  # X2-04: terminal-dead state is definitive → no retry
+                return {
+                    "match": "history",
+                    "externalOid": external_oid,
+                    "order": hist_row,
+                }
 
-        try:
-            open_rows = await self.open_orders(symbol)
-        except MexcError:
-            open_rows = []
-        for r in open_rows:
-            if isinstance(r, dict) and str(
-                r.get("externalOid") or r.get("external_oid") or ""
-            ) == str(external_oid):
-                return {"match": "open", "externalOid": external_oid, "order": r}
+            try:
+                open_rows = await self.open_orders(symbol)
+            except MexcError:
+                open_rows = []
+            for r in open_rows:
+                if isinstance(r, dict) and str(
+                    r.get("externalOid") or r.get("external_oid") or ""
+                ) == str(external_oid):
+                    if _mexc_state_is_dead(r):
+                        return {}  # X2-04
+                    return {"match": "open", "externalOid": external_oid, "order": r}
+
+            # Not found in either list yet — wait for the index to catch up,
+            # unless this was the last attempt.
+            if attempt < attempts - 1 and delay_s > 0:
+                await asyncio.sleep(delay_s)
 
         return {}
+
+
+# MEXC futures order-state codes: 1=uninformed, 2=uncompleted, 3=completed,
+# 4=cancelled, 5=invalid. X2-04: a recovery match may only be reported LIVE for
+# the non-terminal-dead states. Only an EXPLICIT cancelled/invalid marker kills a
+# match — unknown/missing state is NOT dead (over-rejecting a genuine index-lag
+# fill would reopen X2-03: hard error → re-preview → double position).
+_MEXC_DEAD_STATES = frozenset({"4", "5", "cancelled", "canceled", "invalid"})
+
+
+def _mexc_state_is_dead(row: Any) -> bool:
+    """True only if `row` carries an explicit MEXC cancelled(4)/invalid(5) state."""
+    if not isinstance(row, dict):
+        return False
+    raw = row.get("state")
+    if raw is None:
+        raw = row.get("orderState")
+    if raw is None:
+        raw = row.get("order_state")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _MEXC_DEAD_STATES
 
 
 def _opt_float(v: Any) -> float | None:

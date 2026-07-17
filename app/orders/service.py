@@ -1002,6 +1002,37 @@ class OrderService:
                 # a falsy result ({} / None) stays fail-closed (hard error below).
                 if not _recovery_is_match(recovered, external_oid):
                     recovered = None
+                # X2-03 positions-delta fallback. If the oid lookup can't confirm
+                # the order (index-lag: absent from BOTH history and open → {}),
+                # but the same-side hold has GROWN by ≈the ordered size since the
+                # reliable pre_hold read, the order is almost certainly live. Emit
+                # a "delta" marker so the caller treats it as "probably live"
+                # (WARNING, fall-through to verify) instead of a hard error that
+                # would bait the user into re-previewing → double position. This
+                # marker satisfies _recovery_is_match by construction (match set,
+                # externalOid==oid) and NEVER triggers a re-place — it only
+                # suppresses the double-position. Fail-closed guards: MEXC only, a
+                # RELIABLE pre_hold, and a genuine ≈rounded_vol delta; anything
+                # short stays the hard error below.
+                if (
+                    recovered is None
+                    and pre_hold_ok
+                    and getattr(self.client, "exchange_id", "") == "mexc"
+                ):
+                    hold_now, _ot, hold_ok = await self._same_side_hold_vol_ok(
+                        symbol, ticket.side
+                    )
+                    if hold_ok:
+                        rvol = float(gate.rounded_vol)
+                        vol_eps = max(rvol * 1e-4, 1e-9)
+                        delta = max(0.0, hold_now - pre_hold)
+                        if rvol > 0 and delta >= rvol - vol_eps:
+                            recovered = {
+                                "match": "delta",
+                                "externalOid": external_oid,
+                                "order": None,
+                                "positionDelta": delta,
+                            }
             if not recovered:
                 if self.db is not None:
                     await self.db.insert_order(
@@ -1035,9 +1066,16 @@ class OrderService:
         # (and could bait the user into placing it again).
         warnings: list[str] = list(gate.warnings)
         if recovered_from_timeout:
+            via_delta = isinstance(resp, dict) and resp.get("match") == "delta"
+            evidence = (
+                "position grew by ≈the ordered size (positions-delta signal; "
+                "the order index had not caught up yet)"
+                if via_delta
+                else "order found by externalOid"
+            )
             warnings.append(
                 "place_order transport error but order recovered "
-                f"(externalOid={external_oid}). DO NOT re-preview — "
+                f"({evidence}, externalOid={external_oid}). DO NOT re-preview — "
                 f"verify on the exchange. Detail: {transport_err}"
             )
         sl_verified: bool = True

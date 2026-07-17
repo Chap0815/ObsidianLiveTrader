@@ -1625,6 +1625,9 @@ async def test_mexc_recovery_no_match_still_fail_closed():
     place_order (never a blind re-place of a possibly-live order)."""
     client = _happy_client({"orderId": 1})
     client.exchange_id = "mexc"
+    # Order truly did not place: the positions-delta signal (X2-03) must also see
+    # NO new same-side size, so pre_hold==post==0 → no delta → stays fail-closed.
+    client.positions = AsyncMock(side_effect=[[], [], [], []])
 
     async def _place(_body):
         raise MexcError("timeout connecting to upstream")
@@ -1637,6 +1640,37 @@ async def test_mexc_recovery_no_match_still_fail_closed():
         await svc.confirm(prev["token"])
     assert "externalOid" in str(ei.value)
     assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_uses_position_delta_signal():
+    """X2-03: on a timeout where the oid lookup can't confirm the order ({}),
+    a same-side hold that GREW by ≈the ordered size vs pre_hold is trusted as
+    "order probably live" → WARNING, no re-place, no hard error. This is the
+    signal that stops the user re-previewing into a double position when MEXC's
+    order index lags but the position already exists."""
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "mexc"
+    # pre_hold reads 0 (nothing yet); after the timeout the position shows the
+    # ordered size (rounded_vol≈1.0) → delta signal fires.
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
+    )
+
+    async def _place(_body):
+        raise MexcError("timeout connecting to upstream")
+
+    client.place_order = AsyncMock(side_effect=_place)
+    # oid lookup cannot confirm (index-lag) → {}: only the delta may recover it.
+    client.order_by_external_oid = AsyncMock(return_value={})
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    out = await svc.confirm(prev["token"])
+    assert out["ok"] is True
+    assert "recovered_placed" in out["status"]
+    # Fail-closed integrity: the delta signal must NEVER trigger a re-place.
+    assert client.place_order.await_count == 1
+    assert any("DO NOT re-preview" in w for w in out["warnings"])
 
 
 @pytest.mark.asyncio
