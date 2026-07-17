@@ -14,6 +14,7 @@ import argparse
 import getpass
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -161,10 +162,22 @@ def _maybe_test_provider(payload: dict) -> None:
 
 
 def _write_full_env(content: str) -> None:
-    tmp = ENV_PATH.with_name(".env.setup-tmp")
-    tmp.write_text(content, encoding="utf-8", newline="\n")
-    os.replace(tmp, ENV_PATH)
-    restrict_env_permissions(ENV_PATH)  # B-08: never world-/group-readable
+    # B3-04/B3-02: unvorhersehbarer O_EXCL-tmp im .env-Verzeichnis (kein
+    # fester Name, kein Symlink-Pre-Create) + ACL-Haertung VOR os.replace,
+    # damit nie ein Secret-Fenster mit geerbten Rechten entsteht.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(ENV_PATH.parent), prefix=".env.setup-", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        restrict_env_permissions(tmp)  # haerten, bevor es die echte .env wird
+        os.replace(tmp, ENV_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    restrict_env_permissions(ENV_PATH)  # belt-and-suspenders nach replace
     print(f"\nGespeichert: {ENV_PATH}")
 
 
