@@ -343,10 +343,7 @@ async def test_hl_proxy_client_disconnect_cancels_pending_upstream():
         async def send(self, data):
             self.sent.append(data)
 
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
+        async def recv(self):
             try:
                 await asyncio.Event().wait()  # blockiert für immer
             except asyncio.CancelledError:

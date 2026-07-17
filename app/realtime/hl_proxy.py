@@ -18,6 +18,19 @@ from app.config import Settings
 
 log = logging.getLogger("app.realtime.hl")
 
+# E3-03: HL kills an idle subscription after ~60s of app-level silence on
+# sparse coins, so we send an app-level {"method":"ping"} well inside that
+# window. The idle watchdog (E3-02) treats a *received*-side silence longer
+# than this as a dead upstream and forces a reconnect — HL still pushes its
+# own control traffic (and our heartbeat's pong) frequently enough that a real
+# stall is the only way to hit it. Backoff is our own (independent of the
+# websockets library ping) and caps at 10s. All are module-level so tests can
+# shrink them.
+HL_HEARTBEAT_INTERVAL = 50.0
+HL_IDLE_TIMEOUT = 45.0
+HL_BACKOFF_START = 1.0
+HL_BACKOFF_CAP = 10.0
+
 # UI TF → HL candle interval
 TF_TO_HL = {
     "5m": "5m",
@@ -79,10 +92,29 @@ async def proxy_hyperliquid_market(
     symbol: str,
     tf: str = "15m",
 ) -> None:
-    """Bridge HL public WS → browser until client disconnects."""
+    """Bridge HL public WS → browser until the *browser* disconnects.
+
+    E3-02/E3-03: the upstream side is resilient. A clean upstream close, an
+    upstream error, or a silent data stop (idle watchdog) no longer ends the
+    browser session — it triggers a backoff-limited reconnect + resubscribe of
+    the SAME subscriptions, with a `degraded` status frame in between. The one
+    thing that ends the loop is the browser going away
+    (``WebSocketDisconnect`` propagating out of the shared client pump).
+    """
     coin = to_coin(symbol)
     interval = TF_TO_HL.get(tf, "15m")
     url = hl_ws_url(settings)
+    subs = [
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": coin}},
+        {
+            "method": "subscribe",
+            "subscription": {"type": "candle", "coin": coin, "interval": interval},
+        },
+        # bbo pushes on every top-of-book change → sub-second price movement
+        # even when no trade prints (crucial on testnet where trades are sparse
+        # and the chart would otherwise look frozen).
+        {"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}},
+    ]
 
     await client_ws.send_json(
         {
@@ -95,66 +127,58 @@ async def proxy_hyperliquid_market(
         }
     )
 
+    # The client control pump lives for the WHOLE session, spanning every
+    # upstream reconnect. It is the single source of "browser gone": when it
+    # completes it raised WebSocketDisconnect, which we propagate to end.
+    client_task = asyncio.create_task(_pump_client(client_ws))
+    backoff = HL_BACKOFF_START
     try:
-        async with websockets.connect(
-            url,
-            ping_interval=20,
-            ping_timeout=20,
-            open_timeout=15,
-            max_size=8 * 1024 * 1024,
-        ) as upstream:
-            subs = [
-                {"method": "subscribe", "subscription": {"type": "trades", "coin": coin}},
-                {
-                    "method": "subscribe",
-                    "subscription": {
-                        "type": "candle",
-                        "coin": coin,
-                        "interval": interval,
-                    },
-                },
-                # bbo pushes on every top-of-book change → sub-second price
-                # movement even when no trade prints (crucial on testnet where
-                # trades are sparse and the chart would otherwise look frozen).
-                {"method": "subscribe", "subscription": {"type": "bbo", "coin": coin}},
-            ]
-            for sub in subs:
-                await upstream.send(json.dumps(sub))
+        while not client_task.done():
+            try:
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    open_timeout=15,
+                    max_size=8 * 1024 * 1024,
+                ) as upstream:
+                    for sub in subs:
+                        await upstream.send(json.dumps(sub))
 
-            await client_ws.send_json(
-                {
-                    "type": "status",
-                    "status": "live",
-                    "exchange": "hyperliquid",
-                    "coin": coin,
-                    "tf": tf,
-                    "subscriptions": ["trades", f"candle:{interval}"],
-                }
-            )
+                    await client_ws.send_json(
+                        {
+                            "type": "status",
+                            "status": "live",
+                            "exchange": "hyperliquid",
+                            "coin": coin,
+                            "tf": tf,
+                            "subscriptions": ["trades", f"candle:{interval}"],
+                        }
+                    )
+                    # A full connect+subscribe succeeded → reset backoff so a
+                    # later single blip doesn't inherit a long delay.
+                    backoff = HL_BACKOFF_START
+                    await _run_upstream_session(client_ws, upstream, coin, client_task)
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                # Upstream connect/subscribe/pump failed → reconnect below.
+                log.warning("hl upstream ended coin=%s: %s", coin, e)
 
-            # Concurrent: upstream → client, client → control (unsubscribe/close)
-            async def pump_upstream() -> None:
-                async for raw in upstream:
-                    try:
-                        msg = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    out = _normalize_hl(msg, coin=coin)
-                    if out is None:
-                        continue
-                    await client_ws.send_json(out)
-
-            t1 = asyncio.create_task(pump_upstream())
-            t2 = asyncio.create_task(_pump_client(client_ws))
-            done, pending = await asyncio.wait(
-                {t1, t2}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for t in pending:
-                t.cancel()
-            for t in done:
-                exc = t.exception()
-                if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.CancelledError)):
-                    raise exc
+            if client_task.done():
+                break
+            # Upstream side ended while the browser is still here → tell the
+            # browser we're degraded, back off, then reconnect + resubscribe.
+            try:
+                await client_ws.send_json(
+                    {"type": "status", "status": "degraded", "coin": coin}
+                )
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, HL_BACKOFF_CAP)
     except WebSocketDisconnect:
         log.info("browser disconnected coin=%s", coin)
     except Exception as e:
@@ -165,6 +189,81 @@ async def proxy_hyperliquid_market(
             )
         except Exception:
             pass
+    finally:
+        if not client_task.done():
+            client_task.cancel()
+        await asyncio.gather(client_task, return_exceptions=True)
+
+
+async def _run_upstream_session(
+    client_ws: WebSocket,
+    upstream: Any,
+    coin: str,
+    client_task: asyncio.Task,
+) -> None:
+    """Pump ONE upstream connection concurrently with the shared client pump.
+
+    Returns normally when the *upstream* ended (clean close, error or idle
+    watchdog timeout) → the caller reconnects. Raises ``WebSocketDisconnect``
+    when the *browser* went away → the caller ends the whole proxy.
+
+    Follows the file's FIRST_COMPLETED + cancel-pending pattern. The upstream
+    read/heartbeat tasks are fully torn down (cancelled + awaited) before this
+    returns, so no reconnect ever leaks a task from the previous connection.
+    The shared ``client_task`` is NEVER cancelled here — it outlives the
+    session and is owned by the caller.
+    """
+
+    async def pump_upstream() -> None:
+        while True:
+            # Idle watchdog (E3-02): a silent upstream that never closes still
+            # gets torn down so the caller can reconnect.
+            raw = await asyncio.wait_for(upstream.recv(), timeout=HL_IDLE_TIMEOUT)
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            out = _normalize_hl(msg, coin=coin)
+            if out is None:
+                # HL's app-ping reply ({"channel":"pong"}) and any other
+                # unhandled frame fall through here → not forwarded.
+                continue
+            await client_ws.send_json(out)
+
+    async def heartbeat() -> None:
+        # E3-03: HL enforces an app-level ping on inactivity (60s idle kill on
+        # sparse coins). Its `pong` reply is dropped by _normalize_hl above.
+        while True:
+            await asyncio.sleep(HL_HEARTBEAT_INTERVAL)
+            await upstream.send(json.dumps({"method": "ping"}))
+
+    up_task = asyncio.create_task(pump_upstream())
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        done, _pending = await asyncio.wait(
+            {up_task, hb_task, client_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (up_task, hb_task):
+            if not t.done():
+                t.cancel()
+        # Await the upstream-scoped tasks so cancellation completes and no
+        # "exception was never retrieved" warning leaks across reconnects.
+        await asyncio.gather(up_task, hb_task, return_exceptions=True)
+
+    if client_task in done:
+        # Browser gone → surface it so the caller ends the proxy.
+        exc = client_task.exception()
+        if exc is not None:
+            raise exc
+        return
+    # Upstream side finished. A send to a dead browser raises
+    # WebSocketDisconnect → propagate; anything else (idle TimeoutError,
+    # ConnectionClosed, …) just means: reconnect.
+    for t in done:
+        if isinstance(t.exception(), WebSocketDisconnect):
+            raise t.exception()
 
 
 def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
