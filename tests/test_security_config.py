@@ -268,6 +268,12 @@ def test_mainnet_with_ack_starts(monkeypatch):
             mainnet_ack=True,
         ),
     )
+    # Instanz-Lock neutralisieren: dieser Test prueft den MAINNET-Gate + Chip,
+    # NICHT die Single-Instance-Mechanik (das tut test_file_lock_detects_
+    # second_instance). Der echte Lock liegt im geteilten tmp-DB-Verzeichnis
+    # und wuerde sonst mit jedem parallelen pytest-Lauf kollidieren.
+    monkeypatch.setattr(main, "_acquire_instance_lock", lambda data_dir: data_dir)
+    monkeypatch.setattr(main, "_release_instance_lock", lambda lock_path: None)
     with TestClient(main.app) as tc:
         r = tc.get("/api/health")
     assert r.status_code == 200
