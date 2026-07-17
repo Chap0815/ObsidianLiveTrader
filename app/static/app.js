@@ -2635,11 +2635,16 @@
     }
   }
 
-  /** Reference entry price for size/risk math: limit price, else entry ref,
-   *  else the live last price. */
+  /** Reference entry price for size/risk math: limit price (LIMIT orders
+   *  only — T3-01: a MARKET order must never size off a stale #ticket-price
+   *  left over from a prior limit order), else entry ref, else the live
+   *  last price — mirroring the backend gate, which sizes MARKET orders off
+   *  live_price regardless of what #ticket-price contains. */
   function refEntryPrice() {
+    const orderType = ($("ticket-type") && $("ticket-type").value) || "market";
+    const limitPx = orderType === "limit" ? numOrNull($("ticket-price")) : null;
     return (
-      numOrNull($("ticket-price")) ||
+      limitPx ||
       numOrNull($("ticket-entry")) ||
       (state.market && state.market.last_price) ||
       state.lastPx ||
@@ -2709,8 +2714,69 @@
       : entry * (1 - raw / 100);
   }
 
+  /** T3-02: converts existing SL/TP field values across a Kurs<->% toggle so
+   *  a typed "61000" (price) never gets silently reinterpreted as "61000 %".
+   *  Mirrors setSizeMode's unit-conversion pattern below. */
+  function convertSltpFieldsOnModeSwitch(prevMode, nextMode) {
+    if (prevMode === nextMode) return;
+    const sl = $("ticket-sl");
+    const tp = $("ticket-tp1");
+    if (prevMode === "pct" && nextMode === "price") {
+      // %→Kurs: reuse the existing resolvers — state.sltpMode is still "pct"
+      // at this point, so they read the raw field values as % distances.
+      const slPrice = resolveStop();
+      const tpPrice = resolveTp();
+      if (sl && slPrice != null) sl.value = String(Math.round(slPrice * 100) / 100);
+      if (tp && tpPrice != null) tp.value = String(Math.round(tpPrice * 100) / 100);
+      return;
+    }
+    if (prevMode === "price" && nextMode === "pct") {
+      // Kurs→%: derive the % distance from the raw price + refEntryPrice().
+      const entry = refEntryPrice();
+      if (!entry) return;
+      const long = currentSide() === "long";
+      const slRaw = numOrNull(sl);
+      if (sl && slRaw != null && slRaw > 0) {
+        const pct = long
+          ? ((entry - slRaw) / entry) * 100
+          : ((slRaw - entry) / entry) * 100;
+        sl.value = String(Math.round(pct * 100) / 100);
+      }
+      const tpRaw = numOrNull(tp);
+      if (tp && tpRaw != null && tpRaw > 0) {
+        const pct = long
+          ? ((tpRaw - entry) / entry) * 100
+          : ((entry - tpRaw) / entry) * 100;
+        tp.value = String(Math.round(pct * 100) / 100);
+      }
+    }
+  }
+
+  /** Shows a "%" / currency suffix badge on the SL/TP inputs so the active
+   *  unit is always visible next to the typed value (T3-02). */
+  function updateSltpUnitSuffix() {
+    const unit = state.sltpMode === "pct" ? "%" : ccy();
+    [
+      ["ticket-sl", "field-sl"],
+      ["ticket-tp1", "field-tp"],
+    ].forEach(function (pair) {
+      const input = $(pair[0]);
+      if (!input || !input.parentElement) return;
+      let badge = input.parentElement.querySelector(".sltp-unit");
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "sltp-unit";
+        input.parentElement.appendChild(badge);
+      }
+      badge.textContent = unit;
+    });
+  }
+
   function setSltpMode(mode) {
-    state.sltpMode = mode === "pct" ? "pct" : "price";
+    const prevMode = sltpMode();
+    const nextMode = mode === "pct" ? "pct" : "price";
+    convertSltpFieldsOnModeSwitch(prevMode, nextMode);
+    state.sltpMode = nextMode;
     document.querySelectorAll(".sltp-mode-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-mode") === state.sltpMode);
     });
@@ -2723,6 +2789,7 @@
       if (sl) sl.placeholder = "Kurs, z.B. 61000";
       if (tp) tp.placeholder = "Kurs, z.B. 64000";
     }
+    updateSltpUnitSuffix();
     drawTicketLines();
     updateRiskReadout();
   }
@@ -3069,6 +3136,16 @@
       setTicketError("Erst Stop-Loss-Kurs eintragen — dann kann die Größe berechnet werden.");
       return;
     }
+    // T3-04: margin mode needs a real leverage to turn notional into margin.
+    // No "|| 1" fallback — that would silently write the FULL notional as
+    // margin, causing up to Nx oversize once the leverage is filled in later.
+    if (sizeMode() === "margin") {
+      const levCheck = numOrNull($("ticket-leverage"));
+      if (!levCheck || levCheck <= 0) {
+        setTicketError("Hebel eintragen — Margin-Größe kann sonst nicht berechnet werden.");
+        return;
+      }
+    }
     const rp = maxRiskPct();
     try {
       const res = await apiFetch("/api/sizing/suggest", {
@@ -3102,7 +3179,14 @@
       if (usdtEl && data.notional_usdt != null) {
         let val = data.notional_usdt;
         if (sizeMode() === "margin") {
-          const lev = numOrNull($("ticket-leverage")) || 1;
+          // T3-04: no "|| 1" fallback — writing full notional as margin when
+          // leverage is missing/invalid would oversize up to Nx once the
+          // user later fills in the real leverage.
+          const lev = numOrNull($("ticket-leverage"));
+          if (!lev || lev <= 0) {
+            setTicketError("Hebel eintragen — Margin-Größe kann sonst nicht berechnet werden.");
+            return;
+          }
           val = data.notional_usdt / lev;
         }
         usdtEl.value = String(Math.round(val * 100) / 100);
@@ -5322,6 +5406,11 @@
     const form = $("order-form");
     if (form) form.classList.toggle("is-market", type === "market");
 
+    // T3-01: a stale limit price must not be reachable (typing/tabbing into
+    // it) once we're on Market — disabled also removes it from tab order.
+    const priceEl = $("ticket-price");
+    if (priceEl) priceEl.disabled = type === "market";
+
     // In % mode the side flips SL/TP price direction — refresh lines + readout
     drawTicketLines();
     updateRiskReadout();
@@ -5369,6 +5458,7 @@
       });
     });
     setSizeMode(state.sizeMode); // reflect restored mode in buttons + label
+    setSltpMode(state.sltpMode); // build the %/currency suffix badges (T3-02)
     syncTicketSegments();
     updateTriggerModeUi();
   }

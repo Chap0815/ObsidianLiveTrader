@@ -2695,9 +2695,34 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   width: 100%;
 }
 
-/* Market order: limit price is irrelevant */
+/* Market order: limit price is irrelevant (T3-01: field is also `disabled`
+   via JS, which already removes it from tab order — this just dims it) */
 #order-form.is-market #field-limit-price {
   opacity: 0.35;
+  pointer-events: none;
+}
+
+/* T3-02: "%" / currency suffix badge on the SL/TP inputs, so the active
+   Kurs<->% unit is always visible next to the typed value. */
+.field-sl,
+.field-tp {
+  position: relative;
+}
+
+.field-sl input,
+.field-tp input {
+  padding-right: 32px;
+}
+
+.field-sl > .sltp-unit,
+.field-tp > .sltp-unit {
+  position: absolute;
+  right: 10px;
+  bottom: 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--faint);
   pointer-events: none;
 }
 
