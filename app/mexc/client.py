@@ -588,8 +588,15 @@ class MexcClient:
         side: str,
         vol: float,
         open_type: int = 1,
+        external_oid: str | None = None,
     ) -> dict[str, Any]:
-        """Emergency flatten: close long=side 4, close short=side 2, type market."""
+        """Emergency flatten: close long=side 4, close short=side 2, type market.
+
+        X2-06: an optional deterministic ``external_oid`` is stamped onto the
+        order (namespaced ``close:`` so it never collides with the entry oid) so
+        a transport timeout during a close can be recovered/looked-up
+        unambiguously via ``order_by_external_oid`` instead of guessing.
+        """
         mexc_side = 4 if side == "long" else 2
         body = {
             "symbol": symbol,
@@ -599,6 +606,8 @@ class MexcClient:
             "type": 5,
             "openType": open_type,
         }
+        if external_oid:
+            body["externalOid"] = f"close:{external_oid}"
         return await self.place_order(body)
 
     # O-09: history fallback window — widened from the old page_size=20 and

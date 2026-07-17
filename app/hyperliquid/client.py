@@ -69,28 +69,40 @@ def round_hl_price(px: float, sz_decimals: int) -> float:
     return round(rounded_sig, max_dec)
 
 
-def round_hl_price_side_aware(px: float, sz_decimals: int, *, is_buy: bool) -> float:
-    """Side-aware variant of ``round_hl_price`` for SL/TP trigger prices (O-06).
+def round_hl_price_side_aware(
+    px: float, sz_decimals: int, *, is_buy: bool, kind: str = "sl"
+) -> float:
+    """Side-aware variant of ``round_hl_price`` for SL/TP trigger prices (X2-05).
 
     Same precision grid as ``round_hl_price`` (5 significant figures AND max
-    ``6 - szDecimals`` decimals), but rounds DIRECTIONALLY instead of nearest:
+    ``6 - szDecimals`` decimals), but rounds DIRECTIONALLY toward entry instead
+    of nearest, so the exchange-tick precision cut can never make the placed
+    trigger RISKIER than the value the risk gate approved:
 
-      is_buy True  (long position)  -> floor (rounds away from entry, never
-                                        closer/above it)
-      is_buy False (short position) -> ceil  (rounds away from entry, never
-                                        closer/below it)
+      SL  is_buy True  (long, SL below entry)  -> ceil  (up, toward entry)
+          is_buy False (short, SL above entry) -> floor (down, toward entry)
+      TP  is_buy True  (long, TP above entry)  -> floor (down, toward entry)
+          is_buy False (short, TP below entry) -> ceil  (up, toward entry)
 
-    Mirrors the side mapping in app/risk/sizing.py round_trigger_to_unit
-    (long -> down, short -> up, for both SL and TP) so a trigger's mandatory
-    exchange-tick rounding can never move it toward entry beyond what was
-    already risk-approved — only ever the conservative away-from-entry
-    direction. Uses Decimal so the grid step (a power of ten) divides exactly,
-    avoiding the float dust nearest-rounding's ``round()`` has to shrug off.
+    Why toward entry (reverses the prior round-15 "away from entry" choice):
+    on Hyperliquid ``price_unit == 0``, so the gate's ``round_trigger_to_unit``
+    is a no-op and computes RRR/realized risk on the RAW SL/TP. If the client
+    then rounded AWAY from entry it would widen the SL below (or above) that raw
+    value, so the placed loss would exceed the gate-approved risk by up to one
+    tick. Rounding TOWARD entry keeps realized risk ≤ gate and RRR ≤ gate
+    (reward never overstated). Uses Decimal so the grid step (a power of ten)
+    divides exactly, avoiding the float dust nearest-rounding's ``round()`` has
+    to shrug off.
     """
     if px is None or px <= 0:
         return px
     max_dec = max(0, 6 - int(sz_decimals or 0))
-    rounding = ROUND_FLOOR if is_buy else ROUND_CEILING
+    k = (kind or "sl").strip().lower()
+    is_sl = k in ("sl", "stop", "stop_loss", "stoploss")
+    if is_sl:
+        rounding = ROUND_CEILING if is_buy else ROUND_FLOOR
+    else:  # take-profit
+        rounding = ROUND_FLOOR if is_buy else ROUND_CEILING
     d = Decimal(str(px))
     if px >= 100_000:
         # 6+ integer digits: integer prices always allowed (mirrors round_hl_price).
@@ -814,16 +826,16 @@ class HyperliquidClient:
 
             sl = body.get("stopLossPrice")
             tp = body.get("takeProfitPrice")
-            # O-06: side-aware rounding (never toward/past entry) so the
-            # exchange-tick precision cut can never make the real trigger
-            # riskier than the already risk-approved SL/TP.
+            # X2-05: side-aware rounding TOWARD entry so the exchange-tick
+            # precision cut can never make the real trigger riskier (SL) or
+            # overstate reward (TP) beyond the already risk-approved SL/TP.
             sl_px = (
-                round_hl_price_side_aware(float(sl), sz_dec, is_buy=is_buy)
+                round_hl_price_side_aware(float(sl), sz_dec, is_buy=is_buy, kind="sl")
                 if sl and float(sl) > 0
                 else None
             )
             tp_px = (
-                round_hl_price_side_aware(float(tp), sz_dec, is_buy=is_buy)
+                round_hl_price_side_aware(float(tp), sz_dec, is_buy=is_buy, kind="tp")
                 if tp and float(tp) > 0
                 else None
             )
@@ -941,7 +953,7 @@ class HyperliquidClient:
             # single TP if the split would round a rung to zero size.
             tp2 = body.get("takeProfitPrice2")
             tp2_px = (
-                round_hl_price_side_aware(float(tp2), sz_dec, is_buy=is_buy)
+                round_hl_price_side_aware(float(tp2), sz_dec, is_buy=is_buy, kind="tp")
                 if tp2 and float(tp2) > 0
                 else None
             )
@@ -1034,10 +1046,13 @@ class HyperliquidClient:
             is_buy_close = pos == "short"
             row = self._asset_row(coin)
             sz_dec = int(row.get("szDecimals") or 0)
-            # O-06: side-aware — position_side (not the close order's is_buy_close)
-            # decides direction, since the trigger must stay conservative
-            # relative to the OPEN position, not the closing leg.
-            trg = round_hl_price_side_aware(float(trigger_px), sz_dec, is_buy=(pos == "long"))
+            # X2-05: side-aware toward entry — position_side (not the close
+            # order's is_buy_close) decides direction, since the trigger must
+            # stay conservative relative to the OPEN position, not the closing
+            # leg. tpsl chooses SL vs TP geometry.
+            trg = round_hl_price_side_aware(
+                float(trigger_px), sz_dec, is_buy=(pos == "long"), kind=tpsl
+            )
             if trg <= 0:
                 raise HyperliquidError("trigger_px must be > 0")
             result = ex.order(

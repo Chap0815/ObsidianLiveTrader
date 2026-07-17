@@ -302,12 +302,14 @@ async def test_market_partial_fill_sizes_sl_to_new_fill_only():
 
 
 @pytest.mark.asyncio
-async def test_hl_sl_rounds_away_from_entry():
-    """O-06: a long SL's exchange-tick rounding must never move it closer to
-    entry. At szDecimals=5 (max 1 decimal), nearest-rounding of 99.95 goes UP
-    to 100.0 (round_hl_price(99.95, 5) == 100.0) — side-aware rounding must
-    floor it to 99.9 instead, so the placed trigger is never less protective
-    than what was risk-approved."""
+async def test_hl_sl_rounds_toward_entry_via_place_order():
+    """X2-05 (flips prior Task-15 test): a long SL's exchange-tick rounding must
+    round TOWARD entry, never wider. On HL price_unit==0, so the risk gate does
+    NOT round the SL (it computes risk on the raw value); if the client then
+    FLOORED the SL (away from entry, further below), the placed loss would exceed
+    the gate-approved risk by up to one tick. Correct: CEIL a long SL (up, toward
+    entry) so the placed risk is never larger than the gate saw. At szDecimals=5
+    (max 1 decimal) a raw SL of 99.95 must ceil to 100.0, never floor to 99.9."""
     c = _client()
     await c.place_order(
         {
@@ -320,8 +322,32 @@ async def test_hl_sl_rounds_away_from_entry():
     )
     trig = _sl_trigger_calls(c)
     assert len(trig) == 1
-    assert trig[0].args[3] == pytest.approx(99.9)  # floor, never the nearest 100.0
-    assert trig[0].args[3] <= 99.95  # never closer to entry than requested
+    assert trig[0].args[3] == pytest.approx(100.0)  # ceil toward entry, not 99.9
+    assert trig[0].args[3] >= 99.95  # never wider (further from entry) than raw
+
+
+def test_hl_sl_rounds_toward_entry_never_wider():
+    """X2-05 unit proof for round_hl_price_side_aware. SL rounds TOWARD entry
+    (long ceil / short floor) so realized risk is never wider than the raw,
+    gate-approved value; TP rounds TOWARD entry too (long floor / short ceil) so
+    RRR is never overstated at placement. szDecimals=5 → 0.1 tick.
+
+    Concrete: long entry 100, raw SL 95.03 → OLD floor 95.0 (risk 5.0) vs NEW
+    ceil 95.1 (risk 4.9 ≤ the 4.97 the gate approved)."""
+    from app.hyperliquid.client import round_hl_price_side_aware as r
+
+    # long SL: ceil (up, toward entry) — risk 100-95.1 = 4.9 < floor's 5.0
+    assert r(95.03, 5, is_buy=True, kind="sl") == pytest.approx(95.1)
+    assert r(95.03, 5, is_buy=True, kind="sl") >= 95.03
+    # short SL (above entry): floor (down, toward entry) — risk never wider
+    assert r(104.97, 5, is_buy=False, kind="sl") == pytest.approx(104.9)
+    assert r(104.97, 5, is_buy=False, kind="sl") <= 104.97
+    # long TP (above entry): floor (toward entry) — reward/RRR never overstated
+    assert r(104.97, 5, is_buy=True, kind="tp") == pytest.approx(104.9)
+    assert r(104.97, 5, is_buy=True, kind="tp") <= 104.97
+    # short TP (below entry): ceil (toward entry) — RRR never overstated
+    assert r(95.03, 5, is_buy=False, kind="tp") == pytest.approx(95.1)
+    assert r(95.03, 5, is_buy=False, kind="tp") >= 95.03
 
 
 @pytest.mark.asyncio

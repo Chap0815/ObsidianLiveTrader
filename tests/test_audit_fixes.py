@@ -837,7 +837,9 @@ async def test_sl_unverified_triggers_flatten():
     out = await svc.confirm(prev["token"])
     assert out["sl_verified"] is False
     client.close_position_market.assert_awaited()
-    client.close_position_market.assert_awaited()
+    # X2-06: the auto-flatten close must pass the entry external_oid through so
+    # the O-08 close-cloid recovery is wired (not dead code).
+    assert client.close_position_market.await_args.kwargs.get("external_oid")
 
 
 @pytest.mark.asyncio

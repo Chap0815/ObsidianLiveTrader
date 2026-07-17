@@ -1429,11 +1429,15 @@ class OrderService:
                         )
                 else:
                     vol = min(float(gate.rounded_vol), new_fill)
+                    # X2-06: pass the entry externalOid so the O-08 close-cloid
+                    # recovery is wired — a timeout on this flatten can be
+                    # recovered via order_by_external_oid("close:"+oid).
                     flatten_result = await self.client.close_position_market(
                         symbol,
                         side=ticket.side,
                         vol=vol,
                         open_type=pos_open_type or open_type,
+                        external_oid=external_oid,
                     )
                     warnings.append(
                         f"AUTO_FLATTEN: market close vol={vol} "
@@ -1660,10 +1664,38 @@ class OrderService:
                     "flipped between check and send — refusing to close the wrong "
                     "side"
                 )
+            # X2-07: the position may have SHRUNK between the stale positions()
+            # read used to size close_vol and this fresh recheck. Re-apply the
+            # close fraction to the live hold (or clamp an absolute/full vol to
+            # it) so a shrunk external position never receives an oversized
+            # close. No-op when the position is unchanged. HL clamps client-side.
+            if fraction is not None and float(fraction) > 0:
+                close_vol = min(close_vol, live_hold * min(1.0, float(fraction)))
+            else:
+                close_vol = min(close_vol, live_hold)
+            # Keep the (possibly reduced) partial lot-aligned; never round a full
+            # close down into dust.
+            is_full = close_vol >= live_hold - 1e-12
+            if not is_full and vol_unit > 0:
+                close_vol = round_down_to_unit(close_vol, vol_unit)
+            if close_vol <= 0:
+                raise OrderError(
+                    f"close aborted: after re-checking the live {side} position on "
+                    f"{symbol} the closable amount rounded to zero — verify on the "
+                    "exchange"
+                )
 
+        # X2-06: deterministic close externalOid so the O-08 close-cloid recovery
+        # is wired (the client namespaces it "close:"+oid) — a timeout during the
+        # send can be recovered via order_by_external_oid instead of guessing.
+        close_oid = f"mlt-close-{uuid.uuid4().hex[:20]}"
         try:
             resp = await self.client.close_position_market(
-                symbol, side=side, vol=close_vol, open_type=open_type
+                symbol,
+                side=side,
+                vol=close_vol,
+                open_type=open_type,
+                external_oid=close_oid,
             )
         except ExchangeError as e:
             if self.db is not None:

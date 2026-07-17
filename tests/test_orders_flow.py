@@ -842,3 +842,46 @@ async def test_stop_lookup_error_yields_unknown_not_flatten(client, store):
     assert conf["sl_verified"] is False
     assert conf["status"] == "placed_sl_unknown"
     client.close_position_market.assert_not_called()
+
+
+# ── X2-06 / X2-07: close-cloid wiring + MEXC live-hold clamp ─────────────────
+
+
+def _pos(hold: float) -> list:
+    return [{"symbol": "BTC_USDT", "side": "long", "hold_vol": hold, "open_type": 1}]
+
+
+@pytest.mark.asyncio
+async def test_mexc_close_clamps_vol_to_live_hold(client, store):
+    """X2-07: on MEXC the positions() read used to size the close happens BEFORE
+    the contract_meta() yield; the position can shrink externally in that window.
+    The O-09 live-side recheck must re-apply the close fraction to the FRESH
+    live_hold and clamp close_vol, so a shrunk position never gets an oversized
+    close. Here hold reads 10 (→ 50% = 5) but the live recheck reads 4 (→ 50% = 2);
+    the send must be clamped to 2, not 5."""
+    # MEXC reads positions() 3x: sizing (10), O-09 live recheck (4), post-close
+    # residual verify (2). The clamp must key off the fresh live 4, not stale 10.
+    reads = iter([10.0, 4.0])
+
+    async def _positions(_symbol=None):
+        try:
+            return _pos(next(reads))
+        except StopIteration:
+            return _pos(2.0)
+
+    client.positions = AsyncMock(side_effect=_positions)
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    await svc.close_position(symbol="BTC_USDT", side="long", fraction=0.5)
+    sent_vol = client.close_position_market.await_args.kwargs["vol"]
+    assert sent_vol == pytest.approx(2.0)  # 4 * 0.5, not the stale 10 * 0.5 = 5
+
+
+@pytest.mark.asyncio
+async def test_close_path_passes_external_oid(client, store):
+    """X2-06: the manual-close call-site must pass a non-None external_oid so the
+    O-08 close-cloid recovery (client stamps 'close:'+oid) is not dead code."""
+    client.positions = AsyncMock(return_value=_pos(5.0))
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    await svc.close_position(symbol="BTC_USDT", side="long", fraction=1.0)
+    passed = client.close_position_market.await_args.kwargs.get("external_oid")
+    assert passed  # truthy, non-None deterministic close oid
