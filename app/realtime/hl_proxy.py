@@ -26,7 +26,10 @@ log = logging.getLogger("app.realtime.hl")
 # stall is the only way to hit it. Backoff is our own (independent of the
 # websockets library ping) and caps at 10s. All are module-level so tests can
 # shrink them.
-HL_HEARTBEAT_INTERVAL = 50.0
+# Heartbeat MUSS kleiner als der Idle-Watchdog sein: sonst feuert der
+# Watchdog (recv-Timeout) auf einem ruhigen Coin, BEVOR der erste App-Ping
+# raus ist, dessen pong den Read wieder wecken wuerde -> Dauer-Reconnect.
+HL_HEARTBEAT_INTERVAL = 30.0
 HL_IDLE_TIMEOUT = 45.0
 HL_BACKOFF_START = 1.0
 HL_BACKOFF_CAP = 10.0
