@@ -35,6 +35,8 @@
     liveBar: null, // { time, open, high, low, close } chart seconds
     lastPx: null,
     _lastTickTs: null, // ms timestamp of the last live price update (U-02 stale-feed banner)
+    _lastAppPingTs: 0, // ms timestamp of the last client app-ping sent (Task 4/E3-01)
+    _lastPongTs: null, // ms timestamp of the last app-pong received — socket-alive proof, NOT price data
     // Chart line groups (KI-Analyse, echte Positionen, offene Orders/Trigger)
     proposalLines: [],
     positionLines: [],
@@ -875,23 +877,35 @@
     cd.textContent = " · " + (h > 0 ? h + ":" + mm + ":" + ss : mm + ":" + ss);
   }
 
-  const STALE_PRICE_MS = 15000; // U-02: no price tick for this long + WS down => feed considered stale
+  const STALE_PRICE_MS = 30000; // E3-01: no price tick for this long => feed considered stale, PERIOD
+  const APP_PING_INTERVAL_MS = 10000; // Task 4: client app-ping cadence, piggybacked on the 5s poll tick
+  const APP_PONG_TIMEOUT_MS = 25000; // Task 4: no pong for this long => socket is dead, force reconnect
 
-  /** U-02: manual-SL protection (checkManualSlAlarm) only ever fires from a
-   *  live price tick — so if the feed goes dark, nothing re-evaluates and the
-   *  trader is never told their SL is now unmonitored. Surface a banner once
-   *  the feed has been silent for STALE_PRICE_MS *and* the WS is down
-   *  (error/off); a healthy WS or REST fallback still ticking counts as
-   *  "not stale" even while reconnecting. Called from setLivePrice (clears it
-   *  the instant a fresh tick lands), setChartMeta and the 5s background poll
+  /** U-02/E3-01: manual-SL protection (checkManualSlAlarm) and uPnL only ever
+   *  fire from a live price tick — so if the feed goes dark, nothing
+   *  re-evaluates and the trader is never told their SL is now unmonitored.
+   *  Staleness is judged PURELY by tick age, regardless of wsStatus: a
+   *  zombie-live WS (laptop sleep, silent HL subscription loss, network
+   *  change without a socket close) still reports wsStatus "live" while
+   *  serving nothing but frozen prices — the previous `wsDown && age>15s`
+   *  gate never caught that case (E3-01, HOCH). wsStatus is only used to
+   *  pick the banner's wording. Called from setLivePrice (clears it the
+   *  instant a fresh tick lands), setChartMeta and the 5s background poll
    *  (so it also FIRES when no tick arrives at all, not only on the next one). */
   function updateStaleBanner() {
     const el = $("stale-banner");
     const priceEl = $("ctx-price");
     const wsDown = state.wsStatus === "error" || state.wsStatus === "off";
     const age = state._lastTickTs != null ? Date.now() - state._lastTickTs : null;
-    const stale = wsDown && age != null && age > STALE_PRICE_MS;
-    if (el) el.classList.toggle("hidden", !stale);
+    const stale = age != null && age > STALE_PRICE_MS;
+    if (el) {
+      el.classList.toggle("hidden", !stale);
+      if (stale) {
+        el.textContent = wsDown
+          ? "WS getrennt — Preis veraltet, Manual-SL wird NICHT überwacht"
+          : "Feed eingefroren — Preis veraltet, Manual-SL wird NICHT überwacht";
+      }
+    }
     if (priceEl) priceEl.classList.toggle("price-stale", stale);
   }
 
@@ -1089,6 +1103,33 @@
     }
   }
 
+  function updateWsBadge() {
+    const badge = $("rt-badge");
+    if (badge) {
+      badge.classList.toggle("ok-live", state.wsStatus === "live");
+      badge.title =
+        state.wsStatus === "live"
+          ? "Realtime verbunden"
+          : "Realtime: " + state.wsStatus;
+    }
+  }
+
+  /** E3-07: shared by onclose AND the `new WebSocket()` constructor-throw
+   *  catch, so a synchronous construction failure (rare, but observed on
+   *  some browsers/extensions) backs off and retries exactly like a normal
+   *  disconnect instead of leaving realtime dead forever. Reuses the single
+   *  state._wsReconnect timer — never schedules a second one. */
+  function scheduleWsReconnect() {
+    state.wsRetry = Math.min((state.wsRetry || 0) + 1, 5);
+    const delay = Math.min(2000 * Math.pow(2, state.wsRetry - 1), 30000);
+    clearTimeout(state._wsReconnect);
+    state._wsReconnect = setTimeout(function () {
+      if (!state.ws && state.symbol) {
+        startRealtime(state.symbol, state.tf);
+      }
+    }, delay);
+  }
+
   function stopRealtime() {
     // Cancel pending reconnect so a symbol/TF change does not revive the old WS.
     if (state._wsReconnect) {
@@ -1129,12 +1170,19 @@
     } catch (e) {
       console.error("WS open failed", e);
       state.wsStatus = "error";
+      updateWsBadge();
+      scheduleWsReconnect(); // E3-07: a constructor throw must not kill realtime for good
       return;
     }
     state.ws = ws;
 
     ws.onopen = function () {
       state.wsStatus = "connecting";
+      // Task 4: fresh grace period for the app-ping watchdog on every new
+      // socket — otherwise a pong timestamp from the PREVIOUS connection
+      // could immediately look "expired" and force-close the brand new one.
+      state._lastPongTs = Date.now();
+      state._lastAppPingTs = 0;
     };
 
     ws.onmessage = function (ev) {
@@ -1145,6 +1193,13 @@
         return;
       }
       if (!msg || !msg.type) return;
+
+      if (msg.type === "pong") {
+        // Task 4/E3-01: proves the SOCKET is alive — deliberately NOT fed
+        // into _lastTickTs, which must only ever reflect real price data.
+        state._lastPongTs = Date.now();
+        return;
+      }
 
       if (msg.type === "status") {
         if (msg.status === "live" || msg.status === "poll_fallback") {
@@ -1166,14 +1221,7 @@
             state.market.ltf.candles.length) ||
             "…"
         );
-        const badge = $("rt-badge");
-        if (badge) {
-          badge.classList.toggle("ok-live", state.wsStatus === "live");
-          badge.title =
-            state.wsStatus === "live"
-              ? "Realtime verbunden"
-              : "Realtime: " + state.wsStatus;
-        }
+        updateWsBadge();
         return;
       }
 
@@ -1181,11 +1229,22 @@
         // Bind ticks to the ACTIVE symbol: a stale tick from the previous coin
         // must never be checked against the new position's SL (false alarm).
         if (msg.coin && !symMatch(msg.coin, state.symbol)) return;
+        // E3-04: any actual price frame proves the feed is live — a transient
+        // MEXC poll error (one "status":"error" frame) must not leave the
+        // badge stuck once mids resume, without waiting for another "status".
+        if (state.wsStatus !== "live") {
+          state.wsStatus = "live";
+          updateWsBadge();
+        }
         applyLiveTrade(msg.px, msg.time);
         return;
       }
       if (msg.type === "mid") {
         if (msg.coin && !symMatch(msg.coin, state.symbol)) return;
+        if (state.wsStatus !== "live") {
+          state.wsStatus = "live";
+          updateWsBadge();
+        }
         applyLiveTrade(msg.px, msg.time || Date.now());
         return;
       }
@@ -1194,6 +1253,10 @@
         // symbol during a switch must not feed the new coin's chart / SL-alarm /
         // uPnL with the wrong price (audit exchange H-1).
         if (msg.coin && !symMatch(msg.coin, state.symbol)) return;
+        if (state.wsStatus !== "live") {
+          state.wsStatus = "live";
+          updateWsBadge();
+        }
         applyLiveCandle(msg.bar);
       }
     };
@@ -1208,14 +1271,7 @@
         state.wsStatus = "off";
         // Exponential backoff (2s → 30s cap) so a dead upstream is not
         // hammered every 2s; resets on the next successful connect.
-        state.wsRetry = Math.min((state.wsRetry || 0) + 1, 5);
-        const delay = Math.min(2000 * Math.pow(2, state.wsRetry - 1), 30000);
-        clearTimeout(state._wsReconnect);
-        state._wsReconnect = setTimeout(function () {
-          if (!state.ws && state.symbol) {
-            startRealtime(state.symbol, state.tf);
-          }
-        }, delay);
+        scheduleWsReconnect();
       }
     };
   }
@@ -6069,6 +6125,31 @@
       // that re-checks staleness when NO tick arrives at all (a dead feed
       // never calls setLivePrice/checkManualSlAlarm again to notice itself).
       updateStaleBanner();
+      // Task 4/E3-01: client app-ping watchdog. A pong proves the SOCKET is
+      // alive; it is tracked separately from _lastTickTs (price data) so a
+      // frozen-but-open WS (laptop sleep, network change, silent HL
+      // subscription loss) gets force-closed and reconnected instead of
+      // sitting there forever "live" with dead prices. Piggybacks on this
+      // existing 5s tick instead of adding a second timer.
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        const _now = Date.now();
+        if (_now - (state._lastAppPingTs || 0) >= APP_PING_INTERVAL_MS) {
+          state._lastAppPingTs = _now;
+          try {
+            state.ws.send(JSON.stringify({ type: "ping" }));
+          } catch (_) {
+            /* ignore — onerror/onclose will handle a truly dead socket */
+          }
+        }
+        if (state._lastPongTs != null && _now - state._lastPongTs > APP_PONG_TIMEOUT_MS) {
+          console.warn("WS app-ping timeout — forcing reconnect");
+          try {
+            state.ws.close();
+          } catch (_) {
+            /* ignore */
+          }
+        }
+      }
       if (!state.symbol) return;
       if (state.activeView !== "chart") return; // chart hidden (overview active) → skip background loads
       if (!state._chartKey) return; // overview start: no chart loaded yet → no market polling

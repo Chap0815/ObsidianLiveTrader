@@ -1978,42 +1978,92 @@ MEXC_POLL_BASE_DELAY_S = 1.0
 MEXC_POLL_MAX_DELAY_S = 30.0
 
 
-async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None:
+async def _mexc_ping_pong(websocket: WebSocket) -> None:
+    """Echo client app-pings with a pong (Task 4/E3-01 client watchdog).
+
+    Mirrors ``hl_proxy._pump_client``: tolerant JSON parsing, ignores any
+    frame that isn't valid JSON or not a well-formed ``{"type": "ping"}``.
+    A genuine disconnect propagates as WebSocketDisconnect so the caller's
+    FIRST_COMPLETED race ends the whole poll loop, same as the send side.
+    """
+    while True:
+        raw = await websocket.receive_text()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "ping":
+            await websocket.send_json({"type": "pong"})
+
+
+async def _mexc_poll_send_loop(websocket: WebSocket, client, symbol: str) -> None:
     delay = MEXC_POLL_BASE_DELAY_S
+    while True:
+        if client is None:
+            await websocket.send_json(
+                {"type": "status", "status": "error", "error": "no client"}
+            )
+            break
+        # Backoff gilt NUR fuer Ticker-Fehler. Sends an den Browser stehen
+        # bewusst AUSSERHALB des try: ein Send-Fehler (Client weg) muss
+        # sofort propagieren (-> WebSocketDisconnect beendet die Schleife),
+        # statt als "Ticker-Fehler" einen Backoff-Schlaf zu verursachen.
+        mid_message: dict | None = None
+        err_message: dict | None = None
+        try:
+            t = await client.ticker(symbol)
+            mid_message = {
+                "type": "mid",
+                "coin": symbol,
+                "px": float(t.last_price),
+                "time": t.timestamp,
+            }
+            delay = MEXC_POLL_BASE_DELAY_S
+        except Exception as e:
+            # Detail nur ins Server-Log (B-03-Muster) — der Client bekommt
+            # eine generische Meldung, keine rohen Provider-/Stacktexte.
+            log.warning("MEXC-Poll ticker error for %s: %s", symbol, e)
+            err_message = {
+                "type": "status",
+                "status": "error",
+                "error": "Ticker nicht erreichbar — neuer Versuch folgt",
+            }
+            delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
+        await websocket.send_json(mid_message if mid_message else err_message)
+        await asyncio.sleep(delay)
+
+
+async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None:
+    """Drive the MEXC REST-poll fallback, plus (Task 4/E3-01) echo the
+    client's app-ping so its pong-watchdog does not false-trigger a
+    reconnect on the MEXC branch (Hyperliquid's proxy already answers ping
+    via ``hl_proxy._pump_client`` — this was the missing half, see
+    docs/superpowers/reviews/2026-07-16-audit3-realtime.md E3-03).
+
+    Real ``WebSocket`` instances always expose ``receive_text``; some unit
+    tests (test_mexc_poll_backoff.py) drive this with a minimal send-only
+    double that only exercises the poll/backoff logic and has no
+    ``receive_text`` — skip the ping-echo task for those instead of raising.
+    """
     try:
-        while True:
-            if client is None:
-                await websocket.send_json(
-                    {"type": "status", "status": "error", "error": "no client"}
-                )
-                break
-            # Backoff gilt NUR fuer Ticker-Fehler. Sends an den Browser stehen
-            # bewusst AUSSERHALB des try: ein Send-Fehler (Client weg) muss
-            # sofort propagieren (-> WebSocketDisconnect beendet die Schleife),
-            # statt als "Ticker-Fehler" einen Backoff-Schlaf zu verursachen.
-            mid_message: dict | None = None
-            err_message: dict | None = None
-            try:
-                t = await client.ticker(symbol)
-                mid_message = {
-                    "type": "mid",
-                    "coin": symbol,
-                    "px": float(t.last_price),
-                    "time": t.timestamp,
-                }
-                delay = MEXC_POLL_BASE_DELAY_S
-            except Exception as e:
-                # Detail nur ins Server-Log (B-03-Muster) — der Client bekommt
-                # eine generische Meldung, keine rohen Provider-/Stacktexte.
-                log.warning("MEXC-Poll ticker error for %s: %s", symbol, e)
-                err_message = {
-                    "type": "status",
-                    "status": "error",
-                    "error": "Ticker nicht erreichbar — neuer Versuch folgt",
-                }
-                delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
-            await websocket.send_json(mid_message if mid_message else err_message)
-            await asyncio.sleep(delay)
+        if hasattr(websocket, "receive_text"):
+            send_task = asyncio.create_task(
+                _mexc_poll_send_loop(websocket, client, symbol)
+            )
+            ping_task = asyncio.create_task(_mexc_ping_pong(websocket))
+            done, pending = await asyncio.wait(
+                {send_task, ping_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                exc = t.exception()
+                if exc and not isinstance(
+                    exc, (WebSocketDisconnect, asyncio.CancelledError)
+                ):
+                    raise exc
+        else:
+            await _mexc_poll_send_loop(websocket, client, symbol)
     except WebSocketDisconnect:
         pass
 

@@ -1,6 +1,7 @@
 """Q-06(a): MEXC REST-poll fallback in /ws/market must back off on repeated
 ticker errors instead of hammering the exchange at a flat 1s cadence."""
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.main import (
     MEXC_POLL_BASE_DELAY_S,
     MEXC_POLL_MAX_DELAY_S,
+    _mexc_ping_pong,
     _mexc_poll_fallback,
 )
 
@@ -87,3 +89,38 @@ async def test_mexc_poll_resets_delay_after_success():
         MEXC_POLL_BASE_DELAY_S * 4,
         MEXC_POLL_BASE_DELAY_S,
     ]
+
+
+@pytest.mark.asyncio
+async def test_mexc_ping_pong_echoes_client_ping():
+    """Task 4/E3-03: the MEXC branch must answer a client app-ping with a
+    pong (mirrors hl_proxy._pump_client) so the browser's pong-watchdog does
+    not false-trigger a reconnect while on the MEXC exchange."""
+
+    class _RecvFakeWS:
+        def __init__(self, frames):
+            self.frames = list(frames)
+            self.sent: list = []
+
+        async def receive_text(self):
+            if not self.frames:
+                raise WebSocketDisconnect()
+            return self.frames.pop(0)
+
+        async def send_json(self, data):
+            self.sent.append(data)
+
+    ws = _RecvFakeWS(
+        [
+            json.dumps({"type": "ping"}),
+            "not valid json",
+            json.dumps({"type": "something-else"}),
+        ]
+    )
+
+    with pytest.raises(WebSocketDisconnect):
+        await _mexc_ping_pong(ws)
+
+    # Only the well-formed ping frame produced a pong; garbage/other frames
+    # were ignored rather than crashing the loop.
+    assert ws.sent == [{"type": "pong"}]
