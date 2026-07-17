@@ -229,6 +229,51 @@ def test_api_responses_have_no_store_and_nosniff():
     assert r.headers["referrer-policy"] == "no-referrer"
 
 
+def test_mainnet_armed_without_ack_fails_closed(monkeypatch):
+    """W3-01: armed on Hyperliquid MAINNET without MAINNET_ACK must fail-closed
+    at startup (silent testnet→echtgeld switch is the dangerous moment)."""
+    import app.main as main
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: Settings(
+            trading_enabled=True,
+            exchange="hyperliquid",
+            hl_testnet=False,
+            local_api_token="test-token",
+            mainnet_ack=False,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="MAINNET_ACK"):
+        with TestClient(main.app):
+            pass
+
+
+def test_mainnet_with_ack_starts(monkeypatch):
+    """W3-01: the same armed-mainnet config starts once MAINNET_ACK=true, and
+    health then reports live_trading=True (drives the red MAINNET chip)."""
+    import app.main as main
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: Settings(
+            trading_enabled=True,
+            exchange="hyperliquid",
+            hl_testnet=False,
+            local_api_token="test-token",
+            mainnet_ack=True,
+        ),
+    )
+    with TestClient(main.app) as tc:
+        r = tc.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["live_trading"] is True
+
+
 def test_env_file_written_restrictive_perms(tmp_path):
     """B-08: .env carries exchange API secrets and the local auth token, so it
     must not be group-/world-readable after an atomic write. POSIX: chmod

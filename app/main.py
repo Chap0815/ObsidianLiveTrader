@@ -207,6 +207,34 @@ def _release_instance_lock(lock_path: Path) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
+
+    # W3-01: Mainnet-Echtgeld-Schutz (fail-closed). Der Wechsel von Testnet auf
+    # Echtgeld ist sonst ein stilles HL_TESTNET=false, während TRADING_ENABLED=
+    # true aus der Testnet-Phase scharf bleibt. Bis der Nutzer den Wechsel
+    # einmalig ausdrücklich bestätigt, wird ein scharfer Mainnet-Start abgelehnt.
+    # Bewusst hier (Startup) statt als pydantic-Validator: Settings() muss für
+    # disarmte Inspektion/health/Tests konstruierbar bleiben. Nur Hyperliquid hat
+    # ein Testnet — bei MEXC (kein Testnet) ist dieses Gate ein No-op. Raise vor
+    # jeder Ressourcen-Akquise (Lock/DB), daher kein Cleanup nötig.
+    _hl_mainnet = s.exchange == "hyperliquid" and not s.hl_testnet
+    if _hl_mainnet and s.trading_enabled and not s.mainnet_ack:
+        raise RuntimeError(
+            "Mainnet + scharfes Trading erkannt (HL_TESTNET=false, "
+            "TRADING_ENABLED=true) — zur Bestätigung einmalig MAINNET_ACK=true "
+            "in die .env setzen. Empfohlen vorher: Trading disarmen "
+            "(TRADING_ENABLED=false), Agent-Key-Scope prüfen und mit einer "
+            "Micro-Probe testen, dann wieder armen. Siehe README, Abschnitt "
+            "„Wechsel auf Mainnet“."
+        )
+    # Loud real-money startup notice: armed on mainnet (HL live) or any armed
+    # MEXC (MEXC has no testnet). Mirrors the /api/health live_trading flag.
+    if s.trading_enabled and not (s.exchange == "hyperliquid" and s.hl_testnet):
+        log.warning(
+            "MAINNET · ECHTGELD AKTIV: scharfes Trading auf %s — Orders bewegen "
+            "echtes Kapital.",
+            s.exchange,
+        )
+
     client = create_exchange_client(s)
     db = Database(s.database_path)
 

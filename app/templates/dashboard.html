@@ -41,6 +41,13 @@
       <span class="arm-dot" aria-hidden="true"></span>
       <span class="arm-text">{% if trading_enabled %}LIVE{% else %}DISARMED{% endif %}</span>
     </span>
+    {# W3-01: lauter roter Echtgeld-Chip. Sichtbar nur wenn scharf UND Mainnet
+       (health.live_trading). JS toggelt das hidden-Attribut in loadHealth(). #}
+    <span id="mainnet-chip" class="mainnet-chip"{% if not (trading_enabled and not hl_testnet) %} hidden{% endif %}
+          data-tip="ECHTGELD: scharfes Trading auf dem Mainnet. Orders bewegen echtes Kapital.">
+      <span class="mainnet-dot" aria-hidden="true"></span>
+      <span class="mainnet-text">MAINNET · ECHTGELD</span>
+    </span>
     <div class="health" title="API-Status">
       <span class="health-item">
         <span id="dot-exchange" class="status-dot unknown"></span>

@@ -1500,6 +1500,10 @@
         const t = arm.querySelector(".arm-text");
         if (t) t.textContent = h.trading_enabled ? "LIVE" : "DISARMED";
       }
+      // W3-01: red MAINNET · ECHTGELD chip — visible only when armed AND on
+      // mainnet (live_trading = trading_enabled && not testnet, from health).
+      const mainnetChip = $("mainnet-chip");
+      if (mainnetChip) mainnetChip.hidden = h.live_trading !== true;
       try { renderInstrumentRail(); } catch (_) {}
 
       // Active-exchange LED + label (works for hyperliquid AND mexc)

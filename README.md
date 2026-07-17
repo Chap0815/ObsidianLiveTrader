@@ -83,6 +83,7 @@ Python 3.11+ empfohlen.
 | `DATABASE_PATH` | `data/trader.db` | SQLite Audit (Proposals/Orders) |
 | **`TRADING_ENABLED`** | **`false`** | **`false` = DISARMED** — kein Place/Confirm. `true` erfordert `LOCAL_API_TOKEN` gesetzt (sonst Startfehler) |
 | **`LOCAL_API_TOKEN`** | leer | **Pflicht**, sobald `TRADING_ENABLED=true` — Auth-Token für die lokale API |
+| **`MAINNET_ACK`** | **`false`** | **Echtgeld-Schutz.** `HL_TESTNET=false` + `TRADING_ENABLED=true` startet **nur** mit `MAINNET_ACK=true` (sonst Startfehler). Nur Hyperliquid (MEXC hat kein Testnet). Siehe [Wechsel auf Mainnet](#wechsel-auf-mainnet) |
 | **`ALLOW_UNPROTECTED_ENTRY`** | **`false`** | **`false`** blockiert Orders ohne Stop-Loss |
 | `ALLOW_MANUAL_TRIGGER` | `false` | Manueller Trigger-Mode (Entry ohne Börsen-SL/TP); `false` = fail-closed blocken (bereits im Preview-Gate, R-04) |
 | `RISK_SLIPPAGE_PCT` | `0.05` | Slippage-Puffer im Risk-Gate |
@@ -97,6 +98,18 @@ Python 3.11+ empfohlen.
 | `STRICT_AVAILABLE_MARGIN` | `true` | Order gegen tatsächlich verfügbare Margin prüfen (Preset `balanced`) |
 
 Vollständige Vorlage: [`.env.example`](.env.example). Secrets **nie committen**.
+
+### Wechsel auf Mainnet
+
+Der Sprung von Hyperliquid-**Testnet** (Spielgeld) auf **Mainnet** (echtes Kapital) ist der gefährlichste Moment: ein stilles `HL_TESTNET=false` reicht sonst, während `TRADING_ENABLED=true` aus der Testnet-Phase scharf bleibt. Deshalb ist ein scharfer Mainnet-Start **fail-closed** und wird abgelehnt, bis du ihn mit `MAINNET_ACK=true` einmalig bestätigst. Ablauf:
+
+1. **Trading disarmen** — `TRADING_ENABLED=false` setzen, bevor du irgendetwas an der Börsen-Konfiguration änderst.
+2. **Auf Mainnet umstellen** — `HL_TESTNET=false`; echten Mainnet-Agent-Key in `HL_PRIVATE_KEY` (bzw. `HL_ACCOUNT_ADDRESS` bei Agent-/API-Wallet) hinterlegen.
+3. **Agent-Key-Scope prüfen** — der Key darf **nur traden, nicht abheben** (kein Withdraw-Scope). Siehe [Task 0 Spike](#task-0-spike-live-pfad-manuell-beweisen).
+4. **Micro-Probe** — mit minimaler Size + SL einen Place/Cancel auf Mainnet beweisen (Task-0-Spike gegen Mainnet), damit Keys/Netz/Adresse stimmen.
+5. **Bestätigen & armen** — `MAINNET_ACK=true` **und** `TRADING_ENABLED=true` setzen, App neu starten. Im UI erscheint dann der rote Chip **MAINNET · ECHTGELD**, im Log eine `MAINNET · ECHTGELD AKTIV`-Zeile.
+
+Wieder auf Testnet zurück (`HL_TESTNET=true`) deaktiviert das Gate automatisch — `MAINNET_ACK` darf gesetzt bleiben, greift aber nur bei Mainnet.
 
 ### MEXC-Key-Hygiene
 

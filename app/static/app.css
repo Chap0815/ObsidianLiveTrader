@@ -140,6 +140,38 @@ body {
   50% { opacity: 0.25; }
 }
 
+/* ── Mainnet / real-money chip (topbar) — W3-01 ──────────────
+   Loud RED danger chip, shown only when armed AND on mainnet
+   (health.live_trading). Distinct from the amber "live" accent so
+   the echtgeld state can never be confused with mere arming.       */
+.mainnet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid #e0392b;
+  background: rgba(224, 57, 43, 0.22);
+  font-family: var(--mono);
+  font-size: 14.3px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: #ff9086;
+  cursor: default;
+}
+.mainnet-chip[hidden] { display: none; }
+
+.mainnet-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e0392b;
+  box-shadow: 0 0 6px rgba(224, 57, 43, 0.8);
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) { .mainnet-dot { animation: none; } }
+
 /* legacy classes kept for JS-toggled badges (history/exchange chips) */
 .banner-chip,
 .disarmed-badge {

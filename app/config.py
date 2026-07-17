@@ -94,6 +94,14 @@ class Settings(BaseSettings):
     hl_private_key: str = ""
     hl_account_address: str = ""  # main wallet address if using agent key
     hl_testnet: bool = True
+    # W3-01: explicit one-time acknowledgement for the testnet→mainnet switch.
+    # Switching to real money is otherwise a silent HL_TESTNET=false while
+    # TRADING_ENABLED=true from the testnet phase stays armed. Fail-closed
+    # default False: an armed Hyperliquid mainnet start is refused until the
+    # user sets MAINNET_ACK=true (enforced in the lifespan startup, not here,
+    # so Settings() stays constructible for disarmed/inspection use). MEXC has
+    # no testnet, so this gate is a no-op there.
+    mainnet_ack: bool = False
     hl_base_url: str = ""  # empty → SDK default from testnet flag
     # Q-01: hard per-request timeout (seconds) for every Hyperliquid SDK HTTP
     # call. The SDK defaults to NO timeout, so a hung endpoint would block a
