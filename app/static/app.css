@@ -367,7 +367,9 @@ body {
 
 .brand-mark {
   color: var(--accent);
-  font-size: var(--fs-2xl);
+  /* Literal beibehalten: 23.8px liegt zwischen --fs-xl(21) und --fs-2xl(27),
+     kein Token innerhalb der ≤2px-Toleranz (Skalenluecke 21→27). */
+  font-size: 23.8px;
   line-height: 1;
 }
 
@@ -3154,7 +3156,8 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .modal-close {
-  font-size: var(--fs-2xl);
+  /* Literal beibehalten: 23.8px, kein --fs-Token innerhalb ≤2px (siehe .brand-mark). */
+  font-size: 23.8px;
   line-height: 1;
 }
 
@@ -3288,7 +3291,8 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .setup-head .brand-mark {
-  font-size: var(--fs-display);
+  /* Literal beibehalten: 37px, --fs-display(34) waere 3px Shift (>2px-Toleranz). */
+  font-size: 37px;
   line-height: 1.2;
 }
 
