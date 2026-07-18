@@ -4146,6 +4146,10 @@
         setup: hit.setup,
         key_level: hit.key_level != null ? hit.key_level : hit.entry,
         score: hit.score,
+        // S2-04: pass the screener's own rationale through so the analyzer
+        // sees WHY the coin was flagged (truncated — free LLM text, not a
+        // structured field; server-side sanitizer truncates again anyway).
+        reason: hit.reason ? String(hit.reason).slice(0, 120) : undefined,
       };
     }
 
@@ -5293,6 +5297,47 @@
     );
   }
 
+  // S2-06: a scan is a snapshot, not a live feed — past 10 minutes the
+  // underlying setup may already be gone, so the strip must say so instead
+  // of quietly aging into a stale click target.
+  const SCAN_STALE_MIN = 10;
+
+  function scanAgeMinutes(scannedAt) {
+    if (typeof scannedAt !== "number") return null;
+    return (Date.now() / 1000 - scannedAt) / 60;
+  }
+
+  function scanAgeLabel(scannedAt) {
+    const mins = scanAgeMinutes(scannedAt);
+    if (mins === null) return "";
+    if (mins < 1) return "gerade eben";
+    return "vor " + Math.floor(mins) + "m";
+  }
+
+  /** Refresh just the "vor Xm" age label + stale hint on the already-rendered
+   *  scan strip, without rebuilding the chips (called on a timer). */
+  function updateScanAgeDisplay() {
+    const strip = $("scan-strip");
+    const data = state.scanResults;
+    if (!strip || !data) return;
+    const mins = scanAgeMinutes(data.scanned_at);
+    if (mins === null) return;
+    const stale = mins > SCAN_STALE_MIN;
+    const ageEl = strip.querySelector("#scan-age");
+    if (ageEl) ageEl.textContent = scanAgeLabel(data.scanned_at);
+    strip.classList.toggle("scan-stale", stale);
+    const head = strip.querySelector(".scan-strip-head");
+    let hintEl = strip.querySelector(".scan-stale-hint");
+    if (stale && head && !hintEl) {
+      hintEl = document.createElement("span");
+      hintEl.className = "scan-stale-hint";
+      hintEl.textContent = " · veraltet — neu scannen";
+      head.appendChild(hintEl);
+    } else if (!stale && hintEl) {
+      hintEl.remove();
+    }
+  }
+
   /** Scan results live in a PERSISTENT strip above the analysis. Clicking a
    *  coin analyses it without destroying the other findings. */
   function renderScanResults(data) {
@@ -5304,6 +5349,13 @@
     const hiddenCount = allRows.length - rows.length;
     state.scanResults = data;
 
+    if (state._scanAgeTimer) clearInterval(state._scanAgeTimer);
+    if (strip && data && typeof data.scanned_at === "number") {
+      state._scanAgeTimer = setInterval(updateScanAgeDisplay, 15000);
+    }
+
+    const ageSpan = ' · <span id="scan-age">' + escapeHtml(scanAgeLabel(data && data.scanned_at)) + "</span>";
+
     if (!strip) return;
     if (!rows.length) {
       strip.className = "scan-strip";
@@ -5313,8 +5365,9 @@
       strip.innerHTML =
         '<div class="scan-strip-head">Markt-Scan · ' +
         escapeHtml(String(data.model_used || "?")) + " · " +
-        ((data.scanned || []).length || 0) + " Coins</div>" +
+        ((data.scanned || []).length || 0) + " Coins" + ageSpan + "</div>" +
         '<div class="scan-empty">' + emptyMsg + '</div>';
+      updateScanAgeDisplay();
       const body = $("proposal-body");
       if (body) {
         body.className = "placeholder";
@@ -5332,6 +5385,7 @@
       (hiddenCount
         ? " (" + hiddenCount + " bereits offen ausgeblendet)"
         : "") +
+      ageSpan +
       ' <span class="scan-hint">— Coin anklicken für Detail-Analyse</span></div>' +
       '<div class="scan-chips">';
     rows.forEach(function (r) {
@@ -5350,6 +5404,7 @@
 
     strip.className = "scan-strip";
     strip.innerHTML = html;
+    updateScanAgeDisplay();
     strip.querySelectorAll(".scan-chip").forEach(function (b) {
       b.addEventListener("click", function () {
         openCoinAndAnalyze(b.getAttribute("data-symbol"));

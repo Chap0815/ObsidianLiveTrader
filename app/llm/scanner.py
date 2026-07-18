@@ -76,11 +76,23 @@ Selection method per coin:
    under a long idea is a fade-risk deprioritizer. When oi_read is absent
    (MEXC / cold-start), ignore it — do not infer positioning.
 
-Scoring: 0-10 as an ABSOLUTE quality bar, not a relative ranking. A 6 means
-"a disciplined analyst would actually take this now." Only include coins with
-score >= 5 that clear both hard rejects above (against-daily is a score cap, not
-a reject). Maximum 6 results, sorted by score descending. Returning an empty
-list is the correct answer in a quiet market.
+Scoring: 0-10 as an ABSOLUTE quality bar, not a relative ranking. Ground the
+scale on these anchors instead of picking a number in the abstract:
+  - 5 = valid-but-marginal: clears both hard rejects but only one weak
+    confluence, or a level that's close-but-not-clean. Worth a second look,
+    not a conviction pick.
+  - 6 = takeable: "a disciplined analyst would actually take this now" — at
+    least 2 confluences agree (regime + momentum + location + funding/OI).
+  - 8 = A+: confluences stack cleanly with no meaningful conflict anywhere in
+    the read (regime, momentum, location, funding/OI all agree) — this is
+    roughly the deep analyzer's own "high" target-confidence tier, so hand it
+    off as such.
+  - 10 = reserved for the rare textbook case; do not hand it out for a merely
+    good setup.
+Only include coins with score >= 5 that clear both hard rejects above
+(against-daily is a score cap, not a reject). Maximum 6 results, sorted by
+score descending. Returning an empty list is the correct answer in a quiet
+market.
 
 Output ONLY valid JSON, no markdown, exactly this schema:
 {

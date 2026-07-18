@@ -2252,6 +2252,10 @@ async def market_scan(
         "tf": tf,
         "htf": htf,
         "errors": fetch_errors,
+        # S2-06: epoch seconds the scan completed — lets the frontend show
+        # "vor Xm" and flag the strip as stale once it's aged past its
+        # usefulness (a scan is a snapshot, not a live feed).
+        "scanned_at": _time.time(),
         "note": "Screening only — open a coin for the full analysis before trading.",
     }
 

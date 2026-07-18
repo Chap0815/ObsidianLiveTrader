@@ -1982,6 +1982,18 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-weight: 400;
 }
 
+/* S2-06: scan is a snapshot — flag it once it's aged past usefulness */
+.scan-stale-hint {
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--warn, #e0a23d);
+  font-weight: 600;
+}
+
+.scan-strip.scan-stale {
+  border-bottom-color: var(--warn, #e0a23d);
+}
+
 .scan-empty {
   font-family: var(--sans);
   font-size: 16.5px;

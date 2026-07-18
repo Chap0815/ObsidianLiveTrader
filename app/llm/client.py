@@ -715,6 +715,13 @@ def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
     score = raw.get("score")
     if isinstance(score, (int, float)):
         out["score"] = score
+    # S2-04: the screener's own rationale for the pick — without it the
+    # analyzer re-derives blind and can't see WHY the coin was flagged.
+    # Truncated to ~120 chars: it is LLM-origin free text, not a structured
+    # field, so it's a hint for the analyzer prompt, not a contract value.
+    reason = raw.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        out["reason"] = reason.strip()[:120]
     return out or None
 
 

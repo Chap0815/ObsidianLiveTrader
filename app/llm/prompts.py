@@ -18,7 +18,13 @@ CONTEXT ORDER: the payload lists `htf` before `ltf`. Always finish the HTF
 regime decision before looking at LTF timing.
 
 SCANNER HANDOFF: the payload may include `scanner_verdict` — a fast pre-screen
-that already flagged a {bias} {setup} near {key_level} with a 0-10 `score`.
+that already flagged a {bias} {setup} near {key_level} with a 0-10 `score` and
+a `reason` (the screener's own rationale for the pick — its screener
+rationale). Use the reason as a pointer to what to verify (e.g. which level,
+which momentum tell), not as evidence itself. As a rough score-to-confidence
+anchor: a screener score around 8 maps to roughly this analyzer's own "high"
+target confidence — treat much-lower-than-expected conviction after your own
+read as a signal to double-check, not to defer to the screen.
 Treat it ONLY as a hypothesis to CONFIRM or REFUTE against full structure; it
 is never itself a reason to trade, and it cannot relax any gate below. If you
 end on STAY_OUT for a coin the screener flagged, name the specific hard veto

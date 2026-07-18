@@ -327,6 +327,87 @@ async def test_build_scan_contexts_isolates_error_with_gather():
     assert len(errors) == 1 and "BROKEN" in errors[0]
 
 
+# --- S2-04: scanner rationale must survive the analyzer handoff sanitizer --
+
+
+def test_scanner_verdict_keeps_reason():
+    """_sanitize_scanner_verdict must pass the screener's own rationale
+    through (truncated ~120 chars) so the analyzer sees WHY the coin was
+    flagged, not just bias/setup/score."""
+    from app.llm.client import _sanitize_scanner_verdict
+
+    long_reason = "bounced off daily support with bullish RSI divergence " * 5
+    out = _sanitize_scanner_verdict(
+        {"bias": "long", "setup": "pullback", "score": 7, "reason": long_reason}
+    )
+    assert out["reason"] == long_reason.strip()[:120]
+    assert len(out["reason"]) <= 120
+
+    out2 = _sanitize_scanner_verdict(
+        {"bias": "short", "setup": "reversal", "score": 6, "reason": "RSI overbought at resistance"}
+    )
+    assert out2["reason"] == "RSI overbought at resistance"
+
+    # absent/blank reason -> key simply omitted, no crash
+    out3 = _sanitize_scanner_verdict({"bias": "long", "setup": "breakout", "score": 8})
+    assert "reason" not in out3
+
+
+# --- S2-06: /api/scan must carry a scanned_at timestamp for staleness UI ---
+
+
+def test_scan_response_has_scanned_at(monkeypatch):
+    import time as _time
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    import app.llm.scanner as scanner_mod
+    from app.analysis.context import clear_daily_cache
+    from app.config import Settings, get_settings
+    from app.main import app
+
+    clear_daily_cache()
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    get_settings.cache_clear()
+
+    client = MagicMock()
+    client.market_overview = AsyncMock(
+        return_value=[{"symbol": "BTC", "volume24": 1e9, "funding": 0.0, "last": 100.0}]
+    )
+    client.klines = AsyncMock(
+        return_value=[
+            Candle(
+                time=(1_700_000_000 + i * 900) * 1000,
+                open=100.0, high=101.0, low=99.0, close=100.5, vol=5,
+            )
+            for i in range(60)
+        ]
+    )
+
+    async def fake_scan_with_llm(contexts, settings):
+        return [], "test-model"
+
+    monkeypatch.setattr(scanner_mod, "scan_with_llm", fake_scan_with_llm)
+
+    before = _time.time()
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post("/api/scan", json={"tf": "15m", "htf": "1H"})
+    after = _time.time()
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "scanned_at" in data
+    assert isinstance(data["scanned_at"], (int, float))
+    assert before <= data["scanned_at"] <= after
+
+
 def test_parse_scan_results_salvages_truncated_json():
     """Model cut off at max_tokens mid-array: keep the complete objects."""
     from app.llm.scanner import parse_scan_results
