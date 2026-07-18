@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ from app.config import Settings
 from app.llm.client import (
     LlmError,
     _categorize_provider_http_error,
+    _log_llm_metrics,
     _oi_read_label,
     compact_daily_for_llm,
     compact_tf_for_llm,
@@ -364,6 +366,7 @@ async def _anthropic_text(
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout) as c:
             r = await c.post(url, headers=headers, json=body)
@@ -380,6 +383,14 @@ async def _anthropic_text(
             raw=detail,
         )
     payload = r.json()
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider=provider_label,
+        model=model,
+        route="scanner",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
     parts = [
         str(b.get("text") or "")
         for b in payload.get("content") or []
@@ -416,6 +427,7 @@ async def _openai_compat_text(
             {"role": "user", "content": user},
         ],
     }
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout) as c:
             r = await c.post(base_url.rstrip("/") + "/chat/completions", headers=headers, json=body)
@@ -432,10 +444,19 @@ async def _openai_compat_text(
             raw=detail,
         )
     try:
-        choice = r.json()["choices"][0]
+        payload = r.json()
+        choice = payload["choices"][0]
         content = str(choice["message"].get("content") or "")
     except (KeyError, IndexError, TypeError) as e:
         raise LlmError("Scanner response missing content") from e
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider=provider_label,
+        model=model,
+        route="scanner",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
     if not content.strip():
         finish = choice.get("finish_reason") or "?"
         raise LlmError(

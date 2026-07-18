@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -171,6 +172,9 @@ def parse_proposal(text: str) -> TradeProposal:
         salvaged = salvage_proposal_json(text)
         if salvaged is None:
             raise
+        log.warning(
+            "Proposal JSON recovered via salvage; response was truncated"
+        )
         data = salvaged
     if isinstance(data, dict):
         data = _normalize_setup_confidence(data)
@@ -197,6 +201,9 @@ def parse_reevaluation(text: str) -> ReevaluateProposal:
         salvaged = salvage_proposal_json(text)
         if salvaged is None:
             raise
+        log.warning(
+            "Reevaluation JSON recovered via salvage; response was truncated"
+        )
         data = salvaged
     if isinstance(data, dict):
         data = _normalize_reevaluate_confidence(data)
@@ -888,6 +895,77 @@ _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 _RETRY_BACKOFF_SECONDS = 0.5
 
 
+def _log_llm_metrics(
+    *,
+    provider: str,
+    model: str | None,
+    route: str,
+    elapsed_ms: float,
+    payload: dict[str, Any] | None,
+) -> None:
+    """Emit exactly ONE greppable `LLM_METRICS` INFO line per LLM call with
+    latency + usage/cache/finish_reason, read defensively from either the
+    OpenAI-shaped response (xai/openai/ollama: choices[0].finish_reason,
+    usage.prompt_tokens/completion_tokens, usage.completion_tokens_details.
+    reasoning_tokens, usage.prompt_tokens_details.cached_tokens) or the
+    Anthropic-shaped response (claude: top-level stop_reason, usage.
+    input_tokens/output_tokens/cache_read_input_tokens/
+    cache_creation_input_tokens).
+
+    Purely observational (O2-02/L2X-03/O2-04): never raises — a missing or
+    unexpected `usage`/`choices` shape just logs fewer fields instead of
+    breaking the advisory call that triggered it.
+    """
+    try:
+        payload = payload or {}
+        usage = payload.get("usage") or {}
+
+        # Anthropic shape
+        stop_reason = payload.get("stop_reason")
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        cache_read_tokens = usage.get("cache_read_input_tokens")
+        cache_creation_tokens = usage.get("cache_creation_input_tokens")
+
+        # OpenAI-shaped (xai/openai/ollama)
+        finish_reason = None
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            choice0 = choices[0] if isinstance(choices[0], dict) else {}
+            finish_reason = choice0.get("finish_reason")
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        completion_details = usage.get("completion_tokens_details") or {}
+        reasoning_tokens = completion_details.get("reasoning_tokens")
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = prompt_details.get("cached_tokens")
+
+        log.info(
+            "LLM_METRICS provider=%s model=%s route=%s elapsed_ms=%.0f "
+            "input_tokens=%s output_tokens=%s prompt_tokens=%s "
+            "completion_tokens=%s reasoning_tokens=%s cached_tokens=%s "
+            "cache_read_input_tokens=%s cache_creation_input_tokens=%s "
+            "finish_reason=%s stop_reason=%s",
+            provider,
+            model,
+            route,
+            elapsed_ms,
+            input_tokens,
+            output_tokens,
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens,
+            cached_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            finish_reason,
+            stop_reason,
+        )
+    except Exception:
+        # Metrics logging must never break an advisory LLM call.
+        log.debug("LLM_METRICS logging failed", exc_info=True)
+
+
 async def _post_with_retry(
     post: Callable[[], Awaitable[httpx.Response]],
 ) -> httpx.Response:
@@ -968,6 +1046,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             return await client.post(url, headers=headers, json=payload)
 
     sent_body = body
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
@@ -1007,6 +1086,15 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         payload = r.json()
     except json.JSONDecodeError as e:
         raise LlmError("Claude returned non-JSON response") from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider="Claude",
+        model=sent_body.get("model"),
+        route="analyze",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     if payload.get("stop_reason") == "max_tokens":
         log.warning(
@@ -1054,6 +1142,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         async with httpx.AsyncClient(timeout=90.0) as client:
             return await client.post(url, headers=headers, json=body)
 
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
@@ -1072,6 +1161,15 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider="xAI",
+        model=body.get("model"),
+        route="analyze",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     return _parse_content_to_proposal(str(content), provider="xAI", context=context)
 
@@ -1107,6 +1205,7 @@ async def _call_openai_compat(
         async with httpx.AsyncClient(timeout=timeout) as client:
             return await client.post(url, headers=headers, json=body)
 
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
@@ -1128,6 +1227,15 @@ async def _call_openai_compat(
             f"{provider_label} response missing choices content",
             raw=getattr(r, "text", None),
         ) from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider=provider_label,
+        model=model,
+        route="analyze",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     return _parse_content_to_proposal(str(content), provider=provider_label, context=context)
 
@@ -1211,6 +1319,7 @@ async def _call_claude_reevaluate(
         async with httpx.AsyncClient(timeout=120.0) as client:
             return await client.post(url, headers=headers, json=body)
 
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
@@ -1228,6 +1337,15 @@ async def _call_claude_reevaluate(
         payload = r.json()
     except json.JSONDecodeError as e:
         raise LlmError("Claude returned non-JSON response") from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider="Claude",
+        model=body.get("model"),
+        route="reevaluate",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     text_parts: list[str] = []
     try:
@@ -1267,6 +1385,7 @@ async def _call_xai_reevaluate(
         async with httpx.AsyncClient(timeout=90.0) as client:
             return await client.post(url, headers=headers, json=body)
 
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
@@ -1285,6 +1404,15 @@ async def _call_xai_reevaluate(
         content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider="xAI",
+        model=body.get("model"),
+        route="reevaluate",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     return _parse_content_to_reevaluation(str(content), provider="xAI")
 
@@ -1320,6 +1448,7 @@ async def _call_openai_compat_reevaluate(
         async with httpx.AsyncClient(timeout=timeout) as client:
             return await client.post(url, headers=headers, json=body)
 
+    t0 = time.monotonic()
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
@@ -1341,6 +1470,15 @@ async def _call_openai_compat_reevaluate(
             f"{provider_label} response missing choices content",
             raw=getattr(r, "text", None),
         ) from e
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    _log_llm_metrics(
+        provider=provider_label,
+        model=model,
+        route="reevaluate",
+        elapsed_ms=elapsed_ms,
+        payload=payload,
+    )
 
     return _parse_content_to_reevaluation(str(content), provider=provider_label)
 
