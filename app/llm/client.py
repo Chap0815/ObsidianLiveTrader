@@ -755,9 +755,8 @@ def build_llm_context(
         "note": (
             "Advisory only. Read daily (regime anchor), then htf (regime), then "
             "ltf (timing). Human must apply and pass risk gates before any order. "
-            "When a real, fully-gated setup exists (>=1 confluence, valid stop, "
-            "rrr>=min_rrr), TAKE the directional stance — do not hide in STAY_OUT; "
-            "reserve STAY_OUT for the hard vetoes only."
+            "Follow the system prompt's decision_policy for action vs STAY_OUT "
+            "and for SIZE TO CONVICTION sizing."
         ),
     }
     if include_acct:

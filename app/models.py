@@ -112,6 +112,21 @@ class MarketSnapshot(BaseModel):
 TrendLabel = Literal["bullish", "bearish", "ranging"]
 TradeAction = Literal["STRONG_BUY", "BUY", "STAY_OUT", "SELL", "STRONG_SHORT"]
 SetupConfidence = Literal["low", "medium", "high"]
+# Intended holding horizon of the setup (P2-08).
+TimeHorizon = Literal["scalp", "intraday", "swing"]
+
+
+class Confluence(BaseModel):
+    """One independent confluence supporting the trade side (P2-07).
+
+    The array length IS the confluence count that feeds the DECISION block;
+    an item with EMPTY evidence does not count. `type` is the evidence kind
+    (regime / pattern / value_at_structure / momentum / funding / positioning),
+    `evidence` names the concrete data (a price, a swing, a reading).
+    """
+
+    type: str = ""
+    evidence: str = ""
 
 
 class ProposalKeyLevels(BaseModel):
@@ -135,12 +150,17 @@ class TradeProposal(BaseModel):
     chart_pattern: str = ""
     pattern_confidence: str = ""  # low | medium | high | ""
     volume_momentum: str = ""
-    # Overall confidence in the setup (distinct from pattern_confidence): the
-    # prompt requires "low" whenever LTF momentum is turning against the
-    # trade direction or the achievable rrr is below risk_policy.min_rrr.
-    # Default "medium" so older/loose LLM output that omits the field still
-    # validates (see app/llm/client.py parse_proposal normalization).
+    # Overall confidence in the setup (distinct from pattern_confidence). The
+    # prompt DERIVES this from evidence (CONFIDENCE DERIVATION table, no
+    # medium-anchoring, P2-05). The "medium" here is only a PARSE fallback so
+    # older/loose LLM output that omits the field still validates — it is NOT a
+    # modeling default (see app/llm/client.py parse_proposal normalization).
     setup_confidence: SetupConfidence = "medium"
+    # Numeric conviction (0-10) the LLM DERIVES alongside setup_confidence
+    # (P2-05, breaks the medium mode-collapse): 0-3 -> low, 4-6 -> medium,
+    # 7-10 -> high. Optional/nullable so older output that omits it still
+    # validates (see parse_proposal normalization).
+    conviction_score: int | None = Field(None, ge=0, le=10)
     action: TradeAction
     trigger_entry_zone: str = ""
     entry_price: float | None = None
@@ -158,6 +178,14 @@ class TradeProposal(BaseModel):
     # when the LLM has no distinct level beyond the stop-loss itself.
     invalidation_price: float | None = None
     invalidation_tf: str = ""
+    # Independent confluences the DECISION counted (P2-07). The array length
+    # IS the count; an item with EMPTY evidence does not count. Default empty
+    # so older proposals that omit it still parse.
+    confluences: list[Confluence] = Field(default_factory=list)
+    # Concise "if wrong, then" counter-thesis (P2-08). Null when none stated.
+    alternative_scenario: str | None = None
+    # Intended holding horizon (P2-08). Null when the LLM leaves it unset.
+    time_horizon: TimeHorizon | None = None
     rationale: str = ""
 
 
