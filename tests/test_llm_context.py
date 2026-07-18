@@ -10,8 +10,13 @@ from app.analysis.context import (
     is_btc_symbol,
 )
 from app.config import Settings
-from app.llm.client import _ema_stack_label, build_llm_context
-from app.llm.prompts import build_system_prompt
+from app.journal.stats import build_stats_response, build_track_record
+from app.llm.client import (
+    _ema_stack_label,
+    build_llm_context,
+    build_original_thesis,
+)
+from app.llm.prompts import build_reevaluate_system_prompt, build_system_prompt
 from app.models import Candle
 
 
@@ -144,3 +149,90 @@ def test_context_omits_premium_and_empty_oi():
     assert ctx2["market"]["open_interest"] == 500.0
     assert ctx2["market"]["oi_change_pct_1h"] == 1.1
     assert "premium" not in ctx2["market"]
+
+
+# --- Task 21 K2-01/F2-01: track_record calibration hint in the analyze ctx ----
+
+
+def _raw_stats(wins=15, losses=10):
+    """A journal_stats()-shaped raw dict with resolved groups big enough to pass
+    the sample gate; overall net denominator populated."""
+    grp = {"wins": 14, "losses": 8, "sum_r": 6.0}  # 22 resolved
+    return {
+        "total": 60,
+        "stay_out": 5,
+        "wins": wins,
+        "losses": losses,
+        "overall_sum_r": 5.0,
+        "overall_sum_r_net": 3.0,
+        "overall_net_sample": wins + losses,
+        "by_confidence": {"high": dict(grp)},
+        "by_setup": {"pullback": dict(grp)},
+    }
+
+
+def test_track_record_block_present_when_sample_ok():
+    stats = build_stats_response(_raw_stats(), min_sample=20)
+    tr = build_track_record(stats, min_sample=20)
+    assert tr is not None
+    # overall carries n + net expectancy + the HONEST Wilson LOWER bound
+    assert tr["overall"]["n"] == 25
+    assert tr["overall"]["net_expectancy_r"] is not None
+    lo = tr["overall"]["win_rate_lo"]
+    # never the point estimate (15/25 = 0.6): the lower bound is strictly below
+    assert lo is not None and 0.0 <= lo < 0.6
+    # per-group breakdowns present (each >= min_sample) with n + lower bound
+    assert "high" in tr["by_confidence"]
+    assert tr["by_confidence"]["high"]["n"] == 22
+    assert tr["by_confidence"]["high"]["win_rate_lo"] is not None
+    assert "pullback" in tr["by_setup"]
+    # it reaches the analyze prompt, framed as a CALIBRATION HINT (not a veto)
+    ctx = build_llm_context(
+        _market(), {}, Settings(include_account_in_llm=False), track_record=tr
+    )
+    assert ctx["track_record"] == tr
+    prompt = build_system_prompt(ctx)
+    assert "TRACK RECORD (calibration hint)" in prompt
+
+
+def test_track_record_absent_below_min_sample():
+    stats = build_stats_response(_raw_stats(wins=6, losses=4), min_sample=20)
+    # overall resolved sample is 10 < 20 -> no block at all (never noise as edge)
+    assert build_track_record(stats, min_sample=20) is None
+    # and with no track_record supplied the prompt has no calibration section
+    ctx = build_llm_context(_market(), {}, Settings(include_account_in_llm=False))
+    assert "track_record" not in ctx
+    assert "TRACK RECORD (calibration hint)" not in build_system_prompt(ctx)
+
+
+# --- Task 21 O2-06: ORIGINAL thesis anchor in the reevaluate context ----------
+
+
+def test_reevaluate_context_contains_original_thesis():
+    proposal = {
+        "action": "BUY",
+        "setup_confidence": "medium",
+        "chart_pattern": "Bull Flag",
+        "entry_price": 100.0,
+        "stop_loss": 95.0,
+        "tp1": 110.0,
+        "rationale": "1H uptrend, pullback into EMA20 at prior support.",
+        "conviction_score": 5,
+    }
+    thesis = build_original_thesis(proposal)
+    assert thesis is not None
+    assert thesis["chart_pattern"] == "Bull Flag"
+    assert thesis["entry_price"] == 100.0
+    assert thesis["stop_loss"] == 95.0
+    assert thesis["tp1"] == 110.0
+    assert thesis["setup_confidence"] == "medium"
+    assert thesis["rationale"]
+    # a STAY_OUT / level-less proposal never opened a position -> no anchor
+    assert build_original_thesis({"action": "STAY_OUT"}) is None
+    assert build_original_thesis(None) is None
+    # the reevaluate prompt gains the consistency-anchor instruction ONLY when
+    # the block is present (the base prompt must not already carry it)
+    with_thesis = build_reevaluate_system_prompt({"original_thesis": thesis})
+    assert "ORIGINAL THESIS (consistency anchor)" in with_thesis
+    assert "state explicitly whether it still holds" in with_thesis
+    assert "ORIGINAL THESIS (consistency anchor)" not in build_reevaluate_system_prompt()

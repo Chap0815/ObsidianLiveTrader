@@ -174,6 +174,27 @@ NEVER forces STAY_OUT on its own. When the block is absent, skip this check.
 """
 
 
+# Track-record calibration hint — appended ONLY when the payload carries a
+# `track_record` block (present only when the KI's own resolved shadow sample is
+# >= journal_min_sample; see app/journal/stats.py build_track_record). A SOFT
+# calibration input to setup_confidence, NEVER a veto/threshold/auto-size.
+_TRACK_RECORD_RULE = """TRACK RECORD (calibration hint): the payload may include a
+`track_record` block — YOUR OWN recent shadow-book results: overall
+{n, net_expectancy_r, win_rate_lo} plus by_confidence and by_setup, each group with
+its sample size n and win_rate_lo = the Wilson LOWER bound of that group's win rate.
+Use it ONLY to CALIBRATE the setup_confidence you would otherwise derive: weight your
+confidence by your own recent hit rate on THIS setup type and confidence tier. A weak
+win_rate_lo (or negative net_expectancy_r) on the tier/setup you are about to emit is a
+reason to be MORE conservative with setup_confidence; a strong one supports it.
+This is a SOFT hint only: it NEVER forces STAY_OUT, never relaxes or overrides a
+decision_policy hard veto, and never replaces the CONFIDENCE DERIVATION table — it nudges
+the label within what the evidence already allows. The numbers are a shadow book (fill at
+entry_price, tp1 only, and possibly correlated rows), so win_rate_lo is a conservative
+FLOOR, not i.i.d. ground truth — do not treat it as a precise probability. When the block
+is absent, skip this check.
+"""
+
+
 _PROMPT_TAIL = """</method>
 
 <decision_policy authoritative="true">
@@ -372,6 +393,14 @@ def _btc_regime_present(context: dict[str, Any] | None) -> bool:
     return isinstance(mr, dict) and bool(mr)
 
 
+def _track_record_present(context: dict[str, Any] | None) -> bool:
+    """True when the payload carries a track_record calibration block (Task 21)."""
+    if not context:
+        return False
+    tr = context.get("track_record")
+    return isinstance(tr, dict) and bool(tr)
+
+
 def build_system_prompt(context: dict[str, Any] | None = None) -> str:
     """Compose the analyst system prompt.
 
@@ -386,6 +415,8 @@ def build_system_prompt(context: dict[str, Any] | None = None) -> str:
         parts.append(_OI_STEP)
     if _btc_regime_present(context):
         parts.append(_BTC_REGIME_RULE)
+    if _track_record_present(context):
+        parts.append(_TRACK_RECORD_RULE)
     parts.append(_PROMPT_TAIL)
     return "\n".join(parts)
 
@@ -491,7 +522,33 @@ JSON schema:
 """
 
 
-def build_reevaluate_system_prompt() -> str:
+# Original-thesis anchor — appended ONLY when the reevaluate payload carries an
+# `original_thesis` block (looked up from the journal/DB for this symbol; absent
+# when no prior proposal exists). Task 21 (O2-06): reevaluate must check CURRENT
+# structure against what was ACTUALLY proposed, not a cold re-derivation.
+_ORIGINAL_THESIS_RULE = """
+
+ORIGINAL THESIS (consistency anchor): the payload may include an `original_thesis`
+block — the core of the proposal this position was opened on (action, setup_confidence,
+chart_pattern, entry_price, stop_loss, tp1, rationale). Compare current structure against
+the ORIGINAL thesis and state explicitly whether it still holds: has the named
+chart_pattern played out, failed, or morphed; is price respecting the original entry/
+stop/tp geometry; does the original rationale still describe what the market is doing? Make
+this comparison the backbone of your `reason`. If the original thesis is clearly
+invalidated, that weighs toward CLOSE; if it is playing out as proposed, that supports HOLD
+or protecting gains. When the block is absent, judge against current structure alone.
+"""
+
+
+def build_reevaluate_system_prompt(context: dict[str, Any] | None = None) -> str:
+    """Compose the reevaluate system prompt.
+
+    The ORIGINAL-thesis consistency-anchor rule (Task 21 / O2-06) is appended
+    only when the payload carries an `original_thesis` block (looked up from the
+    journal/DB); on a cold reevaluate with no prior proposal it is omitted.
+    """
+    if context and isinstance(context.get("original_thesis"), dict) and context["original_thesis"]:
+        return REEVALUATE_SYSTEM_PROMPT + _ORIGINAL_THESIS_RULE
     return REEVALUATE_SYSTEM_PROMPT
 
 

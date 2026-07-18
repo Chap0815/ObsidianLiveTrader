@@ -252,6 +252,30 @@ class Database:
                 out.append(d)
             return out
 
+    async def latest_proposal_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Task 21 (O2-06): the most recent stored proposal for a symbol — the
+        ORIGINAL thesis the reevaluate path compares current structure against.
+        Returns None (never raises for a missing row) when there is no proposal;
+        the caller soft-fails so reevaluate is never broken by a lookup miss."""
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, symbol, proposal_json
+                FROM proposals
+                WHERE symbol = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            )
+            r = await cur.fetchone()
+            if r is None:
+                return None
+            d = dict(r)
+            d["proposal"] = _loads(d.pop("proposal_json"))
+            return d
+
     async def recent_orders(self, limit: int = 20) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row

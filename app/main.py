@@ -35,6 +35,7 @@ from app.llm.client import (
     _sanitize_scanner_verdict,
     analyze_with_llm,
     build_llm_context,
+    build_original_thesis,
     reevaluate_with_llm,
 )
 
@@ -72,6 +73,29 @@ async def _none_async() -> None:
     """Awaitable that yields None — used as the BTC-regime branch when analysing
     BTC itself, so asyncio.gather keeps a uniform (snapshot, regime) shape."""
     return None
+
+
+async def _journal_track_record(request: "Request", s) -> dict | None:
+    """Task 21 (K2-01/F2-01): build the compact `track_record` calibration block
+    from the KI's own shadow book, reusing build_stats_response / db.journal_stats
+    (one aggregate, never recomputed). Fully soft-failing — ANY problem (journal
+    disabled, no DB, stats error) returns None so the block is simply omitted and
+    analyze is NEVER broken. Gating on n >= journal_min_sample happens in
+    build_track_record."""
+    if not getattr(s, "journal_enabled", True):
+        return None
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return None
+    try:
+        from app.journal.stats import build_stats_response, build_track_record
+
+        raw = await db.journal_stats()
+        stats = build_stats_response(raw, min_sample=s.journal_min_sample)
+        return build_track_record(stats, min_sample=s.journal_min_sample)
+    except Exception:
+        log.debug("track_record build failed (advisory, ignored)", exc_info=True)
+        return None
 
 
 BASE = Path(__file__).resolve().parent
@@ -1310,11 +1334,15 @@ async def analyze(
         # (degrades to None) so it can't fail analyze.
         want_btc = not is_btc_symbol(symbol)
         try:
-            snap, market_regime = await asyncio.gather(
+            snap, market_regime, track_record = await asyncio.gather(
                 build_market_snapshot(
                     symbol, tf, htf, client, limit_hint=s.kline_limit_hint
                 ),
                 fetch_btc_regime(client) if want_btc else _none_async(),
+                # Task 21 (K2-01/F2-01): the KI's own shadow track record, fetched
+                # CONCURRENTLY (no serial latency) and fully soft-failing — never
+                # raises, so it can't break analyze; None -> block omitted.
+                _journal_track_record(request, s),
             )
         except ExchangeError as e:
             raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
@@ -1338,6 +1366,7 @@ async def analyze(
             market_api, acct, s,
             scanner_verdict=body.scanner_verdict,
             market_regime=market_regime,
+            track_record=track_record,
         )
 
         try:
@@ -1591,6 +1620,23 @@ async def reevaluate(
     # Same market context builder as /api/analyze, plus the position on top.
     context = build_llm_context(market_api, acct, s)
     context["position"] = position_ctx
+
+    # Task 21 (O2-06): look up the ORIGINAL proposal this position was opened on
+    # and thread its core fields into the context, so reevaluate checks CURRENT
+    # structure against what was actually proposed — not a cold re-derivation.
+    # Soft-fail: a missing proposal / DB error just omits the anchor, never
+    # breaks the (advisory) reevaluate.
+    db_re: Database | None = getattr(request.app.state, "db", None)
+    if db_re is not None:
+        try:
+            row = await db_re.latest_proposal_for_symbol(symbol)
+            thesis = build_original_thesis((row or {}).get("proposal"))
+            if thesis is not None:
+                if row and row.get("created_at"):
+                    thesis["proposed_at"] = row.get("created_at")
+                context["original_thesis"] = thesis
+        except Exception:
+            log.debug("original_thesis lookup failed (advisory, ignored)", exc_info=True)
 
     try:
         result = await reevaluate_with_llm(context, s)

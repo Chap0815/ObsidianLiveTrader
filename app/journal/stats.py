@@ -160,3 +160,63 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
         "by_setup": by_setup,
         "caveats": caveats,
     }
+
+
+def _lower_bound(block: dict[str, Any]) -> float | None:
+    """Wilson LOWER bound of a group's win rate, or None when no sample.
+
+    The lower bound (not the point win_rate) is the honest number to feed the
+    model: a 2/2 = 100% group has a low Wilson floor, so it can never read as
+    edge. See build_track_record for why this matters given weak journal dedupe.
+    """
+    ci = block.get("win_rate_ci95")
+    if isinstance(ci, (list, tuple)) and len(ci) == 2:
+        return ci[0]
+    return None
+
+
+def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, Any] | None:
+    """Task 21 (K2-01/F2-01): a COMPACT, honest calibration block for the
+    analyze prompt, derived from an already-built build_stats_response() output
+    (never recomputed).
+
+    Shape (only the fields the model needs to CALIBRATE its own confidence):
+      overall: {n, net_expectancy_r, win_rate_lo}
+      by_confidence / by_setup: {name: {n, win_rate_lo, avg_r}} — only groups
+        whose own n >= min_sample (small groups are dropped, never shown as edge).
+
+    Returns None when the overall resolved sample is below min_sample — the
+    whole block is omitted rather than presenting noise as ground truth.
+
+    Honesty guards (the journal dedupe is weak — context_hash includes
+    last_price, so rows can be correlated and the Wilson interval optimistically
+    tight): (a) gate on overall n >= min_sample, (b) ship the Wilson LOWER bound
+    not the point estimate, (c) the prompt frames this as a SOFT hint the model
+    weighs, never a veto/threshold. See app/llm/prompts.py _TRACK_RECORD_RULE.
+    """
+    overall = stats.get("overall") or {}
+    n = int(overall.get("sample") or 0)
+    if n < min_sample:
+        return None
+
+    def _groups(grp: dict[str, Any] | None) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name, block in (grp or {}).items():
+            gn = int(block.get("sample") or 0)
+            if gn >= min_sample:
+                out[name] = {
+                    "n": gn,
+                    "win_rate_lo": _lower_bound(block),
+                    "avg_r": block.get("avg_realized_rrr"),
+                }
+        return out
+
+    return {
+        "overall": {
+            "n": n,
+            "net_expectancy_r": overall.get("avg_realized_rrr_net"),
+            "win_rate_lo": _lower_bound(overall),
+        },
+        "by_confidence": _groups(stats.get("by_confidence")),
+        "by_setup": _groups(stats.get("by_setup")),
+    }

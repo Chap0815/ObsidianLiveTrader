@@ -718,6 +718,7 @@ def build_llm_context(
     settings: Settings,
     scanner_verdict: dict[str, Any] | None = None,
     market_regime: dict[str, Any] | None = None,
+    track_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     account = account or {}
     # F-15 (privacy): default to false (opt-in) — a missing attribute must
@@ -792,7 +793,41 @@ def build_llm_context(
     # clearly opposite BTC regime (never a hard veto — Anti-Overtrading-konform).
     if market_regime:
         ctx["market_regime"] = market_regime
+
+    # Task 21 (K2-01/F2-01): close the learn-loop — surface the KI's OWN recent
+    # shadow-book track record (overall net + by_confidence + by_setup, each with
+    # n and the Wilson LOWER bound) so the model can CALIBRATE its confidence by
+    # its own hit rate on this setup type. Present only when the caller supplied
+    # a block (gated on n >= journal_min_sample upstream). Advisory calibration
+    # hint, NEVER a veto/threshold — see _TRACK_RECORD_RULE in prompts.py.
+    if track_record:
+        ctx["track_record"] = track_record
     return ctx
+
+
+def build_original_thesis(proposal: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Task 21 (O2-06): extract the ORIGINAL proposal's core fields for the
+    reevaluate context — the consistency anchor the model compares CURRENT
+    structure against, instead of re-deriving the thesis cold.
+
+    Returns None when there is no usable directional thesis (no proposal, a
+    STAY_OUT, or a proposal without an entry level — none of those ever opened a
+    position, so there is nothing to hold the current structure against).
+    """
+    if not isinstance(proposal, dict) or not proposal:
+        return None
+    action = str(proposal.get("action") or "").upper()
+    if action == "STAY_OUT" or proposal.get("entry_price") is None:
+        return None
+    return {
+        "action": proposal.get("action"),
+        "setup_confidence": proposal.get("setup_confidence"),
+        "chart_pattern": proposal.get("chart_pattern"),
+        "entry_price": proposal.get("entry_price"),
+        "stop_loss": proposal.get("stop_loss"),
+        "tp1": proposal.get("tp1"),
+        "rationale": proposal.get("rationale"),
+    }
 
 
 class LlmError(Exception):
@@ -1423,7 +1458,7 @@ async def _call_claude_reevaluate(
     body: dict[str, Any] = {
         "model": settings.anthropic_model,
         "max_tokens": 1200,
-        "system": build_reevaluate_system_prompt(),
+        "system": build_reevaluate_system_prompt(context),
         "messages": [
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
@@ -1493,7 +1528,7 @@ async def _call_xai_reevaluate(
         # answer. 4000 is a runaway cap; real cost tracks actual usage.
         "max_tokens": 4000,
         "messages": [
-            {"role": "system", "content": build_reevaluate_system_prompt()},
+            {"role": "system", "content": build_reevaluate_system_prompt(context)},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
         "temperature": 0.0,
@@ -1588,7 +1623,7 @@ async def _call_openai_compat_reevaluate(
         "model": model,
         "max_tokens": 1200,
         "messages": [
-            {"role": "system", "content": build_reevaluate_system_prompt()},
+            {"role": "system", "content": build_reevaluate_system_prompt(context)},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
         "temperature": 0.0,
