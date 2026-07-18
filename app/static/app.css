@@ -17,26 +17,76 @@
   --hairline: #1c1728;        /* subtle dividers */
   --text: #eceaf4;
   --muted: #a5a1bc;
-  --faint: #6a6584;
+  --faint: #8983a6;           /* D3-04: was #6a6584 (~3.5:1 on --bg-panel) → ~5.4:1, WCAG-AA for small text */
 
   --accent: #9b87f5;          /* indigo-violet signature (arrowhead) */
   --accent-dim: rgba(155, 135, 245, 0.14);
   --accent-line: rgba(155, 135, 245, 0.42);
   --violet: #b79cff;          /* secondary neon, sparing */
 
-  --long: #46c08a;
-  --long-dim: rgba(70, 192, 138, 0.13);
-  --short: #e6584e;
-  --short-dim: rgba(230, 88, 78, 0.13);
+  /* D3-01/D3-06: the ONE green/red — chart candles AND UI chrome read from
+     these same values (app.js caches them via getComputedStyle, see
+     getChartColors()). Canon = the former chart tones; the former UI-chrome
+     tones (#46c08a/#e6584e) are retired. */
+  --long: #4fbe8e;
+  --long-dim: rgba(79, 190, 142, 0.13);
+  --long-line: rgba(79, 190, 142, 0.5);   /* replaces the old rgba(46,189,133,…) literals */
+  --short: #e35349;
+  --short-dim: rgba(227, 83, 73, 0.13);
+  --short-line: rgba(227, 83, 73, 0.5);   /* replaces the old rgba(246,70,93,…) literals */
 
   /* legacy aliases still referenced from JS-injected inline styles */
-  --green: #46c08a;
-  --red: #e6584e;
+  --green: #4fbe8e;
+  --red: #e35349;
 
-  --live: #e0a23d;            /* armed / live-money attention (amber, serious) */
+  /* ---- Chart overlay colors (D3-01) — app.js reads these once via
+     getComputedStyle (getChartColors()) instead of hardcoding hex; single
+     source shared with any CSS that needs the same semantic color.
+     C3-10: EMA is deliberately desaturated/hue-shifted off --accent/--violet
+     so it reads as background and never competes with the KI-entry line
+     (which used to share EMA50's hex). ---- */
+  --chart-ema20: #5d7690;        /* was #5aa6e6 — desaturated */
+  --chart-ema50: #7d7690;        /* was #b07ae0 — desaturated, off the accent hue */
+  --chart-ki-entry: var(--violet); /* KI proposal entry — reuses the UI accent family */
+  --chart-order: #8b7ae6;        /* pending order marker */
+  --chart-ticket-entry: #5aa6e6; /* draft ticket entry/limit preview line */
+  --chart-level: #9d9ab6;        /* support/resistance, break-even guide */
+  --chart-pool: #6b6788;         /* liquidity-pool markers (dimmest) */
+  --chart-liq: #c0392b;          /* liquidation — deliberately distinct from --short: the survival line */
+  --chart-long-soft: #a0d8c0;    /* neutral long-entry guide line */
+  --chart-short-soft: #e6a0a0;   /* neutral short-entry guide line */
+
+  /* D3-03: LIVE is its OWN signal — never borrowed from --short (loss) and
+     kept visually distinct from --warn (mere caution/STAY_OUT/manual-SL).
+     Used identically in the topbar arm-status chip AND the instrument rail. */
+  --live: #e0a23d;
   --warn: #e5a93c;
 
   --radius: 4px;
+  --radius-sm: 3px;
+  --radius-lg: 6px;
+  --radius-pill: 999px;
+
+  /* ---- Type scale (Task 27 will migrate the ~43 ad-hoc sizes onto this;
+     defined now, not yet applied anywhere) ---- */
+  --fs-2xs: 10px;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-base: 14px;
+  --fs-md: 15.5px;
+  --fs-lg: 18px;
+  --fs-xl: 21px;
+  --fs-2xl: 27px;
+  --fs-display: 34px;
+
+  /* ---- Spacing scale, 4px basis (Task 27; defined now, not yet applied) ---- */
+  --space-1: 4px;
+  --space-1h: 6px;
+  --space-2: 8px;
+  --space-2h: 10px;
+  --space-3: 12px;
+  --space-4: 16px;
+
   --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --mono: "IBM Plex Mono", "Cascadia Code", Consolas, monospace;
 }
@@ -99,7 +149,9 @@ body {
 }
 
 /* ── Arming status chip (topbar) ─────────────────────────────
-   Disarmed: quiet violet chip. Armed: red + pulsing dot.        */
+   Disarmed: quiet violet chip. Armed: amber (--live) + pulsing dot —
+   D3-03: LIVE reads identically here and in the instrument rail, and is
+   never confused with --short (loss) or --warn (mere caution).        */
 .arm-status {
   display: inline-flex;
   align-items: center;
@@ -125,13 +177,13 @@ body {
 
 .arm-status.armed {
   border-color: var(--live);
-  background: rgba(192, 57, 43, 0.16);
-  color: #ffb9b0;
+  background: color-mix(in srgb, var(--live) 16%, transparent);
+  color: #ffd9a0;
 }
 
 .arm-status.armed .arm-dot {
   background: var(--live);
-  box-shadow: 0 0 6px rgba(192, 57, 43, 0.7);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--live) 70%, transparent);
   animation: live-pulse 1.4s ease-in-out infinite;
 }
 
@@ -455,12 +507,12 @@ select:focus {
 .btn-reset:hover:not(:disabled) {
   color: #ffb9c2;
   border-color: var(--short);
-  background: rgba(230, 88, 78, 0.1);
+  background: color-mix(in srgb, var(--short) 10%, transparent);
 }
 
 /* kept for JS/legacy markup */
 .btn-danger {
-  background: rgba(246, 70, 93, 0.1);
+  background: color-mix(in srgb, var(--short) 10%, transparent);
   border-color: var(--short);
   color: #ffb9c2;
 }
@@ -491,12 +543,12 @@ select:focus {
 
 .status-dot.ok {
   background: var(--long);
-  box-shadow: 0 0 6px rgba(46, 189, 133, 0.6);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--long) 60%, transparent);
 }
 
 .status-dot.bad {
   background: var(--short);
-  box-shadow: 0 0 6px rgba(246, 70, 93, 0.5);
+  box-shadow: 0 0 6px var(--short-line);
 }
 
 .status-dot.unknown {
@@ -789,7 +841,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 .btn-ai-lines.active {
   color: var(--accent);
-  border-color: rgba(242, 169, 59, 0.5);
+  border-color: var(--accent-line);
   background: var(--accent-dim);
 }
 
@@ -1111,7 +1163,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 #rt-badge.ok-live {
   opacity: 1;
   color: var(--long);
-  border-color: rgba(46, 189, 133, 0.5);
+  border-color: var(--long-line);
   background: var(--long-dim);
 }
 
@@ -1451,19 +1503,19 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 /* Resting entry-limit order that has not filled yet */
 .side-tag.tag-wait {
-  color: var(--warn, #e0a23d);
-  background: color-mix(in srgb, var(--warn, #e0a23d) 18%, transparent);
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
 }
 
 /* Cross-coin "also open on…" overview */
 .other-coins-head {
   margin-top: 10px;
   padding-top: 8px;
-  border-top: 1px solid var(--border, #2a2438);
+  border-top: 1px solid var(--border);
   font-size: 14.3px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--muted, #8a86a0);
+  color: var(--muted);
 }
 .other-coin-row {
   display: flex;
@@ -1472,25 +1524,25 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   width: 100%;
   margin-top: 4px;
   padding: 6px 8px;
-  border: 1px solid var(--border, #2a2438);
+  border: 1px solid var(--border);
   border-radius: 5px;
-  background: var(--bg-elevated, #171320);
-  color: var(--text, #e8e4f0);
+  background: var(--bg-elevated);
+  color: var(--text);
   cursor: pointer;
   font: inherit;
   text-align: left;
 }
 .other-coin-row:hover {
-  border-color: var(--accent, #9a86e8);
-  background: color-mix(in srgb, var(--accent, #9a86e8) 10%, transparent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .other-coin-detail {
-  color: var(--muted, #8a86a0);
+  color: var(--muted);
   font-size: 14.5px;
 }
 .other-coin-go {
   margin-left: auto;
-  color: var(--accent, #9a86e8);
+  color: var(--accent);
   font-size: 14.5px;
 }
 
@@ -1504,26 +1556,26 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   letter-spacing: 0.02em;
 }
 .cp-sl-ok {
-  color: var(--long, #4fbe8e);
-  background: color-mix(in srgb, var(--long, #4fbe8e) 14%, transparent);
+  color: var(--long);
+  background: color-mix(in srgb, var(--long) 14%, transparent);
 }
 .cp-sl-unknown {
-  color: var(--muted, #8a86a0);
-  background: var(--bg-elevated, #171320);
+  color: var(--muted);
+  background: var(--bg-elevated);
 }
 .cp-sl-missing {
   color: #fff;
-  background: var(--short, #e35349);
+  background: var(--short);
   animation: cp-sl-pulse 1.8s ease-in-out infinite;
 }
 .cp-sl-manual {
   color: #111;
-  background: var(--warn, #e0b341);
+  background: var(--warn);
   font-weight: 600;
 }
 .cp-sl-alarm {
   color: #fff !important;
-  background: var(--short, #e35349) !important;
+  background: var(--short) !important;
   animation: cp-sl-pulse 0.6s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
@@ -1546,10 +1598,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 .cp-reeval-btn {
   width: 100%;
-  border: 1px solid var(--accent, #9a86e8);
+  border: 1px solid var(--accent);
   border-radius: var(--radius);
   background: transparent;
-  color: var(--accent, #9a86e8);
+  color: var(--accent);
   font-family: var(--mono);
   font-size: 13.9px;
   font-weight: 600;
@@ -1560,7 +1612,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 
 .cp-reeval-btn:hover:not(:disabled) {
-  background: var(--accent, #9a86e8);
+  background: var(--accent);
   color: #fff;
 }
 
@@ -1574,7 +1626,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .cp-reeval-out {
   margin-top: 8px;
   padding: 8px 10px;
-  border: 1px solid var(--border, #2a2438);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-inset);
   font-family: var(--sans);
@@ -1582,10 +1634,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   line-height: 1.4;
 }
 
-.cp-reeval-loading { color: var(--muted, #8a86a0); font-family: var(--mono); }
+.cp-reeval-loading { color: var(--muted); font-family: var(--mono); }
 
 .cp-reeval-error {
-  color: var(--short, #e35349);
+  color: var(--short);
   font-family: var(--mono);
 }
 
@@ -1617,19 +1669,19 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 
 .cp-reeval-action.reeval-action-hold {
-  color: var(--muted, #8a86a0);
+  color: var(--muted);
   background: var(--bg-elevated);
 }
 .cp-reeval-action.reeval-action-move_sl_be {
-  color: var(--long, #4fbe8e);
+  color: var(--long);
   background: var(--long-dim);
 }
 .cp-reeval-action.reeval-action-partial_close {
-  color: var(--warn, #e0a23d);
+  color: var(--warn);
   background: rgba(224, 162, 61, 0.12);
 }
 .cp-reeval-action.reeval-action-close {
-  color: var(--short, #e35349);
+  color: var(--short);
   background: var(--short-dim);
 }
 
@@ -1644,10 +1696,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 .cp-reeval-reason { color: var(--text); margin-bottom: 4px; }
 
-.cp-reeval-risk { color: var(--warn, #e0a23d); margin-bottom: 4px; }
+.cp-reeval-risk { color: var(--warn); margin-bottom: 4px; }
 
 .cp-reeval-foot {
-  color: var(--faint, #6a6580);
+  color: var(--faint);
   font-size: 12.2px;
   font-family: var(--mono);
 }
@@ -1746,8 +1798,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .mini-chg.pos-pos { color: var(--long); }
 .mini-chg.pos-neg { color: var(--short); }
 .mini-pnl { padding: 1px 5px; border-radius: 3px; font-weight: 600; }
-.mini-pnl.pos-pos { color: var(--long); background: rgba(79,190,142,0.12); }
-.mini-pnl.pos-neg { color: var(--short); background: rgba(227,83,73,0.12); }
+.mini-pnl.pos-pos { color: var(--long); background: color-mix(in srgb, var(--long) 12%, transparent); }
+.mini-pnl.pos-neg { color: var(--short); background: color-mix(in srgb, var(--short) 12%, transparent); }
 .mini-canvas { display: block; width: 100%; height: 220px; }
 .mini-remove {
   position: absolute; top: 4px; right: 4px; border: none; background: transparent;
@@ -1850,7 +1902,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 .news-src-cointelegraph {
   color: var(--long); background: var(--long-dim);
-  border-color: rgba(70, 192, 138, 0.32);
+  border-color: color-mix(in srgb, var(--long) 32%, transparent);
 }
 .news-src-decrypt {
   color: var(--violet); background: rgba(183, 156, 255, 0.14);
@@ -1986,12 +2038,12 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .scan-stale-hint {
   text-transform: none;
   letter-spacing: normal;
-  color: var(--warn, #e0a23d);
+  color: var(--warn);
   font-weight: 600;
 }
 
 .scan-strip.scan-stale {
-  border-bottom-color: var(--warn, #e0a23d);
+  border-bottom-color: var(--warn);
 }
 
 .scan-empty {
@@ -2326,14 +2378,14 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .action-STRONG_BUY,
 .action-BUY {
   color: var(--long);
-  border-color: rgba(46, 189, 133, 0.5);
+  border-color: var(--long-line);
   background: var(--long-dim);
 }
 
 .action-SELL,
 .action-STRONG_SHORT {
   color: var(--short);
-  border-color: rgba(246, 70, 93, 0.5);
+  border-color: var(--short-line);
   background: var(--short-dim);
 }
 
@@ -2507,7 +2559,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 /* Per-coin leverage cap shown next to the "Hebel" label, e.g. "· max 40×" */
 .lev-max-hint {
   margin-left: 4px;
-  color: var(--muted, #8a86a0);
+  color: var(--muted);
   font-size: 0.82em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -2542,7 +2594,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .size-mode-seg {
   display: inline-flex;
   margin-left: 8px;
-  border: 1px solid var(--border, #2a2438);
+  border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
   vertical-align: middle;
@@ -2551,12 +2603,12 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   padding: 1px 8px;
   font-size: 14.3px;
   background: transparent;
-  color: var(--muted, #8a86a0);
+  color: var(--muted);
   border: none;
   cursor: pointer;
 }
-.size-mode-btn + .size-mode-btn { border-left: 1px solid var(--border, #2a2438); }
-.size-mode-btn.active { background: var(--bg-elevated, #171320); color: var(--text, #fff); }
+.size-mode-btn + .size-mode-btn { border-left: 1px solid var(--border); }
+.size-mode-btn.active { background: var(--bg-elevated); color: var(--text); }
 
 .sltp-mode-btn {
   border: none;
@@ -2983,17 +3035,17 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-size: 11.6px;
   font-weight: 600;
   letter-spacing: 0.04em;
-  border: 1px solid var(--border, #333);
+  border: 1px solid var(--border);
 }
 
 .journal-badge-WIN {
-  border-color: rgba(70, 192, 138, 0.6);
+  border-color: color-mix(in srgb, var(--long) 60%, transparent);
   background: var(--long-dim);
   color: var(--long);
 }
 
 .journal-badge-LOSS {
-  border-color: rgba(230, 88, 78, 0.6);
+  border-color: color-mix(in srgb, var(--short) 60%, transparent);
   background: var(--short-dim);
   color: var(--short);
 }
@@ -3380,7 +3432,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   border-radius: 999px;
   font-family: var(--mono);
   font-size: 13px;
-  border: 1px solid var(--border, #333);
+  border: 1px solid var(--border);
   color: var(--text);
 }
 
@@ -3572,8 +3624,8 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-size: 10.5px; letter-spacing: 0.12em; font-weight: 700;
   padding: 3px 8px; border-radius: 3px;
 }
-.ir-side.long { background: var(--long-dim); color: var(--long); box-shadow: inset 0 0 0 1px rgba(70, 192, 138, 0.3); }
-.ir-side.short { background: var(--short-dim); color: var(--short); box-shadow: inset 0 0 0 1px rgba(230, 88, 78, 0.3); }
+.ir-side.long { background: var(--long-dim); color: var(--long); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--long) 30%, transparent); }
+.ir-side.short { background: var(--short-dim); color: var(--short); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--short) 30%, transparent); }
 .ir-pnlcell { min-width: 190px; }
 .ir-bigpnl {
   font-size: 27.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1;

@@ -150,7 +150,62 @@
     el.classList.add(ok == null ? "unknown" : ok ? "ok" : "bad");
   }
 
+  // D3-01: ONE color source for the chart/canvas overlays — read once from
+  // the CSS custom properties (the same tokens the UI chrome uses for P&L),
+  // cached, instead of scattering hex literals across every draw function.
+  // Populated lazily on first use rather than at module-parse time: the
+  // stylesheet is linked in <head> and this script runs at the end of
+  // <body> (see base.html), so by the time any chart function runs the CSS
+  // is already applied — but initChart() also primes the cache explicitly
+  // as its first step, so nothing ever reads it before the chart exists.
+  let _chartColors = null;
+  function getChartColors() {
+    if (_chartColors) return _chartColors;
+    const cs = getComputedStyle(document.documentElement);
+    const v = function (name, fallback) {
+      const val = cs.getPropertyValue(name);
+      return val && val.trim() ? val.trim() : fallback;
+    };
+    _chartColors = {
+      // Named-color (not hex) fallbacks here on purpose: this branch should
+      // never fire per the load-order guarantee above, and using a plain
+      // CSS keyword rather than a hex literal keeps the old dual-palette
+      // hexes (D3-01) from ever reappearing in this file, even as dead code.
+      long: v("--long", "green"),
+      short: v("--short", "red"),
+      ema20: v("--chart-ema20", "#5d7690"),
+      ema50: v("--chart-ema50", "#7d7690"),
+      kiEntry: v("--chart-ki-entry", "#b79cff"),
+      order: v("--chart-order", "#8b7ae6"),
+      ticketEntry: v("--chart-ticket-entry", "#5aa6e6"),
+      level: v("--chart-level", "#9d9ab6"),
+      pool: v("--chart-pool", "#6b6788"),
+      liq: v("--chart-liq", "#c0392b"),
+      longSoft: v("--chart-long-soft", "#a0d8c0"),
+      shortSoft: v("--chart-short-soft", "#e6a0a0"),
+    };
+    return _chartColors;
+  }
+
+  // Parse a cached "#rrggbb" (or shorthand "#rgb") token and return it as an
+  // rgba() string at the given alpha — used for the translucent SL/TP fields
+  // and dimmed trade-close markers, which need an alpha the CSS token itself
+  // doesn't carry.
+  function chartColorAlpha(hex, alpha) {
+    let h = String(hex || "").trim().replace(/^#/, "");
+    if (h.length === 3) {
+      h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    }
+    const n = parseInt(h, 16);
+    if (!Number.isFinite(n) || h.length !== 6) return hex;
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    return "rgba(" + r + ", " + g + ", " + b + ", " + alpha + ")";
+  }
+
   function initChart() {
+    const chartColors = getChartColors();
     const el = $("chart");
     if (!el || typeof LightweightCharts === "undefined") {
       console.error("Lightweight Charts not available");
@@ -200,22 +255,22 @@
     const chart = state.chart;
     if (typeof chart.addCandlestickSeries === "function") {
       state.candleSeries = chart.addCandlestickSeries({
-        upColor: "#4fbe8e",
-        downColor: "#e35349",
-        borderUpColor: "#4fbe8e",
-        borderDownColor: "#e35349",
-        wickUpColor: "#4fbe8e",
-        wickDownColor: "#e35349",
+        upColor: chartColors.long,
+        downColor: chartColors.short,
+        borderUpColor: chartColors.long,
+        borderDownColor: chartColors.short,
+        wickUpColor: chartColors.long,
+        wickDownColor: chartColors.short,
       });
       state.ema20Series = chart.addLineSeries({
-        color: "#5aa6e6",
+        color: chartColors.ema20,
         lineWidth: 1,
         priceLineVisible: false,
         lastValueVisible: false,
         title: "EMA20",
       });
       state.ema50Series = chart.addLineSeries({
-        color: "#b07ae0",
+        color: chartColors.ema50,
         lineWidth: 1,
         priceLineVisible: false,
         lastValueVisible: false,
@@ -230,22 +285,22 @@
     } else if (typeof chart.addSeries === "function") {
       // v5+
       state.candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
-        upColor: "#4fbe8e",
-        downColor: "#e35349",
-        borderUpColor: "#4fbe8e",
-        borderDownColor: "#e35349",
-        wickUpColor: "#4fbe8e",
-        wickDownColor: "#e35349",
+        upColor: chartColors.long,
+        downColor: chartColors.short,
+        borderUpColor: chartColors.long,
+        borderDownColor: chartColors.short,
+        wickUpColor: chartColors.long,
+        wickDownColor: chartColors.short,
       });
       state.ema20Series = chart.addSeries(LightweightCharts.LineSeries, {
-        color: "#5aa6e6",
+        color: chartColors.ema20,
         lineWidth: 1,
         priceLineVisible: false,
         lastValueVisible: false,
         title: "EMA20",
       });
       state.ema50Series = chart.addSeries(LightweightCharts.LineSeries, {
-        color: "#b07ae0",
+        color: chartColors.ema50,
         lineWidth: 1,
         priceLineVisible: false,
         lastValueVisible: false,
@@ -377,6 +432,7 @@
   }
 
   function _drawTradeZones() {
+    const chartColors = getChartColors();
     const cv = tradeOverlayCanvas();
     if (!cv || !state.chart || !state.candleSeries) return;
     const ctx = cv.getContext("2d");
@@ -480,11 +536,11 @@
         ctx.fillText(label + " " + fmt(price, 4) + extra, xStart + 6, y - 4);
       }
 
-      band(sl, "rgba(227, 83, 73, 0.17)", "#e35349", "SL");
-      band(tp, "rgba(79, 190, 142, 0.17)", "#4fbe8e", "TP");
+      band(sl, chartColorAlpha(chartColors.short, 0.17), chartColors.short, "SL");
+      band(tp, chartColorAlpha(chartColors.long, 0.17), chartColors.long, "TP");
 
       // entry line (neutral)
-      ctx.strokeStyle = short ? "#e6a0a0" : "#a0d8c0";
+      ctx.strokeStyle = short ? chartColors.shortSoft : chartColors.longSoft;
       ctx.setLineDash([4, 3]);
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -492,7 +548,7 @@
       ctx.lineTo(xEnd, yEntry);
       ctx.stroke();
       ctx.setLineDash([]);
-      ctx.fillStyle = short ? "#e6a0a0" : "#a0d8c0";
+      ctx.fillStyle = short ? chartColors.shortSoft : chartColors.longSoft;
       ctx.font = "10px 'IBM Plex Mono', monospace";
       ctx.fillText((short ? "Short " : "Long ") + fmt(entry, 4), xStart + 6, yEntry - 4);
     });
@@ -666,6 +722,7 @@
   }
 
   function drawProposalLines() {
+    const chartColors = getChartColors();
     state.proposalLines = clearLineGroup(state.proposalLines);
     if (!state.candleSeries || !state.showAiLines) return;
     // With a live trade open, the chart focuses on the trade (position + zones);
@@ -688,29 +745,30 @@
     }
     // Core trade — hidden once applied to the ticket (ticket lines take over)
     if (!state.proposalApplied) {
-      addChartLine(g, p.entry_price, "#b07ae0", 2, "KI Entry", 2);
-      addChartLine(g, p.stop_loss, "#e35349", 1, "KI SL -1R");
-      addChartLine(g, p.tp1, "#4fbe8e", 1, tpTitle("KI TP1", p.tp1));
+      addChartLine(g, p.entry_price, chartColors.kiEntry, 2, "KI Entry", 2);
+      addChartLine(g, p.stop_loss, chartColors.short, 1, "KI SL -1R");
+      addChartLine(g, p.tp1, chartColors.long, 1, tpTitle("KI TP1", p.tp1));
     }
-    addChartLine(g, p.tp2, "#4fbe8e", 4, tpTitle("KI TP2", p.tp2));
-    addChartLine(g, p.tp3, "#4fbe8e", 4, tpTitle("KI TP3", p.tp3));
+    addChartLine(g, p.tp2, chartColors.long, 4, tpTitle("KI TP2", p.tp2));
+    addChartLine(g, p.tp3, chartColors.long, 4, tpTitle("KI TP3", p.tp3));
 
     // Analysis levels
     const kl = p.key_levels || {};
-    addChartLine(g, kl.immediate_support, "#9d9ab6", 4, "Support");
-    addChartLine(g, kl.immediate_resistance, "#9d9ab6", 4, "Resist");
+    addChartLine(g, kl.immediate_support, chartColors.level, 4, "Support");
+    addChartLine(g, kl.immediate_resistance, chartColors.level, 4, "Resist");
     const pools = Array.isArray(kl.major_liquidity_pools)
       ? kl.major_liquidity_pools
       : [];
     pools.slice(0, 3).forEach(function (v) {
       const n = Number(v);
       if (Number.isFinite(n) && n > 0) {
-        addChartLine(g, n, "#6b6788", 4, "Pool");
+        addChartLine(g, n, chartColors.pool, 4, "Pool");
       }
     });
   }
 
   function drawPositionLines() {
+    const chartColors = getChartColors();
     state.positionLines = clearLineGroup(state.positionLines);
     if (!state.candleSeries) return;
     const positions = (state.account && state.account.positions) || [];
@@ -721,7 +779,7 @@
       addChartLine(
         state.positionLines,
         entry,
-        short ? "#e35349" : "#4fbe8e",
+        short ? chartColors.short : chartColors.long,
         0,
         (short ? "Short" : "Long") + " " + fmt(p.hold_vol, 4),
         2
@@ -731,20 +789,21 @@
       if (Number.isFinite(entry) && entry > 0) {
         const feeRt = 0.0006;
         const be = short ? entry * (1 - feeRt) : entry * (1 + feeRt);
-        addChartLine(state.positionLines, be, "#9d9ab6", 1, "BE≈");
+        addChartLine(state.positionLines, be, chartColors.level, 1, "BE≈");
       }
       // Liquidation — the survival line; keeps its numeric axis label.
-      addChartLine(state.positionLines, p.liquidate_price, "#c0392b", 3, "⚠ LIQ", undefined, true);
+      addChartLine(state.positionLines, p.liquidate_price, chartColors.liq, 3, "⚠ LIQ", undefined, true);
     });
   }
 
   function drawOrderLines() {
+    const chartColors = getChartColors();
     state.orderLines = clearLineGroup(state.orderLines);
     if (!state.candleSeries) return;
     const d = state.openOrders || {};
     (d.orders || []).forEach(function (o) {
       if (o.symbol && !symMatch(o.symbol, state.symbol)) return;
-      addChartLine(state.orderLines, o.price, "#8b7ae6", 2, "Order");
+      addChartLine(state.orderLines, o.price, chartColors.order, 2, "Order");
     });
     (d.stop_orders || []).forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
@@ -752,11 +811,11 @@
       const slPx = Number(s.stopLossPrice);
       const tpPx = Number(s.takeProfitPrice);
       if (Number.isFinite(slPx) && slPx > 0) {
-        addChartLine(state.orderLines, slPx, "#e35349", 2, "SL aktiv");
+        addChartLine(state.orderLines, slPx, chartColors.short, 2, "SL aktiv");
         drew = true;
       }
       if (Number.isFinite(tpPx) && tpPx > 0) {
-        addChartLine(state.orderLines, tpPx, "#4fbe8e", 2, "TP aktiv");
+        addChartLine(state.orderLines, tpPx, chartColors.long, 2, "TP aktiv");
         drew = true;
       }
       if (!drew) {
@@ -766,7 +825,7 @@
         addChartLine(
           state.orderLines,
           px,
-          isTp ? "#4fbe8e" : "#e35349",
+          isTp ? chartColors.long : chartColors.short,
           2,
           isTp ? "TP aktiv" : "SL aktiv"
         );
@@ -777,13 +836,14 @@
   function drawTicketLines() {
     if (!state.candleSeries) return;
     clearPriceLines();
+    const chartColors = getChartColors();
 
     // SL/TP resolve through the price/% mode; entry & limit are always prices
     const specs = [
-      { price: numOrNull($("ticket-entry")), color: "#5aa6e6", title: "Entry" },
-      { price: numOrNull($("ticket-price")), color: "#8b7ae6", title: "Limit" },
-      { price: resolveStop(), color: "#e35349", title: "SL" },
-      { price: resolveTp(), color: "#4fbe8e", title: "TP1" },
+      { price: numOrNull($("ticket-entry")), color: chartColors.ticketEntry, title: "Entry" },
+      { price: numOrNull($("ticket-price")), color: chartColors.order, title: "Limit" },
+      { price: resolveStop(), color: chartColors.short, title: "SL" },
+      { price: resolveTp(), color: chartColors.long, title: "TP1" },
     ];
 
     for (const s of specs) {
@@ -2558,6 +2618,7 @@
       typeof state.candleSeries.setMarkers !== "function"
     )
       return;
+    const chartColors = getChartColors();
     const tf = state.tf || "15m";
     const groups = new Map(); // "time|side" -> aggregated group
 
@@ -2630,11 +2691,11 @@
       const closeOnly = g.anyClose && !g.anyOpen;
       const color = closeOnly
         ? buy
-          ? "rgba(79, 190, 142, 0.45)" // dimmed: close of a long
-          : "rgba(227, 83, 73, 0.45)" // dimmed: close of a short
+          ? chartColorAlpha(chartColors.long, 0.45) // dimmed: close of a long
+          : chartColorAlpha(chartColors.short, 0.45) // dimmed: close of a short
         : buy
-          ? "#4fbe8e"
-          : "#e35349";
+          ? chartColors.long
+          : chartColors.short;
       const marker = {
         time: g.time,
         position: buy ? "belowBar" : "aboveBar",
@@ -4753,6 +4814,7 @@
   }
 
   function renderOverviewGrid() {
+    const chartColors = getChartColors();
     const grid = $("overview-grid");
     if (!grid) return;
     const syms = overviewSymbols();
@@ -4825,9 +4887,9 @@
         // via the HL-aware symMatch) canonically keys tradeMarkers by bare
         // coin — route through markerKey() so a manual SL/TP still draws.
         const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
-        marks.push({ price: Number(pos.entry_price), color: "#9d9ab6" });
-        if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: "#e35349" });
-        if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: "#4fbe8e" });
+        marks.push({ price: Number(pos.entry_price), color: chartColors.level });
+        if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: chartColors.short });
+        if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: chartColors.long });
       }
       // Draw after insertion so the canvas has a measured width.
       requestAnimationFrame(function () {
@@ -4847,6 +4909,7 @@
 
   function drawMiniCandles(cv, candles, marks) {
     if (!cv) return;
+    const chartColors = getChartColors();
     const ctx = cv.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
@@ -4900,8 +4963,8 @@
     cs.forEach(function (c, i) {
       const x = 1 + i * bw + bw / 2;
       const up = c.close >= c.open;
-      ctx.strokeStyle = up ? "#4fbe8e" : "#e35349";
-      ctx.fillStyle = up ? "#4fbe8e" : "#e35349";
+      ctx.strokeStyle = up ? chartColors.long : chartColors.short;
+      ctx.fillStyle = up ? chartColors.long : chartColors.short;
       ctx.beginPath();
       ctx.moveTo(x, y(c.high));
       ctx.lineTo(x, y(c.low));
