@@ -18,7 +18,13 @@ import pytest
 
 import app.llm.client as client_mod
 from app.config import Settings
-from app.llm.client import _call_xai, parse_proposal, parse_reevaluation
+from app.llm.client import (
+    LlmError,
+    _call_xai,
+    _call_xai_reevaluate,
+    parse_proposal,
+    parse_reevaluation,
+)
 
 
 class _FakeResp:
@@ -48,6 +54,34 @@ class _FakeClient:
         return False
 
     async def post(self, url, headers=None, json=None):
+        return _FakeResp(self._status_code, self._payload)
+
+    async def aclose(self):
+        return None
+
+
+class _CapturingClient:
+    """httpx.AsyncClient stand-in that records the constructor kwargs (e.g.
+    timeout) and every posted JSON body, returning a fixed response."""
+
+    def __init__(self, status_code, payload):
+        self._status_code = status_code
+        self._payload = payload
+        self.constructor_kwargs: list[dict] = []
+        self.posted_bodies: list[dict] = []
+
+    def __call__(self, *a, **kw):
+        self.constructor_kwargs.append(kw)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        self.posted_bodies.append(json)
         return _FakeResp(self._status_code, self._payload)
 
     async def aclose(self):
@@ -146,3 +180,140 @@ def test_reevaluation_salvage_path_emits_warning(caplog):
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("recovered via salvage" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_xai_analyze_budget_and_timeout(monkeypatch):
+    """Task 12 (O2-12/L2X-11): grok-4 is always-on-reasoning and reasoning
+    tokens count against max_tokens, so the old 1800/1200 caps silently
+    starved the JSON answer. analyze must send max_tokens=10000 and reevaluate
+    max_tokens=4000, both over a 120s httpx timeout (was 90s — inverted vs.
+    Claude's 120s despite grok being the faster model)."""
+    analyze_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake_analyze = _CapturingClient(200, analyze_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake_analyze)
+
+    await _call_xai({"symbol": "BTC"}, _settings())
+
+    assert fake_analyze.constructor_kwargs[-1]["timeout"] == 120.0
+    assert fake_analyze.posted_bodies[-1]["max_tokens"] == 10000
+
+    reevaluate_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"action": "HOLD", "confidence": "medium", "reason": "ok"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake_reevaluate = _CapturingClient(200, reevaluate_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake_reevaluate)
+
+    await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
+
+    assert fake_reevaluate.constructor_kwargs[-1]["timeout"] == 120.0
+    assert fake_reevaluate.posted_bodies[-1]["max_tokens"] == 4000
+
+
+@pytest.mark.asyncio
+async def test_xai_empty_content_reports_finish_reason(monkeypatch, caplog):
+    """O2-14/L2X-12: an empty completion with finish_reason=='length' means
+    grok burned the whole max_tokens budget on reasoning before emitting any
+    answer. That must surface as a WARNING (mirroring the Claude
+    stop_reason==max_tokens log) plus a clear, actionable LlmError instead of
+    a generic/confusing 'empty content' or JSON-parse failure."""
+    truncated_payload = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {"content": ""},
+            }
+        ],
+        "usage": {},
+    }
+    fake = _FakeClient(200, truncated_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+
+    with caplog.at_level(logging.WARNING, logger="app.llm.client"):
+        with pytest.raises(LlmError) as exc_info:
+            await _call_xai({"symbol": "BTC"}, _settings())
+
+    message = str(exc_info.value)
+    assert "abgeschnitten" in message
+    assert "Token-Budget" in message
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("length" in r.getMessage() for r in warnings)
+
+    # Same handling for the reevaluate call.
+    fake2 = _FakeClient(200, truncated_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake2)
+
+    with pytest.raises(LlmError) as exc_info2:
+        await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
+
+    message2 = str(exc_info2.value)
+    assert "abgeschnitten" in message2
+    assert "Token-Budget" in message2
+
+
+@pytest.mark.asyncio
+async def test_xai_body_has_no_reasoning_effort(monkeypatch):
+    """O2-14: grok-4 answers HTTP 400 to an unsupported `reasoning_effort`
+    param (only grok-3-mini accepts it). Pin that neither the analyze nor the
+    reevaluate xai request body ever includes that key."""
+    analyze_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake_analyze = _CapturingClient(200, analyze_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake_analyze)
+
+    await _call_xai({"symbol": "BTC"}, _settings())
+
+    assert "reasoning_effort" not in fake_analyze.posted_bodies[-1]
+
+    reevaluate_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"action": "HOLD", "confidence": "medium", "reason": "ok"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake_reevaluate = _CapturingClient(200, reevaluate_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake_reevaluate)
+
+    await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
+
+    assert "reasoning_effort" not in fake_reevaluate.posted_bodies[-1]

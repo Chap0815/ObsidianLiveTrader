@@ -29,6 +29,7 @@ from app.llm.client import (
     _categorize_provider_http_error,
     _log_llm_metrics,
     _oi_read_label,
+    _post_with_retry,
     compact_daily_for_llm,
     compact_tf_for_llm,
     extract_json_object,
@@ -427,10 +428,19 @@ async def _openai_compat_text(
             {"role": "user", "content": user},
         ],
     }
+    url = base_url.rstrip("/") + "/chat/completions"
+
+    async def _post() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            return await c.post(url, headers=headers, json=body)
+
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.post(base_url.rstrip("/") + "/chat/completions", headers=headers, json=body)
+        # O2-14/L2X-12: this call carries production xai/grok scanner traffic
+        # — route it through the same transient-retry helper the analyze/
+        # reevaluate calls use so a single 502/503/504/429 or client timeout
+        # gets one retry instead of failing the whole scan.
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"Scanner ({provider_label}) request failed: {e}") from e
     if r.status_code >= 400:

@@ -1129,17 +1129,30 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
     }
     body: dict[str, Any] = {
         "model": settings.xai_model,
-        "max_tokens": 1800,
+        # O2-12/L2X-11: grok-4 is always-on-reasoning — reasoning tokens are
+        # billed against and consumed from max_tokens BEFORE the JSON answer
+        # is emitted. 1800 let a normal reasoning pass silently exhaust the
+        # whole budget, returning empty/truncated content on the money path.
+        # 10000 is a runaway cap, not a target: actual cost tracks real token
+        # usage, not this ceiling. Mirrors scanner.py's 8000 for the same
+        # documented failure mode.
+        "max_tokens": 10000,
         "messages": [
             {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
+        # O2-14: do NOT add "reasoning_effort" here — grok-4 rejects the
+        # param with HTTP 400; only grok-3-mini accepts it. Don't add it
+        # without first gating on the configured model.
     }
 
     async def _post() -> httpx.Response:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        # Was 90s — inverted vs. Claude's 120s despite grok being the faster
+        # model; raised to give the larger max_tokens budget above room to
+        # complete without a spurious client-side timeout.
+        async with httpx.AsyncClient(timeout=120.0) as client:
             return await client.post(url, headers=headers, json=body)
 
     t0 = time.monotonic()
@@ -1158,7 +1171,8 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
 
     try:
         payload = r.json()
-        content = payload["choices"][0]["message"]["content"]
+        choice0 = payload["choices"][0]
+        content = choice0["message"]["content"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
 
@@ -1170,6 +1184,21 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         elapsed_ms=elapsed_ms,
         payload=payload,
     )
+
+    finish_reason = choice0.get("finish_reason") if isinstance(choice0, dict) else None
+    if finish_reason == "length":
+        # Mirrors the Claude stop_reason==max_tokens warning above: make a
+        # truncated/empty response visible instead of a silent bad proposal.
+        log.warning(
+            "xAI analyze call hit max_tokens (finish_reason=length, max_tokens=%s); "
+            "response may be truncated",
+            body.get("max_tokens"),
+        )
+        if not str(content or "").strip():
+            raise LlmError(
+                "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
+                f"(finish_reason=length, max_tokens={body['max_tokens']})"
+            )
 
     return _parse_content_to_proposal(str(content), provider="xAI", context=context)
 
@@ -1372,17 +1401,25 @@ async def _call_xai_reevaluate(
     }
     body: dict[str, Any] = {
         "model": settings.xai_model,
-        "max_tokens": 1200,
+        # O2-12/L2X-11: same always-on-reasoning risk as _call_xai above —
+        # 1200 could be silently consumed by reasoning tokens before any
+        # answer. 4000 is a runaway cap; real cost tracks actual usage.
+        "max_tokens": 4000,
         "messages": [
             {"role": "system", "content": build_reevaluate_system_prompt()},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
+        # O2-14: do NOT add "reasoning_effort" here — grok-4 rejects the
+        # param with HTTP 400; only grok-3-mini accepts it. Don't add it
+        # without first gating on the configured model.
     }
 
     async def _post() -> httpx.Response:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        # Was 90s — inverted vs. Claude's 120s despite grok being the faster
+        # model; raised to match the larger max_tokens budget above.
+        async with httpx.AsyncClient(timeout=120.0) as client:
             return await client.post(url, headers=headers, json=body)
 
     t0 = time.monotonic()
@@ -1401,7 +1438,8 @@ async def _call_xai_reevaluate(
 
     try:
         payload = r.json()
-        content = payload["choices"][0]["message"]["content"]
+        choice0 = payload["choices"][0]
+        content = choice0["message"]["content"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
 
@@ -1413,6 +1451,19 @@ async def _call_xai_reevaluate(
         elapsed_ms=elapsed_ms,
         payload=payload,
     )
+
+    finish_reason = choice0.get("finish_reason") if isinstance(choice0, dict) else None
+    if finish_reason == "length":
+        log.warning(
+            "xAI reevaluate call hit max_tokens (finish_reason=length, max_tokens=%s); "
+            "response may be truncated",
+            body.get("max_tokens"),
+        )
+        if not str(content or "").strip():
+            raise LlmError(
+                "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
+                f"(finish_reason=length, max_tokens={body['max_tokens']})"
+            )
 
     return _parse_content_to_reevaluation(str(content), provider="xAI")
 
