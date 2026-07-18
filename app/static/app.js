@@ -572,7 +572,16 @@
         }
         ctx.fillStyle = colorLine;
         ctx.font = "10px 'IBM Plex Mono', monospace";
-        ctx.fillText(label + " " + fmt(price, 4) + extra, xStart + 6, y - 4);
+        // C3-03: the entry label always sits at yEntry-4. When this band's
+        // line lands within 14px of the entry line, that default y-4
+        // baseline would overlap the entry text — nudge this label further
+        // away from entry (to a fixed 14px clearance) instead of stacking
+        // unreadable text on the left edge.
+        let labelY = y - 4;
+        if (Math.abs(y - yEntry) < 14) {
+          labelY = y <= yEntry ? yEntry - 18 : yEntry + 10;
+        }
+        ctx.fillText(label + " " + fmt(price, 4) + extra, xStart + 6, labelY);
       }
 
       band(sl, chartColorAlpha(chartColors.short, 0.17), chartColors.short, "SL");
@@ -906,10 +915,75 @@
     });
   }
 
+  /** All currently active order/position price levels for the active symbol —
+   *  the SAME source drawPositionLines/drawOrderLines draw from, read
+   *  directly (not the priceLine objects) so this works regardless of draw
+   *  order. Used to dedupe the ticket's own dashed lines against them
+   *  (C3-03/T3-08): once a "real" order/position line already marks a price,
+   *  the ticket-dashed line at that same price is pure redundant clutter —
+   *  and on the left edge, unreadable overlap. */
+  function activeLinePrices() {
+    const out = [];
+    const positions = (state.account && state.account.positions) || [];
+    positions.forEach(function (p) {
+      if (!symMatch(p.symbol, state.symbol)) return;
+      const entry = Number(p.entry_price);
+      if (Number.isFinite(entry) && entry > 0) {
+        out.push(entry);
+        const short = String(p.side || "").toLowerCase() === "short";
+        const feeRt = 0.0006;
+        out.push(short ? entry * (1 - feeRt) : entry * (1 + feeRt)); // BE≈
+      }
+      const liq = Number(p.liquidate_price);
+      if (Number.isFinite(liq) && liq > 0) out.push(liq);
+    });
+    const d = state.openOrders || {};
+    (d.orders || []).forEach(function (o) {
+      if (o.symbol && !symMatch(o.symbol, state.symbol)) return;
+      const px = Number(o.price);
+      if (Number.isFinite(px) && px > 0) out.push(px);
+    });
+    (d.stop_orders || []).forEach(function (s) {
+      if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
+      const slPx = Number(s.stopLossPrice);
+      const tpPx = Number(s.takeProfitPrice);
+      let drew = false;
+      if (Number.isFinite(slPx) && slPx > 0) {
+        out.push(slPx);
+        drew = true;
+      }
+      if (Number.isFinite(tpPx) && tpPx > 0) {
+        out.push(tpPx);
+        drew = true;
+      }
+      if (!drew) {
+        const px = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
+        if (Number.isFinite(px) && px > 0) out.push(px);
+      }
+    });
+    return out;
+  }
+
   function drawTicketLines() {
     if (!state.candleSeries) return;
     clearPriceLines();
     const chartColors = getChartColors();
+
+    // Same tick/price_unit source the rest of the app reads (contract meta
+    // from /api/market); falls back to a small relative epsilon so float
+    // dust never blocks the dedupe when it's unavailable (e.g. before the
+    // first market load).
+    const priceUnit = Number(
+      state.market && state.market.contract && state.market.contract.priceUnit
+    );
+    const tickTol = priceUnit > 0 ? priceUnit : null;
+    const activePx = activeLinePrices();
+    function dupesActiveLine(px) {
+      return activePx.some(function (ap) {
+        const tol = tickTol != null ? tickTol : Math.max(Math.abs(px), Math.abs(ap)) * 1e-6;
+        return Math.abs(px - ap) <= tol;
+      });
+    }
 
     // SL/TP resolve through the price/% mode; entry & limit are always prices
     const specs = [
@@ -922,6 +996,10 @@
     for (const s of specs) {
       const val = s.price;
       if (!Number.isFinite(val) || val <= 0) continue;
+      // T3-08: an active order/position line already marks this price (±1
+      // tick) — keep THAT one (it's the real thing) and drop this redundant
+      // ticket-dashed duplicate instead of stacking two lines at one price.
+      if (dupesActiveLine(val)) continue;
       const pl = state.candleSeries.createPriceLine({
         price: val,
         color: s.color,
@@ -6319,6 +6397,30 @@
     }
   }
 
+  /** C3-03/T3-08: after an order actually PLACED, the ticket's disposable
+   *  inputs must not linger — a stale SL/TP/limit-price becomes a duplicate
+   *  chart line on the next redraw (drawTicketLines dedupes those, but the
+   *  cleaner fix is to not leave them stale at all), and a stale Manual
+   *  trigger mode would silently carry into the NEXT submit (sticky-manual
+   *  duplicate-order risk). Size/leverage/side are KEPT — a series of
+   *  same-setup trades shouldn't have to re-type those. Called ONLY from
+   *  runConfirm's success branch (after res.ok, order confirmed placed) —
+   *  never on error/block/timeout, where the trader still needs their inputs
+   *  to correct and resubmit. */
+  function resetTicketAfterConfirm() {
+    ["ticket-price", "ticket-sl", "ticket-tp1"].forEach(function (id) {
+      const el = $(id);
+      if (el) el.value = "";
+    });
+    state.triggerMode = "auto";
+    document.querySelectorAll(".trigger-mode-btn").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-trigger") === "auto");
+    });
+    updateTriggerModeUi();
+    try { drawTicketLines(); } catch (_) {}
+    try { updateRiskReadout(); } catch (_) {}
+  }
+
   async function runConfirm() {
     // Set busy immediately (before any await) so a double-click cannot
     // fire two confirms with the same preview token.
@@ -6425,6 +6527,12 @@
         };
         saveTradeMarkers();
       }
+      // Success-only (we're past the `!res.ok` early-return above and any
+      // sl_verified check — the order IS placed on the exchange either way,
+      // sl_verified only distinguishes whether the protective stop was
+      // confirmed): clear the disposable ticket inputs + un-stick Manual
+      // mode now, never on the error/catch paths below.
+      resetTicketAfterConfirm();
       closeConfirmModal();
       loadAccount();
       loadOpenOrders();
