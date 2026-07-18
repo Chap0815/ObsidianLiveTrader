@@ -1222,9 +1222,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     # Opus 4.6+ / Sonnet 4.6+ family the old `thinking.budget_tokens` field
     # is REJECTED (400) — the only supported "on" mode is adaptive thinking,
     # with depth controlled by `output_config.effort` instead of a token
-    # count. "medium" effort approximates the modest amount of extra
-    # reasoning a ~3000-token budget would have given on older models,
-    # without jumping to the (slower/pricier) "high" default.
+    # count (Task 15/P2-04: raised to "high" — see the body below).
     # max_tokens is raised 1800 -> 16000: thinking + the JSON response share
     # the same max_tokens budget, so a smaller cap risks the reasoning phase
     # consuming the whole budget on a large context and truncating (or
@@ -1250,7 +1248,11 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
         "max_tokens": 16000,
         "system": system_block,
         "thinking": {"type": "adaptive"},
-        "output_config": {"effort": "medium"},
+        # Task 15 (P2-04/O2-01): raised medium->high. This is the fallback
+        # deep-analysis path (production is xai/grok-4) — "high" matches the
+        # depth xai gets by default and avoids the Claude fallback silently
+        # reasoning less thoroughly than the primary provider.
+        "output_config": {"effort": "high"},
         "messages": [
             {"role": "user", "content": user_prompt},
         ],
@@ -1607,10 +1609,19 @@ async def _call_claude_reevaluate(
         "anthropic-version": settings.anthropic_version,
         "Content-Type": "application/json",
     }
+    # Task 15 (P2-04/O2-01): same fix as the analyze call above — omitting
+    # `thinking` leaves adaptive thinking ON by default on the current Opus/
+    # Sonnet 4.6+ family, and thinking + the JSON answer share this call's
+    # max_tokens budget. The old fixed 1200-token cap left thinking no
+    # headroom at all, risking a truncated/empty reevaluation. Raised to
+    # 8000 (still well under this call's 120s httpx timeout) and thinking
+    # made explicit so the truncation failure mode below is actually
+    # detectable via stop_reason rather than silently starved.
     body: dict[str, Any] = {
         "model": settings.anthropic_model,
-        "max_tokens": 1200,
+        "max_tokens": 8000,
         "system": build_reevaluate_system_prompt(context),
+        "thinking": {"type": "adaptive"},
         "messages": [
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
@@ -1647,6 +1658,12 @@ async def _call_claude_reevaluate(
         elapsed_ms=elapsed_ms,
         payload=payload,
     )
+
+    if payload.get("stop_reason") == "max_tokens":
+        log.warning(
+            "Claude reevaluate call hit max_tokens (%s); response may be truncated",
+            body.get("max_tokens"),
+        )
 
     text_parts: list[str] = []
     try:

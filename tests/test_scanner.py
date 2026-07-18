@@ -427,3 +427,55 @@ def test_parse_scan_results_salvages_truncated_json():
     assert "AAVE" in syms and "BTC" in syms  # complete ones survive
     assert "SOL" not in syms  # truncated one dropped, no crash
     assert out[0].symbol == "AAVE"  # highest score first
+
+
+# --- Task 15 (P2-03/S2-03): scanner Anthropic body must disable thinking ---
+
+
+@pytest.mark.asyncio
+async def test_scanner_anthropic_thinking_disabled(monkeypatch):
+    """On Sonnet 5 (and the current Opus/Sonnet 4.6+ family), omitting the
+    `thinking` field leaves adaptive thinking ON by default, which eats into
+    the scanner's max_tokens budget and can truncate the JSON answer before
+    it's written. The scanner call must explicitly disable it, and the
+    max_tokens cap is raised 4096->6000 for headroom consistent with the
+    OpenAI-compat scanner path."""
+    import json as _json
+
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.text = _json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    class _CapturingClient:
+        posted_bodies: list[dict] = []
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            _CapturingClient.posted_bodies.append(json)
+            return _FakeResp({"content": [{"type": "text", "text": '{"results": []}'}]})
+
+    _CapturingClient.posted_bodies = []
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", _CapturingClient)
+
+    settings = Settings(anthropic_api_key="k")
+    await scanner_mod._anthropic_text("sys", "user", "claude-sonnet-5", settings)
+
+    body = _CapturingClient.posted_bodies[-1]
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["max_tokens"] == 6000

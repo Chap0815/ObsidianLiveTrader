@@ -21,6 +21,7 @@ import app.llm.client as client_mod
 from app.config import Settings
 from app.llm.client import (
     LlmError,
+    _call_claude_reevaluate,
     _call_xai,
     _call_xai_reevaluate,
     _strictify_schema,
@@ -395,6 +396,51 @@ async def test_xai_body_has_no_reasoning_effort(monkeypatch):
     await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
 
     assert "reasoning_effort" not in fake_reevaluate.posted_bodies[-1]
+
+
+@pytest.mark.asyncio
+async def test_claude_reevaluate_budget_and_warnlog(monkeypatch, caplog):
+    """Task 15 (P2-04/O2-01): the Claude reevaluate call used to send neither
+    a `thinking` field nor enough max_tokens for the fixed 1200-token cap to
+    survive adaptive thinking eating into it — and had no truncation warning
+    at all (unlike the analyze call's stop_reason==max_tokens log). Pin the
+    fixed request shape (adaptive thinking, max_tokens=8000) and the WARNING
+    log when the response is truncated."""
+    ok_payload = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"action": "HOLD", "confidence": "medium", "reason": "ok"}),
+            }
+        ],
+        "stop_reason": "end_turn",
+    }
+    fake = _CapturingClient(200, ok_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+
+    await _call_claude_reevaluate({"symbol": "BTC"}, _settings())
+
+    body = fake.posted_bodies[-1]
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["max_tokens"] == 8000
+
+    truncated_payload = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"action": "HOLD", "confidence": "medium", "reason": "ok"}),
+            }
+        ],
+        "stop_reason": "max_tokens",
+    }
+    fake2 = _CapturingClient(200, truncated_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake2)
+
+    with caplog.at_level(logging.WARNING, logger="app.llm.client"):
+        await _call_claude_reevaluate({"symbol": "BTC"}, _settings())
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("max_tokens" in r.getMessage() for r in warnings)
 
 
 @pytest.mark.asyncio

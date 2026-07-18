@@ -377,7 +377,15 @@ async def _anthropic_text(
     }
     body = {
         "model": model,
-        "max_tokens": 4096,
+        # Task 15 (P2-03/S2-03): on Sonnet 5 / the current Opus/Sonnet 4.6+
+        # family, omitting `thinking` leaves adaptive thinking ON by default
+        # — it shares this call's max_tokens budget with the JSON answer, so
+        # a scan can silently truncate mid-array. The scanner wants a fast,
+        # cheap screen, not extended reasoning, so thinking is explicitly
+        # disabled. max_tokens raised 4096->6000 for headroom, consistent
+        # with the OpenAI-compat scanner path's budget (S2-02).
+        "max_tokens": 6000,
+        "thinking": {"type": "disabled"},
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
