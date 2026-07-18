@@ -112,6 +112,40 @@ ANALYZE_CACHE_TTL_S = 120.0
 # (by insertion order) is dropped once the cache exceeds this many entries.
 ANALYZE_CACHE_MAX_ENTRIES = 256
 
+# L2X-05: tf -> candle duration in seconds. floor(now / seconds) goes into the
+# analyze cache key so a candle CLOSE auto-invalidates the entry — a cached
+# proposal can never be served across a candle boundary (which would hand back
+# stale structure on a fast 5m scalp). Kept as a local copy (like the journal
+# resolver's) to avoid an import dependency on an exchange module.
+_TF_CANDLE_SECONDS: dict[str, int] = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1H": 3600,
+    "4H": 14_400,
+    "1D": 86_400,
+    "Min1": 60,
+    "Min5": 300,
+    "Min15": 900,
+    "Min60": 3600,
+    "Hour4": 14_400,
+    "Day1": 86_400,
+}
+
+
+def _candle_bucket(tf: str) -> int:
+    """Wall-clock candle index for `tf` (floor(now / candle_seconds)), or 0 if
+    the tf is unknown.
+
+    Putting this into the analyze cache key (L2X-05) makes a candle CLOSE
+    auto-invalidate the cached proposal: the bucket increments the instant a
+    new candle opens, so an entry can never be served across a candle boundary.
+    Unknown tf -> 0 (falls back to the plain TTL, no candle coupling)."""
+    secs = _TF_CANDLE_SECONDS.get(tf)
+    if not secs:
+        return 0
+    return int(_time.time() // secs)
+
 # F-16 (deployment/concurrency): env var names some process managers use to
 # announce a multi-worker/multi-process launch. Checked at startup so a
 # non-default deployment (this app's own launcher, scripts/launch.py, never
@@ -343,10 +377,14 @@ async def lifespan(app: FastAPI):
     # Singleflight lock for /api/news: concurrent cache-miss callers await
     # one in-flight refresh instead of each firing a full feed-fetch batch.
     app.state.news_lock = _asyncio.Lock()
-    # Singleflight lock for /api/analyze: mirrors news_lock above — two
-    # concurrent identical cache-miss requests must trigger only ONE LLM
-    # call, not two (see analyze() below).
-    app.state.analyze_lock = _asyncio.Lock()
+    # L2X-01: PER-KEY singleflight for /api/analyze. A single global lock would
+    # serialize DIFFERENT coins (two tabs → ~2x latency at Grok p50 ~15s). This
+    # dict maps a cache_key -> [asyncio.Lock, refcount]: identical in-flight
+    # requests share one lock (→ exactly ONE LLM call, the round-1 guarantee),
+    # while different keys run concurrently. Entries are deleted on idle
+    # (refcount 0) so the dict can't leak one entry per coin forever
+    # (see analyze() below for the race-free scheme).
+    app.state.analyze_locks = {}
     multi_worker_warning = _detect_multi_worker_env()
     if multi_worker_warning:
         log.warning(multi_worker_warning)
@@ -1306,7 +1344,12 @@ async def analyze(
     # price. Only SUCCESSFUL proposals are cached (errors are never cached);
     # STAY_OUT is a valid, cacheable result.
     verdict_key = _scanner_verdict_cache_key(body.scanner_verdict)
-    cache_key = (symbol, tf, htf, s.llm_provider, verdict_key)
+    # L2X-05: the candle bucket (floor(now / candle_seconds)) is part of the
+    # key so a candle CLOSE auto-invalidates the entry — a cached proposal is
+    # never served across a candle boundary (stale-structure guard for fast
+    # scalps). Within one candle the bucket is stable, so normal cache hits
+    # still work; the 120s TTL remains the upper bound.
+    cache_key = (symbol, tf, htf, s.llm_provider, verdict_key, _candle_bucket(tf))
 
     def _cache_lookup() -> dict | None:
         cache: dict = getattr(request.app.state, "analyze_cache", None) or {}
@@ -1493,19 +1536,42 @@ async def analyze(
     if body.force:
         return await _run_analyze()
 
-    # Singleflight on a cache MISS (mirrors /api/news's news_lock): two
-    # concurrent identical requests must trigger only ONE LLM call. Acquire
-    # the lock, then RE-CHECK the cache — another caller may have already
-    # populated it while this one was waiting.
-    lock = getattr(request.app.state, "analyze_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        request.app.state.analyze_lock = lock
-    async with lock:
-        hit = _cache_lookup()
-        if hit is not None:
-            return hit
-        return await _run_analyze()
+    # PER-KEY singleflight on a cache MISS (L2X-01). Two concurrent identical
+    # requests (same cache_key) must trigger only ONE LLM call, but DIFFERENT
+    # coins/keys must run concurrently (a single global lock serialized them).
+    # Acquire this key's lock, then RE-CHECK the cache — another caller may have
+    # populated it while this one waited.
+    #
+    # Race-free scheme (single-threaded asyncio): `entry = [Lock, refcount]`.
+    #  * Get-or-create + refcount++ runs with NO await in between, so it is
+    #    atomic under the event loop — two same-key coroutines can never both
+    #    create a fresh entry; the second sees the first's entry.
+    #  * refcount counts how many coroutines hold-OR-await this lock.
+    #  * On exit, decrement and (only if refcount hit 0) delete run together
+    #    with NO await between them, so no other coroutine can interleave in the
+    #    window where the entry becomes deletable — the deleted entry is
+    #    provably unheld and unawaited. A late same-key request after the delete
+    #    simply creates a fresh entry. The dict thus holds at most one entry per
+    #    DISTINCT in-flight key and empties at quiescence (no per-coin leak).
+    locks = getattr(request.app.state, "analyze_locks", None)
+    if locks is None:
+        locks = {}
+        request.app.state.analyze_locks = locks
+    entry = locks.get(cache_key)
+    if entry is None:
+        entry = [asyncio.Lock(), 0]
+        locks[cache_key] = entry
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            hit = _cache_lookup()
+            if hit is not None:
+                return hit
+            return await _run_analyze()
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and locks.get(cache_key) is entry:
+            del locks[cache_key]
 
 
 def _extract_position_sl_tp(

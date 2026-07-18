@@ -378,8 +378,12 @@ def test_analyze_cache_key_includes_resolved_provider(monkeypatch):
 @pytest.mark.asyncio
 async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
     """Two concurrent, identical cache-miss analyze requests must result in
-    ONE real LLM call — the second waits on app.state.analyze_lock, then
-    re-checks the (now-populated) cache instead of firing its own LLM call."""
+    ONE real LLM call — the second waits on the PER-KEY lock, then re-checks
+    the (now-populated) cache instead of firing its own LLM call.
+
+    (Task 23: the single global analyze_lock was replaced by a per-key lock
+    dict `app.state.analyze_locks`; identical requests share one key → one
+    lock → still exactly one LLM call.)"""
     import asyncio as _asyncio
 
     import httpx
@@ -405,7 +409,7 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
 
     app.state.mexc = client
     app.state.analyze_cache = {}
-    app.state.analyze_lock = _asyncio.Lock()
+    app.state.analyze_locks = {}
 
     p1 = patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock()))
     p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
@@ -419,7 +423,7 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
             t1 = _asyncio.create_task(ac.post("/api/analyze", json=body))
             await _asyncio.wait_for(started.wait(), timeout=2.0)
             t2 = _asyncio.create_task(ac.post("/api/analyze", json=body))
-            await _asyncio.sleep(0.1)  # let t2 reach (and block on) analyze_lock
+            await _asyncio.sleep(0.1)  # let t2 reach (and block on) the per-key lock
             release.set()
             r1 = await t1
             r2 = await t2
@@ -430,6 +434,133 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
     # cache hit — which one wins the race is not the point, only the call count.
     cached_flags = sorted([r1.json()["cached"], r2.json()["cached"]])
     assert cached_flags == [False, True]
+
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_analyze_different_coins_run_concurrently(monkeypatch):
+    """Task 23 (L2X-01): two DIFFERENT coins (→ two different cache keys) must
+    run their LLM calls CONCURRENTLY, not serialized behind one global lock.
+
+    Both fake LLM calls block on a shared gate; the test only releases the gate
+    AFTER both have started. Under the old single global analyze_lock the
+    second request would block before ever starting its LLM call, `both_started`
+    would never fire, and `wait_for` would time out."""
+    import asyncio as _asyncio
+
+    import httpx
+
+    _env(monkeypatch)
+    from app.main import app
+
+    inflight = 0
+    max_inflight = 0
+    gate = _asyncio.Event()
+    both_started = _asyncio.Event()
+
+    async def fake_analyze_with_llm(context, settings):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        if inflight >= 2:
+            both_started.set()
+        await gate.wait()
+        inflight -= 1
+        return _proposal()
+
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    app.state.mexc = client
+    app.state.analyze_cache = {}
+    app.state.analyze_locks = {}
+
+    p1 = patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock()))
+    p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
+    p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
+    p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+
+    transport = httpx.ASGITransport(app=app)
+    with p1, p2, p3, p4:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            t1 = _asyncio.create_task(
+                ac.post("/api/analyze", json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"})
+            )
+            t2 = _asyncio.create_task(
+                ac.post("/api/analyze", json={"symbol": "ETH_USDT", "tf": "15m", "htf": "1H"})
+            )
+            # If the two coins were serialized, only one LLM call would ever be
+            # in flight and this would time out.
+            await _asyncio.wait_for(both_started.wait(), timeout=2.0)
+            gate.set()
+            r1 = await t1
+            r2 = await t2
+
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    assert max_inflight == 2  # both LLM calls were genuinely concurrent
+    # The per-key lock dict must empty out once both requests finish (no leak).
+    assert app.state.analyze_locks == {}
+
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_same_key_still_singleflight(monkeypatch):
+    """Task 23: the per-key scheme must PRESERVE the round-1 guarantee — two
+    concurrent identical requests (same key) still trigger exactly ONE LLM
+    call; the second waits on the shared per-key lock and serves the cache."""
+    import asyncio as _asyncio
+
+    import httpx
+
+    _env(monkeypatch)
+    from app.main import app
+
+    llm_calls = 0
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def fake_analyze_with_llm(context, settings):
+        nonlocal llm_calls
+        llm_calls += 1
+        started.set()
+        await release.wait()
+        return _proposal()
+
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+
+    app.state.mexc = client
+    app.state.analyze_cache = {}
+    app.state.analyze_locks = {}
+
+    p1 = patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock()))
+    p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
+    p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
+    p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+
+    transport = httpx.ASGITransport(app=app)
+    body = {"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
+    with p1, p2, p3, p4:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            t1 = _asyncio.create_task(ac.post("/api/analyze", json=body))
+            await _asyncio.wait_for(started.wait(), timeout=2.0)
+            t2 = _asyncio.create_task(ac.post("/api/analyze", json=body))
+            await _asyncio.sleep(0.1)  # let t2 reach (and block on) the per-key lock
+            release.set()
+            r1 = await t1
+            r2 = await t2
+
+    assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+    assert llm_calls == 1
+    cached_flags = sorted([r1.json()["cached"], r2.json()["cached"]])
+    assert cached_flags == [False, True]
+    assert app.state.analyze_locks == {}  # entry deleted on idle
 
     get_settings.cache_clear()
 
