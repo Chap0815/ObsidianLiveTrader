@@ -141,6 +141,24 @@
     return t > 1e12 ? Math.floor(t / 1000) : Math.floor(t);
   }
 
+  /** C3-11: LWC v4 renders epoch timestamps as UTC by default — for a DE
+   *  user (UTC+2) the axis and crosshair are hours off the wall clock, and
+   *  disagree with the trades panel's (already-local) relative times.
+   *  FORMAT-ONLY: this only changes how a `time` value is displayed
+   *  (crosshair label / axis tick), never the stored value itself — the bar
+   *  time bucketing (barOpenTimeSec) that keeps candles/fills consistent is
+   *  untouched. `time` here is always a plain UTCTimestamp (seconds) since
+   *  every series in this file is fed via candlesToSeries/emaToSeries with
+   *  numeric `time`, never LWC's BusinessDay form. */
+  function chartLocalTime(time, withSeconds) {
+    const sec = Number(time);
+    if (!Number.isFinite(sec)) return "";
+    const d = new Date(sec * 1000);
+    return withSeconds
+      ? d.toLocaleTimeString("de-DE")
+      : d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+  }
+
   // U-06: `ok` is normally boolean, but `null`/`undefined` (status not yet
   // known, e.g. before the first /api/health response) resets the dot to
   // the neutral "unknown" look instead of forcing a false "bad" red.
@@ -233,12 +251,22 @@
         scaleMargins: { top: 0.08, bottom: 0.22 }, // room for volume below
         entireTextOnly: true, // never draw a half-clipped price label at the edge
       },
+      // C3-11: local (de-DE) time on axis + crosshair instead of raw UTC —
+      // format-only, see chartLocalTime() above.
+      localization: {
+        timeFormatter: function (time) {
+          return chartLocalTime(time, true);
+        },
+      },
       timeScale: {
         borderColor: "#2b2740",
         timeVisible: true,
         secondsVisible: false,
         rightOffset: 6, // breathing room next to the live candle
         barSpacing: 7,
+        tickMarkFormatter: function (time) {
+          return chartLocalTime(time, false);
+        },
       },
       watermark: {
         visible: true,
@@ -488,9 +516,20 @@
       const yEntry = series.priceToCoordinate(entry);
       if (yEntry == null) return;
 
-      // x-start: entry candle time if we recorded it, else left edge
+      // x-start: entry candle time. C3-07: neither in-memory
+      // tradeEntryTimes (lost on reload) nor a fixed bucket (breaks on TF
+      // switch — a 15m bucket is not a bar time on the 4H chart) survive.
+      // Prefer the oldest known OPEN fill (HL only, self-healing, needs no
+      // storage), else the persisted raw-ms entry time re-bucketed to the
+      // CURRENT tf, else the legacy in-memory value as a last resort.
       let xStart = 0;
-      const et = state.tradeEntryTimes && state.tradeEntryTimes[p.symbol];
+      let et = oldestOpenFillTime(p.symbol);
+      if (et == null && mk && mk.entryMs) {
+        et = barOpenTimeSec(mk.entryMs, state.tf || "15m");
+      }
+      if (et == null) {
+        et = state.tradeEntryTimes && state.tradeEntryTimes[p.symbol];
+      }
       if (et != null) {
         const xc = ts.timeToCoordinate(et);
         if (xc != null) xStart = Math.max(0, xc);
@@ -719,6 +758,40 @@
       ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
     }
     return ex === "hyperliquid" ? s.split("_")[0] : s;
+  }
+
+  /** Three-way fill classification (C3-02): Hyperliquid's free-text `dir`
+   *  field says what actually happened. A naive `dir.indexOf("close")`
+   *  check only recognizes ordinary closes — liquidations ("Liquidated
+   *  Long") and position flips ("Long > Short") contain no "close"
+   *  substring, so they fell through to the OPEN branch and the worst
+   *  possible event (a liquidation) rendered as a normal, full-color,
+   *  deliberate-looking entry marker. Detect both explicitly so they get
+   *  their own (unmissable) treatment instead. */
+  function classifyFillDir(dir) {
+    const s = String(dir || "").toLowerCase();
+    if (s.indexOf("liquidat") !== -1 || s.indexOf(">") !== -1) return "liq";
+    if (s.indexOf("close") !== -1) return "close";
+    return "open";
+  }
+
+  /** C3-07: the most durable source for "when did this position start" is
+   *  the oldest still-known OPEN fill for the symbol — it needs no
+   *  persistence at all and survives a full localStorage wipe. Preferred
+   *  over the persisted tradeMarkers.entryMs when fills are loaded (HL
+   *  only; MEXC has no fill history so this always falls through). Returns
+   *  the entry bucketed to the CURRENT tf, or null if no open fill is known. */
+  function oldestOpenFillTime(symbol) {
+    const fills = state.fills || [];
+    let minMs = null;
+    fills.forEach(function (f) {
+      if (!symMatch(f.symbol, symbol)) return;
+      if (classifyFillDir(f.dir) !== "open") return;
+      const t = Number(f.time);
+      if (!(t > 0)) return;
+      if (minMs == null || t < minMs) minMs = t;
+    });
+    return minMs == null ? null : barOpenTimeSec(minMs, state.tf || "15m");
   }
 
   function drawProposalLines() {
@@ -2618,6 +2691,16 @@
       typeof state.candleSeries.setMarkers !== "function"
     )
       return;
+    // C3-06: loadFills() and loadMarket() resolve independently after a
+    // coin/TF switch (goToSymbol fires both). If fills for the NEW
+    // symbol/tf land before the new candles do, state.symbol/state.tf are
+    // already the new values but state._chartKey (set only once loadMarket's
+    // response lands) still reflects the OLD chart — drawing here would
+    // bucket against the wrong series. Bail; loadMarket calls
+    // applyTradeMarkers again right after it updates _chartKey.
+    if (state._chartKey && state._chartKey !== state.symbol + "|" + state.tf) {
+      return;
+    }
     const chartColors = getChartColors();
     const tf = state.tf || "15m";
     const groups = new Map(); // "time|side" -> aggregated group
@@ -2636,25 +2719,44 @@
         tf
       );
     }
+    // C3-05: lastT is the last REST candle's open time. A WS-driven live bar
+    // can already be newer (new bar opened, no poll yet) — without this, a
+    // fill landing in that fresh live bar is outside the window and its
+    // marker is dropped until the next ~15s poll pulls the candle in,
+    // delaying the trader's own entry marker at the most exciting moment.
+    const upperT =
+      lastT != null && state.liveBar && Number.isFinite(state.liveBar.time)
+        ? Math.max(lastT, state.liveBar.time)
+        : lastT;
 
     (state.fills || []).forEach(function (f) {
       if (!symMatch(f.symbol, state.symbol) || !(Number(f.time) > 0)) return;
       const side = f.side === "buy" ? "buy" : "sell";
       const time = barOpenTimeSec(f.time, tf);
-      if (firstT != null && (time < firstT || time > lastT)) return; // outside window
+      if (firstT != null && (time < firstT || time > upperT)) return; // outside window
       const sz = Number(f.sz) || 0;
       const px = Number(f.px) || 0;
-      const dirStr = String(f.dir || "").toLowerCase();
-      const isClose = dirStr.indexOf("close") !== -1;
+      const cls = classifyFillDir(f.dir); // C3-02: "open" | "close" | "liq"
       const key = time + "|" + side;
       let g = groups.get(key);
       if (!g) {
-        g = { time: time, side: side, sz: 0, notional: 0, anyOpen: false, anyClose: false };
+        g = {
+          time: time,
+          side: side,
+          sz: 0,
+          notional: 0,
+          anyOpen: false,
+          anyClose: false,
+          anyLiq: false,
+          closedPnl: 0,
+        };
         groups.set(key, g);
       }
       g.sz += sz;
       g.notional += sz * px;
-      if (isClose) g.anyClose = true;
+      g.closedPnl += Number(f.closed_pnl) || 0;
+      if (cls === "liq") g.anyLiq = true;
+      else if (cls === "close") g.anyClose = true;
       else g.anyOpen = true;
     });
 
@@ -2668,10 +2770,15 @@
     }
     // Only label the biggest groups (by notional) once there are more than
     // a handful — otherwise text spam creeps back in on busy symbols.
+    // Liquidation/flip groups are exempt (always labeled "LIQ" below) so
+    // they never have to compete for one of the scarce text slots.
     let textKeys = null;
-    if (groupList.length > TRADE_MARKER_TEXT_CAP) {
+    const textCandidates = groupList.filter(function (g) {
+      return !g.anyLiq;
+    });
+    if (textCandidates.length > TRADE_MARKER_TEXT_CAP) {
       textKeys = new Set(
-        groupList
+        textCandidates
           .slice()
           .sort(function (a, b) {
             return b.notional - a.notional;
@@ -2686,6 +2793,20 @@
     const markers = groupList.map(function (g) {
       const buy = g.side === "buy";
       const avgPx = g.sz > 0 ? g.notional / g.sz : 0;
+      // C3-02: a liquidation or position flip is the worst-case event on the
+      // chart — it must never be mistaken for a deliberate, well-colored
+      // entry. Own shape/color/text, always labeled, independent of
+      // open/close state (a liq bucket may well ALSO contain an open fill
+      // from the resulting flip; the liq still dominates the marker).
+      if (g.anyLiq) {
+        return {
+          time: g.time,
+          position: buy ? "belowBar" : "aboveBar",
+          color: chartColors.liq,
+          shape: "square",
+          text: "LIQ", // exempt from the text-count cap (see textCandidates above)
+        };
+      }
       // A bucket with ANY open fill is treated as an entry (full color) even
       // if it also contains a close fill — the entry is what must stand out.
       const closeOnly = g.anyClose && !g.anyOpen;
@@ -2704,7 +2825,13 @@
       };
       const wantText = !textKeys || textKeys.has(g.time + "|" + g.side);
       if (wantText) {
-        marker.text = (buy ? "▲ " : "▼ ") + fmt(g.sz, 4) + " @ " + fmt(avgPx, 4);
+        let txt = (buy ? "▲ " : "▼ ") + fmt(g.sz, 4) + " @ " + fmt(avgPx, 4);
+        // C3-08: the most telling number on a close — what it actually made
+        // or lost — was fetched from the backend but never shown anywhere.
+        if (closeOnly) {
+          txt += " · " + (g.closedPnl >= 0 ? "+" : "") + fmt(g.closedPnl, 2);
+        }
+        marker.text = txt;
       }
       return marker;
     });
@@ -3660,6 +3787,13 @@
           const sym = String(f.symbol || state.symbol || "—").split("_")[0];
           const t = Number(f.time);
           const iso = Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null;
+          // C3-08: realized PnL is delivered per-fill by the backend
+          // (closed_pnl) but was never rendered anywhere — the panel could
+          // say a position was closed, not whether that was a win or a loss.
+          const pnl = Number(f.closed_pnl);
+          const hasPnl = Number.isFinite(pnl) && pnl !== 0;
+          const pnlCls = hasPnl ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
+          const pnlTxt = hasPnl ? (pnl >= 0 ? "+" : "") + fmt(pnl, 2) : "—";
           return (
             '<div class="trade-row">' +
             '<span class="trade-sym">' + escapeHtml(sym) + "</span>" +
@@ -3667,6 +3801,7 @@
             (side === "buy" ? "BUY" : "SELL") + "</span>" +
             '<span class="trade-sz">' + fmt(f.sz, 4) + "</span>" +
             '<span class="trade-px">' + fmt(f.px, 4) + "</span>" +
+            '<span class="trade-pnl ' + pnlCls + '">' + escapeHtml(pnlTxt) + "</span>" +
             '<span class="trade-time">' + (iso ? escapeHtml(relTime(iso)) : "") + "</span>" +
             "</div>"
           );
@@ -6271,16 +6406,22 @@
       if (sym) {
         const key = String(sym).toUpperCase();
         if (state.liveBar && state.liveBar.time) {
-          state.tradeEntryTimes[key] = state.liveBar.time;
+          state.tradeEntryTimes[key] = state.liveBar.time; // legacy in-memory fallback
         }
         // A3-01: write under the canonical key so every read site (position
         // zones, mini-tiles, the manual-SL alarm) can find it again.
+        // C3-07: entryMs is the RAW ms timestamp, not bucketed to the
+        // CURRENT tf — bucketing happens at draw time (barOpenTimeSec in
+        // _drawTradeZones), so the zone start survives both a reload (this
+        // is persisted, tradeEntryTimes above is not) and a TF switch (a
+        // bucket fixed to today's tf is not a bar time on a different tf).
         state.tradeMarkers[markerKey(key)] = {
           sl: Number(sm.stop_loss) || null,
           tp: Number(sm.take_profit) || null,
           side: sm.side,
           manual: (sm.trigger_mode || state.triggerMode) === "manual",
           ts: Date.now(),
+          entryMs: Date.now(),
         };
         saveTradeMarkers();
       }
