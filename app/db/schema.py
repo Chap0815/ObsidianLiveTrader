@@ -65,7 +65,13 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   realized_r_net REAL,                     -- realized_r minus round-trip costs (F2-07); NULL when gross is
   ambiguous     INTEGER NOT NULL DEFAULT 0,-- 1 = tp1 & sl inside the same candle
   last_checked_at TEXT,                    -- UTC ISO of last resolver pass (debug/backoff)
-  proposal_id   INTEGER                    -- FK-ish link to proposals.id (best-effort, nullable)
+  proposal_id   INTEGER,                   -- FK-ish link to proposals.id (best-effort, nullable)
+  -- Task 20 attribution/versioning (F2-04/K2-04, F2-08, F2-12). Added here for
+  -- fresh DBs; on EXISTING DBs these are backfilled by the idempotent ALTER
+  -- migration in Database.init() (CREATE TABLE IF NOT EXISTS never adds columns).
+  setup_type    TEXT,                      -- chart_pattern[/time_horizon] attribution key
+  context_hash  TEXT,                      -- stable hash of analysis context (dedupe key)
+  prompt_version TEXT                      -- hash of build_system_prompt() (regime attribution)
 );
 
 CREATE INDEX IF NOT EXISTS idx_journal_created ON journal_entries(created_at DESC);

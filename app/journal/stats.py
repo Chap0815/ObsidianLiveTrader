@@ -36,18 +36,36 @@ def _round(x: float | None, digits: int = 3) -> float | None:
 
 
 def _block(
-    wins: int, losses: int, sum_r: float, min_sample: int
+    wins: int,
+    losses: int,
+    sum_r: float,
+    min_sample: int,
+    *,
+    ambiguous: int = 0,
+    clean_wins: int = 0,
+    clean_losses: int = 0,
 ) -> dict[str, Any]:
-    """One {wins, losses, sample, win_rate, avg_realized_rrr, low_sample} block."""
+    """One per-group stats block.
+
+    F2-09: `win_rate_ci95` (Wilson) so a small-n group ships its uncertainty,
+    not just a point estimate. F2-10: `ambiguous` (intrabar tp1&sl ties, counted
+    pessimistically as LOSS by the resolver) plus a `clean_win_rate` that drops
+    those rows entirely — so the ambiguity is visible and correctable.
+    """
     sample = wins + losses
     win_rate = _round(wins / sample) if sample else None
     avg_r = _round(sum_r / sample) if sample else None
+    clean_sample = clean_wins + clean_losses
+    clean_win_rate = _round(clean_wins / clean_sample) if clean_sample else None
     return {
         "wins": wins,
         "losses": losses,
         "sample": sample,
         "win_rate": win_rate,
+        "win_rate_ci95": wilson_ci(wins, losses),
         "avg_realized_rrr": avg_r,
+        "ambiguous": ambiguous,
+        "clean_win_rate": clean_win_rate,
         "low_sample": sample < min_sample,
     }
 
@@ -60,6 +78,9 @@ def _groups(raw_groups: dict[str, Any], min_sample: int) -> dict[str, Any]:
             int(g.get("losses", 0)),
             float(g.get("sum_r", 0.0)),
             min_sample,
+            ambiguous=int(g.get("ambiguous", 0)),
+            clean_wins=int(g.get("clean_wins", 0)),
+            clean_losses=int(g.get("clean_losses", 0)),
         )
     return out
 
@@ -81,11 +102,12 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
     by_confidence = _groups(raw.get("by_confidence", {}), min_sample)
     by_action = _groups(raw.get("by_action", {}), min_sample)
     by_provider = _groups(raw.get("by_provider", {}), min_sample)
+    by_setup = _groups(raw.get("by_setup", {}), min_sample)
 
     # Caveats: name any non-empty group below the sample threshold, plus the
     # standing shadow-fill disclaimer so the rates are never misread as PnL.
     low_named: list[str] = []
-    for grp in (by_confidence, by_action, by_provider):
+    for grp in (by_confidence, by_action, by_provider, by_setup):
         for name, block in grp.items():
             if 0 < block["sample"] < min_sample:
                 low_named.append(name)
@@ -135,5 +157,6 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
         "by_confidence": by_confidence,
         "by_action": by_action,
         "by_provider": by_provider,
+        "by_setup": by_setup,
         "caveats": caveats,
     }

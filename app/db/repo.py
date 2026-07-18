@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +122,26 @@ class Database:
                 await conn.execute(
                     "ALTER TABLE journal_entries ADD COLUMN realized_r_net REAL"
                 )
+            # Task 20 (F2-04/K2-04, F2-08, F2-12): additive attribution/versioning
+            # columns. Same idempotent pattern — CREATE TABLE IF NOT EXISTS never
+            # adds a column to an already-created table, so on a pre-existing DB
+            # (real journal data present) these must be ADDed explicitly or every
+            # INSERT would break with "no such column". Bestandszeilen = NULL.
+            # Literals are hardcoded (never request-derived) -> f-string is safe.
+            for _col in ("setup_type", "context_hash", "prompt_version"):
+                if _col not in cols:
+                    await conn.execute(
+                        f"ALTER TABLE journal_entries ADD COLUMN {_col} TEXT"
+                    )
+            # Index on setup_type for the by_setup GROUP BY. Created HERE (not in
+            # SCHEMA_SQL) so it runs only AFTER the column exists on both fresh
+            # DBs (CREATE TABLE above) and migrated DBs (ALTER above) — a CREATE
+            # INDEX inside SCHEMA_SQL would fail on an old DB whose table has no
+            # setup_type column yet (executescript runs before this migration).
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journal_setup "
+                "ON journal_entries(setup_type)"
+            )
             await conn.commit()
 
     async def insert_proposal(
@@ -294,19 +314,73 @@ class Database:
         status: str = "PENDING",
         proposal_id: int | None = None,
         created_at: str | None = None,
+        setup_type: str | None = None,
+        context_hash: str | None = None,
+        prompt_version: str | None = None,
+        dedupe_window_min: int = 30,
     ) -> int:
+        now = created_at or _utc_now_iso()
         async with self._acquire() as conn:
+            # F2-08 dedupe: repeatedly analysing the SAME context within a short
+            # window would otherwise write N correlated rows and inflate the
+            # sample (tightening the Wilson CI dishonestly). If a still-PENDING
+            # row with the same context_hash exists inside the window, UPDATE it
+            # in place with the latest analysis instead of inserting a new row.
+            # Only PENDING rows are collapsed — a row that already resolved
+            # (WIN/LOSS/…) is a real observation and must never be overwritten.
+            if context_hash:
+                try:
+                    base_dt = datetime.fromisoformat(now)
+                except ValueError:
+                    base_dt = datetime.now(timezone.utc)
+                threshold = (
+                    base_dt - timedelta(minutes=dedupe_window_min)
+                ).isoformat()
+                cur = await conn.execute(
+                    """
+                    SELECT id FROM journal_entries
+                    WHERE context_hash = ? AND status = 'PENDING'
+                          AND created_at >= ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (context_hash, threshold),
+                )
+                dup = await cur.fetchone()
+                if dup is not None:
+                    existing_id = int(dup[0])
+                    await conn.execute(
+                        """
+                        UPDATE journal_entries
+                        SET created_at = ?, symbol = ?, tf = ?, htf = ?,
+                            action = ?, direction = ?, setup_confidence = ?,
+                            entry_price = ?, stop_loss = ?, tp1 = ?, rrr = ?,
+                            provider = ?, model = ?, scanner_summary = ?,
+                            last_price_t0 = ?, status = ?, proposal_id = ?,
+                            setup_type = ?, prompt_version = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            now, symbol, tf, htf, action, direction,
+                            setup_confidence, entry_price, stop_loss, tp1, rrr,
+                            provider, model, scanner_summary, last_price_t0,
+                            status, proposal_id, setup_type, prompt_version,
+                            existing_id,
+                        ),
+                    )
+                    await conn.commit()
+                    return existing_id
+
             cur = await conn.execute(
                 """
                 INSERT INTO journal_entries
                   (created_at, symbol, tf, htf, action, direction,
                    setup_confidence, entry_price, stop_loss, tp1, rrr,
                    provider, model, scanner_summary, last_price_t0,
-                   status, proposal_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   status, proposal_id, setup_type, context_hash, prompt_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    created_at or _utc_now_iso(),
+                    now,
                     symbol,
                     tf,
                     htf,
@@ -323,6 +397,9 @@ class Database:
                     last_price_t0,
                     status,
                     proposal_id,
+                    setup_type,
+                    context_hash,
+                    prompt_version,
                 ),
             )
             await conn.commit()
@@ -467,7 +544,16 @@ class Database:
                            SUM(CASE WHEN status='WIN'  THEN 1 ELSE 0 END) AS wins,
                            SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) AS losses,
                            SUM(CASE WHEN status IN ('WIN','LOSS')
-                                    THEN realized_r ELSE 0 END) AS sum_r
+                                    THEN realized_r ELSE 0 END) AS sum_r,
+                           -- F2-10: ambiguous resolved rows + a CLEAN win/loss
+                           -- split (ambiguous excluded) so the endpoint can show
+                           -- a win rate that isn't inflated by intrabar ties.
+                           SUM(CASE WHEN status IN ('WIN','LOSS') AND ambiguous=1
+                                    THEN 1 ELSE 0 END) AS ambiguous,
+                           SUM(CASE WHEN status='WIN'  AND ambiguous=0
+                                    THEN 1 ELSE 0 END) AS clean_wins,
+                           SUM(CASE WHEN status='LOSS' AND ambiguous=0
+                                    THEN 1 ELSE 0 END) AS clean_losses
                     FROM journal_entries
                     WHERE status IN ('WIN','LOSS') AND {column} IS NOT NULL
                     GROUP BY {column}
@@ -482,6 +568,9 @@ class Database:
                         "wins": int(r["wins"] or 0),
                         "losses": int(r["losses"] or 0),
                         "sum_r": float(r["sum_r"] or 0.0),
+                        "ambiguous": int(r["ambiguous"] or 0),
+                        "clean_wins": int(r["clean_wins"] or 0),
+                        "clean_losses": int(r["clean_losses"] or 0),
                     }
                 return out
 
@@ -526,6 +615,10 @@ class Database:
                 "by_confidence": await _groups("setup_confidence"),
                 "by_action": await _groups("action"),
                 "by_provider": await _groups("provider"),
+                # F2-04/K2-04 attribution: win rate keyed by the setup type
+                # (chart_pattern[/time_horizon]). NULL setup_type rows are
+                # excluded by the _groups WHERE clause (pre-migration rows).
+                "by_setup": await _groups("setup_type"),
             }
 
     async def clear_journal(self) -> int:

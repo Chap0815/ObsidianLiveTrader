@@ -38,6 +38,8 @@ from app.llm.client import (
     reevaluate_with_llm,
 )
 
+from app.llm.prompts import build_system_prompt
+
 # Back-compat alias
 GrokError = LlmError
 from app.mexc.client import empty_account
@@ -1216,6 +1218,20 @@ def _journal_model_for_provider(s: Settings) -> str | None:
     }.get(provider)
 
 
+def _journal_setup_type(proposal) -> str | None:
+    """F2-04 attribution key from the proposal's chart_pattern + time_horizon
+    (Task 14b fields). getattr-defensive so a proposal missing either field
+    never breaks the advisory journal write. Returns None when there is no
+    named pattern AND no horizon (so it stays out of the by_setup group)."""
+    pattern = (getattr(proposal, "chart_pattern", "") or "").strip()
+    if pattern.lower() in ("", "none"):
+        pattern = ""
+    horizon_raw = getattr(proposal, "time_horizon", None)
+    horizon = str(horizon_raw).strip() if horizon_raw else ""
+    parts = [p for p in (pattern, horizon) if p]
+    return "/".join(parts) if parts else None
+
+
 def _journal_status_for(action: str | None, entry, sl, tp1) -> str:
     """SKIPPED for STAY_OUT (never resolvable) or a non-STAY_OUT proposal that
     is missing entry/sl/tp1 (degenerate — cannot be shadow-resolved). Else
@@ -1391,6 +1407,13 @@ async def analyze(
                         proposal.stop_loss,
                         proposal.tp1,
                     )
+                    # F2-12: version the journal row by the exact system prompt
+                    # it was produced under, so a prompt change segments regimes
+                    # instead of silently mixing them. Hash of the assembled
+                    # prompt (context-conditional OI/regime sections included).
+                    prompt_version = hashlib.sha256(
+                        build_system_prompt(context).encode("utf-8")
+                    ).hexdigest()[:16]
                     await db.insert_journal_entry(
                         symbol=symbol,
                         tf=tf,
@@ -1408,6 +1431,9 @@ async def analyze(
                         last_price_t0=market_api.get("last_price"),
                         status=status,
                         proposal_id=proposal_id,
+                        setup_type=_journal_setup_type(proposal),
+                        context_hash=context_hash,
+                        prompt_version=prompt_version,
                     )
                 except Exception:
                     # Journal is advisory — never break analyze on a write error.
