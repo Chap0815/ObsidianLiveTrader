@@ -206,6 +206,89 @@ async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
     return {**_DEFAULT_MARKET_EXTRAS, **(extras or {})}
 
 
+# --- BTC market-regime anchor (K2-02) ---------------------------------------
+# Every altcoin is dominated by BTC beta, yet each coin is analysed in isolation.
+# We fetch a tiny BTC regime block (daily + htf ema_stack + htf stretch) ONCE and
+# reuse it across every altcoin analyze within the TTL, so it never adds a serial
+# per-coin upstream cost. The daily/htf klines themselves also flow through the
+# shared _daily_cache, so a warm cache costs zero upstream calls. Any failure
+# degrades to None (block omitted) — it must NEVER break analyze.
+_BTC_REGIME_SYMBOL = "BTC_USDT"
+_BTC_REGIME_TTL_S: float = 300.0
+_btc_regime_cache: dict[tuple[str, str], tuple[float, dict[str, Any] | None]] = {}
+
+
+def clear_btc_regime_cache() -> None:
+    _btc_regime_cache.clear()
+
+
+def is_btc_symbol(symbol: str | None) -> bool:
+    """True for BTC itself — the regime block is self-referential there (K2-02)."""
+    base = str(symbol or "").upper().split("_", 1)[0]
+    return base in ("BTC", "XBT")
+
+
+def _stack_and_stretch(candles: list[Candle]) -> tuple[str, float | None]:
+    """(ema_stack label, price_vs_ema20_pct) for a candle series, or ('unknown', None)."""
+    # Local import avoids a module-level app.analysis <- app.llm layering cycle;
+    # reusing _ema_stack_label keeps the M2-03 pullback fix consistent for BTC too.
+    from app.llm.client import _ema_stack_label
+
+    if not candles:
+        return "unknown", None
+    bundle = indicator_bundle(candles)
+    last = bundle.get("last") or {}
+    last_close = candles[-1].close
+    stack = _ema_stack_label(last, last_close)
+    stretch: float | None = None
+    e20 = last.get("ema20")
+    try:
+        if last_close and e20:
+            stretch = round((last_close - e20) / e20 * 100.0, 3)
+    except (TypeError, ZeroDivisionError):
+        stretch = None
+    return stack, stretch
+
+
+async def fetch_btc_regime(
+    client: Any,
+    *,
+    htf: str = "1H",
+    daily: str = "1D",
+    htf_limit_hint: int = 260,
+    daily_limit_hint: int = 260,
+    ttl: float = _BTC_REGIME_TTL_S,
+) -> dict[str, Any] | None:
+    """Compact BTC regime anchor: btc_daily_stack, btc_htf_stack,
+    btc_price_vs_ema20_pct (1H stretch). Cached ~5 min and reused across all
+    altcoin analyses. Returns None on any failure/empty data (block omitted)."""
+    key = (htf, daily)
+    now = time.time()
+    hit = _btc_regime_cache.get(key)
+    if hit is not None and (now - hit[0]) < ttl:
+        return hit[1]
+    try:
+        htf_candles = await _fetch_daily_candles(
+            client, _BTC_REGIME_SYMBOL, htf, htf_limit_hint
+        )
+        daily_candles = await _fetch_daily_candles(
+            client, _BTC_REGIME_SYMBOL, daily, daily_limit_hint
+        )
+    except Exception:
+        return None  # never cache/raise — degrade gracefully
+    if not htf_candles or not daily_candles:
+        return None
+    daily_stack, _ = _stack_and_stretch(daily_candles)
+    htf_stack, htf_stretch = _stack_and_stretch(htf_candles)
+    block: dict[str, Any] = {
+        "btc_daily_stack": daily_stack,
+        "btc_htf_stack": htf_stack,
+        "btc_price_vs_ema20_pct": htf_stretch,
+    }
+    _btc_regime_cache[key] = (now, block)
+    return block
+
+
 async def build_market_snapshot(
     symbol: str,
     ltf: str,

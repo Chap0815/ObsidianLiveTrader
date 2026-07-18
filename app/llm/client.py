@@ -444,14 +444,24 @@ def _series_tail(series: Any, k: int = 12) -> list:
 
 
 def _ema_stack_label(last: dict[str, Any], last_close: float | None) -> str:
-    """bullish / bearish / mixed from EMA20/50/200 ordering + price location."""
+    """bullish / bearish / mixed from EMA20/50/200 ordering + regime line.
+
+    M2-03: the price gate is the EMA200 (the major regime line), NOT the EMA50.
+    A healthy pullback INTO value — price below EMA50 but still above EMA200,
+    EMAs themselves still stacked bullish — is the BEST entry, not a regime
+    breakdown; the old `last_close > e50` gate flipped it to "mixed" exactly
+    there. Gating on EMA200 keeps such a pullback "bullish" while still turning
+    the label off once price loses the EMA200 (a genuine regime break the lagging
+    EMA order alone would miss for many bars). Chosen over a separate
+    `price_location` field to keep the change surgical and prompt-neutral.
+    """
     try:
         e20, e50, e200 = last.get("ema20"), last.get("ema50"), last.get("ema200")
         if e20 is None or e50 is None or e200 is None:
             return "unknown"
-        if e20 > e50 > e200 and (last_close is None or last_close > e50):
+        if e20 > e50 > e200 and (last_close is None or last_close > e200):
             return "bullish"
-        if e20 < e50 < e200 and (last_close is None or last_close < e50):
+        if e20 < e50 < e200 and (last_close is None or last_close < e200):
             return "bearish"
         return "mixed"
     except TypeError:
@@ -698,6 +708,7 @@ def build_llm_context(
     account: dict[str, Any] | None,
     settings: Settings,
     scanner_verdict: dict[str, Any] | None = None,
+    market_regime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     account = account or {}
     # F-15 (privacy): default to false (opt-in) — a missing attribute must
@@ -707,12 +718,14 @@ def build_llm_context(
     daily_c = compact_daily_for_llm(market_api.get("daily") or {})
     htf_c = compact_tf_for_llm(market_api.get("htf") or {})
     ltf_c = compact_tf_for_llm(market_api.get("ltf") or {})
-    market_block: dict[str, Any] = {
-        "open_interest": src_market.get("open_interest"),
-        "oi_change_pct_1h": src_market.get("oi_change_pct_1h"),
-        "oi_change_pct_4h": src_market.get("oi_change_pct_4h"),
-        "premium": src_market.get("premium"),
-    }
+    # K2-05: `premium` is dead ballast (never read by the prompt) and is dropped.
+    # OI fields are emitted ONLY when open_interest is actually present (null on
+    # MEXC / HL cold-start), so the block is empty rather than a row of nulls.
+    market_block: dict[str, Any] = {}
+    if src_market.get("open_interest") is not None:
+        market_block["open_interest"] = src_market.get("open_interest")
+        market_block["oi_change_pct_1h"] = src_market.get("oi_change_pct_1h")
+        market_block["oi_change_pct_4h"] = src_market.get("oi_change_pct_4h")
     # Precompute the price<->OI positioning label when OI is actually present
     # (null on MEXC / HL cold-start -> label omitted, no wasted tokens).
     oi_read = _oi_read_label(src_market, (market_api.get("ltf") or {}).get("candles"))
@@ -764,6 +777,13 @@ def build_llm_context(
     verdict = _sanitize_scanner_verdict(scanner_verdict)
     if verdict is not None:
         ctx["scanner_verdict"] = verdict
+
+    # K2-02: BTC beta is the dominant factor for altcoins. When a cached BTC
+    # regime anchor is supplied (omitted when analysing BTC itself, or when the
+    # BTC fetch failed), surface it so the prompt can CAP setup_confidence on a
+    # clearly opposite BTC regime (never a hard veto — Anti-Overtrading-konform).
+    if market_regime:
+        ctx["market_regime"] = market_regime
     return ctx
 
 

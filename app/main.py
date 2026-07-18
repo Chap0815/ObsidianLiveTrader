@@ -20,7 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.analysis.context import build_market_snapshot, snapshot_to_api_dict
+from app.analysis.context import (
+    build_market_snapshot,
+    fetch_btc_regime,
+    is_btc_symbol,
+    snapshot_to_api_dict,
+)
 from app.config import Settings, get_settings
 from app.db.repo import Database
 from app.exchange_factory import create_exchange_client, exchange_ready
@@ -59,6 +64,13 @@ from app.security import (
 )
 
 ExchangeError = (MexcError, HyperliquidError)
+
+
+async def _none_async() -> None:
+    """Awaitable that yields None — used as the BTC-regime branch when analysing
+    BTC itself, so asyncio.gather keeps a uniform (snapshot, regime) shape."""
+    return None
+
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -1276,9 +1288,17 @@ async def analyze(
             return hit
 
     async def _run_analyze() -> dict:
+        # BTC regime anchor (K2-02) is fetched CONCURRENTLY with the coin
+        # snapshot and is cached ~5 min, so it adds no serial latency; on BTC
+        # itself the block is self-referential and skipped. It never raises
+        # (degrades to None) so it can't fail analyze.
+        want_btc = not is_btc_symbol(symbol)
         try:
-            snap = await build_market_snapshot(
-                symbol, tf, htf, client, limit_hint=s.kline_limit_hint
+            snap, market_regime = await asyncio.gather(
+                build_market_snapshot(
+                    symbol, tf, htf, client, limit_hint=s.kline_limit_hint
+                ),
+                fetch_btc_regime(client) if want_btc else _none_async(),
             )
         except ExchangeError as e:
             raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
@@ -1298,7 +1318,11 @@ async def analyze(
                 else "MEXC keys not configured"
             )
 
-        context = build_llm_context(market_api, acct, s, scanner_verdict=body.scanner_verdict)
+        context = build_llm_context(
+            market_api, acct, s,
+            scanner_verdict=body.scanner_verdict,
+            market_regime=market_regime,
+        )
 
         try:
             proposal = await analyze_with_llm(context, s)

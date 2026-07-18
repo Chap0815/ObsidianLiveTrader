@@ -144,6 +144,19 @@ _OI_STEP = """8. Open interest (positioning): market.open_interest is current OI
 """
 
 
+# BTC market-regime cap — appended ONLY when the payload carries a
+# `market_regime` block (omitted when analysing BTC itself or when the BTC fetch
+# failed). A CAP on setup_confidence, never a hard veto (Anti-Overtrading).
+_BTC_REGIME_RULE = """MARKET REGIME (BTC beta): the payload may include a `market_regime`
+block (btc_daily_stack, btc_htf_stack, btc_price_vs_ema20_pct). BTC is the
+dominant beta for altcoins. When BTC's regime is CLEARLY OPPOSITE to your
+proposed trade direction — both btc_daily_stack and btc_htf_stack bearish under
+a proposed LONG, or both bullish under a proposed SHORT — CAP setup_confidence at
+"low" and name the BTC headwind in the rationale. This is a CAP, never a veto: it
+NEVER forces STAY_OUT on its own. When the block is absent, skip this check.
+"""
+
+
 _PROMPT_TAIL = """DECISION — action vs STAY_OUT (this is the single, authoritative rule; it
 overrides any looser wording elsewhere in this prompt):
 First count the independent confluences on ONE side (step 6). Then STAY_OUT —
@@ -292,16 +305,28 @@ def _oi_present(context: dict[str, Any] | None) -> bool:
     return market.get("open_interest") is not None
 
 
+def _btc_regime_present(context: dict[str, Any] | None) -> bool:
+    """True when the payload carries a BTC market_regime anchor block (K2-02)."""
+    if not context:
+        return False
+    mr = context.get("market_regime")
+    return isinstance(mr, dict) and bool(mr)
+
+
 def build_system_prompt(context: dict[str, Any] | None = None) -> str:
     """Compose the analyst system prompt.
 
     The Open-Interest step is included only when the call actually carries OI
     (or when no context is given, e.g. schema/consistency tests). Omitting it on
-    the common null-OI path trims tokens and removes a no-op instruction.
+    the common null-OI path trims tokens and removes a no-op instruction. The
+    BTC market-regime cap is appended only when a `market_regime` block is
+    present (never when analysing BTC itself).
     """
     parts = [_PROMPT_HEAD]
     if _oi_present(context):
         parts.append(_OI_STEP)
+    if _btc_regime_present(context):
+        parts.append(_BTC_REGIME_RULE)
     parts.append(_PROMPT_TAIL)
     return "\n".join(parts)
 

@@ -62,10 +62,13 @@ def test_build_llm_context_exposes_market_block_without_prev_day_px():
                    "oi_change_pct_1h": 1.1, "oi_change_pct_4h": 3.3, "prev_day_px": 98.0},
     }
     ctx = build_llm_context(market, {}, Settings(include_account_in_llm=False))
+    # K2-05: `premium` is dropped as dead token ballast (never read by the
+    # prompt); OI fields remain because open_interest is present here.
     assert ctx["market"] == {
         "open_interest": 500.0, "oi_change_pct_1h": 1.1,
-        "oi_change_pct_4h": 3.3, "premium": 0.002,
+        "oi_change_pct_4h": 3.3,
     }
+    assert "premium" not in ctx["market"]
     assert "prev_day_px" not in ctx["market"]
 
 
