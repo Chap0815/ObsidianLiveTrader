@@ -95,12 +95,13 @@ def _post(
 
 
 def _risk_entry(max_risk_pct: float = 10.0) -> float:
-    """The same market-adverse-slip-buffered entry validate_order (G3) and
-    the endpoint use for risk math on a market long — NOT the raw last price.
+    """R2-01: the endpoint (and the real gate, M-B) use the RAW last price as
+    the market-order risk basis — NO market_entry_slippage_pct shift. The shift
+    used to be applied only in sizing, which under-sized the suggestion vs the
+    gate; removing it restores exact parity. The remaining adverse-fill buffer
+    is RISK_SLIPPAGE_PCT inside suggest_vol(), identical to the gate.
     """
-    settings = _settings(max_risk_pct)
-    slip = settings.market_entry_slippage_pct
-    return ENTRY * (1.0 + slip / 100.0)
+    return ENTRY
 
 
 def _expected_vol(
@@ -132,6 +133,67 @@ def _expected_vol(
         leverage=leverage,
         max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
     )
+
+
+def test_sizing_matches_gate_no_slippage_shift(monkeypatch):
+    """R2-01: the market-order sizing suggestion uses the RAW last price as its
+    risk/entry basis — EXACTLY what the real gate (validate_order, M-B) uses —
+    with NO market_entry_slippage_pct shift. Proves parity two ways:
+      1. body["entry"] == raw last (no shift), and body["vol"] == a raw-entry
+         suggest_vol() (the shifted result would be strictly smaller).
+      2. Feeding the SUGGESTED vol back through validate_order at the same raw
+         last price passes G3 and reports risk_pct == max_risk_pct (the gate
+         agrees the suggestion sizes to the full, unchanged budget).
+    """
+    from app.models import OrderTicket
+    from app.risk.gates import validate_order
+
+    max_risk = 2.0
+    settings = _settings(max_risk)
+    mock = _mock_client()
+    r = _post(monkeypatch, {}, max_risk_pct=max_risk, mock=mock)
+    assert r.status_code == 200
+    body = r.json()
+
+    # (1) No slippage shift: the entry basis IS the raw last price.
+    assert body["entry"] == ENTRY
+
+    # The size equals a suggest_vol() computed on the RAW entry (the fix) …
+    expected_raw = suggest_vol(
+        EQUITY, max_risk, CONTRACT_SIZE, ENTRY, STOP, VOL_UNIT, MIN_VOL,
+        side="long", slippage_pct=settings.risk_slippage_pct,
+        available_usdt=AVAILABLE, leverage=5,
+        max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
+    )
+    assert body["vol"] == expected_raw
+
+    # … and it is STRICTLY LARGER than the OLD, buggy slip-shifted suggestion
+    # (proving the under-sizing is gone, not merely renamed).
+    shifted_entry = ENTRY * (1.0 + settings.market_entry_slippage_pct / 100.0)
+    shifted_vol = suggest_vol(
+        EQUITY, max_risk, CONTRACT_SIZE, shifted_entry, STOP, VOL_UNIT, MIN_VOL,
+        side="long", slippage_pct=settings.risk_slippage_pct,
+        available_usdt=AVAILABLE, leverage=5,
+        max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
+    )
+    assert body["vol"] > shifted_vol
+
+    # (2) The gate, given the SUGGESTED vol at the SAME raw last, sizes to the
+    # full budget and does NOT reject it — exact math parity.
+    ticket = OrderTicket(
+        symbol="BTC_USDT", side="long", order_type="market",
+        vol=body["vol"], stop_loss=STOP, leverage=5,
+    )
+    gate = validate_order(
+        ticket, _contract_meta(), EQUITY, settings, last_price=ENTRY,
+        available_usdt=AVAILABLE,
+    )
+    assert gate.entry_for_risk == ENTRY  # gate uses raw last too
+    # Suggestion sizes to (approximately) the full max_risk_pct budget; never
+    # over it. Floor-to-vol_unit rounding only ever leaves it at/just under.
+    assert gate.risk_pct <= max_risk + 1e-9
+    assert gate.risk_pct >= max_risk - 0.05
+    assert not any("MAX_RISK_PCT" in e for e in gate.errors)
 
 
 def test_sizing_suggest_uses_requested_risk_pct_not_max(monkeypatch):

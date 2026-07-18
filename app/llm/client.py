@@ -362,6 +362,69 @@ def _price_plausibility_flags(
     return ("; ".join(hard) or None), ("; ".join(warn) or None)
 
 
+def _fmt_leverage(val: float) -> str:
+    """Compact leverage number: drop the trailing .0 on integral caps."""
+    f = float(val)
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _leverage_cap_from_context(context: dict[str, Any] | None) -> float | None:
+    """The binding leverage ceiling = min(risk_policy.max_leverage,
+    contract.max_leverage) (R2-02). Falls back to whichever cap is present when
+    the other is missing — NEVER raises and NEVER returns a cap ABOVE either
+    known limit (the clamp only ever tightens). None only when NO cap is known.
+    """
+    if not isinstance(context, dict):
+        return None
+    rp = context.get("risk_policy")
+    policy = rp.get("max_leverage") if isinstance(rp, dict) else None
+    contract = context.get("contract")
+    coin = contract.get("max_leverage") if isinstance(contract, dict) else None
+    caps = [float(x) for x in (policy, coin) if isinstance(x, (int, float)) and x > 0]
+    return min(caps) if caps else None
+
+
+def _clamp_leverage_string(rec: str, cap: float) -> tuple[str, bool]:
+    """Rewrite every numeric leverage token in the free-text
+    recommended_leverage that EXCEEDS ``cap`` down to ``cap``. Returns
+    (new_string, changed)."""
+    changed = False
+
+    def _repl(m: re.Match[str]) -> str:
+        nonlocal changed
+        val = float(m.group(0))
+        if val > cap + 1e-9:
+            changed = True
+            return _fmt_leverage(cap)
+        return m.group(0)
+
+    new = re.sub(r"\d+(?:\.\d+)?", _repl, rec)
+    return new, changed
+
+
+def _apply_leverage_clamp(
+    proposal: TradeProposal, context: dict[str, Any] | None
+) -> TradeProposal:
+    """Server-side safety net (R2-02): never let a directional proposal's
+    recommended_leverage exceed min(risk_policy.max_leverage,
+    contract.max_leverage). The LLM is ALSO told the coin cap in-context so it
+    proposes within it (less friction); this clamp is the net for the cases it
+    doesn't. STAY_OUT / empty strings are left untouched."""
+    if proposal.action == "STAY_OUT":
+        return proposal
+    rec = proposal.recommended_leverage or ""
+    cap = _leverage_cap_from_context(context)
+    if cap is None or not rec.strip():
+        return proposal
+    new_rec, changed = _clamp_leverage_string(rec, cap)
+    if not changed:
+        return proposal
+    note = f"(auf Coin-Max {_fmt_leverage(cap)}x begrenzt)"
+    if note not in new_rec:
+        new_rec = f"{new_rec} {note}".strip()
+    return proposal.model_copy(update={"recommended_leverage": new_rec})
+
+
 def annotate_proposal(
     proposal: TradeProposal, context: dict[str, Any] | None = None
 ) -> TradeProposal:
@@ -436,7 +499,9 @@ def annotate_proposal(
         proposal = proposal.model_copy(
             update={"setup_confidence": capped_confidence, "rationale": rationale}
         )
-    return proposal
+    # R2-02 safety net: clamp recommended_leverage to the coin/policy cap so a
+    # directional proposal never "proposes then blocks" at preview.
+    return _apply_leverage_clamp(proposal, context)
 
 
 def _series_tail(series: Any, k: int = 12) -> list:
@@ -739,6 +804,53 @@ def _compact_funding_for_llm(funding: dict[str, Any] | None) -> dict[str, Any]:
     return {k: src[k] for k in _LLM_FUNDING_KEYS if k in src}
 
 
+def _remaining_risk_budget_pct(
+    account: dict[str, Any], market_api: dict[str, Any], settings: Settings
+) -> float | None:
+    """R2-04: aggregate risk head-room left under MAX_RISK_PCT once the OPEN
+    same-side position(s) on this symbol are accounted for — so an add-on
+    suggestion doesn't blow the aggregate G3 budget. Worst-case (max) over the
+    two sides is used (an add-on is same-side; we don't yet know which side the
+    model will pick, so report the tightest). None when there is no open
+    position on the symbol, equity is unknown, or it cannot be computed. Never
+    raises (uses the non-strict, fail-open estimator)."""
+    positions = account.get("positions") or []
+    if not positions:
+        return None
+    symbol = market_api.get("symbol")
+    equity = account.get("equity_usdt")
+    if not symbol or not isinstance(equity, (int, float)) or equity <= 0:
+        return None
+    contract = market_api.get("contract") or {}
+    csize = contract.get("contractSize")
+    csize = float(csize) if isinstance(csize, (int, float)) and csize > 0 else 1.0
+    # Local import: keeps the LLM module free of an order-service import at
+    # module load (and avoids any import-cycle surprise).
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    worst = 0.0
+    has_pos = False
+    for side in ("long", "short"):
+        try:
+            risk, _ = estimate_same_side_risk_usdt(
+                positions,
+                symbol=symbol,
+                side=side,
+                contract_size=csize,
+                strict=False,
+                pos_risk_cap_pct=float(getattr(settings, "aggregate_pos_risk_cap_pct", 2.0)),
+            )
+        except Exception:
+            risk = 0.0
+        if risk > 0:
+            has_pos = True
+            worst = max(worst, risk)
+    if not has_pos:
+        return None
+    used_pct = worst / float(equity) * 100.0
+    return round(max(0.0, float(settings.max_risk_pct) - used_pct), 4)
+
+
 def build_llm_context(
     market_api: dict[str, Any],
     account: dict[str, Any] | None,
@@ -769,10 +881,13 @@ def build_llm_context(
     if oi_read is not None:
         market_block["oi_read"] = oi_read
     # Order: daily (regime anchor) first, then htf (regime), then ltf (timing)
-    # `contract` is intentionally NOT included (O1): the prompt sets leverage
-    # from risk_policy.max_leverage and never reads contract.*; annotate_proposal
-    # doesn't touch it either. The block flowed to the UI via a separate path
-    # (snapshot_to_api_dict), so dropping it here only trims LLM input tokens.
+    # R2-02: the ONLY contract field the model needs is the per-coin
+    # max_leverage — surfaced so it proposes WITHIN the coin cap instead of
+    # "propose then block" at preview. The rest of the contract block stays out
+    # (O1 token trim); the full block still flows to the UI via a separate path
+    # (snapshot_to_api_dict). annotate_proposal ALSO clamps to this cap server-side.
+    src_contract = market_api.get("contract") or {}
+    coin_max_lev = src_contract.get("maxLeverage")
     ctx: dict[str, Any] = {
         "symbol": market_api.get("symbol"),
         "last_price": market_api.get("last_price"),
@@ -789,6 +904,11 @@ def build_llm_context(
             "strict_rrr": settings.strict_rrr,
             "max_notional_usdt": settings.max_notional_usdt,
         },
+        # R2-02: per-coin exchange leverage cap (e.g. BTC 40x on HL). The model
+        # picks min(this, risk_policy.max_leverage); annotate_proposal clamps.
+        "contract": {"max_leverage": coin_max_lev}
+        if isinstance(coin_max_lev, (int, float)) and coin_max_lev > 0
+        else {},
         "note": (
             "Advisory only. Read daily (regime anchor), then htf (regime), then "
             "ltf (timing). Human must apply and pass risk gates before any order. "
@@ -803,6 +923,11 @@ def build_llm_context(
             "positions": account.get("positions") or [],
             "error": account.get("error"),
         }
+        # R2-04: when an open same-side position exists on this symbol, surface
+        # the aggregate risk head-room so an add-on stays inside MAX_RISK_PCT.
+        remaining = _remaining_risk_budget_pct(account, market_api, settings)
+        if remaining is not None:
+            ctx["remaining_risk_budget_pct"] = remaining
     else:
         ctx["account"] = {"omitted": True, "reason": "INCLUDE_ACCOUNT_IN_LLM=false"}
 

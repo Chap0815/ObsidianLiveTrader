@@ -205,6 +205,61 @@ def test_track_record_absent_below_min_sample():
     assert "TRACK RECORD (calibration hint)" not in build_system_prompt(ctx)
 
 
+# --- R2-04: aggregate remaining risk budget when a position exists ------------
+
+
+def _pos(**kw):
+    base = {
+        "symbol": "ETH_USDT",
+        "side": "long",
+        "hold_vol": 100.0,
+        "entry_price": 100.0,
+        "stop_loss": 95.0,  # 5-USDT loss/contract -> known same-side risk
+        "liquidate_price": 50.0,
+    }
+    base.update(kw)
+    return base
+
+
+def test_context_has_remaining_budget_with_position():
+    """R2-04: an OPEN same-side position on the symbol surfaces
+    remaining_risk_budget_pct = MAX_RISK_PCT - used, so an add-on suggestion
+    stays inside the aggregate G3 budget."""
+    settings = Settings(include_account_in_llm=True, max_risk_pct=5.0)
+    account = {
+        "equity_usdt": 10_000.0,
+        "available_usdt": 5_000.0,
+        # loss-to-own-SL = |100-95| * contractSize(1) * 100 = 500 USDT = 5% of
+        # 10k equity; but market contractSize is {} here -> 1.0 default.
+        "positions": [_pos(hold_vol=40.0)],  # |5|*1*40 = 200 USDT = 2% used
+    }
+    mk = _market()
+    mk["contract"] = {"contractSize": 1.0, "maxLeverage": 25}
+    ctx = build_llm_context(mk, account, settings)
+    assert "remaining_risk_budget_pct" in ctx
+    # 5% cap - 2% used = ~3% remaining.
+    assert ctx["remaining_risk_budget_pct"] == pytest.approx(3.0, abs=1e-6)
+    # and the per-coin cap is exposed for the leverage clamp/context (R2-02)
+    assert ctx["contract"]["max_leverage"] == 25
+
+
+def test_context_no_remaining_budget_without_position():
+    """No open position -> field omitted (no wasted tokens, nothing to bound)."""
+    settings = Settings(include_account_in_llm=True, max_risk_pct=5.0)
+    account = {"equity_usdt": 10_000.0, "available_usdt": 5_000.0, "positions": []}
+    ctx = build_llm_context(_market(), account, settings)
+    assert "remaining_risk_budget_pct" not in ctx
+
+
+def test_context_remaining_budget_omitted_when_account_private():
+    """Privacy: with INCLUDE_ACCOUNT_IN_LLM=false the positions never reach the
+    context, so the budget field is never computed/leaked."""
+    settings = Settings(include_account_in_llm=False, max_risk_pct=5.0)
+    account = {"equity_usdt": 10_000.0, "positions": [_pos()]}
+    ctx = build_llm_context(_market(), account, settings)
+    assert "remaining_risk_budget_pct" not in ctx
+
+
 # --- Task 21 O2-06: ORIGINAL thesis anchor in the reevaluate context ----------
 
 

@@ -76,9 +76,16 @@ def _market_api():
     }
 
 
-def test_build_llm_context_drops_contract_block():
+def test_build_llm_context_keeps_only_contract_max_leverage():
+    """R2-02 (revises O1): the FULL contract block is still trimmed for tokens,
+    but the ONE field the model needs — the per-coin max_leverage — is now
+    surfaced so it proposes within the coin cap instead of 'propose then block'
+    at preview. contractSize/minLeverage/apiAllowed remain dropped."""
     ctx = build_llm_context(_market_api(), {}, Settings(include_account_in_llm=False))
-    assert "contract" not in ctx
+    assert ctx["contract"] == {"max_leverage": 100}
+    assert "contractSize" not in ctx["contract"]
+    assert "minLeverage" not in ctx["contract"]
+    assert "apiAllowed" not in ctx["contract"]
 
 
 def test_build_llm_context_trims_funding_to_referenced_fields():

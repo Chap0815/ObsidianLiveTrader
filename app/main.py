@@ -1973,11 +1973,12 @@ async def sizing_suggest(
     F-09: this must size CONSISTENTLY with the real gate the Preview/Confirm
     path enforces (app.risk.gates.validate_order) — otherwise a suggested
     size can be too large (or geometrically invalid) at the actual gate.
-    So the same inputs the gate uses are threaded through here: the market
-    adverse-fill slippage buffer, the RISK_SLIPPAGE_PCT buffer on SL
-    distance, directional SL geometry, existing same-side risk, available
-    margin and the equity-relative notional cap. See suggest_vol() in
-    app/risk/sizing.py for the shared clamp math.
+    So the same inputs the gate uses are threaded through here: the RAW last
+    price as the market entry basis (R2-01 — the gate's entry_for_risk, no
+    slippage shift), the RISK_SLIPPAGE_PCT buffer on SL distance, directional
+    SL geometry, existing same-side risk, available margin and the
+    equity-relative notional cap. See suggest_vol() in app/risk/sizing.py for
+    the shared clamp math.
     """
     s = get_settings()
     client: MexcClient | None = _exchange_client(request)
@@ -1994,16 +1995,15 @@ async def sizing_suggest(
 
     entry = float(ticket.entry or ticket.price or last or 0)
     if (ticket.order_type or "").lower() == "market" and last > 0:
+        # R2-01: use the RAW last price as the risk/entry basis — EXACTLY what
+        # validate_order (gate M-B) now does for a market order. The old
+        # market_entry_slippage_pct shift here was removed together with the
+        # gate's: applying it only in sizing made the suggestion systematically
+        # SMALLER than the gate would accept (up to ~33% under-size on a tight
+        # stop, where the shift inflates the entry→SL distance most). The
+        # remaining adverse-fill buffer is RISK_SLIPPAGE_PCT inside suggest_vol()
+        # (== the gate's risk_usdt buffer), so the two size the SAME number.
         entry = last
-        # Same adverse-fill slippage buffer validate_order applies to
-        # entry_for_risk for market orders (G3) — a market suggestion must
-        # not assume a friendlier fill than the gate will.
-        slip = float(getattr(s, "market_entry_slippage_pct", 0.0) or 0.0)
-        if slip > 0 and side_l in ("long", "short"):
-            if side_l == "long":
-                entry = entry * (1.0 + slip / 100.0)
-            else:
-                entry = entry * (1.0 - slip / 100.0)
     stop = float(ticket.stop_loss or 0)
     if entry <= 0 or stop <= 0:
         raise HTTPException(status_code=400, detail="entry and stop_loss required")

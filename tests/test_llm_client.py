@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import pytest
 
@@ -23,9 +24,59 @@ from app.llm.client import (
     _call_xai,
     _call_xai_reevaluate,
     _strictify_schema,
+    annotate_proposal,
     parse_proposal,
     parse_reevaluation,
 )
+from app.models import TradeProposal
+
+
+def _directional_proposal(recommended_leverage: str) -> TradeProposal:
+    """A geometrically-valid BUY so annotate_proposal keeps it directional and
+    only the leverage clamp is exercised."""
+    return TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=98.0,
+        tp1=106.0,
+        rrr=3.0,
+        recommended_leverage=recommended_leverage,
+    )
+
+
+def test_annotate_clamps_leverage_to_contract():
+    """R2-02: a proposal recommending leverage ABOVE the per-coin
+    contract.max_leverage is clamped down to min(risk_policy, contract) server
+    side — the 'propose then block' at preview is gone. The policy cap (50) is
+    higher than the coin cap (10), so the coin cap binds."""
+    ctx = {
+        "risk_policy": {"max_leverage": 50},
+        "contract": {"max_leverage": 10},
+    }
+    out = annotate_proposal(_directional_proposal("20x isolated"), ctx)
+    # No number in the string may exceed the coin cap …
+    nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", out.recommended_leverage)]
+    assert nums and max(nums) <= 10
+    assert "10x" in out.recommended_leverage
+    assert "20x" not in out.recommended_leverage
+
+    # A range "5-25x" clamps only the offending upper bound; 5 is preserved.
+    out2 = annotate_proposal(_directional_proposal("5-25x cross"), ctx)
+    nums2 = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", out2.recommended_leverage)]
+    assert max(nums2) <= 10 and 5.0 in nums2
+
+    # Already within the cap -> untouched (no spurious note).
+    out3 = annotate_proposal(_directional_proposal("5-8x isolated"), ctx)
+    assert out3.recommended_leverage == "5-8x isolated"
+
+    # Fallback: contract cap missing -> clamp to risk_policy.max_leverage only,
+    # never crashes and never leaves it unclamped-upward.
+    ctx_no_contract = {"risk_policy": {"max_leverage": 10}, "contract": {}}
+    out4 = annotate_proposal(_directional_proposal("20x"), ctx_no_contract)
+    nums4 = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", out4.recommended_leverage)]
+    assert max(nums4) <= 10
 
 
 class _FakeResp:

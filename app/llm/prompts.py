@@ -281,7 +281,10 @@ Rules:
 6. Rationale in English, max ~90 words: state regime, the pattern (with the real
    swing prices that define it, or "no clear pattern"), the trigger, and the
    invalidation. recommended_leverage as a short string (e.g. "5-10x isolated"),
-   never above risk_policy.max_leverage.
+   never above risk_policy.max_leverage NOR contract.max_leverage (the per-coin
+   exchange cap, when present) — pick the LOWER of the two so the size is not
+   rejected at preview. When remaining_risk_budget_pct is present, an add-on to
+   the existing same-side position must fit within it (aggregate MAX_RISK_PCT).
 7. management.move_sl_to_be: the price after which SL moves to break-even.
    management.early_invalidation: what would kill the idea before the SL — state
    it as a STRUCTURAL condition (a decisive break/reclaim of a named swing,
