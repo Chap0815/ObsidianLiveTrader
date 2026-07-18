@@ -192,16 +192,40 @@ def compute_rvol(candles: list[Candle], period: int = 20) -> tuple[float, str]:
 
 
 def indicator_bundle(candles: list[Candle]) -> dict:
-    """Compact indicator snapshot for API/LLM (last values + full series where useful)."""
-    closes = [c.close for c in candles]
+    """Compact indicator snapshot for API/LLM (last values + full series where useful).
+
+    Intra-candle fix (M2-01 / M2-02, dedupe K2-03): the last bar of a live feed
+    is still FORMING, so its half-built OHLCV would repaint every indicator, the
+    rvol numerator and every derived read-label bar-by-bar — making real
+    breakouts read as "unconfirmed" mid-bar and repainting ATR/SL geometry. We
+    therefore drop that live bar ONCE, here, so EMA/RSI/MACD/VWAP/ATR/rvol and
+    all downstream labels are computed on CLOSED bars only. This is the single
+    central chokepoint: every consumer (build_tf_slice's LTF/HTF/Daily slices
+    AND the BTC-regime block via _stack_and_stretch) routes through here.
+
+    The bundle exposes the closed reference (`as_of_close`, `as_of_time`) and a
+    `live_bar_dropped` flag so consumers can (a) anchor read-labels to the same
+    closed close and (b) mark the raw recent_candles — which KEEP the live bar
+    so the model still sees current price action — as still-forming (K2-03).
+
+    Degrades gracefully: with < 2 candles there is no live bar to drop, so the
+    full series is used; every indicator's own length guard falls back to
+    None/neutral rather than crashing (effective guard is now period+2 raw bars,
+    since one bar is removed before the period+1 windows inside the helpers).
+    """
+    live_bar_dropped = len(candles) >= 2
+    closed = candles[:-1] if live_bar_dropped else list(candles)
+
+    closes = [c.close for c in closed]
     macd = compute_macd(closes)
     ema20 = compute_ema(closes, 20)
     ema50 = compute_ema(closes, 50)
     ema200 = compute_ema(closes, 200)
     rsi = compute_rsi(closes, 14)
-    vwap = compute_vwap(candles)
-    atr = compute_atr(candles, 14)
-    rvol, vol_trend = compute_rvol(candles)
+    vwap = compute_vwap(closed)
+    atr = compute_atr(closed, 14)
+    rvol, vol_trend = compute_rvol(closed)
+    as_of = closed[-1] if closed else None
 
     def _last(series: list[float | None]) -> float | None:
         for v in reversed(series):
@@ -221,6 +245,9 @@ def indicator_bundle(candles: list[Candle]) -> dict:
         "atr14": atr,
         "rvol": rvol,
         "vol_trend": vol_trend,
+        "as_of_close": as_of.close if as_of else None,
+        "as_of_time": as_of.time if as_of else None,
+        "live_bar_dropped": live_bar_dropped,
         "last": {
             "ema20": _last(ema20),
             "ema50": _last(ema50),

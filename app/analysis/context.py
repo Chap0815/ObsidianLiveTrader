@@ -238,7 +238,12 @@ def _stack_and_stretch(candles: list[Candle]) -> tuple[str, float | None]:
         return "unknown", None
     bundle = indicator_bundle(candles)
     last = bundle.get("last") or {}
-    last_close = candles[-1].close
+    # Task 16: the bundle already dropped the live bar, so the BTC-regime stack
+    # and stretch must be measured against the same CLOSED close (`as_of_close`),
+    # not the still-forming last candle, to avoid an intra-candle regime repaint.
+    last_close = bundle.get("as_of_close")
+    if last_close is None:
+        last_close = candles[-1].close
     stack = _ema_stack_label(last, last_close)
     stretch: float | None = None
     e20 = last.get("ema20")

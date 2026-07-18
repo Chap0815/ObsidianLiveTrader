@@ -8,6 +8,7 @@ from app.analysis.indicators import (
     compute_rsi,
     compute_rvol,
     compute_vwap,
+    indicator_bundle,
 )
 from app.models import Candle
 
@@ -148,3 +149,48 @@ def test_rvol_short_history_fallback():
     rvol, vol_trend = compute_rvol(candles)
     assert rvol == pytest.approx(1.0)
     assert vol_trend == "flat"
+
+
+# --- Task 16: intra-candle fix — bundle computes on CLOSED bars only ---------
+
+
+def test_rvol_uses_closed_bar_numerator():
+    """indicator_bundle drops the still-forming live bar before rvol, so the
+    numerator is the last CLOSED bar's volume, not the half-built live bar
+    (M2-01). A live bar that has only accumulated a tiny volume so far must NOT
+    drag rvol down and make a real breakout read as 'unconfirmed'."""
+    # 20 prior closed bars vol=5.0, one closed breakout bar vol=50.0, then a
+    # live (forming) bar that has only booked vol=1.0 so far.
+    closed = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=5.0) for i in range(20)
+    ] + [Candle(time=20, open=10, high=11, low=9, close=10, vol=50.0)]
+    live = Candle(time=21, open=10, high=11, low=9, close=10, vol=1.0)
+
+    bundle = indicator_bundle(closed + [live])
+
+    # rvol must equal the closed-bar computation: 50 / mean(prior 20 = 5) = 10.
+    expected_rvol, _ = compute_rvol(closed)
+    assert expected_rvol == pytest.approx(10.0)
+    assert bundle["rvol"] == pytest.approx(expected_rvol)
+    assert bundle["live_bar_dropped"] is True
+    assert bundle["as_of_close"] == pytest.approx(10.0)
+    assert bundle["as_of_time"] == 20
+
+
+def test_atr_ignores_live_bar():
+    """The live bar's High/Low must not repaint ATR / SL geometry (M2-02).
+    A closed series with constant true-range 2.0 yields ATR 2.0; appending a
+    wild still-forming bar (huge range) must leave the bundle's atr14 at 2.0."""
+    from app.analysis.indicators import compute_atr
+
+    closed = [
+        Candle(time=i, open=10, high=11, low=9, close=10, vol=1) for i in range(20)
+    ]
+    # Forming bar with an enormous intra-candle range — would blow ATR up if used.
+    live = Candle(time=20, open=10, high=99, low=1, close=50, vol=1)
+
+    bundle = indicator_bundle(closed + [live])
+
+    expected_atr = compute_atr(closed, 14)[-1]
+    assert expected_atr == pytest.approx(2.0)
+    assert bundle["last"]["atr14"] == pytest.approx(expected_atr)

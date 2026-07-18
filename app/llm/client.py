@@ -491,7 +491,14 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
         {k: v for k, v in c.items() if k != "amount"} if isinstance(c, dict) else c
         for c in tail
     ]
-    last_close = candles[-1].get("close") if candles else None
+    # Read-labels (ema_stack, price_vs_ema20/vwap) must NOT repaint intra-candle
+    # (Task 16 / M2-01): anchor them to the same CLOSED bar the indicator bundle
+    # was computed against (`as_of_close`). recent_candles above deliberately
+    # keep the live bar; only the derived labels use the closed close. Fall back
+    # to the last candle's close for manually-built slices without the marker.
+    last_close = indicators.get("as_of_close")
+    if last_close is None:
+        last_close = candles[-1].get("close") if candles else None
 
     struct_out = {
         "support": structure.get("support"),
@@ -548,6 +555,14 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
     return {
         "tf": slice_dict.get("tf"),
         "recent_candles": recent_candles,
+        # K2-03: recent_candles KEEP the still-forming live bar (current price
+        # action) while every indicator/read-label was computed on closed bars.
+        # This marker tells the model the last recent candle is not yet closed
+        # and gives the timestamp of the last CLOSED bar as the analysis anchor.
+        "bar_progress": {
+            "last_bar_forming": bool(indicators.get("live_bar_dropped")),
+            "closed_as_of": indicators.get("as_of_time"),
+        },
         "indicators_tail": indicators_tail,
         "read": read,
         "structure": struct_out,
@@ -564,7 +579,12 @@ def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
     structure = slice_dict.get("structure") or {}
     candles = slice_dict.get("candles") or []
     last = (indicators.get("last") if isinstance(indicators, dict) else None) or {}
-    last_close = candles[-1].get("close") if candles else None
+    # Anchor the daily regime read to the CLOSED bar (Task 16) — a still-forming
+    # daily candle must not repaint the regime label. Fall back to the last
+    # candle for manually-built slices without the closed-bar marker.
+    last_close = indicators.get("as_of_close")
+    if last_close is None:
+        last_close = candles[-1].get("close") if candles else None
 
     read: dict[str, Any] = {
         "ema_stack": _ema_stack_label(last, last_close),

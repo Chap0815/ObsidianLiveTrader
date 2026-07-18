@@ -103,3 +103,45 @@ def test_build_llm_context_recent_candles_have_no_amount():
     for tf in ("htf", "ltf"):
         for c in ctx[tf]["recent_candles"]:
             assert "amount" not in c
+
+
+def test_recent_candles_keep_live_bar_with_marker():
+    """Task 16 / K2-03: indicators are computed on CLOSED bars, but the raw
+    recent_candles the LLM sees KEEP the still-forming live bar (so the model
+    sees current price action). The compact payload carries a `bar_progress`
+    marker flagging that the last recent candle is not yet closed."""
+    from app.analysis.context import _candles_public
+    from app.analysis.indicators import indicator_bundle
+    from app.models import Candle
+
+    candles = [
+        Candle(
+            time=1_700_000_000_000 + i * 900_000,
+            open=100.0 + i,
+            high=101.0 + i,
+            low=99.0 + i,
+            close=100.5 + i,
+            vol=5.0 + i,
+        )
+        for i in range(60)
+    ]
+    slice_dict = {
+        "tf": "15m",
+        "candles": _candles_public(candles),
+        "indicators": indicator_bundle(candles),
+        "structure": {},
+    }
+
+    out = compact_tf_for_llm(slice_dict)
+
+    # The live (last) bar is retained in recent_candles unchanged.
+    assert out["recent_candles"][-1]["time"] == candles[-1].time
+    assert out["recent_candles"][-1]["close"] == candles[-1].close
+
+    # Marker flags that the last bar is still forming; closed reference is the
+    # PRIOR bar (indicators were computed as-of the last closed bar).
+    assert out["bar_progress"]["last_bar_forming"] is True
+    assert out["bar_progress"]["closed_as_of"] == candles[-2].time
+
+    # And the read-labels are anchored to the CLOSED bar, not the live one.
+    assert slice_dict["indicators"]["as_of_close"] == candles[-2].close

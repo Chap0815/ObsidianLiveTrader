@@ -236,6 +236,8 @@ def _mini_tf(slice_obj, tf: str) -> dict[str, Any]:
     }
     c = compact_tf_for_llm(slice_dict, recent_bars=0)
     c.pop("recent_candles", None)
+    # bar_progress describes recent_candles, which we just dropped for screening.
+    c.pop("bar_progress", None)
     # trim tails to the essentials for screening
     tails = c.get("indicators_tail") or {}
     c["indicators_tail"] = {
