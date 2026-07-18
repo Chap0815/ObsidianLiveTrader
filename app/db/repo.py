@@ -497,15 +497,19 @@ class Database:
 
             # F2-07: NET sum over resolved rows (Task 21's feedback uses net,
             # not gross). Pre-migration WIN/LOSS rows have NULL net -> SUM skips
-            # them, so this stays 0.0 until the resolver repopulates.
+            # them, so this stays 0.0 until the resolver repopulates. COUNT(col)
+            # counts only non-NULL rows -> dedicated net denominator so the net
+            # average is NOT diluted by un-backfilled pre-migration rows.
             sum_r_net = await conn.execute(
                 """
-                SELECT SUM(realized_r_net) FROM journal_entries
+                SELECT SUM(realized_r_net), COUNT(realized_r_net)
+                FROM journal_entries
                 WHERE status IN ('WIN','LOSS')
                 """
             )
             srn = await sum_r_net.fetchone()
             overall_sum_r_net = float(srn[0]) if srn and srn[0] is not None else 0.0
+            overall_net_sample = int(srn[1]) if srn and srn[1] is not None else 0
 
             return {
                 "total": total,
@@ -518,6 +522,7 @@ class Database:
                 "losses": losses,
                 "overall_sum_r": overall_sum_r,
                 "overall_sum_r_net": overall_sum_r_net,
+                "overall_net_sample": overall_net_sample,
                 "by_confidence": await _groups("setup_confidence"),
                 "by_action": await _groups("action"),
                 "by_provider": await _groups("provider"),

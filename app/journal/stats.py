@@ -74,6 +74,9 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
     wins = int(raw.get("wins", 0))
     losses = int(raw.get("losses", 0))
     sample = wins + losses
+    # F2-07: dedicated NET denominator — only WIN/LOSS rows that actually carry
+    # a net value (pre-migration rows have NULL net and must not dilute it).
+    net_sample = int(raw.get("overall_net_sample", 0))
 
     by_confidence = _groups(raw.get("by_confidence", {}), min_sample)
     by_action = _groups(raw.get("by_action", {}), min_sample)
@@ -118,12 +121,15 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             if sample
             else None,
             # F2-07: NET expectancy (after round-trip costs) — Task 21 learns
-            # on this, not the gross avg above.
+            # on this, not the gross avg above. Uses a DEDICATED denominator
+            # (only rows with a non-NULL net) so pre-migration WIN/LOSS rows
+            # (NULL net) don't dilute the average toward 0.
             "avg_realized_rrr_net": _round(
-                float(raw.get("overall_sum_r_net", 0.0)) / sample
+                float(raw.get("overall_sum_r_net", 0.0)) / net_sample
             )
-            if sample
+            if net_sample
             else None,
+            "net_sample": net_sample,
             "low_sample": sample < min_sample,
         },
         "by_confidence": by_confidence,
