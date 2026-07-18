@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
+
+log = logging.getLogger("app.llm.scanner")
 
 from app.analysis.context import (  # noqa: F401
     build_tf_slice,
@@ -430,7 +433,16 @@ def select_scan_universe(
             continue
         seen.add(sym)
         union.append(r)
-    return union[: max(1, settings.scanner_universe_size)]
+    result = union[: max(1, settings.scanner_universe_size)]
+    # Observability (T24): which dimensions actually contributed. On batch
+    # payloads OI-Δ/1h/4h are typically absent -> by_oi empty -> the universe is
+    # effectively momentum(24h)+turnover; this line makes that visible instead of
+    # a silent turnover-only collapse.
+    log.info(
+        "SCANNER_UNIVERSE mode=prefilter pool=%d momentum=%d oi=%d funding=%d -> universe=%d",
+        len(pool), len(by_momentum), len(by_oi), len(by_funding), len(result),
+    )
+    return result
 
 
 # ── Task 24 (S2-08): deterministic rules-prefilter ──────────────────────────
