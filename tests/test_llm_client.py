@@ -22,6 +22,7 @@ from app.llm.client import (
     LlmError,
     _call_xai,
     _call_xai_reevaluate,
+    _strictify_schema,
     parse_proposal,
     parse_reevaluation,
 )
@@ -83,6 +84,32 @@ class _CapturingClient:
     async def post(self, url, headers=None, json=None):
         self.posted_bodies.append(json)
         return _FakeResp(self._status_code, self._payload)
+
+    async def aclose(self):
+        return None
+
+
+class _SeqClient:
+    """httpx.AsyncClient stand-in returning a queued sequence of responses,
+    one per post() call — for exercising retry/fallback code paths."""
+
+    def __init__(self, responses: list[tuple[int, dict]]):
+        self._responses = list(responses)
+        self.posted_bodies: list[dict] = []
+
+    def __call__(self, *a, **kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        self.posted_bodies.append(json)
+        status, payload = self._responses.pop(0)
+        return _FakeResp(status, payload)
 
     async def aclose(self):
         return None
@@ -317,3 +344,196 @@ async def test_xai_body_has_no_reasoning_effort(monkeypatch):
     await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
 
     assert "reasoning_effort" not in fake_reevaluate.posted_bodies[-1]
+
+
+@pytest.mark.asyncio
+async def test_xai_sends_json_schema_strict(monkeypatch):
+    """O2-13: analyze + reevaluate must send response_format=json_schema
+    with strict:true, generated from the Pydantic model at call time (so a
+    future field addition to TradeProposal/ReevaluateProposal flows through
+    automatically) instead of the old bare json_object mode."""
+    analyze_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake = _CapturingClient(200, analyze_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+
+    await _call_xai({"symbol": "BTC"}, _settings())
+
+    rf = fake.posted_bodies[-1]["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["name"]
+    schema = rf["json_schema"]["schema"]
+    assert schema["properties"]["action"]["enum"] == [
+        "STRONG_BUY",
+        "BUY",
+        "STAY_OUT",
+        "SELL",
+        "STRONG_SHORT",
+    ]
+
+    reevaluate_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"action": "HOLD", "confidence": "medium", "reason": "ok"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake2 = _CapturingClient(200, reevaluate_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake2)
+
+    await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
+
+    rf2 = fake2.posted_bodies[-1]["response_format"]
+    assert rf2["type"] == "json_schema"
+    assert rf2["json_schema"]["strict"] is True
+    assert "action" in rf2["json_schema"]["schema"]["properties"]
+
+
+def _assert_all_objects_strict(node) -> None:
+    """Recursively assert every object-shaped schema node (root, nested
+    $defs, items, anyOf branches, ...) has additionalProperties:false and
+    lists ALL of its own properties in `required` (optionality must be
+    expressed via a nullable type, never via omission from required —
+    grok's strict:true rejects the latter)."""
+    if isinstance(node, dict):
+        if node.get("type") == "object" or "properties" in node:
+            assert node.get("additionalProperties") is False, node
+            props = node.get("properties", {})
+            assert set(node.get("required", [])) == set(props.keys()), node
+        for v in node.values():
+            _assert_all_objects_strict(v)
+    elif isinstance(node, list):
+        for item in node:
+            _assert_all_objects_strict(item)
+
+
+@pytest.mark.asyncio
+async def test_xai_schema_has_additional_properties_false(monkeypatch):
+    """CRITICAL (plan review): grok strict:true REQUIRES
+    additionalProperties:false AND every property listed in `required` on
+    EVERY object node, including nested $defs (ProposalKeyLevels,
+    ProposalManagement) — Pydantic's model_json_schema() emits neither by
+    default. Skipping this post-processing makes every xai call answer 400
+    and silently kills Structured Outputs."""
+    analyze_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    fake = _CapturingClient(200, analyze_payload)
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+
+    await _call_xai({"symbol": "BTC"}, _settings())
+
+    schema = fake.posted_bodies[-1]["response_format"]["json_schema"]["schema"]
+    _assert_all_objects_strict(schema)
+    # Nested models must actually be present and exercised, not skipped by
+    # e.g. an empty/absent $defs.
+    assert "$defs" in schema
+    assert len(schema["$defs"]) >= 2
+
+    # Direct unit coverage of the helper itself on a synthetic schema that
+    # mirrors the two shapes _strictify_schema must handle: a top-level
+    # optional field expressed as anyOf[type, null] (must NOT be dropped
+    # from required) and a $ref'd nested object living in $defs.
+    synthetic = {
+        "type": "object",
+        "properties": {
+            "required_field": {"type": "string"},
+            "optional_field": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "nested": {"$ref": "#/$defs/Inner"},
+        },
+        "required": ["required_field"],
+        "$defs": {
+            "Inner": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+            }
+        },
+    }
+    out = _strictify_schema(synthetic)
+    _assert_all_objects_strict(out)
+    assert set(out["required"]) == {"required_field", "optional_field", "nested"}
+    assert out["$defs"]["Inner"]["additionalProperties"] is False
+    assert out["$defs"]["Inner"]["required"] == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_xai_falls_back_to_json_object_on_400(monkeypatch):
+    """O2-13: Structured Outputs (json_schema, strict) is the primary path,
+    but stays a safety-netted addition, not a hard requirement. If the
+    account/model/proxy combination rejects the json_schema request shape
+    (HTTP 400), retry once with the old plain json_object response_format
+    instead of hard-failing the whole analysis — mirrors _call_claude's
+    thinking->plain 400-fallback."""
+    ok_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"htf_trend": "bullish", "ltf_trend": "bullish", "action": "STAY_OUT"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    seq = _SeqClient([(400, {"error": "schema not supported"}), (200, ok_payload)])
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", seq)
+
+    result = await _call_xai({"symbol": "BTC"}, _settings())
+
+    assert result.action == "STAY_OUT"
+    assert len(seq.posted_bodies) == 2
+    assert seq.posted_bodies[0]["response_format"]["type"] == "json_schema"
+    assert seq.posted_bodies[1]["response_format"] == {"type": "json_object"}
+
+    ok_reeval_payload = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": json.dumps(
+                        {"action": "HOLD", "confidence": "medium", "reason": "ok"}
+                    )
+                },
+            }
+        ],
+        "usage": {},
+    }
+    seq2 = _SeqClient([(400, {"error": "schema not supported"}), (200, ok_reeval_payload)])
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", seq2)
+
+    result2 = await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
+
+    assert result2.action == "HOLD"
+    assert len(seq2.posted_bodies) == 2
+    assert seq2.posted_bodies[0]["response_format"]["type"] == "json_schema"
+    assert seq2.posted_bodies[1]["response_format"] == {"type": "json_object"}

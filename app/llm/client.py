@@ -1118,6 +1118,38 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     return _parse_content_to_proposal(content, provider="Claude", context=context)
 
 
+def _strictify_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Post-process a Pydantic `model_json_schema()` output in place so it
+    satisfies xAI/OpenAI-style `strict: true` Structured Outputs.
+
+    `model_json_schema()` does NOT set `additionalProperties: false` and
+    does NOT list Optional fields in `required` (it just omits fields that
+    have a default). grok's `strict: true` REQUIRES both — omitting either
+    makes every call answer HTTP 400. This recurses into every dict/list
+    reachable from the root (covering `properties`, `$defs`/`definitions`,
+    `items`, `anyOf`/`oneOf`/`allOf` branches, ...) and, for every node that
+    looks like an object schema (has a `properties` key), sets
+    `additionalProperties: false` and `required` to ALL of that object's own
+    property names. Optionality is therefore expressed the way Pydantic
+    already expresses it for nullable fields — a `type`/`anyOf` branch that
+    includes `"null"` — never by omission from `required`.
+    """
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("properties"), dict):
+                node["required"] = list(node["properties"].keys())
+                node["additionalProperties"] = False
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(schema)
+    return schema
+
+
 async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposal:
     if not settings.xai_api_key:
         raise LlmError("xAI API key not configured (set XAI_API_KEY)")
@@ -1127,6 +1159,11 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         "Authorization": f"Bearer {settings.xai_api_key}",
         "Content-Type": "application/json",
     }
+    # O2-13: schema generated from the Pydantic model at call time, so a
+    # future field addition to TradeProposal flows through automatically —
+    # then strictified (see _strictify_schema) because grok's strict:true
+    # needs additionalProperties:false + full `required` everywhere.
+    schema = _strictify_schema(TradeProposal.model_json_schema())
     body: dict[str, Any] = {
         "model": settings.xai_model,
         # O2-12/L2X-11: grok-4 is always-on-reasoning — reasoning tokens are
@@ -1142,24 +1179,44 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
             {"role": "user", "content": build_user_prompt(context)},
         ],
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        # O2-13: Structured Outputs — grok enforces the schema/enums
+        # server-side, so the parse layer's salvage/coercion becomes a pure
+        # truncation net instead of the primary correctness backstop.
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "trade_proposal", "schema": schema, "strict": True},
+        },
         # O2-14: do NOT add "reasoning_effort" here — grok-4 rejects the
         # param with HTTP 400; only grok-3-mini accepts it. Don't add it
         # without first gating on the configured model.
     }
 
-    async def _post() -> httpx.Response:
+    async def _post(payload: dict[str, Any]) -> httpx.Response:
         # Was 90s — inverted vs. Claude's 120s despite grok being the faster
         # model; raised to give the larger max_tokens budget above room to
         # complete without a spurious client-side timeout.
         async with httpx.AsyncClient(timeout=120.0) as client:
-            return await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=payload)
 
+    sent_body = body
     t0 = time.monotonic()
     try:
-        r = await _post_with_retry(_post)
+        r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
         raise LlmError(f"xAI request failed: {e}") from e
+
+    # O2-13: json_schema/strict is the primary path, but stays a safety-
+    # netted addition. If this account/model/proxy combination rejects the
+    # json_schema request shape, retry once with the old plain json_object
+    # mode rather than hard-failing the whole analysis (mirrors
+    # _call_claude's thinking->plain 400-fallback above).
+    if r.status_code == 400:
+        fallback_body: dict[str, Any] = {**body, "response_format": {"type": "json_object"}}
+        sent_body = fallback_body
+        try:
+            r = await _post_with_retry(lambda: _post(fallback_body))
+        except httpx.HTTPError as e:
+            raise LlmError(f"xAI request failed: {e}") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -1179,7 +1236,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
         provider="xAI",
-        model=body.get("model"),
+        model=sent_body.get("model"),
         route="analyze",
         elapsed_ms=elapsed_ms,
         payload=payload,
@@ -1192,12 +1249,12 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         log.warning(
             "xAI analyze call hit max_tokens (finish_reason=length, max_tokens=%s); "
             "response may be truncated",
-            body.get("max_tokens"),
+            sent_body.get("max_tokens"),
         )
         if not str(content or "").strip():
             raise LlmError(
                 "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
-                f"(finish_reason=length, max_tokens={body['max_tokens']})"
+                f"(finish_reason=length, max_tokens={sent_body['max_tokens']})"
             )
 
     return _parse_content_to_proposal(str(content), provider="xAI", context=context)
@@ -1399,6 +1456,8 @@ async def _call_xai_reevaluate(
         "Authorization": f"Bearer {settings.xai_api_key}",
         "Content-Type": "application/json",
     }
+    # O2-13: same schema-from-model + strictify treatment as _call_xai above.
+    schema = _strictify_schema(ReevaluateProposal.model_json_schema())
     body: dict[str, Any] = {
         "model": settings.xai_model,
         # O2-12/L2X-11: same always-on-reasoning risk as _call_xai above —
@@ -1410,23 +1469,37 @@ async def _call_xai_reevaluate(
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "reevaluation", "schema": schema, "strict": True},
+        },
         # O2-14: do NOT add "reasoning_effort" here — grok-4 rejects the
         # param with HTTP 400; only grok-3-mini accepts it. Don't add it
         # without first gating on the configured model.
     }
 
-    async def _post() -> httpx.Response:
+    async def _post(payload: dict[str, Any]) -> httpx.Response:
         # Was 90s — inverted vs. Claude's 120s despite grok being the faster
         # model; raised to match the larger max_tokens budget above.
         async with httpx.AsyncClient(timeout=120.0) as client:
-            return await client.post(url, headers=headers, json=body)
+            return await client.post(url, headers=headers, json=payload)
 
+    sent_body = body
     t0 = time.monotonic()
     try:
-        r = await _post_with_retry(_post)
+        r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
         raise LlmError(f"xAI request failed: {e}") from e
+
+    # O2-13: same 400-fallback wiring as _call_xai above — json_schema is
+    # the primary path, json_object stays the safety net.
+    if r.status_code == 400:
+        fallback_body: dict[str, Any] = {**body, "response_format": {"type": "json_object"}}
+        sent_body = fallback_body
+        try:
+            r = await _post_with_retry(lambda: _post(fallback_body))
+        except httpx.HTTPError as e:
+            raise LlmError(f"xAI request failed: {e}") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -1446,7 +1519,7 @@ async def _call_xai_reevaluate(
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
         provider="xAI",
-        model=body.get("model"),
+        model=sent_body.get("model"),
         route="reevaluate",
         elapsed_ms=elapsed_ms,
         payload=payload,
@@ -1457,12 +1530,12 @@ async def _call_xai_reevaluate(
         log.warning(
             "xAI reevaluate call hit max_tokens (finish_reason=length, max_tokens=%s); "
             "response may be truncated",
-            body.get("max_tokens"),
+            sent_body.get("max_tokens"),
         )
         if not str(content or "").strip():
             raise LlmError(
                 "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
-                f"(finish_reason=length, max_tokens={body['max_tokens']})"
+                f"(finish_reason=length, max_tokens={sent_body['max_tokens']})"
             )
 
     return _parse_content_to_reevaluation(str(content), provider="xAI")
