@@ -52,19 +52,28 @@ _VALID_SETUP_CONFIDENCE = {"low", "medium", "high"}
 
 
 def _normalize_setup_confidence(data: dict) -> dict:
-    """Coerce/clear an unexpected setup_confidence value so schema validation
-    doesn't hard-fail on a minor LLM formatting slip (e.g. "Low", "n/a").
+    """Coerce/clear an unexpected setup_confidence / conviction_score value so
+    schema validation doesn't hard-fail on a minor LLM formatting slip (e.g.
+    "Low", "n/a", a conviction_score of 12 or "7").
 
     Missing the key entirely is already fine — the Pydantic field default
-    ("medium") applies. This only touches present-but-invalid values.
+    applies. This only touches present-but-invalid values.
     """
     val = data.get("setup_confidence")
-    if val is None:
-        return data
-    if isinstance(val, str) and val.strip().lower() in _VALID_SETUP_CONFIDENCE:
-        data["setup_confidence"] = val.strip().lower()
-    else:
-        data.pop("setup_confidence", None)  # falls back to the model default
+    if val is not None:
+        if isinstance(val, str) and val.strip().lower() in _VALID_SETUP_CONFIDENCE:
+            data["setup_confidence"] = val.strip().lower()
+        else:
+            data.pop("setup_confidence", None)  # falls back to the model default
+    # conviction_score (0-10): clamp an in-range-able number, drop anything else
+    # so the salvage/free-parse path can't hard-fail on a slip (the xai strict
+    # schema already constrains it; this guards the non-schema paths).
+    if "conviction_score" in data:
+        cs = data.get("conviction_score")
+        try:
+            data["conviction_score"] = max(0, min(10, int(cs)))
+        except (TypeError, ValueError):
+            data.pop("conviction_score", None)  # -> model default (None)
     return data
 
 
