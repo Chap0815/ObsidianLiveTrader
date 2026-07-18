@@ -112,6 +112,16 @@ class Database:
             await conn.execute("PRAGMA synchronous=NORMAL;")
             await conn.execute("PRAGMA busy_timeout=30000;")
             await conn.executescript(SCHEMA_SQL)
+            # F2-07: additive migration for pre-existing DBs. CREATE TABLE IF
+            # NOT EXISTS won't add a column to an already-created table, so add
+            # realized_r_net explicitly when missing. Idempotent + safe: an
+            # empty column defaults to NULL, which stats/SUM already ignore.
+            cur = await conn.execute("PRAGMA table_info(journal_entries)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "realized_r_net" not in cols:
+                await conn.execute(
+                    "ALTER TABLE journal_entries ADD COLUMN realized_r_net REAL"
+                )
             await conn.commit()
 
     async def insert_proposal(
@@ -342,9 +352,10 @@ class Database:
         resolved_at: str | None = None,
         resolved_price: float | None = None,
         realized_r: float | None = None,
+        realized_r_net: float | None = None,
         ambiguous: int = 0,
     ) -> None:
-        """Transition a PENDING row to a terminal state (WIN|LOSS|EXPIRED|SKIPPED).
+        """Transition a PENDING row to a terminal state (WIN|LOSS|EXPIRED|SKIPPED|NO_FILL).
 
         Guarded by `status='PENDING'` in the WHERE clause so the resolver is
         idempotent: a row that already resolved is never revisited/overwritten.
@@ -354,7 +365,8 @@ class Database:
                 """
                 UPDATE journal_entries
                 SET status = ?, resolved_at = ?, resolved_price = ?,
-                    realized_r = ?, ambiguous = ?, last_checked_at = ?
+                    realized_r = ?, realized_r_net = ?, ambiguous = ?,
+                    last_checked_at = ?
                 WHERE id = ? AND status = 'PENDING'
                 """,
                 (
@@ -362,6 +374,7 @@ class Database:
                     resolved_at or _utc_now_iso(),
                     resolved_price,
                     realized_r,
+                    realized_r_net,
                     1 if ambiguous else 0,
                     _utc_now_iso(),
                     entry_id,
@@ -387,7 +400,8 @@ class Database:
                 SELECT id, created_at, symbol, tf, htf, action, direction,
                        setup_confidence, entry_price, stop_loss, tp1, rrr,
                        provider, model, scanner_summary, last_price_t0,
-                       status, resolved_at, resolved_price, realized_r, ambiguous
+                       status, resolved_at, resolved_price, realized_r,
+                       realized_r_net, ambiguous
                 FROM journal_entries
                 ORDER BY id DESC
                 LIMIT ?
@@ -430,6 +444,9 @@ class Database:
             pending = status_counts.get("PENDING", 0)
             expired = status_counts.get("EXPIRED", 0)
             skipped = status_counts.get("SKIPPED", 0)
+            # F2-02: NO_FILL rows are NOT WIN/LOSS (never filled) -> excluded
+            # from win-rate/sum_r everywhere below, surfaced as its own count.
+            no_fill = status_counts.get("NO_FILL", 0)
             wins = status_counts.get("WIN", 0)
             losses = status_counts.get("LOSS", 0)
             total = sum(status_counts.values())
@@ -478,15 +495,29 @@ class Database:
             sr = await sum_r.fetchone()
             overall_sum_r = float(sr[0]) if sr and sr[0] is not None else 0.0
 
+            # F2-07: NET sum over resolved rows (Task 21's feedback uses net,
+            # not gross). Pre-migration WIN/LOSS rows have NULL net -> SUM skips
+            # them, so this stays 0.0 until the resolver repopulates.
+            sum_r_net = await conn.execute(
+                """
+                SELECT SUM(realized_r_net) FROM journal_entries
+                WHERE status IN ('WIN','LOSS')
+                """
+            )
+            srn = await sum_r_net.fetchone()
+            overall_sum_r_net = float(srn[0]) if srn and srn[0] is not None else 0.0
+
             return {
                 "total": total,
                 "stay_out": stay_out,
                 "pending": pending,
                 "expired": expired,
                 "skipped": skipped,
+                "no_fill": no_fill,
                 "wins": wins,
                 "losses": losses,
                 "overall_sum_r": overall_sum_r,
+                "overall_sum_r_net": overall_sum_r_net,
                 "by_confidence": await _groups("setup_confidence"),
                 "by_action": await _groups("action"),
                 "by_provider": await _groups("provider"),

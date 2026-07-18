@@ -58,10 +58,11 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   scanner_summary TEXT,                    -- compact "bias/setup/score" string or NULL
   last_price_t0 REAL,                      -- market last_price when logged (context)
   -- shadow-outcome resolver fields --
-  status        TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING|WIN|LOSS|EXPIRED|SKIPPED
+  status        TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING|WIN|LOSS|EXPIRED|SKIPPED|NO_FILL
   resolved_at   TEXT,                      -- UTC ISO when status left PENDING
   resolved_price REAL,                     -- tp1 or sl level that triggered (for WIN/LOSS)
-  realized_r    REAL,                      -- +reward/risk on WIN, -1.0 on LOSS, NULL otherwise
+  realized_r    REAL,                      -- GROSS +reward/risk on WIN, -1.0 on LOSS, NULL otherwise
+  realized_r_net REAL,                     -- realized_r minus round-trip costs (F2-07); NULL when gross is
   ambiguous     INTEGER NOT NULL DEFAULT 0,-- 1 = tp1 & sl inside the same candle
   last_checked_at TEXT,                    -- UTC ISO of last resolver pass (debug/backoff)
   proposal_id   INTEGER                    -- FK-ish link to proposals.id (best-effort, nullable)

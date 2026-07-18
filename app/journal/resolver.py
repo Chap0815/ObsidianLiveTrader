@@ -46,12 +46,29 @@ _TF_SECONDS: dict[str, int] = {
 _MAX_LIMIT_HINT = 1000
 _DEFAULT_LIMIT_HINT = 500
 
+# F2-06: the resolution window is floored at the base (24h) but scaled UP on
+# higher TFs so a slow winner isn't cut off before it can resolve (which would
+# otherwise bias the EXPIRED bucket toward higher-TF setups). 96 bars is ~4
+# days on 1H, ~16 days on 4H, ~96 days on 1D.
+_WINDOW_TF_BARS = 96
+
+# F2-07: flat cost model for the NET realized R. taker_fee is charged on BOTH
+# legs (round-trip = 2x); slippage_frac is a single round-trip estimate. Both
+# are fractions of price (0.0006 = 0.06%), NOT the "percent" convention used in
+# app/config.py. These are deliberately conservative so net R never flatters.
+_DEFAULT_TAKER_FEE = 0.0006
+_DEFAULT_SLIPPAGE_FRAC = 0.0005
+
 # Terminal + non-terminal states.
 PENDING = "PENDING"
 WIN = "WIN"
 LOSS = "LOSS"
 EXPIRED = "EXPIRED"
 SKIPPED = "SKIPPED"
+# F2-02: a limit entry whose price was never touched by post-t0 price action —
+# the trade never filled, so it is NOT a real WIN/LOSS. Excluded from win-rate,
+# counted separately (see app/journal/stats.py).
+NO_FILL = "NO_FILL"
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,7 @@ class Outcome:
     resolved_price: float | None = None
     realized_r: float | None = None
     ambiguous: bool = False
+    realized_r_net: float | None = None
 
 
 def _parse_iso_ms(created_at: str | datetime) -> int:
@@ -125,6 +143,58 @@ def _touches(
     return (low <= tp1, high >= stop_loss)
 
 
+def resolution_window_s(tf: str, base_window_s: float) -> float:
+    """F2-06: tf-scaled resolution window. Floored at `base_window_s` (24h) but
+    stretched to `_WINDOW_TF_BARS` bars on higher TFs so a slow winner isn't
+    prematurely EXPIRED. Unknown/degenerate tf falls back to the base window."""
+    tf_s = _TF_SECONDS.get(tf)
+    if not tf_s or tf_s <= 0:
+        return base_window_s
+    return max(base_window_s, float(_WINDOW_TF_BARS * tf_s))
+
+
+def _net_r(
+    gross_r: float | None,
+    entry_price: float,
+    risk: float,
+    taker_fee: float,
+    slippage_frac: float,
+) -> float | None:
+    """F2-07: gross R minus round-trip costs, expressed in R units.
+
+    cost_frac (fraction of price) = taker_fee*2 (both legs) + slippage_frac.
+    Converted to R by dividing by the risk fraction (risk/entry_price):
+        cost_r = cost_frac * entry_price / risk.
+    Costs are a drag in BOTH directions, so they always subtract (a loss gets
+    MORE negative, a win smaller). None gross (EXPIRED/NO_FILL/SKIPPED) -> None.
+    """
+    if gross_r is None or risk <= 0 or not entry_price:
+        return gross_r
+    cost_frac = 2.0 * taker_fee + slippage_frac
+    cost_r = cost_frac * (entry_price / risk)
+    return gross_r - cost_r
+
+
+def _entry_fill_index(
+    ordered: list[Any], entry_price: float, order_type: str | None
+) -> int | None:
+    """F2-02: index into `ordered` (candles at/after t0) of the first bar that
+    would fill the entry, or None if it was never touched.
+
+    - market order: fills immediately at the first available bar (index 0).
+    - limit order (default): fills on the first bar whose [low, high] straddles
+      entry_price, i.e. price actually traded through the limit.
+    """
+    if not ordered:
+        return None
+    if order_type == "market":
+        return 0
+    for i, candle in enumerate(ordered):
+        if _field(candle, "low") <= entry_price <= _field(candle, "high"):
+            return i
+    return None
+
+
 def resolve_entry(
     *,
     direction: str | None,
@@ -135,12 +205,17 @@ def resolve_entry(
     candles: Iterable[Any],
     now: datetime,
     window_s: float,
+    order_type: str | None = None,
+    taker_fee: float = _DEFAULT_TAKER_FEE,
+    slippage_frac: float = _DEFAULT_SLIPPAGE_FRAC,
 ) -> Outcome:
     """Decide a shadow outcome for one journal entry. Pure, no I/O.
 
-    Scans candles with `time >= created_at` (t0) in chronological order; the
-    first candle that produces a terminal state wins. See module docstring for
-    the shadow-fill and intrabar-ambiguity limitations.
+    First locates the ENTRY-fill bar (F2-02): TP/SL are only scanned from the
+    bar the entry was actually touched onward. A limit that price never traded
+    back to resolves to NO_FILL (never a fictional WIN/LOSS). From the fill bar
+    on, the first candle that produces a terminal state wins. See module
+    docstring for the shadow-fill and intrabar-ambiguity limitations.
     """
     if not geometry_ok(direction, entry_price, stop_loss, tp1):
         return Outcome(status=SKIPPED)
@@ -163,32 +238,59 @@ def resolve_entry(
         (c for c in all_candles if _field(c, "time") >= t0_ms),
         key=lambda c: _field(c, "time"),
     )
-    for candle in ordered:
-        tp_hit, sl_hit = _touches(direction, candle, stop_loss, tp1)
-        if tp_hit and sl_hit:
-            # Intrabar ambiguity -> pessimistic LOSS.
-            return Outcome(
-                status=LOSS, resolved_price=stop_loss, realized_r=-1.0, ambiguous=True
-            )
-        if tp_hit:
-            return Outcome(status=WIN, resolved_price=tp1, realized_r=realized_win_r)
-        if sl_hit:
-            return Outcome(status=LOSS, resolved_price=stop_loss, realized_r=-1.0)
 
-    # No terminal candle found. Expiring is only safe once (a) the window has
-    # genuinely elapsed AND (b) the fetched candle history actually reaches
-    # back to t0 -- otherwise a real WIN/LOSS could be hiding before our
-    # earliest fetched candle, and reporting EXPIRED would silently discard
-    # it. Coverage-less/incomplete data (resolver was down longer than the
-    # fetch window, or an empty/delisted payload) always stays PENDING so the
-    # next cycle (with a wider or fresh fetch) gets another chance.
+    # F2-02: find the fill bar; only scan TP/SL from there. Intrabar ambiguity
+    # extends to the fill bar itself (entry + SL in the same candle -> LOSS).
+    fill_index = _entry_fill_index(ordered, entry_price, order_type)
+    if fill_index is not None:
+        for candle in ordered[fill_index:]:
+            tp_hit, sl_hit = _touches(direction, candle, stop_loss, tp1)
+            if tp_hit and sl_hit:
+                # Intrabar ambiguity -> pessimistic LOSS.
+                return Outcome(
+                    status=LOSS,
+                    resolved_price=stop_loss,
+                    realized_r=-1.0,
+                    ambiguous=True,
+                    realized_r_net=_net_r(
+                        -1.0, entry_price, risk, taker_fee, slippage_frac
+                    ),
+                )
+            if tp_hit:
+                return Outcome(
+                    status=WIN,
+                    resolved_price=tp1,
+                    realized_r=realized_win_r,
+                    realized_r_net=_net_r(
+                        realized_win_r, entry_price, risk, taker_fee, slippage_frac
+                    ),
+                )
+            if sl_hit:
+                return Outcome(
+                    status=LOSS,
+                    resolved_price=stop_loss,
+                    realized_r=-1.0,
+                    realized_r_net=_net_r(
+                        -1.0, entry_price, risk, taker_fee, slippage_frac
+                    ),
+                )
+
+    # No terminal candle found. Expiring / NO_FILL is only safe once (a) the
+    # window has genuinely elapsed AND (b) the fetched candle history actually
+    # reaches back to t0 -- otherwise a real fill / WIN / LOSS could be hiding
+    # before our earliest fetched candle, and reporting a terminal state would
+    # silently discard it. Coverage-less/incomplete data (resolver was down
+    # longer than the fetch window, or an empty/delisted payload) always stays
+    # PENDING so the next cycle (with a wider/fresh fetch) gets another chance.
     elapsed = (now - _created_dt(created_at)).total_seconds()
     if elapsed >= window_s:
         candle_times = [_field(c, "time") for c in all_candles]
         earliest = min(candle_times) if candle_times else None
         covers_t0 = earliest is not None and earliest <= t0_ms
         if covers_t0:
-            return Outcome(status=EXPIRED)
+            # Entry never touched over a fully-covered, elapsed window -> the
+            # limit never filled. A filled-but-untouched-TP/SL entry -> EXPIRED.
+            return Outcome(status=NO_FILL if fill_index is None else EXPIRED)
     return Outcome(status=PENDING)
 
 
@@ -229,14 +331,17 @@ async def resolve_pending_once(
         groups.setdefault((row["symbol"], row["tf"]), []).append(row)
 
     for (symbol, tf), grp in groups.items():
+        # F2-06: this group's window is the tf-scaled one (floored at window_s),
+        # used both for the fetch sizing and the EXPIRED/NO_FILL gate below.
+        eff_window_s = resolution_window_s(tf, window_s)
         try:
             # Size the fetch to cover from the OLDEST row's t0 to now, not
-            # just `window_s` back from now. If the resolver was down longer
-            # than the window (or a row is older than window_s on its first
-            # resolve), a window_s-only fetch would never reach t0 and the
+            # just `eff_window_s` back from now. If the resolver was down longer
+            # than the window (or a row is older than the window on its first
+            # resolve), a window-only fetch would never reach t0 and the
             # coverage guard in resolve_entry would (correctly) leave it
             # PENDING forever. Still capped at _MAX_LIMIT_HINT bars.
-            max_elapsed_s = window_s
+            max_elapsed_s = eff_window_s
             for row in grp:
                 try:
                     elapsed_row = (now - _created_dt(row["created_at"])).total_seconds()
@@ -268,7 +373,8 @@ async def resolve_pending_once(
                     created_at=row["created_at"],
                     candles=candles,
                     now=now,
-                    window_s=window_s,
+                    window_s=eff_window_s,
+                    order_type=row.get("order_type"),
                 )
                 if outcome.status != PENDING:
                     await db.update_journal_outcome(
@@ -277,6 +383,7 @@ async def resolve_pending_once(
                         resolved_price=outcome.resolved_price,
                         realized_r=outcome.realized_r,
                         ambiguous=outcome.ambiguous,
+                        realized_r_net=outcome.realized_r_net,
                     )
                 else:
                     await db.touch_journal_checked(row["id"])

@@ -104,6 +104,9 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             "pending": int(raw.get("pending", 0)),
             "expired": int(raw.get("expired", 0)),
             "skipped": int(raw.get("skipped", 0)),
+            # F2-02: limit entries that never filled — NOT resolved trades,
+            # excluded from win-rate, surfaced separately.
+            "no_fill": int(raw.get("no_fill", 0)),
         },
         "overall": {
             "wins": wins,
@@ -112,6 +115,13 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             "win_rate": _round(wins / sample) if sample else None,
             "win_rate_ci95": wilson_ci(wins, losses),
             "avg_realized_rrr": _round(float(raw.get("overall_sum_r", 0.0)) / sample)
+            if sample
+            else None,
+            # F2-07: NET expectancy (after round-trip costs) — Task 21 learns
+            # on this, not the gross avg above.
+            "avg_realized_rrr_net": _round(
+                float(raw.get("overall_sum_r_net", 0.0)) / sample
+            )
             if sample
             else None,
             "low_sample": sample < min_sample,

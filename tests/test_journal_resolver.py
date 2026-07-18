@@ -9,9 +9,11 @@ import pytest
 from app.journal.resolver import (
     EXPIRED,
     LOSS,
+    NO_FILL,
     PENDING,
     SKIPPED,
     WIN,
+    resolution_window_s,
     resolve_entry,
 )
 
@@ -143,3 +145,46 @@ def test_degenerate_short_geometry_skipped():
 def test_missing_levels_skipped():
     o = _long(tp1=None, candles=[_candle(5, 103.0, 101.0)])
     assert o.status == SKIPPED
+
+
+# ── Task 19 / F2-02: entry-touch (NO_FILL) ───────────────────────────────────
+def test_untouched_entry_is_no_fill():
+    # Price gaps ABOVE the limit entry (100) and never trades back down to it,
+    # so the limit never fills -- even though it later trades through tp1 (102).
+    # Old resolver miscounted this as a WIN; it must now be NO_FILL (excluded
+    # from win/loss), with no fictional R.
+    o = _long(candles=[_candle(0, 105.0, 103.0), _candle(30, 106.0, 104.0)])
+    assert o.status == NO_FILL
+    assert o.realized_r is None
+    assert o.realized_r_net is None
+
+
+# ── Task 19 / F2-06: tf-scaled resolution window ─────────────────────────────
+def test_window_scales_with_tf():
+    base = 24 * 3600  # 24h floor
+    # Short tf: 96 * 300s = 8h < 24h -> floored at 24h.
+    assert resolution_window_s("5m", base) == base
+    # 15m: 96 * 900s = 24h exactly -> equals the floor (loop tests rely on this).
+    assert resolution_window_s("15m", base) == base
+    # Higher tf must scale UP so slow winners aren't cut off (EXPIRED bias).
+    assert resolution_window_s("4H", base) == 96 * 14_400
+    assert resolution_window_s("1D", base) == 96 * 86_400
+    assert resolution_window_s("1D", base) > base
+    # Unknown tf falls back to the base window, never 0.
+    assert resolution_window_s("bogus", base) == base
+
+
+# ── Task 19 / F2-07: net R subtracts round-trip costs ────────────────────────
+def test_realized_r_net_subtracts_costs():
+    # long entry 100, sl 99 (risk 1.0), tp1 102 (gross +2R). One candle spans
+    # entry and tp1 (fills, then wins). cost_frac = 2*taker + slip = 0.003;
+    # in R = 0.003 * entry/risk = 0.003 * 100/1 = 0.3 -> net = 2.0 - 0.3 = 1.7.
+    o = _long(
+        candles=[_candle(5, 102.5, 99.5)],
+        taker_fee=0.001,
+        slippage_frac=0.001,
+    )
+    assert o.status == WIN
+    assert o.realized_r == pytest.approx(2.0)
+    assert o.realized_r_net == pytest.approx(1.7)
+    assert o.realized_r_net < o.realized_r
