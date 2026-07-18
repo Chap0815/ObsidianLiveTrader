@@ -479,3 +479,140 @@ async def test_scanner_anthropic_thinking_disabled(monkeypatch):
     body = _CapturingClient.posted_bodies[-1]
     assert body["thinking"] == {"type": "disabled"}
     assert body["max_tokens"] == 6000
+
+
+# --- Task 24 (S2-01/S2-08/S2-02): universe union + prefilter + chunk-merge ---
+
+
+def _ctx(symbol, *, ema="bullish", htf_ema="bullish", daily="bullish", rsi=58.0,
+         macd=0.4, stretch=1.0, atr=1.0, price=100.0, support=95.0,
+         resistance=112.0, funding="neutral", oi=None):
+    """Minimal build_scan_contexts-shaped ctx for prefilter unit tests."""
+    ctx = {
+        "symbol": symbol,
+        "last_price": price,
+        "daily_stack": daily,
+        "funding_extreme": funding,
+        "htf": {"read": {"ema_stack": htf_ema}},
+        "ltf": {
+            "read": {"ema_stack": ema, "atr14": atr, "price_vs_ema20_pct": stretch},
+            "indicators_tail": {"rsi14": [rsi], "macd_hist": [macd]},
+            "structure": {"support": support, "resistance": resistance,
+                          "range_high": resistance, "range_low": support},
+        },
+    }
+    if oi is not None:
+        ctx["oi_read"] = oi
+    return ctx
+
+
+def test_select_scan_universe_union_and_floor():
+    """S2-01: the universe is a momentum/flow-ranked UNION gated by a turnover
+    floor. A big mover below the liquidity floor is dropped despite its move;
+    a mid-turnover runner is included AND ranks ahead of a boring high-cap."""
+    from app.config import Settings
+    from app.llm.scanner import select_scan_universe
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_turnover_floor_usd=1e7,
+        scanner_rank_top_n=3,
+        scanner_universe_size=5,
+    )
+    overview = [
+        {"symbol": "BIG", "volume24": 1e9, "price_change_pct": 0.1},   # boring cap
+        {"symbol": "RUN", "volume24": 2e7, "price_change_pct": 25.0},  # runner
+        {"symbol": "MID", "volume24": 5e7, "price_change_pct": 5.0},
+        {"symbol": "DUST", "volume24": 1e6, "price_change_pct": 40.0}, # below floor
+    ]
+    uni = select_scan_universe(overview, s)
+    syms = [r["symbol"] for r in uni]
+    assert "DUST" not in syms                 # dropped by turnover floor
+    assert "RUN" in syms                       # runner surfaced by momentum union
+    assert syms.index("RUN") < syms.index("BIG")  # momentum ranks it above the cap
+
+
+def test_prefilter_reduces_deterministically():
+    """S2-08: the deterministic prefilter reduces N contexts to top-K, is
+    stable/repeatable, and keeps a clean-confluence coin over a weak one."""
+    from app.config import Settings
+    from app.llm.scanner import prefilter_contexts
+
+    s = Settings(scanner_mode="prefilter", scanner_prefilter_top_k=2)
+    contexts = [
+        # strong: stacked bull regime, healthy momentum, near value, room to R
+        _ctx("STRONG", ema="bullish", htf_ema="bullish", daily="bullish",
+             rsi=58, macd=0.5, stretch=0.8, resistance=115.0, oi="price_up_oi_up_real_trend"),
+        # weak: mixed regime, overbought, over-stretched, no room
+        _ctx("WEAK", ema="mixed", htf_ema="mixed", daily="bearish",
+             rsi=82, macd=-0.1, stretch=8.0, resistance=100.5),
+        _ctx("MID", ema="bullish", htf_ema="mixed", daily="bullish",
+             rsi=55, macd=0.2, stretch=2.5, resistance=108.0),
+    ]
+    kept, dropped = prefilter_contexts(contexts, s)
+    assert len(kept) == 2 and len(dropped) == 1
+    kept_syms = {c["symbol"] for c in kept}
+    assert "STRONG" in kept_syms
+    assert "WEAK" not in kept_syms            # weakest is the one dropped
+    # deterministic: identical input -> identical selection & order
+    kept2, _ = prefilter_contexts(contexts, s)
+    assert [c["symbol"] for c in kept2] == [c["symbol"] for c in kept]
+
+
+@pytest.mark.asyncio
+async def test_scan_with_llm_chunks_and_merges(monkeypatch):
+    """S2-02: >chunk_max LLM candidates are split into 2 chunks, each screened,
+    and the results merged (dedup by symbol, highest score wins, capped)."""
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    seen_chunks: list[set[str]] = []
+
+    async def fake_call(system, user, settings):
+        import json as _json
+
+        syms = [c["symbol"] for c in _json.loads(user.split("COINS:\n", 1)[1])]
+        seen_chunks.append(set(syms))
+        # each chunk returns its own first symbol as a pick
+        first = syms[0]
+        return (
+            '{"results": [{"symbol": "%s", "bias": "long", "score": 7}]}' % first,
+            "chunk-model",
+        )
+
+    monkeypatch.setattr(scanner_mod, "_call_scanner_llm", fake_call)
+    s = Settings(anthropic_api_key="k", scanner_mode="prefilter", scanner_llm_chunk_max=12)
+    contexts = [{"symbol": f"C{i}"} for i in range(14)]  # 14 > 12 -> split
+    results, model = await scanner_mod.scan_with_llm(contexts, s)
+    assert len(seen_chunks) == 2                       # two LLM calls
+    assert seen_chunks[0].isdisjoint(seen_chunks[1])   # disjoint halves
+    assert sum(len(c) for c in seen_chunks) == 14      # every coin screened once
+    merged = {r.symbol for r in results}
+    assert merged == {"C0", "C7"}                      # one pick per chunk, merged
+
+
+@pytest.mark.asyncio
+async def test_classic_mode_unchanged(monkeypatch):
+    """Classic parity: select_scan_universe is a pass-through top-N-by-turnover,
+    and scan_with_llm makes exactly ONE call even for >12 coins (no chunking)."""
+    from app.config import Settings
+    from app.llm.scanner import select_scan_universe
+    import app.llm.scanner as scanner_mod
+
+    s = Settings(anthropic_api_key="k", scanner_mode="classic", scanner_max_coins=20)
+    overview = [{"symbol": f"C{i}", "volume24": 1e9 - i, "price_change_pct": 50.0}
+                for i in range(25)]
+    uni = select_scan_universe(overview, s)
+    # classic = old behavior: first scanner_max_coins rows, order untouched
+    assert [r["symbol"] for r in uni] == [r["symbol"] for r in overview[:20]]
+
+    calls = {"n": 0}
+
+    async def fake_call(system, user, settings):
+        calls["n"] += 1
+        return '{"results": []}', "classic-model"
+
+    monkeypatch.setattr(scanner_mod, "_call_scanner_llm", fake_call)
+    contexts = [{"symbol": f"C{i}"} for i in range(20)]  # 20 > 12 but classic
+    await scanner_mod.scan_with_llm(contexts, s)
+    assert calls["n"] == 1  # single batched call, never chunked in classic

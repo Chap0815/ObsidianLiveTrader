@@ -360,6 +360,220 @@ def _scan_user_prompt(contexts: list[dict[str, Any]]) -> str:
     )
 
 
+# ── Task 24 (S2-01): candidate universe ─────────────────────────────────────
+# Classic screened top-N-by-turnover — a blue-chip-chop filter that misses the
+# runners and wastes slots on edge-less high-caps. The prefilter universe is a
+# momentum/flow-ranked UNION gated by a turnover LIQUIDITY FLOOR (no fixed
+# blue-chip slots): a coin enters because it MOVES or carries OI flow, not
+# because it's big. Turnover is a floor + a top-up-to-size tail only.
+#
+# Honest data note: neither exchange's batch market_overview payload carries a
+# 1h/4h price-change or an OI-Δ — HL's assetCtx exposes prevDayPx (24h) +
+# openInterest (level); MEXC's ticker exposes riseFallRate (24h) + holdVol
+# (level). So the universe ranks on the 24h |price-change| (runner proxy) and,
+# where present, |OI-Δ|; the ATR%/RRR/OI-confluence multi-factor scoring runs
+# in the prefilter stage below, where per-coin klines exist. When a ranking
+# field is absent (degraded/cold data) that dimension simply contributes
+# nothing and the turnover top-up keeps the universe non-empty.
+
+
+def _num(v: Any) -> float | None:
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _rank_top(
+    rows: list[dict[str, Any]], key: Any, n: int
+) -> list[dict[str, Any]]:
+    scored = [(k, r) for r in rows if (k := key(r)) is not None]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [r for _, r in scored[:n]]
+
+
+def select_scan_universe(
+    overview: list[dict[str, Any]], settings: Settings
+) -> list[dict[str, Any]]:
+    """Build the scanner candidate universe.
+
+    classic: byte-for-byte the old behavior — the first `scanner_max_coins`
+    rows of the turnover-sorted overview, order untouched.
+
+    prefilter: a de-duplicated UNION of top-N-per-dimension rankings
+    (|price-change|, |OI-Δ|, |funding|) over the turnover-floored pool, topped
+    up by turnover to `scanner_universe_size` so it's never thin/empty."""
+    if (settings.scanner_mode or "classic") == "classic":
+        return list(overview[: max(1, settings.scanner_max_coins)])
+
+    floor = settings.scanner_turnover_floor_usd
+    liquid = [r for r in overview if (_num(r.get("volume24")) or 0.0) >= floor]
+    # Fail-safe: if the floor empties the pool (misconfigured / illiquid market)
+    # fall back to the full overview rather than returning nothing to scan.
+    pool = liquid or list(overview)
+    top_n = settings.scanner_rank_top_n
+
+    by_momentum = _rank_top(
+        pool, lambda r: abs(v) if (v := _num(r.get("price_change_pct"))) is not None else None, top_n
+    )
+    by_oi = _rank_top(
+        pool, lambda r: abs(v) if (v := _num(r.get("oi_change_pct_1h"))) is not None else None, top_n
+    )
+    by_funding = _rank_top(
+        pool, lambda r: abs(v) if (v := _num(r.get("funding"))) is not None else None, top_n
+    )
+    by_turnover = _rank_top(pool, lambda r: _num(r.get("volume24")), len(pool))
+
+    union: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # Momentum/flow first, then a turnover top-up tail to fill remaining slots.
+    for r in [*by_momentum, *by_oi, *by_funding, *by_turnover]:
+        sym = str(r.get("symbol") or "")
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        union.append(r)
+    return union[: max(1, settings.scanner_universe_size)]
+
+
+# ── Task 24 (S2-08): deterministic rules-prefilter ──────────────────────────
+# Cheap (no LLM, no extra fetches) scoring of the ~50 universe contexts that
+# build_scan_contexts already produced, to send only the top-K to the LLM.
+#
+# INCLUSIVE by design (audit constraint): it RANKS and takes the top-K, it does
+# NOT hard-reject on any single metric. Every component is an additive nudge, so
+# a coin that's strong on one dimension the others miss still ranks and can
+# survive. Risk (documented): a coin the LLM would have scored high on a
+# dimension this prefilter under-weights could still be cut when the universe is
+# crowded — mitigated by a generous top-K (default 8) and never single-gating.
+
+
+def _rough_rrr(
+    bias: str, price: float | None, struct: dict[str, Any], atr: float | None
+) -> float | None:
+    """Coarse reward/risk to the nearest OPPOSING structure vs a ~1.5×ATR stop."""
+    p = _num(price)
+    a = _num(atr)
+    if p is None or a is None or p <= 0 or a <= 0:
+        return None
+    if bias == "long":
+        tgt = _num(struct.get("resistance"))
+        if tgt is None or tgt <= p:
+            tgt = _num(struct.get("range_high"))
+        if tgt is None or tgt <= p:
+            return None
+        reward = tgt - p
+    else:
+        tgt = _num(struct.get("support"))
+        if tgt is None or tgt >= p:
+            tgt = _num(struct.get("range_low"))
+        if tgt is None or tgt >= p:
+            return None
+        reward = p - tgt
+    return reward / (a * 1.5)
+
+
+def _prefilter_score(ctx: dict[str, Any]) -> float:
+    """Deterministic 0-ish..N quality nudge sum (higher = better candidate)."""
+    ltf = ctx.get("ltf") or {}
+    htf = ctx.get("htf") or {}
+    read = ltf.get("read") or {}
+    hread = htf.get("read") or {}
+    tails = ltf.get("indicators_tail") or {}
+    struct = ltf.get("structure") or {}
+
+    score = 0.0
+    # 1) Regime alignment across ltf/htf/1D (either direction).
+    stacks = [read.get("ema_stack"), hread.get("ema_stack"), ctx.get("daily_stack")]
+    bull = sum(1 for s in stacks if s == "bullish")
+    bear = sum(1 for s in stacks if s == "bearish")
+    score += max(bull, bear) * 1.5
+    bias = "long" if bull >= bear else "short"
+
+    # 2) Momentum tail (RSI/MACD) supporting the dominant bias; exhaustion penalty.
+    rsi_t = tails.get("rsi14") or []
+    macd_t = tails.get("macd_hist") or []
+    r = _num(rsi_t[-1]) if rsi_t else None
+    m = _num(macd_t[-1]) if macd_t else None
+    if r is not None and m is not None:
+        if bias == "long" and m > 0 and 45 <= r <= 70:
+            score += 1.5
+        elif bias == "short" and m < 0 and 30 <= r <= 55:
+            score += 1.5
+        if r >= 78 or r <= 22:  # over-extended momentum = poor fresh entry
+            score -= 1.0
+
+    # 3) Location / stretch: near value is fresh, far is a no-chase risk.
+    stretch = _num(read.get("price_vs_ema20_pct"))
+    if stretch is not None:
+        if abs(stretch) <= 2.0:
+            score += 1.0
+        elif abs(stretch) >= 6.0:
+            score -= 1.5
+    # ATR% present & tradeable range (not dead-flat).
+    atr = _num(read.get("atr14"))
+    price = _num(ctx.get("last_price"))
+    if atr is not None and price and price > 0 and (atr / price * 100.0) >= 0.3:
+        score += 0.5
+
+    # 4) Rough RRR to nearest opposing structure.
+    rrr = _rough_rrr(bias, price, struct, atr)
+    if rrr is not None:
+        if rrr >= 1.5:
+            score += 1.5
+        elif rrr < 1.0:
+            score -= 1.0
+
+    # 5) Funding / OI confluence (tiebreakers).
+    fe = ctx.get("funding_extreme")
+    if fe == "neutral":
+        score += 0.25
+    elif (bias == "long" and fe == "crowded_short") or (
+        bias == "short" and fe == "crowded_long"
+    ):
+        score += 0.75  # crowded AGAINST us = squeeze fuel our way
+    elif (bias == "long" and fe == "crowded_long") or (
+        bias == "short" and fe == "crowded_short"
+    ):
+        score -= 0.5  # crowded WITH us = squeeze risk against us
+    oi = ctx.get("oi_read")
+    if isinstance(oi, str):
+        if (bias == "long" and oi.startswith("price_up_oi_up")) or (
+            bias == "short" and oi.startswith("price_down_oi_up")
+        ):
+            score += 0.75
+
+    return score
+
+
+def prefilter_contexts(
+    contexts: list[dict[str, Any]], settings: Settings
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rank contexts by _prefilter_score and keep the top-K (prefilter mode).
+
+    Returns (kept, dropped). classic mode is a pass-through (no reduction).
+    Deterministic: ties break on original position, so identical input always
+    yields identical output/order."""
+    if (settings.scanner_mode or "classic") == "classic":
+        return list(contexts), []
+    k = max(1, settings.scanner_prefilter_top_k)
+    scored = [(_prefilter_score(c), i, c) for i, c in enumerate(contexts)]
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    kept = [c for _, _, c in scored[:k]]
+    dropped = [c for _, _, c in scored[k:]]
+    return kept, dropped
+
+
+def _merge_scan_results(results: list[ScanResult]) -> list[ScanResult]:
+    """Merge chunked results: dedupe by symbol (highest score wins), sort desc,
+    cap at 6 — mirrors parse_scan_results' final shaping. Task 22's grounded
+    rubric makes the per-chunk scores absolute, so cross-chunk merge is valid."""
+    best: dict[str, ScanResult] = {}
+    for r in results:
+        key = r.symbol.upper()
+        if key not in best or r.score > best[key].score:
+            best[key] = r
+    out = sorted(best.values(), key=lambda r: r.score, reverse=True)
+    return out[:6]
+
+
 async def _anthropic_text(
     system: str,
     user: str,
@@ -500,65 +714,44 @@ async def _openai_compat_text(
     return content
 
 
-async def scan_with_llm(
-    contexts: list[dict[str, Any]], settings: Settings
-) -> tuple[list[ScanResult], str]:
-    """One batched screener call. Returns (results, model_used)."""
-    if not contexts:
-        return [], "none"
-    user = _scan_user_prompt(contexts)
+async def _call_scanner_llm(
+    system: str, user: str, settings: Settings
+) -> tuple[str, str]:
+    """Route one screener call to the configured provider. Returns (text, model).
 
-    # Cheap model first (token split), fall back to whatever is configured
+    Cheap model first (token split), fall back to whatever is configured."""
     if settings.claude_ready:
         model = settings.scanner_model
-        text = await _anthropic_text(
-            SCANNER_SYSTEM_PROMPT, user, model, settings, provider_label="Claude"
-        )
+        text = await _anthropic_text(system, user, model, settings, provider_label="Claude")
     elif settings.xai_ready:
         model = settings.xai_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT,
-            user,
-            model,
-            settings.xai_base_url,
-            settings.xai_api_key,
+            system, user, model, settings.xai_base_url, settings.xai_api_key,
             provider_label="xAI",
         )
     elif settings.openai_ready:
         model = settings.openai_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT,
-            user,
-            model,
-            settings.openai_base_url,
-            settings.openai_api_key,
+            system, user, model, settings.openai_base_url, settings.openai_api_key,
             provider_label="Codex",
         )
     elif settings.ollama_ready:
         model = settings.ollama_model
         text = await _openai_compat_text(
-            SCANNER_SYSTEM_PROMPT,
-            user,
-            model,
-            settings.ollama_base_url,
-            "",
-            timeout=300.0,
-            provider_label="Ollama",
+            system, user, model, settings.ollama_base_url, "",
+            timeout=300.0, provider_label="Ollama",
         )
     else:
         raise LlmError("No LLM configured for the scanner")
+    return text, model
 
-    # Server-side allowlist: only symbols we actually sent to the LLM may
-    # come back (F-22) — a hallucinated-but-valid-looking symbol is dropped.
-    allowed_symbols = {
-        str(c.get("symbol") or "").upper() for c in contexts if c.get("symbol")
-    }
+
+def _parse_scan_or_raise(
+    text: str, allowed: set[str], model: str
+) -> list[ScanResult]:
     try:
-        return (
-            parse_scan_results(
-                text, allowed_symbols=allowed_symbols, min_score=SCANNER_MIN_SCORE
-            ),
-            model,
+        return parse_scan_results(
+            text, allowed_symbols=allowed, min_score=SCANNER_MIN_SCORE
         )
     except json.JSONDecodeError as e:
         preview = (text or "")[:200].replace("\n", " ")
@@ -567,3 +760,41 @@ async def scan_with_llm(
             f"{preview!r}",
             raw=text,
         ) from e
+
+
+async def scan_with_llm(
+    contexts: list[dict[str, Any]], settings: Settings
+) -> tuple[list[ScanResult], str]:
+    """Screener call(s). Returns (results, model_used).
+
+    Classic mode is ALWAYS a single batched call (byte-for-byte the old path).
+    In prefilter mode, if more than `scanner_llm_chunk_max` candidates remain
+    (a safety net — the prefilter normally sends ~top-K ≤ 8) the set is split
+    into two balanced chunks, each screened separately, and the results merged
+    (S2-02). Task 22's grounded rubric makes per-chunk scores absolute, so a
+    cross-chunk merge stays calibrated."""
+    if not contexts:
+        return [], "none"
+
+    def _allowed(cs: list[dict[str, Any]]) -> set[str]:
+        # Server-side allowlist: only symbols we actually sent may come back
+        # (F-22) — a hallucinated-but-valid-looking symbol is dropped.
+        return {str(c.get("symbol") or "").upper() for c in cs if c.get("symbol")}
+
+    mode = settings.scanner_mode or "classic"
+    if mode == "prefilter" and len(contexts) > settings.scanner_llm_chunk_max:
+        mid = (len(contexts) + 1) // 2
+        chunks = [contexts[:mid], contexts[mid:]]
+        merged: list[ScanResult] = []
+        model_used = "none"
+        for chunk in chunks:
+            text, model_used = await _call_scanner_llm(
+                SCANNER_SYSTEM_PROMPT, _scan_user_prompt(chunk), settings
+            )
+            merged.extend(_parse_scan_or_raise(text, _allowed(chunk), model_used))
+        return _merge_scan_results(merged), model_used
+
+    text, model = await _call_scanner_llm(
+        SCANNER_SYSTEM_PROMPT, _scan_user_prompt(contexts), settings
+    )
+    return _parse_scan_or_raise(text, _allowed(contexts), model), model

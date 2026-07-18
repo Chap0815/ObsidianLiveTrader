@@ -403,12 +403,30 @@ class HyperliquidClient:
                 if not name or u.get("isDelisted"):
                     continue
                 ctx = ctxs[i] if i < len(ctxs) else {}
+                mark = float(ctx.get("markPx") or 0)
+                # 24h price-change % from prevDayPx (Task 24 universe momentum
+                # ranking). prevDayPx is the only price-change horizon HL exposes
+                # in the batch ctx — 1h/4h would need per-coin history we don't
+                # fetch here, so the universe uses the 24h move as the runner
+                # proxy. None when prevDayPx is missing/zero (graceful).
+                prev = _opt_f(ctx.get("prevDayPx"))
+                pchg = (
+                    (mark - prev) / prev * 100.0
+                    if prev and mark and prev > 0
+                    else None
+                )
                 rows.append(
                     {
                         "symbol": name,
                         "volume24": float(ctx.get("dayNtlVlm") or 0),
                         "funding": float(ctx.get("funding") or 0),
-                        "last": float(ctx.get("markPx") or 0),
+                        "last": mark,
+                        # Task 24: momentum + positioning fields for the universe.
+                        # open_interest is a LEVEL (OI-Δ needs history -> not here);
+                        # it alone does not trigger the scanner oi_read (which
+                        # also requires oi_change_pct_1h), so classic stays intact.
+                        "price_change_pct": pchg,
+                        "open_interest": _opt_f(ctx.get("openInterest")),
                     }
                 )
             rows.sort(key=lambda r: r["volume24"], reverse=True)

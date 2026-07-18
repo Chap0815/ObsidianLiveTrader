@@ -306,12 +306,19 @@ class MexcClient:
             sym = str(r.get("symbol") or "")
             if not sym.endswith("_USDT"):
                 continue
+            # Task 24 universe fields. riseFallRate is MEXC's 24h price-change
+            # FRACTION (e.g. 0.05 = +5%) -> ×100 for a percent; holdVol is the
+            # OI LEVEL in contracts (MEXC exposes no OI-Δ, so this alone never
+            # triggers the scanner oi_read and classic stays byte-for-byte).
+            rfr = _opt_float(r.get("riseFallRate"))
             rows.append(
                 {
                     "symbol": sym,
                     "volume24": _f(r.get("amount24")),
                     "funding": _f(r.get("fundingRate")),
                     "last": _f(r.get("lastPrice")),
+                    "price_change_pct": (rfr * 100.0) if rfr is not None else None,
+                    "open_interest": _opt_float(r.get("holdVol")),
                 }
             )
         rows.sort(key=lambda x: x["volume24"], reverse=True)

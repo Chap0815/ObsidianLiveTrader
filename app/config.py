@@ -143,6 +143,25 @@ class Settings(BaseSettings):
     # die Detail-Analyse pro Coin läuft weiter über LLM_PROVIDER (z.B. Opus).
     scanner_model: str = "claude-sonnet-5"
     scanner_max_coins: int = 20
+    # Task 24 (S2-01/S2-08/S2-02) — Scanner-Redesign, reversibel per SCANNER_MODE.
+    #   classic   = altes Verhalten: Top-N-nach-Turnover in EINEM LLM-Call.
+    #   prefilter = Multi-Ranking-Universum (Momentum/Flow + Turnover-Floor),
+    #               deterministischer Rules-Prefilter -> nur Top-K ans LLM,
+    #               Chunk-Split+Merge bei >chunk_max Kandidaten.
+    # Default prefilter; classic bleibt als Fallback byte-genau erhalten.
+    scanner_mode: str = "prefilter"
+    # Kandidaten aus market_overview im prefilter-Mode (Universum vor Klines).
+    scanner_universe_size: int = 50
+    # Top-N je Ranking-Dimension (|price-change|, |OI-Δ|, Volatilität) für die Union.
+    scanner_rank_top_n: int = 20
+    # 24h-Turnover-Liquiditätsfloor (USD): unter diesem Wert fliegt ein Coin
+    # aus dem Universum, egal wie stark er sich bewegt (Wash-/Illiquid-Schutz).
+    scanner_turnover_floor_usd: float = 5_000_000.0
+    # Deterministischer Prefilter reicht nur so viele Coins ans (teure) LLM weiter.
+    scanner_prefilter_top_k: int = 8
+    # >so viele LLM-Kandidaten -> in 2 Chunks splitten und mergen (S2-02). Nur im
+    # prefilter-Mode aktiv; classic bleibt IMMER ein einziger Call (byte-genau).
+    scanner_llm_chunk_max: int = 12
     # Konservativ | Ausgewogen(balanced) | Frei(free). Presets fill only fields
     # NOT explicitly set in .env — see RISK_PROFILES above. These field defaults
     # MIRROR the default "balanced" preset so a config read never lies about the
@@ -251,6 +270,46 @@ class Settings(BaseSettings):
         if x == "mexc":
             return "mexc"
         raise ValueError("EXCHANGE must be 'mexc' or 'hyperliquid'")
+
+    @field_validator("scanner_mode")
+    @classmethod
+    def scanner_mode_ok(cls, v: str) -> str:
+        """Normalize to classic|prefilter. Unknown values fail closed to the
+        safe fallback 'classic' so a typo never silently enables the new path."""
+        x = (v or "prefilter").strip().lower()
+        if x in ("classic", "prefilter"):
+            return x
+        return "classic"
+
+    @field_validator(
+        "scanner_universe_size", "scanner_rank_top_n", "scanner_prefilter_top_k"
+    )
+    @classmethod
+    def scanner_positive_int_ok(cls, v: int, info) -> int:
+        if not (1 <= int(v) <= 500):
+            raise ValueError(
+                f"{info.field_name.upper()} must be an integer in [1, 500] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("scanner_llm_chunk_max")
+    @classmethod
+    def scanner_llm_chunk_max_ok(cls, v: int) -> int:
+        if not (2 <= int(v) <= 100):
+            raise ValueError(
+                f"SCANNER_LLM_CHUNK_MAX must be an integer in [2, 100] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("scanner_turnover_floor_usd")
+    @classmethod
+    def scanner_turnover_floor_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(
+                "SCANNER_TURNOVER_FLOOR_USD must be a finite number >= 0 "
+                f"(0 = off) (got {v!r})"
+            )
+        return v
 
     @field_validator("mexc_base_url")
     @classmethod

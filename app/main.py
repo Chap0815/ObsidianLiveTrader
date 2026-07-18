@@ -2282,7 +2282,12 @@ async def market_scan(
 
     Deep per-coin analysis stays on /api/analyze with LLM_PROVIDER.
     """
-    from app.llm.scanner import build_scan_contexts, scan_with_llm
+    from app.llm.scanner import (
+        build_scan_contexts,
+        prefilter_contexts,
+        scan_with_llm,
+        select_scan_universe,
+    )
 
     s = get_settings()
     client = _exchange_client(request)
@@ -2292,19 +2297,31 @@ async def market_scan(
     tf = str(body.get("tf") or "15m")
     htf = str(body.get("htf") or "1H")
 
+    # Task 24: prefilter mode pulls a bigger overview (the momentum/flow universe
+    # is ranked+floored from it); classic keeps the exact old top-N-by-turnover.
+    mode = s.scanner_mode or "classic"
+    fetch_n = (
+        s.scanner_max_coins
+        if mode == "classic"
+        else max(s.scanner_universe_size, s.scanner_max_coins)
+    )
     try:
-        overview = await client.market_overview(s.scanner_max_coins)
+        overview = await client.market_overview(fetch_n)
     except ExchangeError as e:
         raise HTTPException(status_code=502, detail=f"market overview failed: {e}") from e
     if not overview:
         raise HTTPException(status_code=502, detail="no market overview data")
 
-    contexts, fetch_errors = await build_scan_contexts(client, overview, tf, htf)
+    universe = select_scan_universe(overview, s)
+    contexts, fetch_errors = await build_scan_contexts(client, universe, tf, htf)
     if not contexts:
         raise HTTPException(
             status_code=502,
             detail={"message": "no coin data for scan", "errors": fetch_errors},
         )
+    # Deterministic rules-prefilter: send only the top-K to the (expensive) LLM.
+    if mode == "prefilter":
+        contexts, _prefiltered_out = prefilter_contexts(contexts, s)
 
     try:
         results, model_used = await scan_with_llm(contexts, s)
@@ -2315,6 +2332,8 @@ async def market_scan(
         "results": [r.model_dump() for r in results],
         "scanned": [c["symbol"] for c in contexts],
         "model_used": model_used,
+        "scanner_mode": mode,
+        "universe_size": len(universe),
         "tf": tf,
         "htf": htf,
         "errors": fetch_errors,
