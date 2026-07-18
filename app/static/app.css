@@ -58,8 +58,13 @@
 
   /* D3-03: LIVE is its OWN signal — never borrowed from --short (loss) and
      kept visually distinct from --warn (mere caution/STAY_OUT/manual-SL).
-     Used identically in the topbar arm-status chip AND the instrument rail. */
-  --live: #e0a23d;
+     Used identically in the topbar arm-status chip AND the instrument rail.
+     Distinct HUE (hot orange) from --warn's yellow-amber, so the LIVE↔WARN
+     difference survives a static screenshot AND prefers-reduced-motion (which
+     strips the pulse animation — the previous near-identical ambers left those
+     users with zero LIVE/WARN distinction). Still clear of --short (#e35349)
+     and --chart-liq (#c0392b). */
+  --live: #f5842a;
   --warn: #e5a93c;
 
   --radius: 4px;
