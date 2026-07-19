@@ -1,16 +1,14 @@
-<!DOCTYPE html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ersteinrichtung — Obsidian Live Trader</title>
-  <link rel="icon" href="/static/obsidian.ico" sizes="any" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r22') }}" />
-</head>
-<body>
+{% extends "base.html" %}
+{% block title %}Ersteinrichtung — Obsidian Live Trader{% endblock %}
+
+{# S3-14: this page never touches the chart lib or the trading app bundle
+   (store/utils/trade-math/api/app.js) — it's a standalone first-run form
+   with its own small nonce'd script below. Override both to empty instead
+   of loading ~unused JS. #}
+{% block vendor_scripts %}{% endblock %}
+{% block app_scripts %}{% endblock %}
+
+{% block body %}
   <div class="setup-banner" role="note">
     <span class="arm-status" data-tip="Ersteinrichtung: Trading ist gesperrt, bis TRADING_ENABLED bewusst aktiviert wird.">
       <span class="arm-dot" aria-hidden="true"></span>
@@ -57,8 +55,8 @@
           <div id="fields-hl" class="setup-fields">
             <label>
               <span>Private Key (API/Agent-Wallet, beginnt mit 0x)</span>
-              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
-                <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" style="flex:1" />
+              <span class="key-row">
+                <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" />
                 <button type="button" class="btn-ghost key-eye" data-target="hl-private-key" aria-label="Anzeigen/verbergen">Zeigen</button>
               </span>
               <small class="field-feedback" id="hl-private-key-fb" aria-live="polite"></small>
@@ -71,9 +69,9 @@
             <p class="hint muted">Tipp: Lege in der Hyperliquid-UI unter „API" einen Agent-Key an — der kann handeln, aber nie abheben.</p>
           </div>
 
-          <div id="fields-mainnet" class="setup-note hidden" style="border-color:#c08a2a;background:rgba(192,138,42,.10)">
+          <div id="fields-mainnet" class="setup-note setup-note-danger hidden">
             <strong>Mainnet = echtes Geld.</strong> Zum Bestätigen tippe <code>MAINNET</code>:
-            <label style="margin-top:.5rem;display:block">
+            <label>
               <input type="text" id="mainnet-confirm" placeholder="MAINNET" spellcheck="false" autocomplete="off" />
             </label>
           </div>
@@ -81,15 +79,15 @@
           <div id="fields-mexc" class="setup-fields hidden">
             <label>
               <span>MEXC API Key</span>
-              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
-                <input type="password" id="mexc-api-key" spellcheck="false" style="flex:1" />
+              <span class="key-row">
+                <input type="password" id="mexc-api-key" spellcheck="false" />
                 <button type="button" class="btn-ghost key-eye" data-target="mexc-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
               </span>
             </label>
             <label>
               <span>MEXC API Secret</span>
-              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
-                <input type="password" id="mexc-api-secret" spellcheck="false" style="flex:1" />
+              <span class="key-row">
+                <input type="password" id="mexc-api-secret" spellcheck="false" />
                 <button type="button" class="btn-ghost key-eye" data-target="mexc-api-secret" aria-label="Anzeigen/verbergen">Zeigen</button>
               </span>
             </label>
@@ -114,8 +112,8 @@
           </label>
           <label id="field-llm-key">
             <span id="llm-key-label">Anthropic API Key</span>
-            <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
-              <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" style="flex:1" />
+            <span class="key-row">
+              <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" />
               <button type="button" class="btn-ghost key-eye" data-target="llm-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
             </span>
           </label>
@@ -195,7 +193,7 @@
       <!-- Erweitert -->
       <section class="panel setup-section">
         <details>
-          <summary class="panel-head" style="cursor:pointer"><h2 style="display:inline">Erweitert (optional)</h2></summary>
+          <summary class="panel-head"><span class="panel-head-title">Erweitert (optional)</span></summary>
           <div class="setup-body">
             <div class="setup-grid">
               <label>
@@ -227,7 +225,9 @@
       <p id="setup-ok" class="hint hidden">Gespeichert — Dashboard öffnet…</p>
     </form>
   </main>
+{% endblock %}
 
+{% block scripts %}
   <script nonce="{{ csp_nonce }}">
     (function () {
       "use strict";
@@ -432,5 +432,4 @@
       });
     })();
   </script>
-</body>
-</html>
+{% endblock %}

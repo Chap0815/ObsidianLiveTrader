@@ -9,8 +9,13 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r22') }}" />
+  {# S3-14: wrapped in a block so a page that doesn't need the chart lib
+     (e.g. setup.html) can override it to empty instead of paying for an
+     unused vendor bundle. Dashboard doesn't override — same tag as before. #}
+  {% block vendor_scripts %}
   <!-- Vendored locally (v4.2.0, Apache-2.0) — no CDN dependency for the chart -->
   <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+  {% endblock %}
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -19,6 +24,10 @@
   {# F-19: the local auth token is delivered as an HttpOnly session cookie
      (set by the server on this page), not injected into the DOM. Same-origin
      fetch/WebSocket send it automatically. #}
+  {# S3-14: wrapped in a block so a page that doesn't run the trading app
+     (e.g. setup.html) can override it to empty. Dashboard doesn't override —
+     same tags, same order as before. #}
+  {% block app_scripts %}
   {# A3-02 (Task 43): shared state store. Classic script loaded FIRST — BEFORE
      utils.js/trade-math.js/api.js/app.js — so its top-level `state` and
      `PERSIST` are globals every later script references by bare name. `state`
@@ -45,6 +54,7 @@
      must not reference app.js's `state` — the state object is not yet defined. #}
   <script src="/static/api.js?v={{ asset_version|default('r22') }}"></script>
   <script src="/static/app.js?v={{ asset_version|default('r22') }}"></script>
+  {% endblock %}
   {% block scripts %}{% endblock %}
 </body>
 </html>

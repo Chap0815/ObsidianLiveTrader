@@ -35,10 +35,6 @@
   --short-dim: rgba(227, 83, 73, 0.13);
   --short-line: rgba(227, 83, 73, 0.5);   /* replaces the old rgba(246,70,93,…) literals */
 
-  /* legacy aliases still referenced from JS-injected inline styles */
-  --green: #4fbe8e;
-  --red: #e35349;
-
   /* ---- Chart overlay colors (D3-01) — app.js reads these once via
      getComputedStyle (getChartColors()) instead of hardcoding hex; single
      source shared with any CSS that needs the same semantic color.
@@ -138,6 +134,12 @@ body {
   color: var(--muted);
 }
 
+/* S3-14: tiny layout utility (KI-Keys modal) — replaces an inline
+   style="margin-top:10px" duplicated on two elements. */
+.mt-10 {
+  margin-top: 10px;
+}
+
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -226,21 +228,9 @@ body {
   box-shadow: 0 0 6px rgba(224, 57, 43, 0.8);
   animation: live-pulse 1.4s ease-in-out infinite;
 }
-
-@media (prefers-reduced-motion: reduce) { .mainnet-dot { animation: none; } }
-
-/* legacy classes kept for JS-toggled badges (history/exchange chips) */
-.banner-chip,
-.disarmed-badge {
-  font-family: var(--mono);
-  font-size: var(--fs-base);
-  letter-spacing: 0.08em;
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(224, 162, 61, 0.5);
-  color: var(--warn);
-  background: rgba(227, 179, 65, 0.08);
-}
+/* S3-12: no dedicated reduced-motion override needed — the global
+   *,*::before,*::after{animation:none!important} rule (top of file) already
+   disables this. */
 
 /* ── Hover tooltips (data-tip) ──────────────────────────────
    Elegant, self-contained; no title-attribute lag. Obsidian look. */
@@ -432,7 +422,10 @@ select:focus {
 }
 
 #symbol-input {
-  width: 110px;
+  /* S3-03/04: was 110px here + a conflicting 120px re-declaration further
+     down (".symbol-picker" section) — the later rule always won in the
+     cascade, so 120px is the value the live layout actually renders. */
+  width: 120px;
   text-transform: uppercase;
   font-weight: 600;
 }
@@ -517,13 +510,6 @@ select:focus {
   background: color-mix(in srgb, var(--short) 10%, transparent);
 }
 
-/* kept for JS/legacy markup */
-.btn-danger {
-  background: color-mix(in srgb, var(--short) 10%, transparent);
-  border-color: var(--short);
-  color: #ffb9c2;
-}
-
 /* ── Health + equity ────────────────────────────────────── */
 .health {
   display: flex;
@@ -585,6 +571,97 @@ select:focus {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--text);
+}
+
+/* ── Instrument rail (signature) ─────────────────────────────
+   Always-visible cockpit cluster: armed · exchange · equity · the
+   active position's live P&L / protection / liq. Monochrome ground,
+   colour strictly semantic. S3-12: relocated here from the file's tail
+   (it's topbar-adjacent chrome, not a Responsive-section rule); its
+   breakpoint was folded into the shared 1100px one (see Responsive). */
+.irail {
+  display: flex;
+  align-items: stretch;
+  margin: 0 0 var(--space-3);
+  background: linear-gradient(180deg, #140f1f, #0e0a16);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02), 0 8px 24px -18px #000;
+}
+.ir-cell {
+  padding: var(--space-2h) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  justify-content: center;
+  border-right: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+.ir-cell:last-child { border-right: 0; }
+.ir-lbl {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.ir-v { font-size: var(--fs-base); font-weight: 600; letter-spacing: 0.01em; }
+.ir-num { font-variant-numeric: tabular-nums; }
+.ir-arm { display: flex; align-items: center; gap: var(--space-2); }
+.ir-arm .ir-arm-txt { font-size: var(--fs-base); letter-spacing: 0.12em; color: var(--muted); }
+.ir-arm.on .ir-arm-txt { color: var(--live); }
+.ir-led {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--faint);
+}
+.ir-arm.on .ir-led {
+  background: var(--live);
+  box-shadow: 0 0 0 3px rgba(224, 162, 61, 0.16), 0 0 10px var(--live);
+  animation: ir-pulse 2.4s ease-in-out infinite;
+}
+@keyframes ir-pulse { 50% { opacity: 0.5; } }
+
+/* the position instrument occupies the right side */
+.ir-position {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+}
+.ir-position.ir-flat {
+  align-items: center;
+  padding: 0 20px;
+  color: var(--faint);
+  font-size: var(--fs-sm);
+}
+.ir-posline { display: flex; align-items: center; gap: var(--space-2h); font-size: var(--fs-base); font-weight: 500; }
+.ir-side {
+  font-size: var(--fs-2xs); letter-spacing: 0.12em; font-weight: 700;
+  padding: 3px var(--space-2); border-radius: var(--radius-sm);
+}
+.ir-side.long { background: var(--long-dim); color: var(--long); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--long) 30%, transparent); }
+.ir-side.short { background: var(--short-dim); color: var(--short); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--short) 30%, transparent); }
+.ir-pnlcell { min-width: 190px; }
+.ir-bigpnl {
+  font-size: var(--fs-2xl); font-weight: 600; letter-spacing: -0.01em; line-height: 1;
+  font-variant-numeric: tabular-nums; color: var(--text);
+  display: flex; align-items: baseline; gap: var(--space-2h);
+}
+.ir-bigpnl.pnl-pos { color: var(--long); }
+.ir-bigpnl.pnl-neg { color: var(--short); }
+.ir-bigpnl small { font-size: var(--fs-xs); font-weight: 500; color: var(--faint); letter-spacing: 0; }
+.ir-shield { display: inline-flex; align-items: center; gap: var(--space-1h); font-size: var(--fs-base); color: var(--muted); }
+.ir-shield.ok { color: var(--long); }
+.ir-shield.warn { color: var(--warn); }
+.ir-shield.danger { color: var(--short); font-weight: 600; }
+.ir-gauge {
+  display: block; width: 92px; height: 6px; margin-top: 4px;
+  background: var(--bg-inset); border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm); overflow: hidden;
+}
+.ir-gauge i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--long), var(--warn));
+  border-radius: var(--radius-sm);
 }
 
 /* ── Layout grid ────────────────────────────────────────── */
@@ -689,7 +766,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   gap: var(--space-1h);
   padding-left: 8px;
 }
-.data-act.hidden { display: none; }
+/* S3-08/09: no ".data-act.hidden{display:none}" here — the global
+   .hidden{display:none!important} rule already covers it. */
 
 .data-panes {
   min-height: 0;
@@ -702,8 +780,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   overflow-y: auto;
   max-height: 66vh;
 }
-.data-pane.hidden { display: none; }
-
 /* Inner bodies let the pane own the scroll — no nested scrollbars. */
 .data-panel .positions-body,
 .data-panel .orders-body,
@@ -737,6 +813,29 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .trade-pnl { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .trade-time { color: var(--faint); font-size: var(--fs-xs); text-align: right; white-space: nowrap; }
 .trades-empty { padding: var(--space-4) var(--space-3); color: var(--muted); font-family: var(--sans); font-size: var(--fs-sm); }
+
+/* Task 40 / S3-05: Round-Trips vs Einzel-Fills sub-tab toggle (was inline
+   style= per render — same look, now a real class pair). */
+.rt-subtabs {
+  display: flex;
+  border-bottom: 1px solid var(--hairline);
+  margin-bottom: 8px;
+}
+.rt-subtab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin: 0 10px 0 0;
+  padding: 4px 2px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--muted);
+}
+.rt-subtab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
 
 /* ── Accounts / equity panel (side-rail, below the ticket) ── */
 .accounts-panel .accounts-body { padding: 2px 0; }
@@ -799,8 +898,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   background: var(--short);
   border-bottom: 1px solid var(--hairline);
 }
-.stale-banner.hidden { display: none; }
-
 /* Last price greyed out while the feed is stale — it's no longer trustworthy. */
 .stat-price .stat-value.price-stale {
   color: var(--muted);
@@ -826,7 +923,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border-bottom: 1px solid var(--hairline);
 }
 
-.panel-head h2 {
+.panel-head h2,
+.panel-head-title {
   margin: 0;
   font-family: var(--mono);
   font-size: var(--fs-base);
@@ -836,7 +934,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   color: var(--faint);
 }
 
-.panel-head h2::before {
+.panel-head h2::before,
+.panel-head-title::before {
   content: "// ";
   color: var(--accent);
   opacity: 0.7;
@@ -1105,79 +1204,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border-color: var(--accent);
 }
 
-.proposal-body.scan-mode {
-  display: block;
-}
-
-.scan-results {
-  display: flex;
-  flex-direction: column;
-}
-
-.scan-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1h) var(--space-4);
-  padding: var(--space-2h) var(--space-1h);
-  border-bottom: 1px solid var(--hairline);
-}
-
-.scan-row:last-child {
-  border-bottom: none;
-}
-
-.scan-rank {
-  font-family: var(--mono);
-  font-size: var(--fs-base);
-  font-weight: 600;
-  color: var(--faint);
-  width: 16px;
-  text-align: right;
-}
-
-.scan-score {
-  font-family: var(--mono);
-  font-size: var(--fs-lg);
-  font-weight: 600;
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-}
-
-.scan-score::after {
-  content: "/10";
-  font-size: var(--fs-xs);
-  font-weight: 400;
-  color: var(--faint);
-}
-
-.scan-setup {
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 2px var(--space-2);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-sm);
-}
-
-.scan-reason {
-  font-size: var(--fs-md);
-  color: var(--text);
-  flex: 1 1 240px;
-  min-width: 180px;
-}
-
-.btn-scan-open {
-  margin-left: auto;
-  font-size: var(--fs-base);
-  padding: var(--space-1) var(--space-3);
-}
-
-.rt-badge,
-#rt-badge {
+.rt-badge {
   font-family: var(--mono);
   font-size: var(--fs-xs);
   font-weight: 600;
@@ -1189,8 +1216,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   opacity: 0.6;
 }
 
-.rt-badge.ok-live,
-#rt-badge.ok-live {
+.rt-badge.ok-live {
   opacity: 1;
   color: var(--long);
   border-color: var(--long-line);
@@ -1241,10 +1267,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   top: 0;
   background: #1c1830;
   border: 1px solid #3a3560;
-  border-radius: 4px;
+  border-radius: var(--radius);
   padding: 6px 8px;
-  font-family: "IBM Plex Mono", Consolas, monospace;
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: #d8d5e6;
   white-space: nowrap;
@@ -1333,22 +1359,21 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 /* ── Positions & open orders ────────────────────────────── */
 /* ── Position cockpit (active-symbol trade) ─────────────── */
+/* Multiple account-wide cards stack in the same panel; separate them (without
+   losing each card's own long/short top-border accent) and highlight the one
+   matching the currently active chart symbol. */
 .pos-cockpit {
   padding: var(--space-2) var(--space-2h);
   border-top: 2px solid var(--long);
+  border-bottom: 1px solid var(--hairline);
   cursor: pointer;
   transition: background 0.12s ease;
 }
+.pos-cockpit:last-child { border-bottom: none; }
 
 .pos-cockpit.cp-short { border-top-color: var(--short); }
 
 .pos-cockpit:hover { background: var(--bg-elevated); }
-
-/* Multiple account-wide cards stack in the same panel; separate them (without
-   losing each card's own long/short top-border accent) and highlight the one
-   matching the currently active chart symbol. */
-.pos-cockpit { border-bottom: 1px solid var(--hairline); }
-.pos-cockpit:last-child { border-bottom: none; }
 
 .pos-cockpit.cp-active {
   background: var(--accent-dim);
@@ -1375,6 +1400,15 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   font-family: var(--mono);
   font-size: var(--fs-xs);
   color: var(--muted);
+}
+
+/* T39: "·30s" freshness suffix on non-active position cards (Konto-Poll
+   snapshot, not live-streamed) — subtle, never competes with .cp-sym/.cp-lev. */
+.cp-fresh {
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--faint);
+  opacity: 0.85;
 }
 
 .cp-pnl {
@@ -1494,6 +1528,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
    secondary control (accent on hover, not a one-tap primary). */
 .cp-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1h);
   margin-top: 4px;
@@ -1530,12 +1565,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 
 /* N3-09: inline SL editor — the ✎ SL pencil and the (initially hidden)
-   price field / Setzen / ✕ row. cp-actions wraps so the editor drops onto
-   its own line and spans the card width when opened. */
-.cp-actions {
-  flex-wrap: wrap;
-}
-
+   price field / Setzen / ✕ row. cp-actions wraps (see above) so the editor
+   drops onto its own line and spans the card width when opened. */
 .cp-sl-edit-btn {
   min-height: 32px;
   border: 1px solid var(--border);
@@ -1561,10 +1592,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   align-items: center;
   gap: var(--space-1h);
   margin-top: 4px;
-}
-
-.cp-sl-edit.hidden {
-  display: none;
 }
 
 .cp-sl-input {
@@ -1606,8 +1633,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 
 .cp-sl-cancel-btn:hover {
-  border-color: var(--red);
-  color: var(--red);
+  border-color: var(--short);
+  color: var(--short);
 }
 
 .positions-body,
@@ -1639,7 +1666,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   padding: var(--space-3);
 }
 
-.pos-row,
 .order-row {
   display: flex;
   flex-wrap: wrap;
@@ -1649,7 +1675,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border-bottom: 1px solid var(--hairline);
 }
 
-.pos-row:last-child,
 .order-row:last-child {
   border-bottom: none;
 }
@@ -1759,15 +1784,12 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   background: var(--short) !important;
   animation: cp-sl-pulse 0.6s ease-in-out infinite;
 }
-@media (prefers-reduced-motion: reduce) {
-  .cp-sl-alarm { animation: none; }
-}
+/* S3-12: no per-selector reduced-motion overrides here — the global
+   *,*::before,*::after{animation:none!important} rule already disables
+   both .cp-sl-alarm's and .cp-sl-missing's pulse. */
 @keyframes cp-sl-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.72; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-sl-missing { animation: none; }
 }
 
 /* N3-02: TP-status suffix on the SL banner — informational, never alarming
@@ -1898,7 +1920,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 /* ── Custom Coin-Suche (ersetzt native Datalist) ─────────── */
 .symbol-picker { position: relative; }
-#symbol-input { width: 120px; }
 .symbol-dropdown {
   position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
   min-width: 200px; max-height: 296px; overflow-y: auto;
@@ -1952,7 +1973,6 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 /* Overview tab (E5): mini-chart tile grid, static canvas snapshots */
 .overview { padding: var(--space-2h) var(--space-3) var(--space-4); }
-.overview.hidden { display: none; }
 .overview-head {
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--space-3); margin-bottom: 10px;
@@ -2086,17 +2106,17 @@ a.news-lead:hover .news-lead-title { color: var(--accent); }
   border: 1px solid var(--border); border-radius: var(--radius);
   overflow: hidden;
 }
+/* S3-03/04: was two ".news-row{}" rules (a padding bump had been added as a
+   second block instead of editing the first) — merged; the later value
+   (space-3 space-3) is what the live layout already rendered. */
 .news-row {
   display: flex; align-items: baseline; justify-content: space-between;
-  gap: var(--space-3); padding: var(--space-2h) var(--space-3); text-decoration: none;
+  gap: var(--space-3); padding: var(--space-3) var(--space-3); text-decoration: none;
   border-bottom: 1px solid var(--hairline);
   transition: background 0.12s ease;
 }
 .news-row:last-child { border-bottom: none; }
 a.news-row:hover { background: var(--bg-inset); }
-.news-row {
-  padding: var(--space-3) var(--space-3);
-}
 .news-row-title {
   font-family: var(--sans); font-size: var(--fs-md); color: var(--text);
   line-height: 1.4; flex: 1 1 auto;
@@ -2148,15 +2168,6 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .news-time { color: var(--faint); }
 .news-empty { color: var(--muted); font-size: var(--fs-base); padding: var(--space-4) var(--space-1); }
 
-/* Setup-confidence badge in the KI-analysis panel */
-.setup-conf {
-  display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0 var(--space-1);
-}
-.setup-conf-label {
-  font-size: var(--fs-base); letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--muted);
-}
-
 .pos-kv {
   display: inline-flex;
   align-items: baseline;
@@ -2184,8 +2195,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-size: var(--fs-base);
 }
 
-.order-row .btn-cancel-order,
-.pos-row .btn-cancel-order {
+.order-row .btn-cancel-order {
   margin-left: auto;
   min-height: 32px;
   font-size: var(--fs-sm);
@@ -2198,8 +2208,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-family: var(--sans);
 }
 
-.order-row .btn-cancel-order:hover,
-.pos-row .btn-cancel-order:hover {
+.order-row .btn-cancel-order:hover {
   border-color: var(--short);
   color: var(--short);
 }
@@ -2652,52 +2661,6 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   background: rgba(227, 179, 65, 0.08);
 }
 
-.proposal-rationale {
-  margin: var(--space-2h) 0 0;
-  font-size: var(--fs-md);
-  line-height: 1.55;
-  white-space: pre-wrap;
-  color: var(--text);
-}
-
-.proposal-meta {
-  margin: var(--space-2h) 0 0;
-  font-size: var(--fs-base);
-  color: var(--faint);
-}
-
-/* ── Key-value grids (proposal + modal) ─────────────────── */
-.kv {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: var(--space-1h) var(--space-3);
-  margin: 0;
-  padding: 0;
-}
-
-.kv dt {
-  font-family: var(--mono);
-  color: var(--faint);
-  font-size: var(--fs-base);
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  align-self: baseline;
-  padding-top: 2px;
-}
-
-.kv dd {
-  margin: 0;
-  font-family: var(--mono);
-  font-size: var(--fs-md);
-  font-variant-numeric: tabular-nums;
-  word-break: break-word;
-}
-
-.proposal-kv {
-  padding: 0 0 var(--space-1) 0;
-}
-
 /* ── Order ticket ───────────────────────────────────────── */
 .ticket-panel {
   border-top: 2px solid var(--long);
@@ -3047,25 +3010,6 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   pointer-events: none;
 }
 
-/* Live risk readout */
-.ticket-readout {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-2h);
-  background: var(--bg-inset);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
-}
-
-#ticket-notional-hint {
-  font-family: var(--mono);
-  font-size: var(--fs-base);
-  font-variant-numeric: tabular-nums;
-  color: var(--muted);
-}
-
 /* Submit takes the selected side's color — direction is unmistakable */
 .btn-submit {
   border: 1px solid var(--long);
@@ -3330,7 +3274,25 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   cursor: help;
 }
 
-/* ── Confirm modal ──────────────────────────────────────── */
+/* Task 40 / N3-17 / S3-05: the active Entries-table filter chip above the
+   journal table (was inline style= on both the wrapper and the ✕ button). */
+.journal-filter-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 8px;
+}
+.journal-filter-clear {
+  cursor: pointer;
+  border: 1px solid currentColor;
+  background: none;
+  border-radius: 10px;
+  padding: 0 8px;
+  font: inherit;
+  color: inherit;
+}
+
+/* ── Modal chrome (confirm + KI-Keys) ───────────────────── */
 .modal {
   position: fixed;
   inset: 0;
@@ -3341,9 +3303,8 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   padding: var(--space-4);
 }
 
-.modal.hidden {
-  display: none !important;
-}
+/* no ".modal.hidden{display:none}" here — the global .hidden!important rule
+   already covers it. */
 
 .modal-backdrop {
   position: absolute;
@@ -3402,20 +3363,13 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   padding: var(--space-4);
 }
 
-.modal-body .kv {
-  padding: 0;
-}
-
-.modal-body .warn-list,
-.modal-body .err-list {
+.modal-body .warn-list {
   margin: var(--space-3) 0 0;
   padding-left: 18px;
   font-size: var(--fs-base);
   line-height: 1.55;
+  color: var(--warn);
 }
-
-.modal-body .err-list { color: var(--short); }
-.modal-body .warn-list { color: var(--warn); }
 
 .modal-body .live-warn {
   margin: var(--space-3) 0 0;
@@ -3493,9 +3447,8 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   color: #ffb9c2;
 }
 
-.toast.hidden {
-  display: none !important;
-}
+/* no ".toast.hidden{display:none}" here — the global .hidden!important rule
+   already covers it. */
 
 /* ── First-run setup wizard ─────────────────────────────── */
 /* Safety banner: reuses the topbar .arm-status chip (S3-01) instead of the
@@ -3590,6 +3543,14 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   border-color: #3a3552;
 }
 
+/* S3-13: the actual <input type="radio"> is visually hidden (below), so a
+   keyboard tab stop needs the visible focus ring on the card itself. */
+.choice-card:focus-within {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .choice-card.active {
   border-color: var(--accent);
   background: var(--accent-dim);
@@ -3622,6 +3583,32 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   gap: var(--space-2h);
 }
 
+/* S3-14: setup.html inline-style extractions (secret-input row, mainnet
+   note, mainnet label, "Erweitert" summary — its title is a span now, see
+   .panel-head-title near .panel-head h2). */
+.key-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+.key-row input {
+  flex: 1;
+}
+
+.setup-note-danger {
+  border-color: #c08a2a;
+  background: rgba(192, 138, 42, 0.1);
+}
+
+#fields-mainnet label {
+  margin-top: 0.5rem;
+  display: block;
+}
+
+summary.panel-head {
+  cursor: pointer;
+}
+
 .setup-body label {
   display: flex;
   flex-direction: column;
@@ -3648,24 +3635,28 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   gap: var(--space-2h);
 }
 
-.setup-check {
-  flex-direction: row !important;
+/* S3-07: tightened to "label.setup-check" (adds the element type) so
+   specificity ties/beats ".setup-body label" / ".setup-body label > span"
+   without !important — same cascade outcome, none of the nine !important
+   flags needed anymore. */
+label.setup-check {
+  flex-direction: row;
   align-items: flex-start;
-  gap: var(--space-2) !important;
+  gap: var(--space-2);
 }
 
-.setup-check input {
-  width: auto !important;
+label.setup-check input {
+  width: auto;
   margin-top: 2px;
 }
 
-.setup-check > span {
-  text-transform: none !important;
-  letter-spacing: normal !important;
-  font-family: var(--sans) !important;
-  font-size: var(--fs-md) !important;
-  color: var(--text) !important;
-  font-weight: 400 !important;
+label.setup-check > span {
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--sans);
+  font-size: var(--fs-md);
+  color: var(--text);
+  font-weight: 400;
 }
 
 .setup-note {
@@ -3786,6 +3777,11 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   .data-pane {
     max-height: 360px;
   }
+
+  /* S3-12: was its own @media (max-width: 1080px) block next to .irail —
+     folded into the shared 1100px breakpoint (20px earlier than before). */
+  .irail { flex-wrap: wrap; }
+  .ir-position { margin-left: 0; width: 100%; border-top: 1px solid var(--hairline); }
 }
 
 @media (max-width: 820px) {
@@ -3820,96 +3816,3 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   }
 }
 
-/* ── Instrument rail (signature) ─────────────────────────────
-   Always-visible cockpit cluster: armed · exchange · equity · the
-   active position's live P&L / protection / liq. Monochrome ground,
-   colour strictly semantic. */
-.irail {
-  display: flex;
-  align-items: stretch;
-  margin: 0 0 var(--space-3);
-  background: linear-gradient(180deg, #140f1f, #0e0a16);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02), 0 8px 24px -18px #000;
-}
-.ir-cell {
-  padding: var(--space-2h) var(--space-4);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1h);
-  justify-content: center;
-  border-right: 1px solid var(--hairline);
-  white-space: nowrap;
-}
-.ir-cell:last-child { border-right: 0; }
-.ir-lbl {
-  font-size: var(--fs-2xs);
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-.ir-v { font-size: var(--fs-base); font-weight: 600; letter-spacing: 0.01em; }
-.ir-num { font-variant-numeric: tabular-nums; }
-.ir-arm { display: flex; align-items: center; gap: var(--space-2); }
-.ir-arm .ir-arm-txt { font-size: var(--fs-base); letter-spacing: 0.12em; color: var(--muted); }
-.ir-arm.on .ir-arm-txt { color: var(--live); }
-.ir-led {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--faint);
-}
-.ir-arm.on .ir-led {
-  background: var(--live);
-  box-shadow: 0 0 0 3px rgba(224, 162, 61, 0.16), 0 0 10px var(--live);
-  animation: ir-pulse 2.4s ease-in-out infinite;
-}
-@keyframes ir-pulse { 50% { opacity: 0.5; } }
-
-/* the position instrument occupies the right side */
-.ir-position {
-  margin-left: auto;
-  display: flex;
-  align-items: stretch;
-}
-.ir-position.ir-flat {
-  align-items: center;
-  padding: 0 20px;
-  color: var(--faint);
-  font-size: var(--fs-sm);
-}
-.ir-posline { display: flex; align-items: center; gap: var(--space-2h); font-size: var(--fs-base); font-weight: 500; }
-.ir-side {
-  font-size: var(--fs-2xs); letter-spacing: 0.12em; font-weight: 700;
-  padding: 3px var(--space-2); border-radius: var(--radius-sm);
-}
-.ir-side.long { background: var(--long-dim); color: var(--long); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--long) 30%, transparent); }
-.ir-side.short { background: var(--short-dim); color: var(--short); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--short) 30%, transparent); }
-.ir-pnlcell { min-width: 190px; }
-.ir-bigpnl {
-  font-size: var(--fs-2xl); font-weight: 600; letter-spacing: -0.01em; line-height: 1;
-  font-variant-numeric: tabular-nums; color: var(--text);
-  display: flex; align-items: baseline; gap: var(--space-2h);
-}
-.ir-bigpnl.pnl-pos { color: var(--long); }
-.ir-bigpnl.pnl-neg { color: var(--short); }
-.ir-bigpnl small { font-size: var(--fs-xs); font-weight: 500; color: var(--faint); letter-spacing: 0; }
-.ir-shield { display: inline-flex; align-items: center; gap: var(--space-1h); font-size: var(--fs-base); color: var(--muted); }
-.ir-shield.ok { color: var(--long); }
-.ir-shield.warn { color: var(--warn); }
-.ir-shield.danger { color: var(--short); font-weight: 600; }
-.ir-gauge {
-  display: block; width: 92px; height: 6px; margin-top: 4px;
-  background: var(--bg-inset); border: 1px solid var(--hairline);
-  border-radius: var(--radius-sm); overflow: hidden;
-}
-.ir-gauge i {
-  display: block; height: 100%;
-  background: linear-gradient(90deg, var(--long), var(--warn));
-  border-radius: var(--radius-sm);
-}
-@media (max-width: 1080px) {
-  .irail { flex-wrap: wrap; }
-  .ir-position { margin-left: 0; width: 100%; border-top: 1px solid var(--hairline); }
-}
-@media (prefers-reduced-motion: reduce) { .ir-arm.on .ir-led { animation: none; } }

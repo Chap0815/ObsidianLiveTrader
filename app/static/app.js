@@ -1076,16 +1076,19 @@
     const allowed = c.apiAllowed;
     state.apiAllowed = allowed === true ? true : allowed === false ? false : null;
     const allowEl = $("ctx-api-allowed");
+    // S3-05/06: was inline style.color = "var(--green)"/"var(--red)" (the
+    // legacy alias custom props, since retired) — now the same .pnl-pos/
+    // .pnl-neg classes used everywhere else (var(--long)/var(--short),
+    // the identical color values), toggled off for the unknown/null case.
     if (allowed === true) {
       allowEl.textContent = "true";
-      allowEl.style.color = "var(--green)";
     } else if (allowed === false) {
       allowEl.textContent = "false — Orders gesperrt";
-      allowEl.style.color = "var(--red)";
     } else {
       allowEl.textContent = "—";
-      allowEl.style.color = "";
     }
+    allowEl.classList.toggle("pnl-pos", allowed === true);
+    allowEl.classList.toggle("pnl-neg", allowed === false);
     updateOrderButtonsEnabled();
   }
 
@@ -4699,13 +4702,14 @@
         : entries;
 
       if (activeFilter) {
+        // S3-05/06: was inline style= on both the wrapper and the ✕ button —
+        // now .journal-filter-chip / .journal-filter-clear (identical look).
         html +=
-          '<div class="muted" style="display:flex;align-items:center;gap:8px;margin:2px 0 8px;">' +
+          '<div class="muted journal-filter-chip">' +
           "<span>Filter: <b>" + escapeHtml(_journalFieldLabel(activeFilter.field)) + " = " +
           escapeHtml(activeFilter.value) + "</b> (" + fmt(filteredEntries.length, 0) +
           " von " + fmt(entries.length, 0) + ")</span>" +
-          '<button type="button" data-jf-clear="1" style="cursor:pointer;border:1px solid currentColor;' +
-          'background:none;border-radius:10px;padding:0 8px;font:inherit;color:inherit;">' +
+          '<button type="button" class="journal-filter-clear" data-jf-clear="1">' +
           "✕ Filter löschen</button>" +
           "</div>";
       }
@@ -4975,18 +4979,14 @@
     return { closed: closed, openTrade: open };
   }
 
-  /** Small unstyled sub-tab button (no dedicated CSS class exists for this —
-   *  Task 40 is app.js-only, no CSS touched — so the active/inactive look is
-   *  applied inline instead of adding a class the stylesheet doesn't know). */
+  /** Sub-tab button for the Trades/Einzel-Fills toggle (Task 40 / S3-05:
+   *  now a real CSS class pair — .rt-subtab-btn / .active — instead of an
+   *  inline style= built per render; identical look. */
   function _rtSubtabBtn(key, label, active) {
-    const style = active
-      ? "color:var(--text,inherit);border-bottom-color:var(--accent,currentColor);font-weight:600;"
-      : "color:var(--muted,inherit);border-bottom-color:transparent;";
     return (
-      '<button type="button" data-rt-subtab="' + escapeHtml(key) + '" ' +
-      'aria-pressed="' + (active ? "true" : "false") + '" ' +
-      'style="background:none;border:none;border-bottom:2px solid;margin:0 ' +
-      '10px 0 0;padding:4px 2px;cursor:pointer;font:inherit;' + style + '">' +
+      '<button type="button" class="rt-subtab-btn' + (active ? " active" : "") + '" ' +
+      'data-rt-subtab="' + escapeHtml(key) + '" ' +
+      'aria-pressed="' + (active ? "true" : "false") + '">' +
       escapeHtml(label) +
       "</button>"
     );
@@ -5153,7 +5153,7 @@
     let html = "";
     if (hl) {
       html +=
-        '<div style="display:flex;border-bottom:1px solid var(--hairline,currentColor);margin-bottom:8px;">' +
+        '<div class="rt-subtabs">' +
         _rtSubtabBtn("roundtrips", "Round-Trips", sub === "roundtrips") +
         _rtSubtabBtn("fills", "Einzel-Fills", sub === "fills") +
         "</div>";
