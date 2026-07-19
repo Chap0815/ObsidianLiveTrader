@@ -1362,6 +1362,19 @@
     updateNotionalHint();
     updateLivePnl(state.lastPx); // real-time uPnL on open positions
     try { checkManualSlAlarm(state.lastPx); } catch (e) { console.error("slAlarm", e); }
+    // T3-11: in %-mode, resolveStop()/resolveTp() track the live price via
+    // refEntryPrice()'s market-order fallback — without a redraw here the
+    // ticket's dashed SL/TP chart lines freeze at whatever price they last
+    // resolved to, instead of following the tape like the %-distance implies.
+    // Throttled to ~1/s (not every tick) since a full line redraw per tick
+    // would be wasted work on a fast feed.
+    if (sltpMode() === "pct") {
+      const now = Date.now();
+      if (!state._ticketLinesLastDraw || now - state._ticketLinesLastDraw >= 1000) {
+        state._ticketLinesLastDraw = now;
+        try { drawTicketLines(); } catch (e) { console.error("drawTicketLines", e); }
+      }
+    }
   }
 
   /** Live uPnL: recompute from the streaming price without waiting for the
@@ -1810,6 +1823,7 @@
     // a per-coin max: BTC 40×, ETH 25×, most alts 10×). Clamp the typed value
     // only when the coin actually changed, so silent polls never fight the user.
     applyLeverageCap(!silent || keyChanged);
+    updatePriceFieldSteps(); // T3-10: contract tick may have changed with the coin
     drawTicketLines();
     drawProposalLines();
     drawPositionLines();
@@ -3820,6 +3834,38 @@
     return cs && cs > 0 ? cs : 1;
   }
 
+  /** T3-10: minimum price increment for the active contract (MEXC's
+   *  priceUnit) — the same source drawTicketLines() already reads to dedupe
+   *  against active order/position lines. Falls back to a cent before the
+   *  market's loaded (never 0/NaN — an invalid step attribute is silently
+   *  ignored by the browser, which reverts to the native default of 1). */
+  function tickSize() {
+    const t = Number(
+      state.market && state.market.contract && state.market.contract.priceUnit
+    );
+    return t > 0 ? t : 0.01;
+  }
+
+  /** Arrow-key/spinner step on the price inputs must scale with the coin's
+   *  tick size — a hardcoded step="1" (or the browser's default step of 1
+   *  under step="any") means one ArrowUp on a $0.002 memecoin jumps the
+   *  price by 500x its own value. %-mode SL/TP are NOT prices, so they keep
+   *  a flat 0.1-percentage-point step regardless of tick size. Called
+   *  whenever the contract meta changes (loadMarket) and whenever the
+   *  %/Kurs toggle flips (setSltpMode). */
+  function updatePriceFieldSteps() {
+    const tick = String(tickSize());
+    const entryEl = $("ticket-entry");
+    const priceEl = $("ticket-price");
+    if (entryEl) entryEl.step = tick;
+    if (priceEl) priceEl.step = tick;
+    const slEl = $("ticket-sl");
+    const tpEl = $("ticket-tp1");
+    const step = sltpMode() === "pct" ? "0.1" : tick;
+    if (slEl) slEl.step = step;
+    if (tpEl) tpEl.step = step;
+  }
+
   /** Effective max leverage = min(exchange per-coin cap, app MAX_LEVERAGE).
    *  Updates the input's max, shows the cap next to the field, and (optionally)
    *  clamps a too-high typed value. Prevents the "blocked at preview" surprise. */
@@ -3952,6 +3998,7 @@
       if (tp) tp.placeholder = "Kurs, z.B. 64000";
     }
     updateSltpUnitSuffix();
+    updatePriceFieldSteps(); // T3-10: %-mode uses a flat step, price-mode uses the tick
     drawTicketLines();
     updateRiskReadout();
   }
@@ -4026,6 +4073,20 @@
    *  above the backend cap) before /health has resolved. */
   function maxRiskPct() {
     return Number(state.health && state.health.max_risk_pct) || 1.0;
+  }
+
+  /** T3-03: single source of truth for the RRR threshold — mirrors the
+   *  backend's risk_policy.min_rrr (app/config.py, enforced in
+   *  app/risk/gates.py) so the readout-green color, the confirm-modal ack
+   *  gate and the _humanGate() copy can never disagree with each other or
+   *  with what the server actually enforces. Previously each of those three
+   *  hardcoded its own constant (2, 1.5, "1:2" in the gate text) — a
+   *  conservative-profile min_rrr of 2.0 would then contradict the UI's
+   *  hardcoded 1.5 ack threshold. Falls back to 1.5 (the backend's Settings
+   *  default) before /api/health has resolved. */
+  function minRrr() {
+    const v = Number(state.health && state.health.min_rrr);
+    return Number.isFinite(v) && v > 0 ? v : 1.5;
   }
 
   /** Modus-abhängiger Readout unter dem Größe-Feld: zeigt Coin-Menge plus den
@@ -4246,7 +4307,7 @@
         const rrr = risk > 0 && reward > 0 ? reward / risk : null;
         rrrEl.textContent = rrr != null ? "1 : " + fmt(rrr, 2) : "—";
         rrrEl.className =
-          "risk-val" + (rrr != null && rrr >= 2 ? " rr-good" : rrr != null ? " rr-warn" : "");
+          "risk-val" + (rrr != null && rrr >= minRrr() ? " rr-good" : rrr != null ? " rr-warn" : "");
       } else {
         rrrEl.textContent = "—";
         rrrEl.className = "risk-val rr-dim";
@@ -7339,6 +7400,7 @@
           updateRiskReadout();
         });
         el.addEventListener("change", drawTicketLines);
+        wirePricePaste(el); // T3-09
       }
     });
     // Size/leverage feed the derived vol + margin + risk readouts
@@ -7489,6 +7551,83 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  /** T3-09: a native <input type=number> simply refuses a de-DE formatted
+   *  paste like "61.234,56" — a comma is not a legal character in a number
+   *  input's value, so the browser drops/mangles it on paste instead of
+   *  parsing it. We intercept the raw clipboard text ourselves and resolve
+   *  it to a plain float before it ever reaches the input.
+   *
+   *  Heuristic: when BOTH separators are present, whichever comes LAST is
+   *  the decimal separator (the other is thousands-grouping and gets
+   *  stripped) — "61.234,56" -> comma is last -> 61234.56; "61,234.56" ->
+   *  dot is last -> 61234.56. When only a comma is present, a single comma
+   *  followed by 1-2 trailing digits is read as a de-DE decimal comma
+   *  ("1234,5" -> 1234.5); anything else (multiple commas, or 3+ trailing
+   *  digits) is thousands-grouping and the commas are stripped.
+   *
+   *  A lone dot ("1.234") is deliberately NOT reinterpreted as a thousands
+   *  separator — that is genuinely ambiguous (US decimal vs. de-DE
+   *  thousands with no decimal shown) and guessing wrong would silently
+   *  10x/1000x a price. We take the standard/native reading (1.234) rather
+   *  than guess; a value that still can't parse (e.g. two lone dots,
+   *  "1.234.567" with no comma to disambiguate) reports null so the caller
+   *  can toast instead of writing garbage into the field. */
+  function parsePastedPrice(raw) {
+    let s = String(raw == null ? "" : raw).trim();
+    if (!s) return null;
+    // Strip whitespace (incl. thin/nbsp used as thousands grouping) and any
+    // currency/unit noise, keep only digits, separators and a leading sign.
+    s = s.replace(/[\s  ]/g, "");
+    s = s.replace(/[^0-9.,\-]/g, "");
+    if (!s) return null;
+
+    const hasComma = s.indexOf(",") !== -1;
+    const hasDot = s.indexOf(".") !== -1;
+
+    if (hasComma && hasDot) {
+      if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+        s = s.replace(/\./g, "").replace(",", "."); // de-DE: 61.234,56
+      } else {
+        s = s.replace(/,/g, ""); // en-US: 61,234.56
+      }
+    } else if (hasComma) {
+      const parts = s.split(",");
+      if (parts.length === 2 && parts[1].length >= 1 && parts[1].length <= 2) {
+        s = parts[0] + "." + parts[1]; // de-DE decimal comma: 1234,5
+      } else {
+        s = s.replace(/,/g, ""); // thousands grouping: 61,234 / 1,234,567
+      }
+    }
+
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  /** Wires a paste handler onto a price <input> that normalizes de-DE/en-US
+   *  separators via parsePastedPrice() instead of letting the browser mangle
+   *  (or silently empty) the field. Unreadable input toasts rather than
+   *  guessing or dropping it silently (T3-09). */
+  function wirePricePaste(el) {
+    el.addEventListener("paste", function (e) {
+      const cd = e.clipboardData || window.clipboardData;
+      const raw = cd ? cd.getData("text") : "";
+      if (!raw) return; // nothing to intercept — let the default paste run
+      const n = parsePastedPrice(raw);
+      if (n == null) {
+        e.preventDefault();
+        showToast(
+          'Eingefügter Wert "' + raw.trim() + '" ist nicht lesbar — bitte Zahl manuell eintragen.',
+          "err"
+        );
+        return;
+      }
+      e.preventDefault();
+      el.value = String(n);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
   function readTicket() {
     const symbol =
       ($("symbol-input") && $("symbol-input").value) || state.symbol || "BTC_USDT";
@@ -7613,14 +7752,19 @@
       _sumCell("Risiko", fmt(s.risk_usdt, 2) + " " + ccy(),
                s.risk_pct != null ? fmt(s.risk_pct, 2) + "% Equity" : "", "sum-sl") +
       _sumCell("Chance/Risiko", s.rrr != null ? "1 : " + fmt(s.rrr, 2) : "—",
-               s.rrr != null && s.rrr >= 2 ? "gut" : "") +
+               s.rrr != null && s.rrr >= minRrr() ? "gut" : "") +
       "</div></div>";
 
-    // 3) Warnings (non-blocking)
+    // 3) Warnings (non-blocking) — T3-05: still shown when a gate blocks (the
+    // trader should see EVERYTHING wrong at once, not just the first error),
+    // just re-labeled "außerdem…" since they're additional to the blocker
+    // above, not the only thing standing between here and confirm.
     const warnings = preview.warnings || gate.warnings || [];
-    if (warnings.length && okGates) {
+    if (warnings.length) {
       html +=
-        '<div class="warn-box"><div class="warn-title">Hinweise:</div><ul class="warn-list">' +
+        '<div class="warn-box"><div class="warn-title">' +
+        (okGates ? "Hinweise:" : "Außerdem:") +
+        '</div><ul class="warn-list">' +
         warnings.map((w) => "<li>" + escapeHtml(_humanGate(w)) + "</li>").join("") +
         "</ul></div>";
     }
@@ -7640,7 +7784,7 @@
     }
     // Weak reward:risk is real send-friction too — require an explicit ack
     // checkbox before the confirm button unlocks, same as the manual warning.
-    const weakRrr = canConfirm && s.rrr != null && s.rrr < 1.5;
+    const weakRrr = canConfirm && s.rrr != null && s.rrr < minRrr();
     if (weakRrr) {
       html +=
         '<div class="blocker-box rrr-confirm">' +
@@ -7696,6 +7840,11 @@
       }
     }
     modal.classList.remove("hidden");
+    // T3-07: focus the Abbrechen button (not the browser default of the
+    // first focusable/first confirm-ish control) so an already-fingers-on-
+    // Enter user lands on "cancel", never accidentally on "send live".
+    const cancelBtn = $("btn-confirm-cancel");
+    if (cancelBtn) cancelBtn.focus();
 
     if (state._ttlTimer) clearInterval(state._ttlTimer);
     if (canConfirm) {
@@ -7708,8 +7857,21 @@
           clearInterval(state._ttlTimer);
           if (confirmBtn) confirmBtn.disabled = true;
           if (errEl) {
+            // T3-06: expiry must not be a dead end — one click re-runs the
+            // preview instead of forcing the trader to hunt for "Abbrechen"
+            // and re-find the send button themselves.
             errEl.classList.remove("hidden");
-            errEl.textContent = "Token abgelaufen — bitte erneut Order prüfen.";
+            errEl.innerHTML =
+              "Token abgelaufen — bitte erneut prüfen. " +
+              '<button type="button" id="btn-confirm-expired-retry" class="btn btn-secondary">' +
+              "Abgelaufen — neu prüfen</button>";
+            const retryBtn = $("btn-confirm-expired-retry");
+            if (retryBtn) {
+              retryBtn.addEventListener("click", function () {
+                closeConfirmModal();
+                runPreview();
+              });
+            }
           }
           state.previewToken = null;
         }
@@ -7732,7 +7894,8 @@
     if (/risk .* exceeds MAX_RISK_PCT/i.test(m))
       return "Risiko über dem Limit (MAX_RISK_PCT). SL enger setzen oder Größe reduzieren.";
     if (/RRR .* < MIN_RRR|take_profit required/i.test(m))
-      return "Chance/Risiko zu niedrig — Take-Profit weiter setzen oder SL enger (min. 1:2).";
+      return "Chance/Risiko zu niedrig — Take-Profit weiter setzen oder SL enger (min. 1:" +
+        fmt(minRrr(), 1) + ").";
     if (/leverage .* exceeds/i.test(m))
       return "Hebel über dem Limit — Hebel reduzieren.";
     if (/available|margin/i.test(m) && /exceeds|used/i.test(m))
@@ -7770,6 +7933,12 @@
   }
 
   async function runPreview() {
+    // T3-07: the confirm modal owns the current token/ack state — if it's
+    // open, Enter in a ticket field (or a stray submit) must NOT silently
+    // kick off a second preview and replace the token/checkbox the trader
+    // is looking at right now. Close it explicitly first.
+    const openModal = $("confirm-modal");
+    if (openModal && !openModal.classList.contains("hidden")) return;
     if (state.orderBusy) return;
     // U-03: the send button is disabled via updateOrderButtonsEnabled() when
     // apiAllowed===false, but a focused form field still submits on Enter,
