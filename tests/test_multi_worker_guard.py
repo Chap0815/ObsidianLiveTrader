@@ -54,7 +54,13 @@ import sys
 
 import pytest
 
-from app.main import _acquire_instance_lock, _pid_is_alive, _release_instance_lock
+from app.main import (
+    _acquire_instance_lock,
+    _parse_lock_content,
+    _pid_is_alive,
+    _process_start_time,
+    _release_instance_lock,
+)
 
 
 def _dead_pid() -> int:
@@ -74,12 +80,15 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
       be silently reclaimed instead of blocking startup forever.
     - Release only ever removes a lock THIS process actually owns.
     """
-    # Fresh acquire.
+    # Fresh acquire. B3-01: the lockfile now stores "pid:start_time" (or bare
+    # "pid" if the start time could not be determined) — parse instead of a
+    # literal string match against the new format.
     own_dir = tmp_path / "own"
     own_dir.mkdir()
     lock_path = _acquire_instance_lock(own_dir)
     assert lock_path is not None
-    assert lock_path.read_text().strip() == str(os.getpid())
+    written_pid, _written_start = _parse_lock_content(lock_path.read_text())
+    assert written_pid == os.getpid()
     assert _pid_is_alive(os.getpid()) is True
 
     # Busy: a live foreign PID (the test-runner's parent process) holds it.
@@ -98,7 +107,8 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
     assert _pid_is_alive(_dead_pid()) is False
     reclaimed = _acquire_instance_lock(stale_dir)
     assert reclaimed is not None
-    assert reclaimed.read_text().strip() == str(os.getpid())
+    reclaimed_pid, _reclaimed_start = _parse_lock_content(reclaimed.read_text())
+    assert reclaimed_pid == os.getpid()
 
     # Release: only our own lock is removed; a foreign one is left alone.
     _release_instance_lock(lock_path)
@@ -140,3 +150,49 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
             pass
 
     get_settings.cache_clear()
+
+
+# ── B3-01: PID + process start time in the lockfile ─────────────────────────
+# An alive PID alone is not proof the ORIGINAL lock-owning process is still
+# running — the OS can reassign a dead process's PID to an unrelated new
+# process (PID reuse/wraparound), which would otherwise make a stale lock
+# look permanently busy and block every future ARMED start (a false-positive
+# DoS). Storing + comparing the process START TIME lets a reclaim tell a
+# genuinely-busy PID apart from a reused one.
+
+
+def test_stale_pid_reuse_reclaimed_via_start_time_mismatch(tmp_path):
+    """Same (alive) PID, but the recorded start time does NOT match the
+    current process running under that PID -> the original owner is gone
+    and the PID was reissued -> stale, must be reclaimed (not treated as
+    busy). Contrast: the SAME alive PID with the CORRECT start time must
+    still be treated as genuinely busy (Q-02 fail-closed must not be
+    weakened by this change)."""
+    other_live_pid = os.getppid()  # guaranteed alive for the whole test
+
+    # Reused-PID case: deliberately WRONG start time for this alive PID.
+    reuse_dir = tmp_path / "reuse"
+    reuse_dir.mkdir()
+    (reuse_dir / "instance.lock").write_text(f"{other_live_pid}:1.0")
+    reclaimed = _acquire_instance_lock(reuse_dir)
+    assert reclaimed is not None
+    reclaimed_pid, _ts = _parse_lock_content(reclaimed.read_text())
+    assert reclaimed_pid == os.getpid()
+
+    # Contrast: genuinely busy — same alive PID AND matching start time must
+    # still block (fail-closed preserved). Skips if this platform/permission
+    # cannot resolve a start time at all (inconclusive, not a regression).
+    real_start = _process_start_time(other_live_pid)
+    if real_start is not None:
+        busy_dir = tmp_path / "busy_matching_start"
+        busy_dir.mkdir()
+        (busy_dir / "instance.lock").write_text(f"{other_live_pid}:{real_start}")
+        assert _acquire_instance_lock(busy_dir) is None
+
+    # Backward tolerance: an OLD-format lockfile (bare PID, no start time) on
+    # an alive foreign PID is still treated as busy (today's PID-only path),
+    # not a crash and not a reclaim.
+    old_format_dir = tmp_path / "old_format_busy"
+    old_format_dir.mkdir()
+    (old_format_dir / "instance.lock").write_text(str(other_live_pid))
+    assert _acquire_instance_lock(old_format_dir) is None

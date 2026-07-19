@@ -60,6 +60,7 @@ from app.orders.tokens import PreviewStore
 from app.risk.sizing import suggest_vol
 from app.security import (
     AUTH_COOKIE_NAME,
+    _origin_matches_request,
     build_csp,
     loopback_or_token_middleware,
     normalize_symbol,
@@ -203,6 +204,9 @@ def _detect_multi_worker_env(env: dict[str, str] | None = None) -> str | None:
 _INSTANCE_LOCK_FILENAME = "instance.lock"
 
 
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
 def _pid_is_alive(pid: int) -> bool:
     """Best-effort cross-platform liveness check for a PID read from a
     lockfile. os.kill(pid, 0) (the usual POSIX idiom) is not meaningful on
@@ -212,9 +216,8 @@ def _pid_is_alive(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         handle = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
         )
         if not handle:
             return False
@@ -231,6 +234,103 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _process_start_time(pid: int) -> float | None:
+    """Best-effort process START TIME for `pid`, used by B3-01 to tell a PID
+    that is genuinely still held by the ORIGINAL lock-owning process apart
+    from an unrelated process that happens to have been assigned the same
+    PID after the original one exited (PID reuse/wraparound — an alive-PID
+    check alone cannot see this, and a stale lock that "looks busy" would
+    otherwise permanently block a legitimate ARMED start: a false-positive
+    DoS). Returns None if the start time cannot be determined at all (e.g.
+    no permission, or an unsupported platform) — callers must then treat the
+    comparison as INCONCLUSIVE, not as proof of anything, so this never turns
+    a genuinely-busy lock into a false reclaim.
+
+    No new dependency (no psutil): Windows uses stdlib `ctypes` to call
+    GetProcessTimes(); the value returned is the raw creation FILETIME
+    (100ns ticks since 1601-01-01) packed into one 64-bit int — the same
+    reference point returned by 32-bit os.stat()/psutil.create_time() is
+    UNIX-epoch; ours has none since it's only ever compared against another
+    value produced by this same function, never against wall-clock time.
+    Accuracy: FILETIME has 100ns resolution, so two distinct processes
+    created in the same 100ns tick would be indistinguishable — astronomically
+    unlikely for this app's PID-reuse scenario (one process must have died
+    and the OS must have already reissued its exact PID to a new one).
+    POSIX best-effort mirror: field 22 ("starttime", in clock ticks since
+    boot) of /proc/<pid>/stat — the same field psutil derives create_time()
+    from — kept for platform symmetry with _pid_is_alive() above even though
+    this app's target OS is Windows.
+    """
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        handle = ctypes.windll.kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_t = wintypes.FILETIME()
+            kernel_t = wintypes.FILETIME()
+            user_t = wintypes.FILETIME()
+            ok = ctypes.windll.kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_t),
+                ctypes.byref(kernel_t),
+                ctypes.byref(user_t),
+            )
+            if not ok:
+                return None
+            return float(
+                (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            )
+        except OSError:
+            return None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as f:
+            raw = f.read()
+        # comm (field 2) is parenthesized and may itself contain spaces/
+        # parens, so split on the LAST ')' — everything after is
+        # space-separated starting at field 3 ("state").
+        after = raw.rsplit(")", 1)[-1].split()
+        return float(after[19])  # field 22 == index 19 in `after`
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _parse_lock_content(raw: str) -> tuple[int, float | None]:
+    """Parse lockfile content in either format:
+    - new (B3-01): "<pid>:<start_time>"
+    - old (pre-B3-01, or start time unavailable at write time): "<pid>"
+
+    Backward-tolerant by construction: an old-format lockfile (just a PID)
+    parses fine, just with start_time=None, so a lock written by a
+    not-yet-upgraded process (or a platform where _process_start_time()
+    returned None) is never mistaken for corrupt content.
+    """
+    raw = raw.strip()
+    if not raw:
+        return -1, None
+    pid_part, sep, ts_part = raw.partition(":")
+    try:
+        pid = int(pid_part)
+    except ValueError:
+        return -1, None
+    if not sep:
+        return pid, None
+    try:
+        return pid, float(ts_part)
+    except ValueError:
+        return pid, None
+
+
 def _acquire_instance_lock(data_dir: Path) -> Path | None:
     """Try to take the exclusive startup lock in data_dir.
 
@@ -238,6 +338,20 @@ def _acquire_instance_lock(data_dir: Path) -> Path | None:
     still-live process already holds it. A lock left behind by a dead PID
     (crashed process) is treated as orphaned/stale and silently reclaimed —
     it must never permanently block a normal single-instance start.
+
+    B3-01: an alive PID alone is NOT sufficient proof that the ORIGINAL
+    process still holds the lock — the OS can reassign a dead process's PID
+    to an unrelated new process (PID reuse/wraparound), which would
+    otherwise make a stale lock look permanently busy (false-positive DoS
+    against an ARMED start). The lockfile therefore also stores the lock
+    owner's process START TIME; on a live PID, the reclaim additionally
+    compares the CURRENT start time of that PID against the stored one.
+    Only a definite MISMATCH is treated as a reused PID (stale, reclaim) —
+    if either side's start time is unavailable (old-format lockfile, or
+    _process_start_time() returned None) the comparison is inconclusive and
+    the pre-B3-01 PID-only behavior applies (alive -> busy), preserving the
+    Q-02 fail-closed guarantee: this never turns a genuinely-busy lock into
+    a false reclaim.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
     lock_path = data_dir / _INSTANCE_LOCK_FILENAME
@@ -245,15 +359,26 @@ def _acquire_instance_lock(data_dir: Path) -> Path | None:
 
     if lock_path.exists():
         other_pid = -1
+        other_start: float | None = None
         try:
-            raw = lock_path.read_text(encoding="utf-8").strip()
-            if raw:
-                other_pid = int(raw)
-        except (OSError, ValueError):
+            raw = lock_path.read_text(encoding="utf-8")
+            if raw.strip():
+                other_pid, other_start = _parse_lock_content(raw)
+        except OSError:
             other_pid = -1
         if other_pid > 0 and other_pid != my_pid and _pid_is_alive(other_pid):
-            return None  # held by another live process
-        # Orphaned (dead PID) or unreadable content: reclaim it.
+            current_start = _process_start_time(other_pid)
+            reused_pid = (
+                other_start is not None
+                and current_start is not None
+                and other_start != current_start
+            )
+            if not reused_pid:
+                return None  # held by another live process (genuinely busy)
+            # else: same PID, but the running process's start time doesn't
+            # match what was recorded -> the original owner is gone and the
+            # PID was reissued. Falls through to the reclaim below.
+        # Orphaned (dead PID), reused PID, or unreadable content: reclaim it.
         try:
             lock_path.unlink()
         except OSError:
@@ -265,7 +390,9 @@ def _acquire_instance_lock(data_dir: Path) -> Path | None:
         # Lost a race right after the staleness check above.
         return None
     try:
-        os.write(fd, str(my_pid).encode("ascii"))
+        my_start = _process_start_time(my_pid)
+        content = str(my_pid) if my_start is None else f"{my_pid}:{my_start}"
+        os.write(fd, content.encode("ascii"))
     finally:
         os.close(fd)
     return lock_path
@@ -276,10 +403,11 @@ def _release_instance_lock(lock_path: Path) -> None:
     still matches ours before deleting, so a lock some other process may
     have reclaimed is never deleted out from under it."""
     try:
-        raw = lock_path.read_text(encoding="utf-8").strip()
-        if raw and int(raw) == os.getpid():
+        raw = lock_path.read_text(encoding="utf-8")
+        pid, _start = _parse_lock_content(raw)
+        if pid == os.getpid():
             lock_path.unlink()
-    except (OSError, ValueError):
+    except OSError:
         pass
 
 
@@ -332,7 +460,11 @@ async def lifespan(app: FastAPI):
             "confirm/close trade_lock are NOT shared across processes — "
             "see the single-worker note on _detect_multi_worker_env() "
             "above). Running two live instances against the same data/ is "
-            "unsafe.",
+            "unsafe. "
+            "[Deutsch] Es läuft bereits eine andere Instanz dieser App mit "
+            "denselben Daten (%s) — bitte zuerst die andere Instanz "
+            "beenden, bevor eine zweite gestartet wird.",
+            db.path.parent,
             db.path.parent,
         )
         if s.trading_enabled:
@@ -2130,14 +2262,16 @@ async def ws_market(
     # Origin check: a browser always sends Origin. Reject any cross-origin
     # website so an arbitrary page cannot open this socket and drive the
     # Hyperliquid proxy. Non-browser clients (no Origin header) are allowed.
+    # B3-06: reuses _origin_matches_request (the same port-EXACT same-origin
+    # check the HTTP /api/* CSRF guard uses in loopback_or_token_middleware)
+    # instead of a host-only allowlist — a page on another localhost PORT
+    # (e.g. 127.0.0.1:9999 while the app runs on 8787) is a different origin
+    # in the browser's model and must be rejected too, same as on the HTTP
+    # side, rather than only checking the origin's hostname in isolation.
     origin = websocket.headers.get("origin")
-    if origin is not None:
-        from urllib.parse import urlparse
-
-        origin_host = (urlparse(origin).hostname or "").lower()
-        if origin_host not in ("127.0.0.1", "localhost", "::1"):
-            await websocket.close(code=1008)
-            return
+    if origin is not None and not _origin_matches_request(origin, websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     s = get_settings()
     try:

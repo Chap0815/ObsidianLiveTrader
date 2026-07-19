@@ -263,8 +263,13 @@ def test_ws_market_rejects_cross_origin_with_1008(monkeypatch):
 
 
 def test_ws_market_accepts_loopback_origin_mexc_poll_branch(monkeypatch):
-    """Gegenprobe: ein loopback-Origin wird akzeptiert und landet im
-    MEXC-Poll-Fallback-Branch (erste Nachricht: poll_fallback-Status)."""
+    """Gegenprobe: ein Origin, der zum tatsaechlichen Request-Host+Port passt,
+    wird akzeptiert und landet im MEXC-Poll-Fallback-Branch (erste Nachricht:
+    poll_fallback-Status). B3-06: der Origin-Check ist jetzt port-genau (wie
+    beim HTTP-Pfad) statt nur host-basiert — TestClient bedient unter
+    "testserver" (Default-Port), daher hier "http://testserver" statt eines
+    beliebigen Loopback-Hostnamens wie "localhost", der nicht mehr zum
+    tatsaechlichen Request-Host passen wuerde."""
     from app.config import get_settings
 
     monkeypatch.setattr(
@@ -280,7 +285,7 @@ def test_ws_market_accepts_loopback_origin_mexc_poll_branch(monkeypatch):
         tc.app.state.mexc = poll_client
         tc.app.state.exchange = poll_client
         with tc.websocket_connect(
-            "/ws/market?symbol=BTC_USDT", headers={"origin": "http://localhost"}
+            "/ws/market?symbol=BTC_USDT", headers={"origin": "http://testserver"}
         ) as ws:
             msg = ws.receive_json()
     assert msg["type"] == "status"
