@@ -1529,6 +1529,87 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   background: var(--accent-dim);
 }
 
+/* N3-09: inline SL editor — the ✎ SL pencil and the (initially hidden)
+   price field / Setzen / ✕ row. cp-actions wraps so the editor drops onto
+   its own line and spans the card width when opened. */
+.cp-actions {
+  flex-wrap: wrap;
+}
+
+.cp-sl-edit-btn {
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: var(--space-2);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.cp-sl-edit-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.cp-sl-edit {
+  display: flex;
+  flex: 1 1 100%;
+  align-items: center;
+  gap: var(--space-1h);
+  margin-top: 4px;
+}
+
+.cp-sl-edit.hidden {
+  display: none;
+}
+
+.cp-sl-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: var(--space-2);
+}
+
+.cp-sl-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.cp-sl-set-btn,
+.cp-sl-cancel-btn {
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: var(--space-2);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.cp-sl-set-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.cp-sl-cancel-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
 .positions-body,
 .orders-body {
   font-family: var(--mono);

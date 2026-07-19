@@ -2481,6 +2481,65 @@
         }
         return;
       }
+      if (a === "sl-edit") {
+        // N3-09: reveal/hide the inline SL-price editor. Pure UI toggle, no
+        // network — the actual move is gated behind data-action="sl-set".
+        e.stopPropagation();
+        const box = actionEl.closest(".cp-actions");
+        const ed = box && box.querySelector(".cp-sl-edit");
+        if (ed) {
+          const nowHidden = ed.classList.toggle("hidden");
+          const input = box.querySelector(".cp-sl-input");
+          if (!nowHidden && input) input.focus();
+        }
+        return;
+      }
+      if (a === "sl-edit-cancel") {
+        // Just closes the editor — never touches an order.
+        e.stopPropagation();
+        const box = actionEl.closest(".cp-actions");
+        const ed = box && box.querySelector(".cp-sl-edit");
+        if (ed) ed.classList.add("hidden");
+        return;
+      }
+      if (a === "sl-set") {
+        // N3-09: send the typed SL through the SAME cancel+replace path as BE.
+        // moveStopTo() runs its own window.confirm, so this is NEVER a silent
+        // send. A client-side wrong-side guard rejects an obviously invalid
+        // stop (long above / short below entry) BEFORE any network call — the
+        // server still does the authoritative geometry validation.
+        e.stopPropagation();
+        const box = actionEl.closest(".cp-actions");
+        if (!box) return;
+        const input = box.querySelector(".cp-sl-input");
+        const sym = box.getAttribute("data-sym");
+        const side = box.getAttribute("data-side");
+        const entry = Number(box.getAttribute("data-entry"));
+        const px = Number(input && input.value);
+        if (!Number.isFinite(px) || px <= 0) {
+          showToast("Bitte einen gültigen SL-Preis eingeben.", "err");
+          return;
+        }
+        if (Number.isFinite(entry) && entry > 0) {
+          const isLong = String(side).toLowerCase() !== "short";
+          if (isLong && px >= entry) {
+            showToast(
+              "SL für LONG muss unter dem Entry (" + fmt(entry, 6) + ") liegen.",
+              "err"
+            );
+            return;
+          }
+          if (!isLong && px <= entry) {
+            showToast(
+              "SL für SHORT muss über dem Entry (" + fmt(entry, 6) + ") liegen.",
+              "err"
+            );
+            return;
+          }
+        }
+        moveStopTo(sym, side, px);
+        return;
+      }
       if (a === "reeval") {
         // "KI: Position bewerten" — advisory only, never trades.
         e.stopPropagation();
@@ -2503,6 +2562,19 @@
       const sym = card.getAttribute("data-sym");
       if (sym) goToSymbol(sym);
     }
+  }
+
+  /** N3-09: Enter inside the inline SL field submits it — dispatched through
+   *  the SAME data-action="sl-set" path (and thus the same window.confirm) as
+   *  the "Setzen" button, so there is no confirm-free shortcut. */
+  function onPositionsBodyKeydown(e) {
+    if (e.key !== "Enter") return;
+    const input = e.target;
+    if (!input || !input.classList || !input.classList.contains("cp-sl-input")) return;
+    e.preventDefault();
+    const box = input.closest(".cp-actions");
+    const setBtn = box && box.querySelector(".cp-sl-set-btn");
+    if (setBtn) setBtn.click();
   }
 
   /** N3-01: best-effort MARK price for a position — honest degrade, never
@@ -2607,14 +2679,26 @@
     // banner / reeval block can't drift between what's shown and what's hashed.
     const slHtml = slStatusBanner(p);
     const reevalHtml = reevalResultHtml(p.symbol);
-    const beRow =
+    // N3-09: the actions row always carries the inline SL-editor (✎ SL) so a
+    // stop can be dragged to ANY price from the card; the BE button rides
+    // along only when a break-even price is computable. data-be is included
+    // only when present (the fp above still folds bePrice in either way).
+    const beBtn =
       bePrice != null
-        ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
-          ' data-be="' + escapeHtml(String(bePrice)) + '">' +
-          '<span class="cp-actions-label">Stop</span>' +
-          '<button type="button" class="cp-be-btn" data-action="be" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>' +
-          "</div>"
+        ? '<button type="button" class="cp-be-btn" data-action="be" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>'
         : "";
+    const beRow =
+      '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
+      (bePrice != null ? ' data-be="' + escapeHtml(String(bePrice)) + '"' : "") + ">" +
+      '<span class="cp-actions-label">Stop</span>' +
+      beBtn +
+      '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Stop-Loss auf einen beliebigen Preis nachziehen">✎ SL</button>' +
+      '<span class="cp-sl-edit hidden">' +
+      '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL-Preis" aria-label="Neuer Stop-Loss-Preis" />' +
+      '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Setzen</button>' +
+      '<button type="button" class="cp-sl-cancel-btn" data-action="sl-edit-cancel" title="Abbrechen" aria-label="Abbrechen">✕</button>' +
+      "</span>" +
+      "</div>";
     // Structural fingerprint: everything the user needs EXCEPT the live pnl/roe
     // text (patched in place). SL status + reeval block are included so a
     // protection change or a fresh KI verdict DOES rebuild the card.
@@ -2770,6 +2854,7 @@
     // survives every keyed re-render below.
     if (!state._positionsWired) {
       el.addEventListener("click", onPositionsBodyClick);
+      el.addEventListener("keydown", onPositionsBodyKeydown);
       state._positionsWired = true;
     }
     const positions = (data && data.positions) || [];
@@ -3173,12 +3258,47 @@
           const px = Number.isFinite(slPx) && slPx > 0 ? slPx
             : Number.isFinite(tpPx) && tpPx > 0 ? tpPx
             : trgPx;
+          // N3-11: volume + signed distance to the live market so a resting
+          // trigger is legible at a glance. Volume field name varies by
+          // exchange (MEXC `vol`, others `sz`/`quantity`); show it only when a
+          // finite value exists rather than a misleading "—". These trigger
+          // rows are pre-filtered to the ACTIVE symbol, so state.lastPx is the
+          // right reference for the distance.
+          const svolRaw = Number(
+            s.vol != null ? s.vol : s.sz != null ? s.sz : s.quantity
+          );
+          const volKv =
+            Number.isFinite(svolRaw) && svolRaw > 0 ? posKv("Vol", fmt(svolRaw, 4)) : "";
+          const mkt = Number(state.lastPx);
+          const distPct =
+            Number.isFinite(mkt) && mkt > 0 && Number.isFinite(px) && px > 0
+              ? ((px - mkt) / mkt) * 100
+              : null;
+          const distKv =
+            distPct != null
+              ? posKv("Distanz", (distPct >= 0 ? "+" : "") + fmt(distPct, 2) + "%")
+              : "";
+          // N3-11: cancel a resting trigger. Wired to the EXISTING
+          // /api/orders/cancel path via cancelTriggerOrder(), which prepends a
+          // reinforced confirm for an SL (cancelling it leaves the position
+          // unprotected). Shown only when the order carries a cancellable id.
+          const soid =
+            s.orderId != null ? s.orderId : s.oid != null ? s.oid : s.order_id;
+          const cancelBtn =
+            soid != null
+              ? '<button type="button" class="btn-cancel-order btn-cancel-trigger" data-oid="' +
+                escapeHtml(String(soid)) +
+                '" data-sl="' + (isTp ? "0" : "1") + '">Cancel</button>'
+              : "";
           return (
             '<div class="order-row order-row-trigger">' +
             '<span class="pos-sym">' + escapeHtml(s.symbol || "—") + "</span>" +
             '<span class="side-tag ' + (isTp ? "tag-long" : "tag-short") + '">' +
             (isTp ? "TP AKTIV" : "SL AKTIV") + "</span>" +
             posKv("Trigger", fmt(px, 4)) +
+            volKv +
+            distKv +
+            cancelBtn +
             "</div>"
           );
         })
@@ -3188,9 +3308,19 @@
       // three separate `+=` assignments each re-parse and re-render the
       // entire (already-inserted) HTML, which thrashes the DOM for no reason.
       el.innerHTML = ordersHtml + stopsHtml + otherHtml;
-      el.querySelectorAll(".btn-cancel-order").forEach(function (btn) {
+      el.querySelectorAll(".btn-cancel-order:not(.btn-cancel-trigger)").forEach(function (btn) {
         btn.addEventListener("click", function () {
           cancelOrder(btn.getAttribute("data-oid"));
+        });
+      });
+      // N3-11: trigger (SL/TP) cancels go through a confirm-gated wrapper — an
+      // SL cancel gets a REINFORCED confirm (position ends up unprotected).
+      el.querySelectorAll(".btn-cancel-trigger").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          cancelTriggerOrder(
+            btn.getAttribute("data-oid"),
+            btn.getAttribute("data-sl") === "1"
+          );
         });
       });
       el.querySelectorAll(".other-coin-row").forEach(function (btn) {
@@ -3241,6 +3371,20 @@
     } finally {
       delete state._cancelBusy[orderId];
     }
+  }
+
+  /** N3-11: Cancel a resting SL/TP trigger from the panel. Reuses the EXISTING
+   *  /api/orders/cancel path (via cancelOrder) but prepends a confirm — a
+   *  REINFORCED one for a stop-loss, because cancelling it leaves the position
+   *  UNPROTECTED. There is no send without this confirm. */
+  function cancelTriggerOrder(orderId, isSl) {
+    if (!orderId) return;
+    const text = isSl
+      ? "Stop-Loss #" + orderId + " stornieren?\n\n" +
+        "Die Position wird dann UNGESCHÜTZT — trotzdem stornieren?"
+      : "Take-Profit-Trigger #" + orderId + " stornieren?";
+    if (!window.confirm(text)) return;
+    cancelOrder(orderId);
   }
 
   async function loadAccount() {
@@ -6397,17 +6541,24 @@
     }
   }
 
-  /** Move/replace the stop-loss of an OPEN position to its fee-adjusted
-   *  break-even. A REAL money action: always confirmed, guarded against
+  /** N3-09: Move/replace the stop-loss of an OPEN position to an ARBITRARY
+   *  price `px`. A REAL money action: always confirmed, guarded against
    *  double-submit (state.slBusy), and any backend detail is surfaced verbatim.
-   *  The server places the new stop, OID-verifies it, THEN cancels the old one,
-   *  so the position is never left unprotected during the move. */
-  async function moveStopToBreakEven(symbol, side, be) {
+   *  The server places the new stop, OID-verifies it, THEN cancels the old one
+   *  (/api/orders/modify-sl cancel+replace), so the position is never left
+   *  unprotected during the move. `opts.be` only tweaks the confirm/toast
+   *  wording so the Break-Even button reads identically to before; the geometry
+   *  is validated server-side (long-SL<entry etc.) — this client never bypasses
+   *  that. There is NO path to the API that skips the window.confirm below. */
+  async function moveStopTo(symbol, side, px, opts) {
+    opts = opts || {};
     if (state.slBusy || state.closeBusy || state.orderBusy) return;
-    if (!symbol || !side || !Number.isFinite(be) || be <= 0) return;
+    if (!symbol || !side || !Number.isFinite(px) || px <= 0) return;
+    const isBe = !!opts.be;
+    const target = isBe ? "Break-Even " + fmt(px, 6) : fmt(px, 6);
     const text =
       "Stop-Loss der " + String(side).toUpperCase() + "-Position " + symbol +
-      " auf Break-Even " + fmt(be, 6) + " setzen?\n\n" +
+      " auf " + target + " setzen?\n\n" +
       "Ein neuer Stop wird platziert und verifiziert, danach ein bestehender " +
       "alter Stop gecancelt. Dies ist eine echte Order-Aktion.";
     if (!window.confirm(text)) return;
@@ -6416,7 +6567,7 @@
       const res = await apiFetch("/api/orders/modify-sl", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: symbol, side: side, new_sl: be }),
+        body: JSON.stringify({ symbol: symbol, side: side, new_sl: px }),
       });
       const data = await res.json().catch(function () {
         return {};
@@ -6430,8 +6581,8 @@
           ? " — ⚠ " + data.warnings.join("; ")
           : "";
       showToast(
-        "SL → Break-Even gesetzt: " +
-          fmt(data.new_sl != null ? data.new_sl : be, 6) +
+        (isBe ? "SL → Break-Even gesetzt: " : "SL gesetzt: ") +
+          fmt(data.new_sl != null ? data.new_sl : px, 6) +
           warn,
         warn ? "err" : "ok"
       );
@@ -6445,6 +6596,12 @@
     } finally {
       state.slBusy = false;
     }
+  }
+
+  /** Thin wrapper: SL → fee-adjusted break-even. Behaviour identical to the
+   *  original moveStopToBreakEven (same confirm/toast wording via opts.be). */
+  async function moveStopToBreakEven(symbol, side, be) {
+    return moveStopTo(symbol, side, be, { be: true });
   }
 
   /* ── C3-04b: drag the SL line on the chart ─────────────────────────────
