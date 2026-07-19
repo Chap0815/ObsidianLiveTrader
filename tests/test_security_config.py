@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.security import normalize_symbol
 from fastapi import HTTPException
 

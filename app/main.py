@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -40,9 +41,6 @@ from app.llm.client import (
 )
 
 from app.llm.prompts import build_system_prompt
-
-# Back-compat alias
-GrokError = LlmError
 from app.mexc.client import empty_account
 from app.mexc.errors import MexcError
 from app.models import (
@@ -66,6 +64,12 @@ from app.security import (
     normalize_symbol,
     require_local_token,
 )
+
+if TYPE_CHECKING:  # type-only import — resolves the `MexcClient` annotations, no runtime cost
+    from app.mexc.client import MexcClient
+
+# Back-compat alias (kept below the imports so E402 stays clean)
+GrokError = LlmError
 
 ExchangeError = (MexcError, HyperliquidError)
 

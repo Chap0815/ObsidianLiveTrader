@@ -17,8 +17,6 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-log = logging.getLogger("app.llm.scanner")
-
 from app.analysis.context import (  # noqa: F401
     build_tf_slice,
     _candles_public,
@@ -37,6 +35,8 @@ from app.llm.client import (
     compact_tf_for_llm,
     extract_json_object,
 )
+
+log = logging.getLogger("app.llm.scanner")
 
 SCANNER_SYSTEM_PROMPT = """You are a futures market screener for USDT-M perpetuals.
 You receive compact summaries (indicators, structure, funding) for several coins.

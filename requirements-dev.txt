@@ -1,0 +1,4 @@
+# Dev-only tooling — NOT installed at runtime.
+# Runtime dependencies live in requirements.lock; install those for the app.
+# For development/linting:  pip install -r requirements-dev.txt  then  ruff check .
+ruff==0.15.22

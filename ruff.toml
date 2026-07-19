@@ -1,0 +1,20 @@
+# Minimal lint gate for the project.
+#
+# Ruff's default rule set is kept (pyflakes `F` + pycodestyle `E4/E7/E9`) — it
+# catches real problems (undefined names, bad imports) without the noise of full
+# style enforcement. Install as a dev tool: `pip install -r requirements-dev.txt`
+# then run `ruff check .`.
+target-version = "py311"
+
+[lint]
+# E741 = ambiguous single-char names (`l`/`I`/`O`). Ignored: `l`/`i`/`j` are
+# idiomatic in the indicator/structure math, and renaming working numeric code
+# for a purely cosmetic rule is not worth the correctness risk.
+ignore = ["E741"]
+
+[lint.per-file-ignores]
+# Test scaffolding legitimately uses patterns the linter dislikes:
+#   E402 — imports grouped under a later test section (readability)
+#   E731 — inline lambdas for monkeypatch stubs
+#   F841 — capture vars kept for clarity / bound via nonlocal closures
+"tests/**" = ["E402", "E731", "F841"]
