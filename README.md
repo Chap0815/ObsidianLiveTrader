@@ -18,7 +18,7 @@ Lokale FastAPI-App für **Hyperliquid** (Default: **Testnet**) und optional **ME
    TRADING_ENABLED=false
    ```
 4. `.\start.bat` → Chart mit BTC Testnet-Preis  
-5. Smoke: `py -3 scripts\hl_spike.py` und `py -3 scripts\hl_spike.py --with-account`
+5. Smoke: `.\.venv\Scripts\python.exe scripts\hl_spike.py` und `.\.venv\Scripts\python.exe scripts\hl_spike.py --with-account`
 
 ---
 
@@ -47,8 +47,8 @@ cd "C:\Users\Home\Desktop\Trading view"
 .\start.bat              # Wizard bei Bedarf, dann Server
 .\start.bat setup        # Wizard erzwingen, dann Server
 .\setup.bat              # nur Wizard
-py -3 scripts\launch.py --setup
-py -3 scripts\setup_wizard.py --force
+.\.venv\Scripts\python.exe scripts\launch.py --setup
+.\.venv\Scripts\python.exe scripts\setup_wizard.py --force
 ```
 
 Python 3.11+ empfohlen.
@@ -59,45 +59,111 @@ Python 3.11+ empfohlen.
 
 ## Umgebungsvariablen (`.env`)
 
+Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/config.py) übernommen — bei Abweichung gilt immer der Code. Vollständige, kommentierte Vorlage: [`.env.example`](.env.example). Secrets **nie committen**.
+
+### Server
+
 | Variable | Default | Bedeutung |
 |----------|---------|-----------|
-| `HOST` / `PORT` | `127.0.0.1` / `8787` | Bind (MVP nur localhost) |
+| `HOST` | `127.0.0.1` | Bind-Adresse; nur Loopback erlaubt (LAN-Bind wird abgelehnt) |
+| `PORT` | `8787` | Bind-Port |
+| `SETUP_COMPLETE` | `false` (Code-Default) | Markiert Ersteinrichtung als erledigt. `false` hält `/setup` offen (Fail-safe für einen frischen, noch secret-losen Start); die vollständige `/setup`-Speicherung setzt es auf `true` und sperrt den Assistenten danach. **`.env.example` liefert `true`** — eine reine Kopie der Vorlage gilt als bereits eingerichtet |
+
+### Exchange (MEXC / Hyperliquid)
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
 | `EXCHANGE` | `hyperliquid` | `mexc` \| `hyperliquid` |
 | `MEXC_API_KEY` / `MEXC_API_SECRET` | leer | Futures API — **Trade only, no withdraw** |
-| `MEXC_BASE_URL` | `https://contract.mexc.com` | Futures REST |
+| `MEXC_BASE_URL` | `https://contract.mexc.com` | Futures REST (Host-Allowlist) |
 | `HL_TESTNET` | `true` | Hyperliquid Testnet statt Mainnet |
 | `HL_PRIVATE_KEY` / `HL_ACCOUNT_ADDRESS` | leer | Agent/API-Wallet-Key (kann nicht withdrawen) / Main-Wallet |
-| `LLM_PROVIDER` | `claude` | `claude` \| `xai` \| `openai` \| `ollama` |
-| `ANTHROPIC_MODEL` | `claude-opus-4-8` | Claude-Modell-ID |
-| `XAI_API_KEY` | leer | Grok-Analyse |
-| `XAI_MODEL` | `grok-4` | Modell-ID (bei 404 in `.env` wechseln) |
-| `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API |
-| `DEFAULT_SYMBOL` | `BTC` | Start-Symbol (Hyperliquid-Coin; MEXC: `BTC_USDT`) |
-| **`RISK_PROFILE`** | **`balanced`** | `conservative` \| `balanced` \| `free` — füllt nur nicht explizit gesetzte `MAX_*`/`MIN_*`/`STRICT_*`-Felder |
-| `MAX_LEVERAGE` | `50` | App-Hebel-Cap (zusätzlich Contract-Max); Preset `balanced` |
-| `MAX_RISK_PCT` | `5.0` | Max. Risiko in % Equity pro Trade; Preset `balanced` |
-| `MIN_RRR` | `2.0` | Mindest Risk/Reward |
-| `STRICT_RRR` | `false` | `false` = Low-RRR nur Warning (Preset `balanced`); `true` = blockiert |
-| **`MAX_NOTIONAL_PCT_OF_EQUITY`** | **`5000.0`** | Harter equity-relativer Notional-Cap (Fat-Finger-Guard), 50× Equity; `0` = aus |
-| `PREVIEW_TOKEN_TTL_SECONDS` | `60` | Einmal-Token für Confirm |
-| `DATABASE_PATH` | `data/trader.db` | SQLite Audit (Proposals/Orders) |
-| **`TRADING_ENABLED`** | **`false`** | **`false` = DISARMED** — kein Place/Confirm. `true` erfordert `LOCAL_API_TOKEN` gesetzt (sonst Startfehler) |
-| **`LOCAL_API_TOKEN`** | leer | **Pflicht**, sobald `TRADING_ENABLED=true` — Auth-Token für die lokale API |
+| `HL_BASE_URL` | leer | Override; leer → SDK-Default abhängig von `HL_TESTNET` (Host-Allowlist) |
+| `HL_HTTP_TIMEOUT_S` | `10.0` | Hartes Timeout (s) je Hyperliquid-SDK-HTTP-Call; Bereich `[0.5, 120]` |
 | **`MAINNET_ACK`** | **`false`** | **Echtgeld-Schutz.** `HL_TESTNET=false` + `TRADING_ENABLED=true` startet **nur** mit `MAINNET_ACK=true` (sonst Startfehler). Nur Hyperliquid (MEXC hat kein Testnet). Siehe [Wechsel auf Mainnet](#wechsel-auf-mainnet) |
+
+### KI / LLM-Provider
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
+| `LLM_PROVIDER` | `claude` | `claude` \| `xai` \| `openai` \| `ollama`; Hot-Swap im UI. **Produktiv läuft die App i. d. R. mit `xai` (Grok) — Claude ist der Code-Default/Fallback** |
+| `ANTHROPIC_API_KEY` | leer | Claude-Key (Alias: `CLAUDE_API_KEY`) |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5` | Claude-Modell-ID |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic API (Host-Allowlist) |
+| `ANTHROPIC_VERSION` | `2023-06-01` | Anthropic API-Version-Header |
+| `XAI_API_KEY` | leer | Grok-Analyse |
+| `XAI_MODEL` | `grok-4` | Modell-ID (bei 404 in `.env` wechseln). Günstigere Varianten `grok-4.3`/`grok-4.5` verfügbar — siehe [Modell-Kostenhebel](#modell-kostenhebel-grok-43--45) |
+| `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API (Host-Allowlist) |
+| `OPENAI_API_KEY` | leer | Codex-Key |
+| `OPENAI_MODEL` | `gpt-5.1` | OpenAI/Codex-Modell-ID |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API (Host-Allowlist) |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Lokales Ollama; nur Loopback erlaubt (SSRF-Schutz) |
+| `OLLAMA_MODEL` | `llama3.1` | Ollama-Modell-ID |
+| `INCLUDE_ACCOUNT_IN_LLM` | `false` | Opt-in: sendet Equity/verfügbare Margin/offene Positionen als Analyse-Kontext an den externen LLM-Provider |
+
+#### Modell-Kostenhebel (Grok 4.3 / 4.5)
+
+`XAI_MODEL` ist der einzige Null-Code-Kostenhebel im System: `grok-4.3`/`grok-4.5` kosten laut xAI-Preisliste ca. **60–80 % weniger** pro Token als `grok-4`, bei vergleichbarer Analyse-Qualität für dieses Use-Case. Dokumentierter aktueller Default bleibt **`grok-4`** — die Empfehlung ist, `grok-4.3`/`grok-4.5` erst **per Journal-A/B-Vergleich zu verifizieren** (Proposal-Qualität, Trefferquote), **nicht** ungeprüft automatisch umzustellen. Umstellen: `XAI_MODEL=grok-4.3` (oder `grok-4.5`) in `.env`, danach Journal-Fenster beobachten.
+
+### Markt-Scanner
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
+| `SCANNER_MODEL` | `claude-sonnet-5` | Günstiges/schnelles Modell für den Coin-Screen (Detail-Analyse bleibt `LLM_PROVIDER`) |
+| `SCANNER_MAX_COINS` | `20` | Top-Volumen-Coins, die gescreent werden |
+| `SCANNER_MODE` | `prefilter` | `classic` (alt: Top-N-nach-Turnover in einem LLM-Call) \| `prefilter` (Multi-Ranking-Universum + deterministischer Rules-Prefilter, Chunk-Split/Merge bei vielen Kandidaten) |
+| `SCANNER_UNIVERSE_SIZE` | `50` | Kandidaten aus `market_overview` im `prefilter`-Mode (Universum vor Klines); `[1, 500]` |
+| `SCANNER_RANK_TOP_N` | `20` | Top-N je Ranking-Dimension (\|Preisänderung\|, \|OI-Δ\|, Volatilität) für die Union; `[1, 500]` |
+| `SCANNER_TURNOVER_FLOOR_USD` | `5000000.0` | 24h-Turnover-Liquiditätsfloor (USD); darunter fliegt ein Coin aus dem Universum, egal wie stark er sich bewegt (Wash-/Illiquid-Schutz) |
+| `SCANNER_PREFILTER_TOP_K` | `8` | So viele Coins reicht der deterministische Prefilter maximal ans (teure) LLM weiter; `[1, 500]` |
+| `SCANNER_LLM_CHUNK_MAX` | `12` | Über so vielen LLM-Kandidaten wird in 2 Chunks gesplittet und gemerged (nur `prefilter`-Mode; `classic` bleibt immer ein Call); `[2, 100]` |
+
+### Risiko-Profil & Gates
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
+| **`RISK_PROFILE`** | **`balanced`** | `conservative` \| `balanced` \| `free` — füllt nur nicht explizit gesetzte `MAX_*`/`MIN_*`/`STRICT_*`-Felder |
+| `MAX_LEVERAGE` | `50` | App-Hebel-Cap (zusätzlich Contract-Max); Preset `balanced`; `[1, 500]` |
+| `MAX_RISK_PCT` | `5.0` | Max. Risiko in % Equity pro Trade; Preset `balanced`; `(0, 100]` |
+| `MIN_RRR` | `1.5` | Mindest Risk/Reward; Preset `balanced`; `[0, 1000]` |
+| `STRICT_RRR` | `false` | `false` = Low-RRR nur Warning (Preset `balanced`); `true` = blockiert |
+| `STRICT_AGGREGATE_RISK` | `false` | Portfolioweiter Aggregat-Risiko-Cap (statt nur pro Position); `conservative` setzt das automatisch auf `true` |
+| `AGGREGATE_POS_RISK_CAP_PCT` | `2.0` | Cap für Aggregat-Risiko in % Equity, falls `STRICT_AGGREGATE_RISK=true`; `(0, 100]` |
+| **`MAX_NOTIONAL_PCT_OF_EQUITY`** | **`5000.0`** | Harter equity-relativer Notional-Cap (Fat-Finger-Guard), 50× Equity; `0` = aus; `[0, 1000000]` |
+| `MAX_NOTIONAL_USDT` | `500.0` | **Warnschwelle** pro Order (kein Hard-Block) — der harte Notional-Cap ist `MAX_NOTIONAL_PCT_OF_EQUITY` |
+| `MAX_PRICE_DRIFT_PCT` | `1.0` | Max. Preisdrift zwischen Preview und Confirm; `[0, 100]` |
+| `MARKET_ENTRY_SLIPPAGE_PCT` | `0.15` | Slippage-Toleranz bei Market-Entries; `[0, 100]` |
+| `RISK_SLIPPAGE_PCT` | `0.05` | Slippage-Puffer im Risk-Gate; `[0, 100]` |
+| `STRICT_AVAILABLE_MARGIN` | `true` | Order gegen tatsächlich verfügbare Margin prüfen (Preset `balanced`) |
+| `ALLOW_CROSS_MARGIN` | `false` | Cross-Margin statt Isolated erlauben |
 | **`ALLOW_UNPROTECTED_ENTRY`** | **`false`** | **`false`** blockiert Orders ohne Stop-Loss |
 | `ALLOW_MANUAL_TRIGGER` | `false` | Manueller Trigger-Mode (Entry ohne Börsen-SL/TP); `false` = fail-closed blocken (bereits im Preview-Gate, R-04) |
-| `RISK_SLIPPAGE_PCT` | `0.05` | Slippage-Puffer im Risk-Gate |
-| `MAX_NOTIONAL_USDT` | `500` | **Warnschwelle** pro Order (kein Hard-Block) — der harte Notional-Cap ist `MAX_NOTIONAL_PCT_OF_EQUITY` |
-| `MAX_PRICE_DRIFT_PCT` | `0.5` | Max. Preisdrift zwischen Preview und Confirm |
-| `MARKET_ENTRY_SLIPPAGE_PCT` | `0.15` | Slippage-Toleranz bei Market-Entries |
-| `ALLOW_CROSS_MARGIN` | `false` | Cross-Margin statt Isolated erlauben |
+
+### Trading / Betrieb
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
+| **`TRADING_ENABLED`** | **`false`** | **`false` = DISARMED** — kein Place/Confirm. `true` erfordert `LOCAL_API_TOKEN` gesetzt (sonst Startfehler) |
+| **`LOCAL_API_TOKEN`** | leer | **Pflicht**, sobald `TRADING_ENABLED=true` — Auth-Token für die lokale API |
+| `REQUIRE_LOOPBACK_WHEN_ARMED` | `true` | `TRADING_ENABLED=true` erzwingt Loopback-`HOST` |
+| `DEFAULT_SYMBOL` | `BTC` | Start-Symbol (Hyperliquid-Coin; MEXC: `BTC_USDT`) |
+| `PREVIEW_TOKEN_TTL_SECONDS` | `60` | Einmal-Token für Confirm |
+| `DATABASE_PATH` | `data/trader.db` | SQLite Audit (Proposals/Orders) |
+| `KLINE_LIMIT_HINT` | `500` | Bevorzugte Anzahl Kerzen je Marktabruf |
 | `AUTO_FLATTEN_IF_SL_UNVERIFIED` | `true` | Position sofort schließen, wenn SL nach Placement nicht verifizierbar |
 | `SL_VERIFY_ATTEMPTS` | `3` | Anzahl Polling-Versuche, um den gesetzten SL zu bestätigen |
-| `SL_VERIFY_DELAY_S` | `0.7` | Wartezeit (s) zwischen SL-Verify-Versuchen |
-| `REQUIRE_LOOPBACK_WHEN_ARMED` | `true` | `TRADING_ENABLED=true` erzwingt Loopback-`HOST` |
-| `STRICT_AVAILABLE_MARGIN` | `true` | Order gegen tatsächlich verfügbare Margin prüfen (Preset `balanced`) |
+| `SL_VERIFY_DELAY_S` | `0.7` | Wartezeit (s) zwischen SL-Verify-Versuchen; `[0, 60]` |
+| `CLOSE_VERIFY_ATTEMPTS` | `1` | Polling-Versuche beim Re-Read der Position nach einem Close (deckt verzögerte Fills ab) |
+| `CLOSE_VERIFY_DELAY_S` | `0.0` | Wartezeit (s) zwischen Close-Verify-Versuchen |
 
-Vollständige Vorlage: [`.env.example`](.env.example). Secrets **nie committen**.
+### Journal (KI-Feedback-Loop)
+
+| Variable | Default | Bedeutung |
+|----------|---------|-----------|
+| `JOURNAL_ENABLED` | `true` | KI-Schattenbuch (Advisory/Messung); beeinflusst nie den Order/Gate/Confirm-Pfad |
+| `JOURNAL_RESOLVE_INTERVAL_S` | `60` | Poll-Intervall (s), um offene Journal-Einträge gegen den Markt aufzulösen |
+| `JOURNAL_WINDOW_HOURS` | `24` | Betrachtungsfenster (h) für die Journal-Auswertung |
+| `JOURNAL_MIN_SAMPLE` | `20` | Mindestanzahl Samples, bevor Journal-Statistiken angezeigt werden |
 
 ### Wechsel auf Mainnet
 
@@ -125,7 +191,7 @@ Wieder auf Testnet zurück (`HL_TESTNET=true`) deaktiviert das Gate automatisch 
 ```powershell
 .\start.bat
 # oder:
-py -3 scripts\launch.py
+.\.venv\Scripts\python.exe scripts\launch.py
 # oder:
 .\.venv\Scripts\python.exe -m app
 ```
@@ -148,7 +214,7 @@ Browser: http://127.0.0.1:8787
    Default Sonnet) screent die Top-Volumen-Coins in EINEM Call und listet Setups mit Score.
    Klick auf ein Ergebnis öffnet den Coin und startet die Detail-Analyse.
 3. **Analyse** — KI-Proposal (`POST /api/analyze`) über `LLM_PROVIDER`
-   (Claude Opus / Grok / Codex / Ollama, Hot-Swap per Dropdown); Entry/SL/TP + Levels
+   (Claude / Grok / Codex / Ollama, Hot-Swap per Dropdown; produktiv meist Grok); Entry/SL/TP + Levels
    werden als Linien im Chart gezeichnet (TP mit R-Multiple).
 4. **Proposal übernehmen** — füllt das Order-Ticket (disabled bei `STAY_OUT`).
 5. **Order prüfen (Preview)** — Risk-Gates (`POST /api/orders/preview`); bei OK einmaliges Token.
@@ -178,6 +244,31 @@ Die KI **umgeht keine Gates**. Jeder Ticket wird bei Preview UND Confirm neu val
 ```
 
 Alle Tests mocken MEXC/xAI — **keine echten Keys**, kein Live-Order in CI/pytest.
+
+---
+
+## Betrieb
+
+**Update (3 Zeilen):**
+
+```powershell
+git pull
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+.\start.bat
+```
+
+**Backup:** Vor jedem Update/Update-Test den Server **stoppen**, dann `data/` (SQLite: Proposals/Orders/Journal) **und** `.env` (Secrets + Konfiguration) an einen sicheren Ort kopieren. Beides sind die einzigen Dinge, die einen Neuaufsatz nicht überleben würden — Code selbst ist per `git` reproduzierbar.
+
+**Logs:** Aktuell schreiben alle Logger (`app.main`, `app.llm.client`, `app.llm.scanner`, `app.realtime.hl`, `app.journal.resolver`, `app.env_builder`) nur nach stdout/stderr (Uvicorn-Standard) — nichts wird persistent auf Platte gehalten. Für dauerhafte Logs optional einen `logging.handlers.RotatingFileHandler` (z. B. `maxBytes=5_000_000, backupCount=5`) auf den Root-Logger registrieren; damit rotieren Logdateien automatisch statt unbegrenzt zu wachsen.
+
+**Security-Check (empfohlen, periodisch):**
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pip-audit
+.\.venv\Scripts\python.exe -m pip_audit -r requirements.lock
+```
+
+Prüft alle gepinnten Dependencies gegen bekannte CVEs; vor jedem Mainnet-Wechsel oder mindestens monatlich laufen lassen.
 
 ---
 

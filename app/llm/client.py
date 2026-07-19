@@ -1218,7 +1218,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     # Extended thinking for the deep-analysis call only (the scanner uses a
     # smaller/cheaper model and stays fast — no thinking there).
     #
-    # settings.anthropic_model defaults to "claude-opus-4-8". On the current
+    # settings.anthropic_model defaults to "claude-sonnet-5". On the current
     # Opus 4.6+ / Sonnet 4.6+ family the old `thinking.budget_tokens` field
     # is REJECTED (400) — the only supported "on" mode is adaptive thinking,
     # with depth controlled by `output_config.effort` instead of a token
@@ -1235,7 +1235,10 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     # only; cache_control is GA, no beta header needed). The volatile per-coin
     # JSON context lives in the user turn AFTER this breakpoint, so ordering is
     # correct. Graceful by design: if the prompt is below the cache minimum the
-    # API simply doesn't cache it — no error. Content is unchanged.
+    # API simply doesn't cache it — no error. Content is unchanged. Note the
+    # cache minimum is model-dependent (larger models, e.g. Opus, require more
+    # tokens than smaller ones, e.g. Haiku) — irrelevant here since this static
+    # system prompt comfortably exceeds every model family's threshold.
     system_block = [
         {
             "type": "text",
