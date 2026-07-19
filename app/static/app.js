@@ -24,6 +24,10 @@
     orderBusy: false,
     closeBusy: false,
     slBusy: false, // SL→BE move in flight (double-submit guard)
+    _slDrag: null, // C3-04b: active SL-line drag {symbol,side,entry,sl,newSl,vol,cs,tp}
+    _slHoverGeom: null, // C3-04b: SL geometry under the cursor (hit-zone hover)
+    _slOverlayOn: false, // C3-04b: overlay currently interactive (±4px hit zone)
+    _slDragWired: false, // C3-04b: pointer/keys wired once (initChart runs once, belt+braces)
     historyClearBusy: false, // history reset in flight
     _cancelBusy: {}, // per-order cancel guards (F6/F7)
     llmLabel: "KI", // active provider label for the analyze spinner
@@ -392,6 +396,26 @@
     }
 
     sizeTradeOverlay();
+
+    // C3-04b: wire SL-line drag once. Hover hit-test lives on #chart-wrap so
+    // it keeps firing whether the cursor is over the chart OR the (now
+    // interactive) overlay — both bubble here. The pointer handlers live on
+    // the overlay canvas, which is only reachable while armed (±4px hit zone),
+    // so normal chart pan/zoom off the SL line is never intercepted.
+    if (!state._slDragWired) {
+      const overlay = tradeOverlayCanvas();
+      const wrap = $("chart-wrap");
+      if (overlay && wrap) {
+        wrap.addEventListener("mousemove", onSlHoverMove);
+        wrap.addEventListener("mouseleave", onSlWrapLeave);
+        overlay.addEventListener("pointerdown", onSlDragStart);
+        overlay.addEventListener("pointermove", onSlDragMove);
+        overlay.addEventListener("pointerup", onSlDragEnd);
+        overlay.addEventListener("pointercancel", onSlDragCancel);
+        document.addEventListener("keydown", onSlDragKey);
+        state._slDragWired = true;
+      }
+    }
   }
 
   /** Actually apply the chart's box size from its live container. Guarded
@@ -611,6 +635,41 @@
       ctx.font = "10px 'IBM Plex Mono', monospace";
       ctx.fillText((short ? "Short " : "Long ") + fmt(entry, 4), xStart + 6, yEntry - 4);
     });
+
+    // C3-04b: ghost SL line during an active drag — the WOULD-BE new stop,
+    // following the cursor. Purely visual: nothing is sent until the trader
+    // confirms on drop. Shows the new price + resulting $ risk and RRR (cheap:
+    // entry/vol/cs/tp were snapshotted at drag-start).
+    const drag = state._slDrag;
+    if (drag && symMatch(drag.symbol, state.symbol) && Number.isFinite(drag.newSl)) {
+      const gy = series.priceToCoordinate(drag.newSl);
+      if (gy != null) {
+        ctx.save();
+        ctx.strokeStyle = chartColors.short;
+        ctx.setLineDash([6, 4]);
+        ctx.lineWidth = 1.5;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.moveTo(0, gy);
+        ctx.lineTo(plotW, gy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+        const risk = Math.abs(drag.entry - drag.newSl) * (drag.vol || 0) * (drag.cs || 1);
+        let lbl = "SL→ " + fmt(drag.newSl, 4) + " · −" + fmt(risk, 2);
+        if (Number.isFinite(drag.tp) && drag.tp != null && risk > 0) {
+          const reward = Math.abs(drag.tp - drag.entry) * (drag.vol || 0) * (drag.cs || 1);
+          lbl += " · " + fmt(reward / risk, 1) + "R";
+        }
+        // wrong-side hint so the trader sees the drop will be rejected
+        const wrongSide = drag.side === "long" ? drag.newSl >= drag.entry : drag.newSl <= drag.entry;
+        if (wrongSide) lbl += "  ⚠ falsche Seite";
+        ctx.fillStyle = chartColors.short;
+        ctx.font = "11px 'IBM Plex Mono', monospace";
+        ctx.fillText(lbl, 8, gy - 5);
+        ctx.restore();
+      }
+    }
   }
 
   function candlesToSeries(candles) {
@@ -5678,6 +5737,224 @@
       showToast(
         "SL → Break-Even gesetzt: " +
           fmt(data.new_sl != null ? data.new_sl : be, 6) +
+          warn,
+        warn ? "err" : "ok"
+      );
+      loadAccount();
+      loadOpenOrders();
+    } catch (err) {
+      showToast(
+        "SL verschieben fehlgeschlagen: " + (err && err.message),
+        "err"
+      );
+    } finally {
+      state.slBusy = false;
+    }
+  }
+
+  /* ── C3-04b: drag the SL line on the chart ─────────────────────────────
+     The overlay canvas stays pointer-events:none (normal pan/zoom) EXCEPT
+     while the cursor is within ±4px of the CURRENT position's SL line, where
+     it turns interactive (`sl-drag-armed`). A drag renders a ghost line only;
+     dropping ARMS a pending value and asks for confirmation — the send goes
+     through the SAME /api/orders/modify-sl cancel+replace path as the BE move.
+     There is NO path from pointerup straight to the API: pointerup restores
+     the chart, then calls moveStopViaDrag(), which is gated by window.confirm.
+     Chart handleScroll/handleScale are ALWAYS restored on drag end (drop,
+     Esc, pointer-leave, cancel) so a drag can never freeze the chart. */
+
+  /** SL geometry of the ONE active position on the current chart symbol, or
+   *  null. Mirrors the SL/TP classification in _drawTradeZones: the adverse-
+   *  side exchange trigger is the SL, the favourable one the TP; manual mode
+   *  falls back to the remembered marker SL/TP. Never returns a ticket-draft
+   *  or TP line as the SL — only the real stop of an OPEN position. */
+  function getActiveSlGeom() {
+    const series = state.candleSeries;
+    if (!series) return null;
+    const positions = (state.account && state.account.positions) || [];
+    for (const p of positions) {
+      if (!symMatch(p.symbol, state.symbol)) continue;
+      const entry = Number(p.entry_price);
+      if (!Number.isFinite(entry) || entry <= 0) continue;
+      const short = String(p.side || "").toLowerCase() === "short";
+      let sl = null;
+      let tp = null;
+      const stops = (state.openOrders && state.openOrders.stop_orders) || [];
+      stops.forEach(function (s) {
+        if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
+        const trg = Number(
+          s.stopLossPrice != null ? s.stopLossPrice
+          : s.takeProfitPrice != null ? s.takeProfitPrice
+          : s.triggerPrice != null ? s.triggerPrice : s.price
+        );
+        if (!Number.isFinite(trg) || trg <= 0) return;
+        const below = trg < entry;
+        if (short ? !below : below) sl = trg; // adverse side = SL
+        else tp = trg;
+      });
+      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
+      if (mk) {
+        if (sl == null && mk.sl) sl = mk.sl;
+        if (tp == null && mk.tp) tp = mk.tp;
+      }
+      if (sl == null || !(sl > 0)) continue; // no stop → nothing to drag
+      const vol = Number(p.hold_vol) || 0;
+      const csRaw = Number(p.contract_size);
+      const cs = Number.isFinite(csRaw) && csRaw > 0
+        ? csRaw
+        : Number((state.market && state.market.contract && state.market.contract.contractSize) || 1);
+      return { symbol: p.symbol, side: short ? "short" : "long", entry, sl, vol, cs, tp };
+    }
+    return null;
+  }
+
+  /** Toggle the overlay between inert (normal chart pan/zoom passes through)
+   *  and interactive (grabbable SL line). Class-driven — see .trade-overlay
+   *  rules in app.css. */
+  function setSlOverlayInteractive(on) {
+    const overlay = tradeOverlayCanvas();
+    if (!overlay || on === state._slOverlayOn) return;
+    state._slOverlayOn = on;
+    overlay.classList.toggle("sl-drag-armed", !!on);
+  }
+
+  /** ALWAYS restore chart interaction. Called on every drag terminus so a
+   *  stuck handleScroll:false can never freeze the chart. */
+  function endSlDrag() {
+    state._slDrag = null;
+    try {
+      if (state.chart) state.chart.applyOptions({ handleScroll: true, handleScale: true });
+    } catch (_) {}
+    drawTradeZones(); // ghost gone → real SL line restored to its original spot
+  }
+
+  /** Hover hit-test on the chart wrap (fires for moves over chart AND overlay,
+   *  since both bubble here). Arms the overlay only inside the ±4px SL band. */
+  function onSlHoverMove(ev) {
+    if (state._slDrag) return; // dragging: handled by pointer handlers below
+    const overlay = tradeOverlayCanvas();
+    if (!overlay || !state.candleSeries) return;
+    const geom = getActiveSlGeom();
+    if (!geom) { state._slHoverGeom = null; setSlOverlayInteractive(false); return; }
+    const rect = overlay.getBoundingClientRect();
+    const y = ev.clientY - rect.top;
+    const slY = state.candleSeries.priceToCoordinate(geom.sl);
+    if (slY == null || Math.abs(y - slY) > 4) {
+      state._slHoverGeom = null;
+      setSlOverlayInteractive(false);
+      return;
+    }
+    state._slHoverGeom = geom;
+    setSlOverlayInteractive(true);
+  }
+
+  function onSlDragStart(ev) {
+    const geom = state._slHoverGeom || getActiveSlGeom();
+    if (!geom || !state.candleSeries) return;
+    if (state.orderBusy || state.slBusy || state.closeBusy) {
+      showToast("Order in Arbeit — SL-Drag gesperrt.", null);
+      return;
+    }
+    ev.preventDefault();
+    state._slDrag = Object.assign({}, geom, { newSl: geom.sl });
+    const overlay = tradeOverlayCanvas();
+    try { overlay.setPointerCapture(ev.pointerId); } catch (_) {}
+    // freeze pan/zoom for the duration of the drag
+    try {
+      if (state.chart) state.chart.applyOptions({ handleScroll: false, handleScale: false });
+    } catch (_) {}
+    drawTradeZones();
+  }
+
+  function onSlDragMove(ev) {
+    if (!state._slDrag || !state.candleSeries) return;
+    const overlay = tradeOverlayCanvas();
+    const rect = overlay.getBoundingClientRect();
+    const y = ev.clientY - rect.top;
+    const price = state.candleSeries.coordinateToPrice(y);
+    if (price == null || !(price > 0)) return;
+    state._slDrag.newSl = price;
+    drawTradeZones();
+  }
+
+  /** Drop: NEVER sends. Restore the chart first, then (if the new price moved
+   *  and is on the correct side of entry) ARM the confirm. */
+  function onSlDragEnd(ev) {
+    if (!state._slDrag) return;
+    const d = state._slDrag;
+    const overlay = tradeOverlayCanvas();
+    try { overlay.releasePointerCapture(ev.pointerId); } catch (_) {}
+    const newSl = d.newSl;
+    endSlDrag(); // restores chart + clears drag BEFORE any confirm/async work
+    if (!Number.isFinite(newSl) || !(newSl > 0)) return;
+    // Client-side reject an obviously-invalid SL (wrong side of entry) with a
+    // clear message instead of sending it — the server gates this too.
+    const wrongSide = d.side === "long" ? newSl >= d.entry : newSl <= d.entry;
+    if (wrongSide) {
+      showToast(
+        "SL auf falscher Seite des Entrys (" +
+          (d.side === "long" ? "Long-SL über" : "Short-SL unter") +
+          " Entry) — abgebrochen.",
+        "err"
+      );
+      return;
+    }
+    // No meaningful change → don't bother the trader with a confirm.
+    if (Math.abs(newSl - d.sl) <= Math.abs(d.sl) * 1e-6) return;
+    moveStopViaDrag(d.symbol, d.side, newSl);
+  }
+
+  function onSlDragCancel() {
+    if (state._slDrag) endSlDrag();
+  }
+
+  function onSlWrapLeave() {
+    // Pointer left the chart mid-drag → abort, restore SL + chart.
+    if (state._slDrag) endSlDrag();
+    setSlOverlayInteractive(false);
+  }
+
+  function onSlDragKey(ev) {
+    if (ev.key === "Escape" && state._slDrag) endSlDrag();
+  }
+
+  /** Self-contained SL move via the EXISTING cancel+replace endpoint
+   *  (/api/orders/modify-sl) — same path moveStopToBreakEven uses. Its own
+   *  window.confirm guarantees no send without explicit confirmation, and the
+   *  slBusy/orderBusy guards block a confirm while another order is in flight. */
+  async function moveStopViaDrag(symbol, side, newSl) {
+    if (state.slBusy || state.closeBusy || state.orderBusy) {
+      showToast("Order in Arbeit — SL-Verschiebung nicht gesendet.", null);
+      return;
+    }
+    if (!symbol || !side || !Number.isFinite(newSl) || newSl <= 0) return;
+    const text =
+      "Stop-Loss der " + String(side).toUpperCase() + "-Position " + symbol +
+      " per Drag auf " + fmt(newSl, 6) + " verschieben?\n\n" +
+      "Ein neuer Stop wird platziert und verifiziert, danach ein bestehender " +
+      "alter Stop gecancelt. Dies ist eine echte Order-Aktion.";
+    if (!window.confirm(text)) return; // explicit confirm — the ONLY send gate
+    state.slBusy = true;
+    try {
+      const res = await apiFetch("/api/orders/modify-sl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: symbol, side: side, new_sl: newSl }),
+      });
+      const data = await res.json().catch(function () {
+        return {};
+      });
+      if (!res.ok) {
+        showToast(detailToText(data.detail || data), "err");
+        return;
+      }
+      const warn =
+        Array.isArray(data.warnings) && data.warnings.length
+          ? " — ⚠ " + data.warnings.join("; ")
+          : "";
+      showToast(
+        "SL verschoben: " +
+          fmt(data.new_sl != null ? data.new_sl : newSl, 6) +
           warn,
         warn ? "err" : "ok"
       );

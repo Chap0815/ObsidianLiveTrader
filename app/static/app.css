@@ -1191,12 +1191,21 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   height: 100%;
 }
 
-/* Trade-zone canvas sits above the chart, never eats mouse events */
+/* Trade-zone canvas sits above the chart. Inert by default (pointer-events:
+   none) so normal chart pan/zoom passes straight through — the crosshair/
+   markers underneath keep their hit test. C3-04b arms it (.sl-drag-armed)
+   ONLY while the cursor is within ±4px of the active position's SL line, so
+   the SL can be grabbed and dragged without ever stealing events elsewhere. */
 .trade-overlay {
   position: absolute;
   inset: 0;
   pointer-events: none;
   z-index: 3;
+}
+
+.trade-overlay.sl-drag-armed {
+  pointer-events: auto;
+  cursor: ns-resize;
 }
 
 /* C3-04a: fill-marker hover tooltip. Absolutely positioned inside
