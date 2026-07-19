@@ -2239,29 +2239,55 @@
     return { sl: sl, tp: tp, ordersKnown: ordersKnown, manual: manual };
   }
 
+  /** N3-02: TP suffix for the SL banner — "· TP 0.026 (+9.8%)" when a
+   *  take-profit is known, a neutral (non-alarming) "kein TP" when orders ARE
+   *  loaded and none is set, or "TP-Status unbekannt" while orders haven't
+   *  loaded yet — mirrors the SL banner's ordersKnown gate so an unloaded
+   *  order list never reads as a confirmed "no TP" (same honesty rule as the
+   *  SL "wird geladen" state). */
+  function _tpSuffix(prot, entry) {
+    if (prot.tp != null && Number.isFinite(entry) && entry > 0) {
+      const pct = ((prot.tp - entry) / entry) * 100;
+      return (
+        ' · <span class="cp-tp-status cp-tp-set">TP ' + fmt(prot.tp, 4) +
+        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)</span>"
+      );
+    }
+    if (!prot.ordersKnown) {
+      return ' · <span class="cp-tp-status cp-tp-unknown">TP-Status unbekannt</span>';
+    }
+    return ' · <span class="cp-tp-status cp-tp-none">kein TP</span>';
+  }
+
   /** SL-status banner HTML for a position — green when protected, loud red when
-   *  genuinely unprotected. This is the single most important safety nudge. */
+   *  genuinely unprotected. This is the single most important safety nudge.
+   *  N3-02: extended with the TP suffix so the same banner also answers "do I
+   *  have a target?", not just "am I protected downside?". */
   function slStatusBanner(p) {
     const prot = findPositionProtection(p);
     const entry = Number(p.entry_price);
+    const tp = _tpSuffix(prot, entry);
     if (prot.manual && prot.sl != null && Number.isFinite(entry) && entry > 0) {
       const pct = ((prot.sl - entry) / entry) * 100;
       return (
         '<div class="cp-sl-status cp-sl-manual">SL: MANUELL ' + fmt(prot.sl, 4) +
-        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%) — nur bei offenem Browser</div>"
+        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%) — nur bei offenem Browser" + tp + "</div>"
       );
     }
     if (prot.sl != null && Number.isFinite(entry) && entry > 0) {
       const pct = ((prot.sl - entry) / entry) * 100;
       return (
         '<div class="cp-sl-status cp-sl-ok">🛡 Stop-Loss ' + fmt(prot.sl, 4) +
-        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)</div>"
+        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
       );
     }
     if (!prot.ordersKnown) {
-      return '<div class="cp-sl-status cp-sl-unknown">Stop-Loss-Status wird geladen…</div>';
+      return '<div class="cp-sl-status cp-sl-unknown">Stop-Loss-Status wird geladen…' + tp + "</div>";
     }
-    return '<div class="cp-sl-status cp-sl-missing">⚠ KEIN STOP-LOSS AKTIV — Position ungeschützt</div>';
+    return (
+      '<div class="cp-sl-status cp-sl-missing">⚠ KEIN STOP-LOSS AKTIV — Position ungeschützt' +
+      tp + "</div>"
+    );
   }
 
   /* ── Instrument rail (signature) ─────────────────────────────────────
@@ -2479,10 +2505,39 @@
     }
   }
 
+  /** N3-01: best-effort MARK price for a position — honest degrade, never
+   *  fabricated. The active chart symbol has a live streamed price
+   *  (state.lastPx); any other open position only has a mark once the
+   *  overview mini-tiles have fetched it (state.overviewData, populated only
+   *  while the overview view is active) — otherwise this returns null and the
+   *  card shows "—" rather than guessing. */
+  function _positionMarkPrice(p) {
+    const active = symMatch(p.symbol, state.symbol);
+    const live = Number(state.lastPx);
+    if (active && Number.isFinite(live) && live > 0) return live;
+    const d = state.overviewData && state.overviewData[String(p.symbol || "").toUpperCase()];
+    const last = d && Number(d.last_price);
+    return Number.isFinite(last) && last > 0 ? last : null;
+  }
+
+  /** N3-01: combined ROE + raw price-% sub-line under the big uPnL number.
+   *  ROE is leverage-scaled (misleading for SL decisions at high leverage);
+   *  the price-% is the actual, unleveraged distance entry→mark in the
+   *  position's favor, so the two together show both "how much" and "how far
+   *  price actually moved". Either half degrades to omitted (not "—") when
+   *  unknown, so a card with no mark yet just shows plain ROE. */
+  function _pnlSubText(roe, pricePct) {
+    const roeTxt = roe != null ? (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE" : "";
+    const pxTxt = pricePct != null ? (pricePct >= 0 ? "+" : "") + fmt(pricePct, 1) + "% Px" : "";
+    if (roeTxt && pxTxt) return roeTxt + " · " + pxTxt;
+    return roeTxt || pxTxt;
+  }
+
   /** Build the render model for one position: the full card HTML plus the
    *  structural fingerprint (everything the card shows EXCEPT the live
-   *  uPnL/ROE numbers, which are text-patched in place so the card never
-   *  freezes and never needs a full rebuild just because price drifted). */
+   *  uPnL/ROE/mark/liq-distance numbers, which are text-patched in place so
+   *  the card never freezes and never needs a full rebuild just because price
+   *  drifted). */
   function _positionModel(p, cs) {
     const pnl = Number(p.unrealized_pnl);
     const pnlCls = Number.isFinite(pnl) && pnl !== 0 ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
@@ -2510,6 +2565,35 @@
             ? posIm * posLev
             : null;
     const posCs = hasPosCs ? posCsRaw : cs;
+    // N3-01: mark price + liq-distance-% + raw price-%, all volatile-per-tick
+    // (patched in place, see globalFp below — never gate the structural fp on
+    // these or the card would skip re-render on a pure price move).
+    const mark = _positionMarkPrice(p);
+    const liq = Number(p.liquidate_price);
+    const hasLiq = Number.isFinite(liq) && liq > 0;
+    // Signed distance (liq vs mark): negative when liq sits below mark (the
+    // common LONG case), positive when above (the common SHORT case) — same
+    // "+/- from reference" convention as the SL/TP % elsewhere on this card,
+    // not a side-normalized magnitude.
+    const liqPct = hasLiq && mark != null && mark > 0 ? ((liq - mark) / mark) * 100 : null;
+    const liqAbsPct = liqPct != null ? Math.abs(liqPct) : null;
+    const liqCls = liqAbsPct == null ? "" : liqAbsPct < 5 ? "cp-liq-danger" : liqAbsPct < 10 ? "cp-liq-warn" : "";
+    const liqCellText =
+      fmt(p.liquidate_price, 4) +
+      (liqPct != null ? " (" + (liqPct >= 0 ? "+" : "") + fmt(liqPct, 1) + "%)" : "");
+    // Raw, UNLEVERAGED price move entry→mark, signed so it's positive when
+    // favorable (same sign convention as ROE/uPnL) — this is the number that
+    // matters for an SL decision, unlike ROE which the leverage inflates.
+    // Reuses `entryPx` (already computed above for the notional calc).
+    const pricePct =
+      mark != null && entryPx > 0
+        ? ((mark - entryPx) / entryPx) * (sideVal === "short" ? -1 : 1) * 100
+        : null;
+    // N3-04: "no SL" sort key. A second findPositionProtection() call (the
+    // first lives inside slStatusBanner below) — cheap (loops the already-
+    // fetched open-orders array), and keeping the sort key independent of the
+    // banner HTML avoids coupling the two concerns.
+    const hasSl = findPositionProtection(p).sl != null;
     // Break-even stop incl. ~round-trip taker fees (0.06% total).
     const beEntry = Number(p.entry_price);
     const beFeeRt = 0.0006;
@@ -2558,15 +2642,16 @@
       '<div class="cp-pnl js-upnl-big ' + pnlCls + '">' +
       (pnl >= 0 ? "+" : "") + fmt(p.unrealized_pnl, 2) + " " + ccy() +
       '<span class="cp-pnl-sub js-roe-big ' + pnlCls + '">' +
-      (roe != null ? (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE" : "") + "</span>" +
+      _pnlSubText(roe, pricePct) + "</span>" +
       "</div>" +
       '<div class="cp-grid">' +
       _cpCell("Entry", fmt(p.entry_price, 4)) +
+      _cpCell("Mark", mark != null ? fmt(mark, 4) : "—", "", "js-mark-val") +
       _cpCell(
         "Größe",
         fmt(p.hold_vol, 4) + (notional != null ? " · " + fmt(notional, 0) + " " + ccy() : "")
       ) +
-      _cpCell("Liq", fmt(p.liquidate_price, 4), "cp-liq") +
+      _cpCell("Liq", liqCellText, "cp-liq" + (liqCls ? " " + liqCls : ""), "js-liq-val") +
       _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
       "</div>" +
       beRow +
@@ -2595,12 +2680,25 @@
       pnl: pnl,
       pnlCls: pnlCls,
       roe: roe,
+      // N3-01 volatile fields — patched in place, also folded into globalFp.
+      mark: mark,
+      pricePct: pricePct,
+      liqPct: liqPct,
+      liqCellText: liqCellText,
+      liqCls: liqCls,
+      // N3-03 (Σ header) + N3-04 (sort) inputs.
+      notional: notional,
+      hasSl: hasSl,
+      liqAbsPct: liqAbsPct,
+      isActive: isActive,
     };
   }
 
-  /** In-place patch of a card's live uPnL/ROE (no DOM rebuild → buttons stay
-   *  clickable). Mirrors the per-tick _updateLivePnl writer so the poll value
-   *  and the streaming value use the same text/class shape. */
+  /** In-place patch of a card's live uPnL/ROE/mark/liq-distance (no DOM
+   *  rebuild → buttons stay clickable). Mirrors the per-tick _updateLivePnl
+   *  writer so the poll value and the streaming value use the same text/class
+   *  shape. N3-01: also patches the Mark cell and the Liq cell's distance-%
+   *  text + risk class, since both move every tick the same as uPnL/ROE. */
   function _patchCardLive(card, m) {
     const big = card.querySelector(".js-upnl-big");
     if (big) {
@@ -2612,14 +2710,57 @@
     const sub = card.querySelector(".js-roe-big");
     if (sub) {
       sub.className = "cp-pnl-sub js-roe-big " + m.pnlCls;
-      sub.textContent = m.roe != null ? (m.roe >= 0 ? "+" : "") + fmt(m.roe, 1) + "% ROE" : "";
+      sub.textContent = _pnlSubText(m.roe, m.pricePct);
     }
+    const markEl = card.querySelector(".js-mark-val");
+    if (markEl) markEl.textContent = m.mark != null ? fmt(m.mark, 4) : "—";
+    const liqEl = card.querySelector(".js-liq-val");
+    if (liqEl) liqEl.textContent = m.liqCellText;
+    const liqCell = card.querySelector(".cp-liq");
+    if (liqCell) liqCell.className = "cp-cell cp-liq" + (m.liqCls ? " " + m.liqCls : "");
   }
 
   function _buildCardEl(html) {
     const tmp = document.createElement("div");
     tmp.innerHTML = html;
     return tmp.firstElementChild;
+  }
+
+  /** N3-03: Σ-header above the position cards — Σ uPnL, Σ Notional (+ ×Equity),
+   *  Σ Margin/Equity. Reads acctAggregate (T33, the SAME aggregation the
+   *  Account-Puls/Konto-panel use) for uPnL/used/equity so this can't drift
+   *  from those; Σ Notional sums each model's own per-position `notional`
+   *  (already F-10-correct per-symbol contract size). Hidden entirely when
+   *  there are no open positions. */
+  function _renderPositionsSummary(models, data) {
+    const el = $("positions-summary");
+    if (!el) return;
+    if (!models || !models.length) {
+      el.classList.add("hidden");
+      el.innerHTML = "";
+      return;
+    }
+    const agg = acctAggregate(data || state.account);
+    const c = ccy();
+    let notional = 0, haveNotional = false;
+    models.forEach(function (m) {
+      if (m.notional != null) { notional += m.notional; haveNotional = true; }
+    });
+    const notionalTxt = haveNotional
+      ? fmt(notional, 0) + " " + c +
+        (agg.equity != null && agg.equity > 0 ? " (" + fmt(notional / agg.equity, 1) + "×)" : "")
+      : "—";
+    const marginTxt =
+      agg.used != null && agg.equity != null && agg.equity > 0
+        ? fmt((agg.used / agg.equity) * 100, 1) + "%"
+        : "—";
+    const upnlCls = agg.upnl == null ? "" : agg.upnl > 0 ? "pnl-pos" : agg.upnl < 0 ? "pnl-neg" : "";
+    const upnlTxt = agg.upnl != null ? (agg.upnl >= 0 ? "+" : "") + fmt(agg.upnl, 2) + " " + c : "—";
+    el.classList.remove("hidden");
+    el.innerHTML =
+      posKv("Σ uPnL", upnlTxt, "pos-sum-val " + upnlCls) +
+      posKv("Σ Notional", notionalTxt, "pos-sum-val") +
+      posKv("Σ Margin/Equity", marginTxt, "pos-sum-val");
   }
 
   function renderPositions(data) {
@@ -2636,6 +2777,7 @@
       return Math.abs(Number(p.hold_vol) || 0) > 0;
     });
     if (!open.length) {
+      _renderPositionsSummary([]);
       const msg = data && data.error ? String(data.error) : "Keine offenen Positionen.";
       const emptyFp = "EMPTY" + msg;
       if (state._positionsFp === emptyFp) return;
@@ -2645,31 +2787,60 @@
       return;
     }
 
-    // ALL open positions render as full cockpit cards, account-wide — the
-    // active symbol's card is highlighted (cp-active) but every coin is equally
-    // full/clickable.
-    const active = open.filter(function (p) {
-      return symMatch(p.symbol, state.symbol);
-    });
-    const others = open.filter(function (p) {
-      return !symMatch(p.symbol, state.symbol);
-    });
-    const ordered = active.concat(others);
-
     const cs =
       (state.market && state.market.contract && state.market.contract.contractSize) || 1;
 
-    const models = ordered.map(function (p) {
+    // ALL open positions render as full cockpit cards, account-wide — the
+    // active symbol's card is highlighted (cp-active) but every coin is
+    // equally full/clickable. N3-04: only the ACTIVE group's relative order
+    // is left as-is (API order); the rest is sorted deterministically —
+    // unprotected (no SL) first, then closest-to-liquidation first, with
+    // symbol as a stable tiebreaker — so cards don't reshuffle between polls
+    // on ties.
+    const allModels = open.map(function (p) {
       return _positionModel(p, cs);
     });
+    const activeModels = allModels.filter(function (m) {
+      return m.isActive;
+    });
+    const otherModels = allModels
+      .filter(function (m) {
+        return !m.isActive;
+      })
+      .sort(function (a, b) {
+        const aNoSl = a.hasSl ? 1 : 0;
+        const bNoSl = b.hasSl ? 1 : 0;
+        if (aNoSl !== bNoSl) return aNoSl - bNoSl; // no-SL (0) before protected (1)
+        const aDist = a.liqAbsPct != null ? a.liqAbsPct : Infinity;
+        const bDist = b.liqAbsPct != null ? b.liqAbsPct : Infinity;
+        if (aDist !== bDist) return aDist - bDist; // closest to liq first
+        return a.sym.localeCompare(b.sym); // stable tiebreaker
+      });
+    const models = activeModels.concat(otherModels);
+
+    // N3-03: Σ header (uPnL / Notional / Margin-Auslastung) — reuses
+    // acctAggregate (T33) so it can never drift from the Account-Puls, and is
+    // NOT gated on the globalFp skip below: equity can change (funding,
+    // another symbol's fill) without any card's structure/live fields
+    // changing, and the header must still stay current.
+    _renderPositionsSummary(models, data);
 
     // Render-fingerprint guard: fold every card's structure + live pnl/roe into
     // one string. If it matches the last render AND the panel already shows
     // cards, there is literally nothing to do — skip ALL DOM work (this is what
     // keeps the money-buttons rock-stable between polls).
+    // N3-01: mark/liq-distance/price-% are volatile-per-tick, same as
+    // rawPnl/roe — folded into globalFp so a pure price move (no structural
+    // change) is never skipped by the "nothing to do" guard below.
     const globalFp = models
       .map(function (m) {
-        return m.key + "#" + m.fp + "#" + fmt(m.rawPnl, 2) + "#" + (m.roe != null ? fmt(m.roe, 1) : "-");
+        return (
+          m.key + "#" + m.fp + "#" + fmt(m.rawPnl, 2) +
+          "#" + (m.roe != null ? fmt(m.roe, 1) : "-") +
+          "#" + (m.mark != null ? fmt(m.mark, 6) : "-") +
+          "#" + (m.liqPct != null ? fmt(m.liqPct, 2) : "-") +
+          "#" + (m.pricePct != null ? fmt(m.pricePct, 2) : "-")
+        );
       })
       .join("|");
     const populated = !!el.querySelector(".pos-cockpit");
@@ -2721,11 +2892,12 @@
     });
   }
 
-  function _cpCell(label, value, cls) {
+  function _cpCell(label, value, cls, valCls) {
     return (
       '<div class="cp-cell ' + (cls || "") + '">' +
       '<span class="cp-cell-label">' + escapeHtml(label) + "</span>" +
-      '<span class="cp-cell-val">' + escapeHtml(String(value)) + "</span></div>"
+      '<span class="cp-cell-val' + (valCls ? " " + valCls : "") + '">' +
+      escapeHtml(String(value)) + "</span></div>"
     );
   }
 

@@ -1434,6 +1434,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 
 .cp-cell.cp-liq .cp-cell-val { color: var(--live); }
+/* N3-01: liq-distance risk classes (mirrors the ir-gauge amber/red cutoffs) —
+   <10% amber, <5% red, applied on top of .cp-liq so its default color loses. */
+.cp-cell.cp-liq-warn .cp-cell-val { color: var(--warn); font-weight: 600; }
+.cp-cell.cp-liq-danger .cp-cell-val { color: var(--short); font-weight: 700; }
 
 .cp-close {
   display: flex;
@@ -1533,6 +1537,20 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   overflow-y: auto;
   overflow-x: hidden;
 }
+
+/* N3-03: Σ-header above the position cards — Σ uPnL / Σ Notional / Σ Margin-
+   Auslastung, so 2+ open positions don't require adding cards up in your head. */
+.positions-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-1h) var(--space-2h);
+  margin-bottom: var(--space-1h);
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+}
+.pos-sum-val { font-weight: 600; }
 
 .positions-body.muted,
 .orders-body.muted {
@@ -1669,6 +1687,17 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .cp-sl-missing { animation: none; }
+}
+
+/* N3-02: TP-status suffix on the SL banner — informational, never alarming
+   (a missing TP is a valid choice, not a safety hazard like a missing SL). */
+.cp-tp-status {
+  font-weight: 500;
+  opacity: 0.9;
+}
+.cp-tp-none,
+.cp-tp-unknown {
+  opacity: 0.75;
 }
 
 /* ── "KI: Position bewerten" (advisory reevaluation of an open position) ── */
