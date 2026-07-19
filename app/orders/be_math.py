@@ -40,4 +40,9 @@ def break_even_price(
 ) -> float | None:
     if not math.isfinite(entry) or entry <= 0:
         return None
+    # Trust boundary: a non-finite fee_rt must not silently yield a bogus but
+    # finite BE that could then move a real stop-loss. The intended caller passes
+    # the config-validated `tm_be_fee_rt`; refuse anything non-finite.
+    if not math.isfinite(fee_rt):
+        return None
     return entry * (1 - fee_rt) if is_short else entry * (1 + fee_rt)

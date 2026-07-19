@@ -779,21 +779,52 @@ class Database:
                 await conn.commit()
                 return int(existing["id"])
 
-            cur = await conn.execute(
-                """
-                INSERT INTO position_management
-                  (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                   invalidation_price, armed_rules, be_done, last_alert_state,
-                   status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?)
-                """,
-                (
-                    symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                    invalidation_price, now, now,
-                ),
-            )
-            await conn.commit()
-            return int(cur.lastrowid or 0)
+            try:
+                cur = await conn.execute(
+                    """
+                    INSERT INTO position_management
+                      (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                       invalidation_price, armed_rules, be_done, last_alert_state,
+                       status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?)
+                    """,
+                    (
+                        symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                        invalidation_price, now, now,
+                    ),
+                )
+                await conn.commit()
+                return int(cur.lastrowid or 0)
+            except aiosqlite.IntegrityError:
+                # Race: another writer (arm endpoint vs monitor loop, same
+                # process) inserted the OPEN row between our SELECT and INSERT and
+                # tripped the partial-unique index. Their baseline wins; refresh
+                # the volatile fields in place instead of raising.
+                await conn.rollback()
+                cur = await conn.execute(
+                    """
+                    SELECT id FROM position_management
+                    WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                    """,
+                    (symbol, side),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise
+                await conn.execute(
+                    """
+                    UPDATE position_management
+                    SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
+                        invalidation_price = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        entry_snap, initial_sl_snap, r1, opened_at,
+                        invalidation_price, now, row["id"],
+                    ),
+                )
+                await conn.commit()
+                return int(row["id"])
 
     async def get_open_position_mgmt(
         self, symbol: str, side: str
