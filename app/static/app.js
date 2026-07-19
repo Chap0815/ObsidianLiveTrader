@@ -45,6 +45,16 @@
     proposalLines: [],
     positionLines: [],
     orderLines: [],
+    // C3-12: last-applied (price,title,color,style,width,axisLabel) spec set per
+    // line group — lets each draw diff and only touch lines that actually
+    // changed (applyOptions) instead of remove+recreate every poll (flicker).
+    _lineSpecs: { proposal: [], position: [], order: [], ticket: [] },
+    // T34 re-render hygiene: fingerprint guards so a poll only rebuilds DOM
+    // when something the user sees actually changed.
+    _positionsWired: false, // #positions-body delegated listener attached once
+    _positionsFp: null, // last positions render fingerprint
+    _symbolTabsFp: null, // last symbol-tab bar fingerprint
+    _gridStructFp: null, // last overview-grid structure fingerprint
     proposalSymbol: null,
     proposalApplied: false,
     showAiLines: true,
@@ -728,57 +738,102 @@
     return out;
   }
 
-  function clearPriceLines() {
-    if (!state.candleSeries) return;
-    for (const pl of state.priceLines) {
-      try {
-        state.candleSeries.removePriceLine(pl);
-      } catch (_) {
-        /* ignore */
-      }
-    }
-    state.priceLines = [];
-  }
-
   /* ── Chart line groups ──────────────────────────────────
-     Three independent overlays on the candle series:
+     Three independent overlays on the candle series, plus the dashed ticket
+     lines. Each is reconciled through applyLineGroup() (C3-12) — the group's
+     spec set is diffed and only changed lines are touched (applyOptions /
+     create / remove) instead of remove+recreate on every poll:
      - proposalLines: what the KI suggests (Entry/SL/TP + Levels)
      - positionLines: what is actually open (Entry/Liq)
-     - orderLines:    resting orders + active SL/TP triggers   */
-
-  function clearLineGroup(arr) {
-    if (state.candleSeries && Array.isArray(arr)) {
-      for (const pl of arr) {
-        try {
-          state.candleSeries.removePriceLine(pl);
-        } catch (_) {
-          /* ignore */
-        }
-      }
-    }
-    return [];
-  }
+     - orderLines:    resting orders + active SL/TP triggers
+     - priceLines:    the ticket's own dashed Entry/Limit/SL/TP lines */
 
   // axisLabel (the price box on the right) OFF by default — it stacks and
   // clutters. The title stays as a small label on the line. Only a few key
   // lines (Liq, current price) keep the numeric axis label.
-  function addChartLine(group, price, color, style, title, width, axisLabel) {
+  //
+  // C3-12: this no longer creates the line immediately — it appends a *spec* to
+  // `specs`. applyLineGroup() then diffs the spec set against the last render
+  // and only touches (applyOptions / create / remove) the lines that changed,
+  // instead of tearing every line down and rebuilding it each poll (flicker).
+  function addChartLine(specs, price, color, style, title, width, axisLabel) {
     const px = Number(price);
-    if (!state.candleSeries || !Number.isFinite(px) || px <= 0) return;
-    try {
-      group.push(
-        state.candleSeries.createPriceLine({
-          price: px,
-          color: color,
-          lineWidth: width || 1,
-          lineStyle: style, // 0 solid, 1 dotted, 2 dashed, 4 sparse dotted
-          axisLabelVisible: axisLabel === true,
-          title: title || "",
-        })
-      );
-    } catch (_) {
-      /* chart not ready */
+    if (!Number.isFinite(px) || px <= 0) return;
+    specs.push({
+      price: px,
+      color: color,
+      style: style, // 0 solid, 1 dotted, 2 dashed, 4 sparse dotted
+      title: title || "",
+      width: width || 1,
+      axisLabel: axisLabel === true,
+    });
+  }
+
+  function _lineOpts(s) {
+    return {
+      price: s.price,
+      color: s.color,
+      lineWidth: s.width || 1,
+      lineStyle: s.style,
+      axisLabelVisible: s.axisLabel === true,
+      title: s.title || "",
+    };
+  }
+
+  function _sameLineSpec(a, b) {
+    return (
+      !!a && !!b &&
+      a.price === b.price &&
+      a.color === b.color &&
+      a.style === b.style &&
+      (a.width || 1) === (b.width || 1) &&
+      (a.axisLabel === true) === (b.axisLabel === true) &&
+      (a.title || "") === (b.title || "")
+    );
+  }
+
+  /** C3-12: reconcile one price-line group against a fresh spec list. Reuses
+   *  the existing IPriceLine objects and only calls applyOptions() on the ones
+   *  whose (price,title,color,style,width,axisLabel) actually changed; creates
+   *  the extra, removes the surplus. When the whole set is identical it does
+   *  NOTHING — no more remove+recreate flicker on every poll. `plArr` is
+   *  mutated in place so external references (state.positionLines, …) stay
+   *  valid. */
+  function applyLineGroup(plArr, cacheKey, specs) {
+    if (!state.candleSeries) return;
+    specs = (specs || []).filter(function (s) {
+      const p = Number(s.price);
+      return Number.isFinite(p) && p > 0;
+    });
+    const prev = state._lineSpecs[cacheKey] || [];
+    let same = prev.length === specs.length;
+    if (same) {
+      for (let i = 0; i < specs.length; i++) {
+        if (!_sameLineSpec(prev[i], specs[i])) { same = false; break; }
+      }
     }
+    if (same) return;
+    for (let i = 0; i < specs.length; i++) {
+      if (i < plArr.length) {
+        if (!_sameLineSpec(prev[i], specs[i])) {
+          try {
+            plArr[i].applyOptions(_lineOpts(specs[i]));
+          } catch (_) {
+            // LWC build without price-line applyOptions → remove + recreate
+            // just this one line.
+            try { state.candleSeries.removePriceLine(plArr[i]); } catch (__) {}
+            try { plArr[i] = state.candleSeries.createPriceLine(_lineOpts(specs[i])); } catch (__) {}
+          }
+        }
+      } else {
+        try { plArr.push(state.candleSeries.createPriceLine(_lineOpts(specs[i]))); } catch (_) {}
+      }
+    }
+    while (plArr.length > specs.length) {
+      const pl = plArr.pop();
+      try { state.candleSeries.removePriceLine(pl); } catch (_) {}
+    }
+    state._lineSpecs[cacheKey] = specs;
   }
 
   /** True if there is an open position in the currently shown symbol. */
@@ -878,61 +933,58 @@
 
   function drawProposalLines() {
     const chartColors = getChartColors();
-    state.proposalLines = clearLineGroup(state.proposalLines);
-    if (!state.candleSeries || !state.showAiLines) return;
+    const specs = [];
+    const p = state.proposal;
     // With a live trade open, the chart focuses on the trade (position + zones);
     // the KI planning overlay would just clutter it.
-    if (hasActivePosition()) return;
-    const p = state.proposal;
-    if (!p || p.action === "STAY_OUT") return;
-    if (state.proposalSymbol && !symMatch(state.proposalSymbol, state.symbol)) return;
-
-    const g = state.proposalLines;
-    // R-multiple labels: how much reward per unit of risk each TP pays
-    const risk =
-      p.entry_price && p.stop_loss
-        ? Math.abs(Number(p.entry_price) - Number(p.stop_loss))
-        : null;
-    function tpTitle(name, tp) {
-      if (!risk || tp == null) return name;
-      const r = Math.abs(Number(tp) - Number(p.entry_price)) / risk;
-      return name + " +" + r.toFixed(1) + "R";
-    }
-    // Core trade — hidden once applied to the ticket (ticket lines take over)
-    if (!state.proposalApplied) {
-      addChartLine(g, p.entry_price, chartColors.kiEntry, 2, "KI Entry", 2);
-      addChartLine(g, p.stop_loss, chartColors.short, 1, "KI SL -1R");
-      addChartLine(g, p.tp1, chartColors.long, 1, tpTitle("KI TP1", p.tp1));
-    }
-    addChartLine(g, p.tp2, chartColors.long, 4, tpTitle("KI TP2", p.tp2));
-    addChartLine(g, p.tp3, chartColors.long, 4, tpTitle("KI TP3", p.tp3));
-
-    // Analysis levels
-    const kl = p.key_levels || {};
-    addChartLine(g, kl.immediate_support, chartColors.level, 4, "Support");
-    addChartLine(g, kl.immediate_resistance, chartColors.level, 4, "Resist");
-    const pools = Array.isArray(kl.major_liquidity_pools)
-      ? kl.major_liquidity_pools
-      : [];
-    pools.slice(0, 3).forEach(function (v) {
-      const n = Number(v);
-      if (Number.isFinite(n) && n > 0) {
-        addChartLine(g, n, chartColors.pool, 4, "Pool");
+    const show =
+      state.candleSeries && state.showAiLines && !hasActivePosition() &&
+      p && p.action !== "STAY_OUT" &&
+      !(state.proposalSymbol && !symMatch(state.proposalSymbol, state.symbol));
+    if (show) {
+      // R-multiple labels: how much reward per unit of risk each TP pays
+      const risk =
+        p.entry_price && p.stop_loss
+          ? Math.abs(Number(p.entry_price) - Number(p.stop_loss))
+          : null;
+      const tpTitle = function (name, tp) {
+        if (!risk || tp == null) return name;
+        const r = Math.abs(Number(tp) - Number(p.entry_price)) / risk;
+        return name + " +" + r.toFixed(1) + "R";
+      };
+      // Core trade — hidden once applied to the ticket (ticket lines take over)
+      if (!state.proposalApplied) {
+        addChartLine(specs, p.entry_price, chartColors.kiEntry, 2, "KI Entry", 2);
+        addChartLine(specs, p.stop_loss, chartColors.short, 1, "KI SL -1R");
+        addChartLine(specs, p.tp1, chartColors.long, 1, tpTitle("KI TP1", p.tp1));
       }
-    });
+      addChartLine(specs, p.tp2, chartColors.long, 4, tpTitle("KI TP2", p.tp2));
+      addChartLine(specs, p.tp3, chartColors.long, 4, tpTitle("KI TP3", p.tp3));
+
+      // Analysis levels
+      const kl = p.key_levels || {};
+      addChartLine(specs, kl.immediate_support, chartColors.level, 4, "Support");
+      addChartLine(specs, kl.immediate_resistance, chartColors.level, 4, "Resist");
+      const pools = Array.isArray(kl.major_liquidity_pools)
+        ? kl.major_liquidity_pools
+        : [];
+      pools.slice(0, 3).forEach(function (v) {
+        addChartLine(specs, Number(v), chartColors.pool, 4, "Pool");
+      });
+    }
+    applyLineGroup(state.proposalLines, "proposal", specs);
   }
 
   function drawPositionLines() {
     const chartColors = getChartColors();
-    state.positionLines = clearLineGroup(state.positionLines);
-    if (!state.candleSeries) return;
+    const specs = [];
     const positions = (state.account && state.account.positions) || [];
     positions.forEach(function (p) {
       if (!symMatch(p.symbol, state.symbol)) return;
       const short = String(p.side || "").toLowerCase() === "short";
       const entry = Number(p.entry_price);
       addChartLine(
-        state.positionLines,
+        specs,
         entry,
         short ? chartColors.short : chartColors.long,
         0,
@@ -944,21 +996,21 @@
       if (Number.isFinite(entry) && entry > 0) {
         const feeRt = 0.0006;
         const be = short ? entry * (1 - feeRt) : entry * (1 + feeRt);
-        addChartLine(state.positionLines, be, chartColors.level, 1, "BE≈");
+        addChartLine(specs, be, chartColors.level, 1, "BE≈");
       }
       // Liquidation — the survival line; keeps its numeric axis label.
-      addChartLine(state.positionLines, p.liquidate_price, chartColors.liq, 3, "⚠ LIQ", undefined, true);
+      addChartLine(specs, p.liquidate_price, chartColors.liq, 3, "⚠ LIQ", undefined, true);
     });
+    applyLineGroup(state.positionLines, "position", specs);
   }
 
   function drawOrderLines() {
     const chartColors = getChartColors();
-    state.orderLines = clearLineGroup(state.orderLines);
-    if (!state.candleSeries) return;
+    const specs = [];
     const d = state.openOrders || {};
     (d.orders || []).forEach(function (o) {
       if (o.symbol && !symMatch(o.symbol, state.symbol)) return;
-      addChartLine(state.orderLines, o.price, chartColors.order, 2, "Order");
+      addChartLine(specs, o.price, chartColors.order, 2, "Order");
     });
     (d.stop_orders || []).forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
@@ -966,11 +1018,11 @@
       const slPx = Number(s.stopLossPrice);
       const tpPx = Number(s.takeProfitPrice);
       if (Number.isFinite(slPx) && slPx > 0) {
-        addChartLine(state.orderLines, slPx, chartColors.short, 2, "SL aktiv");
+        addChartLine(specs, slPx, chartColors.short, 2, "SL aktiv");
         drew = true;
       }
       if (Number.isFinite(tpPx) && tpPx > 0) {
-        addChartLine(state.orderLines, tpPx, chartColors.long, 2, "TP aktiv");
+        addChartLine(specs, tpPx, chartColors.long, 2, "TP aktiv");
         drew = true;
       }
       if (!drew) {
@@ -978,7 +1030,7 @@
         const t = String(s.orderType || "").toLowerCase();
         const isTp = t.indexOf("take") >= 0 || t.indexOf("tp") === 0;
         addChartLine(
-          state.orderLines,
+          specs,
           px,
           isTp ? chartColors.long : chartColors.short,
           2,
@@ -986,6 +1038,7 @@
         );
       }
     });
+    applyLineGroup(state.orderLines, "order", specs);
   }
 
   /** All currently active order/position price levels for the active symbol —
@@ -1039,7 +1092,6 @@
 
   function drawTicketLines() {
     if (!state.candleSeries) return;
-    clearPriceLines();
     const chartColors = getChartColors();
 
     // Same tick/price_unit source the rest of the app reads (contract meta
@@ -1059,30 +1111,26 @@
     }
 
     // SL/TP resolve through the price/% mode; entry & limit are always prices
-    const specs = [
+    const ticketSpecs = [
       { price: numOrNull($("ticket-entry")), color: chartColors.ticketEntry, title: "Entry" },
       { price: numOrNull($("ticket-price")), color: chartColors.order, title: "Limit" },
       { price: resolveStop(), color: chartColors.short, title: "SL" },
       { price: resolveTp(), color: chartColors.long, title: "TP1" },
     ];
 
-    for (const s of specs) {
+    const specs = [];
+    for (const s of ticketSpecs) {
       const val = s.price;
       if (!Number.isFinite(val) || val <= 0) continue;
       // T3-08: an active order/position line already marks this price (±1
       // tick) — keep THAT one (it's the real thing) and drop this redundant
       // ticket-dashed duplicate instead of stacking two lines at one price.
       if (dupesActiveLine(val)) continue;
-      const pl = state.candleSeries.createPriceLine({
-        price: val,
-        color: s.color,
-        lineWidth: 1,
-        lineStyle: 2, // dashed
-        axisLabelVisible: true,
-        title: s.title,
-      });
-      state.priceLines.push(pl);
+      // C3-12: diffed against last render — dashed ticket lines only get
+      // touched when a value actually moved, no per-poll remove+recreate.
+      addChartLine(specs, val, s.color, 2, s.title, 1, true);
     }
+    applyLineGroup(state.priceLines, "ticket", specs);
   }
 
   function updateContext(data) {
@@ -1766,14 +1814,31 @@
     if (candles.length) {
       const last = candles[candles.length - 1];
       const t = toChartTime(last.time);
-      state.liveBar = {
-        time: t,
-        open: last.open,
-        high: last.high,
-        low: last.low,
-        close: last.close,
-      };
-      if (data.last_price != null) setLivePrice(data.last_price);
+      const prevLive = state.liveBar;
+      if (
+        silent && !keyChanged && prevLive &&
+        Number.isFinite(prevLive.time) && Number.isFinite(t) && prevLive.time > t
+      ) {
+        // C3-12: on a silent poll the WS live bar can be NEWER than the last
+        // REST candle (REST lags the tape by a few seconds). setData() just
+        // snapped the chart back to that older REST close — re-apply the
+        // in-progress live bar so the current candle doesn't flicker/vanish.
+        try {
+          if (state.candleSeries) state.candleSeries.update(prevLive);
+        } catch (_) {
+          /* chart empty — ignore */
+        }
+        if (data.last_price != null) setLivePrice(data.last_price);
+      } else {
+        state.liveBar = {
+          time: t,
+          open: last.open,
+          high: last.high,
+          low: last.low,
+          close: last.close,
+        };
+        if (data.last_price != null) setLivePrice(data.last_price);
+      }
     }
 
     // Seed entry ref with last price if empty
@@ -2343,23 +2408,246 @@
     if (roeEl && roe != null) roeEl.textContent = (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE";
   }
 
+  /** Tiny djb2 string hash → short base36 token. Used to fold a position
+   *  card's structural signature (which may contain HTML/quotes) into a safe
+   *  `data-fp` attribute for the keyed-patch diff. */
+  function _hashStr(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }
+
+  /** N3-07/A3-03: ONE delegated click listener on #positions-body. This is the
+   *  REAL event delegation the old per-card rebind only pretended to be — it
+   *  survives keyed re-renders because it lives on the panel, not the cards, so
+   *  a Close/BE click can never be lost to a mid-render DOM swap of its button.
+   *  Every action the old per-card listeners fired is dispatched here by
+   *  data-action (money actions) or class (KI-switch), with the bare card click
+   *  as the click-to-chart fallback. Dropping any branch = a dead button. */
+  function onPositionsBodyClick(e) {
+    const t = e.target;
+    const actionEl = t.closest && t.closest("[data-action]");
+    if (actionEl) {
+      const a = actionEl.getAttribute("data-action");
+      if (a === "close-frac") {
+        // Partial-close: closes data-frac of the CURRENT hold (server rounds to lot).
+        e.stopPropagation();
+        const box = actionEl.closest(".cp-close");
+        if (box) {
+          closePositionFrac(
+            box.getAttribute("data-sym"),
+            box.getAttribute("data-side"),
+            Number(actionEl.getAttribute("data-frac"))
+          );
+        }
+        return;
+      }
+      if (a === "be") {
+        // SL → Break-Even: real money action, moves/places the stop at BE.
+        e.stopPropagation();
+        const box = actionEl.closest(".cp-actions");
+        if (box) {
+          moveStopToBreakEven(
+            box.getAttribute("data-sym"),
+            box.getAttribute("data-side"),
+            Number(box.getAttribute("data-be"))
+          );
+        }
+        return;
+      }
+      if (a === "reeval") {
+        // "KI: Position bewerten" — advisory only, never trades.
+        e.stopPropagation();
+        runReevaluate(actionEl.getAttribute("data-sym"));
+        return;
+      }
+    }
+    // A cached reevaluate result may be a categorized "⚠" provider error whose
+    // "KI wechseln" button focuses the provider dropdown (shared warn-banner
+    // markup, so matched by class, not data-action).
+    if (t.closest && t.closest(".btn-ki-switch")) {
+      focusLlmSelect();
+      return;
+    }
+    // K4: bare card click opens that coin's chart; ignore clicks that landed on
+    // an interactive element (buttons above already returned).
+    if (t.closest && t.closest("button, a, input, select, textarea")) return;
+    const card = t.closest && t.closest(".pos-cockpit");
+    if (card) {
+      const sym = card.getAttribute("data-sym");
+      if (sym) goToSymbol(sym);
+    }
+  }
+
+  /** Build the render model for one position: the full card HTML plus the
+   *  structural fingerprint (everything the card shows EXCEPT the live
+   *  uPnL/ROE numbers, which are text-patched in place so the card never
+   *  freezes and never needs a full rebuild just because price drifted). */
+  function _positionModel(p, cs) {
+    const pnl = Number(p.unrealized_pnl);
+    const pnlCls = Number.isFinite(pnl) && pnl !== 0 ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
+    const im = Number(p.im);
+    const roe = Number.isFinite(pnl) && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
+    const isActive = symMatch(p.symbol, state.symbol);
+    // `cs` is the ACTIVE chart symbol's contractSize — correct only for it.
+    // MEXC coins can have different contract sizes, so reusing it for every
+    // other open position's notional would be wrong (F-10). For any other
+    // symbol, derive notional from exchange-reported margin × leverage instead.
+    const posLev = Number(p.leverage);
+    const posIm = Number(p.im);
+    // F-10: prefer the position's OWN contract_size; fall back to the old
+    // proxies only when it's absent (older /api/account payload).
+    const posCsRaw = Number(p.contract_size);
+    const hasPosCs = Number.isFinite(posCsRaw) && posCsRaw > 0;
+    const entryPx = Number(p.entry_price || 0);
+    const notional =
+      hasPosCs && Number.isFinite(entryPx) && entryPx > 0
+        ? Number(p.hold_vol) * posCsRaw * entryPx
+        : isActive
+          ? Number(p.hold_vol) * cs * entryPx
+          : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
+            ? posIm * posLev
+            : null;
+    const posCs = hasPosCs ? posCsRaw : cs;
+    // Break-even stop incl. ~round-trip taker fees (0.06% total).
+    const beEntry = Number(p.entry_price);
+    const beFeeRt = 0.0006;
+    const bePrice =
+      Number.isFinite(beEntry) && beEntry > 0
+        ? sideVal === "short"
+          ? beEntry * (1 - beFeeRt)
+          : beEntry * (1 + beFeeRt)
+        : null;
+    // Computed once, reused for BOTH the HTML and the fingerprint so the SL
+    // banner / reeval block can't drift between what's shown and what's hashed.
+    const slHtml = slStatusBanner(p);
+    const reevalHtml = reevalResultHtml(p.symbol);
+    const beRow =
+      bePrice != null
+        ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
+          ' data-be="' + escapeHtml(String(bePrice)) + '">' +
+          '<span class="cp-actions-label">Stop</span>' +
+          '<button type="button" class="cp-be-btn" data-action="be" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>' +
+          "</div>"
+        : "";
+    // Structural fingerprint: everything the user needs EXCEPT the live pnl/roe
+    // text (patched in place). SL status + reeval block are included so a
+    // protection change or a fresh KI verdict DOES rebuild the card.
+    const fp = _hashStr(
+      [
+        String(p.symbol || ""), sideVal, String(p.leverage),
+        fmt(p.entry_price, 6), fmt(p.hold_vol, 6),
+        p.im != null ? fmt(p.im, 4) : "-",
+        fmt(p.liquidate_price, 6),
+        String(posCs), notional != null ? fmt(notional, 0) : "-",
+        bePrice != null ? String(bePrice) : "-",
+        slHtml, reevalHtml, isActive ? "A" : "-",
+      ].join("")
+    );
+    const html =
+      '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
+      (isActive ? " cp-active" : "") + '" data-fp="' + fp + '"' +
+      _posDataAttrs(p, sideVal, posCs) + ">" +
+      '<div class="cp-head">' +
+      sideTag(p.side) +
+      '<span class="cp-sym">' + escapeHtml(p.symbol || "—") + "</span>" +
+      '<span class="cp-lev">' + escapeHtml(String(p.leverage != null ? p.leverage : "—")) + "×</span>" +
+      "</div>" +
+      slHtml +
+      '<div class="cp-pnl js-upnl-big ' + pnlCls + '">' +
+      (pnl >= 0 ? "+" : "") + fmt(p.unrealized_pnl, 2) + " " + ccy() +
+      '<span class="cp-pnl-sub js-roe-big ' + pnlCls + '">' +
+      (roe != null ? (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE" : "") + "</span>" +
+      "</div>" +
+      '<div class="cp-grid">' +
+      _cpCell("Entry", fmt(p.entry_price, 4)) +
+      _cpCell(
+        "Größe",
+        fmt(p.hold_vol, 4) + (notional != null ? " · " + fmt(notional, 0) + " " + ccy() : "")
+      ) +
+      _cpCell("Liq", fmt(p.liquidate_price, 4), "cp-liq") +
+      _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
+      "</div>" +
+      beRow +
+      '<div class="cp-close" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
+      '<span class="cp-close-label">Schließen</span>' +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.25">25%</button>' +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.5">50%</button>' +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.75">75%</button>' +
+      '<button type="button" class="cp-close-btn cp-close-full" data-action="close-frac" data-frac="1">100%</button>' +
+      "</div>" +
+      '<div class="cp-reeval">' +
+      '<button type="button" class="cp-reeval-btn" data-action="reeval" data-sym="' +
+      escapeHtml(String(p.symbol || "")) + '">KI: Position bewerten</button>' +
+      '<div class="cp-reeval-result" data-sym-result="' +
+      escapeHtml(String(p.symbol || "").toUpperCase()) + '">' +
+      reevalHtml +
+      "</div>" +
+      "</div>" +
+      "</div>";
+    return {
+      key: String(p.symbol || "") + "|" + sideVal,
+      sym: String(p.symbol || ""),
+      html: html,
+      fp: fp,
+      rawPnl: p.unrealized_pnl,
+      pnl: pnl,
+      pnlCls: pnlCls,
+      roe: roe,
+    };
+  }
+
+  /** In-place patch of a card's live uPnL/ROE (no DOM rebuild → buttons stay
+   *  clickable). Mirrors the per-tick _updateLivePnl writer so the poll value
+   *  and the streaming value use the same text/class shape. */
+  function _patchCardLive(card, m) {
+    const big = card.querySelector(".js-upnl-big");
+    if (big) {
+      big.className = "cp-pnl js-upnl-big " + m.pnlCls;
+      if (big.firstChild) {
+        big.firstChild.nodeValue = (m.pnl >= 0 ? "+" : "") + fmt(m.rawPnl, 2) + " " + ccy();
+      }
+    }
+    const sub = card.querySelector(".js-roe-big");
+    if (sub) {
+      sub.className = "cp-pnl-sub js-roe-big " + m.pnlCls;
+      sub.textContent = m.roe != null ? (m.roe >= 0 ? "+" : "") + fmt(m.roe, 1) + "% ROE" : "";
+    }
+  }
+
+  function _buildCardEl(html) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    return tmp.firstElementChild;
+  }
+
   function renderPositions(data) {
     const el = $("positions-body");
     if (!el) return;
+    // Wire the ONE delegated listener a single time; it lives on the panel and
+    // survives every keyed re-render below.
+    if (!state._positionsWired) {
+      el.addEventListener("click", onPositionsBodyClick);
+      state._positionsWired = true;
+    }
     const positions = (data && data.positions) || [];
     const open = positions.filter(function (p) {
       return Math.abs(Number(p.hold_vol) || 0) > 0;
     });
     if (!open.length) {
+      const msg = data && data.error ? String(data.error) : "Keine offenen Positionen.";
+      const emptyFp = "EMPTY" + msg;
+      if (state._positionsFp === emptyFp) return;
+      state._positionsFp = emptyFp;
       el.className = "positions-body muted";
-      el.textContent = data && data.error ? String(data.error) : "Keine offenen Positionen.";
+      el.textContent = msg;
       return;
     }
 
-    // ALL open positions render as full cockpit cards, account-wide — not
-    // just the active symbol. The active symbol's card is visually
-    // highlighted (cp-active) but every other coin is equally full/clickable,
-    // no more "hidden + ansehen" compact rows.
+    // ALL open positions render as full cockpit cards, account-wide — the
+    // active symbol's card is highlighted (cp-active) but every coin is equally
+    // full/clickable.
     const active = open.filter(function (p) {
       return symMatch(p.symbol, state.symbol);
     });
@@ -2371,156 +2659,65 @@
     const cs =
       (state.market && state.market.contract && state.market.contract.contractSize) || 1;
 
-    function cockpit(p) {
-      const pnl = Number(p.unrealized_pnl);
-      const pnlCls = Number.isFinite(pnl) && pnl !== 0 ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
-      const im = Number(p.im);
-      const roe = Number.isFinite(pnl) && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
-      const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
-      const isActive = symMatch(p.symbol, state.symbol);
-      // `cs` above is the ACTIVE chart symbol's contractSize — correct only
-      // for that symbol. MEXC coins can have different contract sizes, so
-      // reusing it for every other open position's notional would be wrong
-      // (F-10). For any other symbol, derive notional from exchange-reported
-      // margin × leverage instead (independent of contractSize); if those
-      // aren't available, show no notional rather than a fabricated number.
-      const posLev = Number(p.leverage);
-      const posIm = Number(p.im);
-      // F-10: each position now carries its OWN contract_size. Prefer it for
-      // notional and the per-tick PnL recompute; only fall back to the old
-      // proxies (active-symbol cs, or margin×leverage) when the field is
-      // absent (older /api/account payload).
-      const posCsRaw = Number(p.contract_size);
-      const hasPosCs = Number.isFinite(posCsRaw) && posCsRaw > 0;
-      const entryPx = Number(p.entry_price || 0);
-      const notional =
-        hasPosCs && Number.isFinite(entryPx) && entryPx > 0
-          ? Number(p.hold_vol) * posCsRaw * entryPx
-          : isActive
-            ? Number(p.hold_vol) * cs * entryPx
-            : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
-              ? posIm * posLev
-              : null;
-      const posCs = hasPosCs ? posCsRaw : cs;
-      // Break-even stop incl. ~round-trip taker fees (0.06% total) — same math
-      // as the BE chart line. Long: entry above; short: entry below, so the
-      // stop at BE actually covers fees rather than sitting at raw entry.
-      const beEntry = Number(p.entry_price);
-      const beFeeRt = 0.0006;
-      const bePrice =
-        Number.isFinite(beEntry) && beEntry > 0
-          ? sideVal === "short"
-            ? beEntry * (1 - beFeeRt)
-            : beEntry * (1 + beFeeRt)
-          : null;
-      const beRow =
-        bePrice != null
-          ? '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
-            ' data-be="' + escapeHtml(String(bePrice)) + '">' +
-            '<span class="cp-actions-label">Stop</span>' +
-            '<button type="button" class="cp-be-btn" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>' +
-            "</div>"
-          : "";
-      return (
-        '<div class="pos-cockpit ' + (sideVal === "short" ? "cp-short" : "cp-long") +
-        (isActive ? " cp-active" : "") + '"' +
-        _posDataAttrs(p, sideVal, posCs) + ">" +
-        '<div class="cp-head">' +
-        sideTag(p.side) +
-        '<span class="cp-sym">' + escapeHtml(p.symbol || "—") + "</span>" +
-        '<span class="cp-lev">' + escapeHtml(String(p.leverage != null ? p.leverage : "—")) + "×</span>" +
-        "</div>" +
-        slStatusBanner(p) +
-        '<div class="cp-pnl js-upnl-big ' + pnlCls + '">' +
-        (pnl >= 0 ? "+" : "") + fmt(p.unrealized_pnl, 2) + " " + ccy() +
-        '<span class="cp-pnl-sub js-roe-big ' + pnlCls + '">' +
-        (roe != null ? (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE" : "") + "</span>" +
-        "</div>" +
-        '<div class="cp-grid">' +
-        _cpCell("Entry", fmt(p.entry_price, 4)) +
-        _cpCell(
-          "Größe",
-          fmt(p.hold_vol, 4) + (notional != null ? " · " + fmt(notional, 0) + " " + ccy() : "")
-        ) +
-        _cpCell("Liq", fmt(p.liquidate_price, 4), "cp-liq") +
-        _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
-        "</div>" +
-        beRow +
-        '<div class="cp-close" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
-        '<span class="cp-close-label">Schließen</span>' +
-        '<button type="button" class="cp-close-btn" data-frac="0.25">25%</button>' +
-        '<button type="button" class="cp-close-btn" data-frac="0.5">50%</button>' +
-        '<button type="button" class="cp-close-btn" data-frac="0.75">75%</button>' +
-        '<button type="button" class="cp-close-btn cp-close-full" data-frac="1">100%</button>' +
-        "</div>" +
-        '<div class="cp-reeval">' +
-        '<button type="button" class="cp-reeval-btn" data-sym="' +
-        escapeHtml(String(p.symbol || "")) + '">KI: Position bewerten</button>' +
-        '<div class="cp-reeval-result" data-sym-result="' +
-        escapeHtml(String(p.symbol || "").toUpperCase()) + '">' +
-        reevalResultHtml(p.symbol) +
-        "</div>" +
-        "</div>" +
-        "</div>"
-      );
-    }
+    const models = ordered.map(function (p) {
+      return _positionModel(p, cs);
+    });
+
+    // Render-fingerprint guard: fold every card's structure + live pnl/roe into
+    // one string. If it matches the last render AND the panel already shows
+    // cards, there is literally nothing to do — skip ALL DOM work (this is what
+    // keeps the money-buttons rock-stable between polls).
+    const globalFp = models
+      .map(function (m) {
+        return m.key + "#" + m.fp + "#" + fmt(m.rawPnl, 2) + "#" + (m.roe != null ? fmt(m.roe, 1) : "-");
+      })
+      .join("|");
+    const populated = !!el.querySelector(".pos-cockpit");
+    if (populated && state._positionsFp === globalFp) return;
+    state._positionsFp = globalFp;
 
     el.className = "positions-body";
-    el.innerHTML = ordered.map(cockpit).join("");
+    // Coming from the muted/empty state → no cards to reuse; clear the text.
+    if (!populated) el.innerHTML = "";
 
-    // Partial-close buttons (cockpit) send a fraction; the server closes that
-    // share of the CURRENT hold with lot rounding.
-    el.querySelectorAll(".cp-close-btn").forEach(function (btn) {
-      btn.addEventListener("click", function (e) {
-        e.stopPropagation(); // never let this bubble into the card's click-to-open-chart
-        const box = btn.closest(".cp-close");
-        if (!box) return;
-        closePositionFrac(
-          box.getAttribute("data-sym"),
-          box.getAttribute("data-side"),
-          Number(btn.getAttribute("data-frac"))
-        );
-      });
+    // Keyed patch: index the cards currently in the DOM by symbol|side.
+    const existing = {};
+    Array.prototype.forEach.call(el.querySelectorAll(".pos-cockpit"), function (c) {
+      existing[c.getAttribute("data-sym") + "|" + (c.getAttribute("data-side") || "")] = c;
     });
 
-    // SL → Break-Even (cockpit): places/moves the stop to the fee-adjusted
-    // break-even price via /api/orders/modify-sl (new stop → verify → cancel
-    // old). A real money action — confirmed before it fires.
-    el.querySelectorAll(".cp-be-btn").forEach(function (btn) {
-      btn.addEventListener("click", function (e) {
-        e.stopPropagation(); // never bubble into the card's click-to-open-chart
-        const box = btn.closest(".cp-actions");
-        if (!box) return;
-        moveStopToBreakEven(
-          box.getAttribute("data-sym"),
-          box.getAttribute("data-side"),
-          Number(box.getAttribute("data-be"))
-        );
-      });
+    const cardFor = {};
+    models.forEach(function (m) {
+      let card = existing[m.key];
+      if (card && card.getAttribute("data-fp") === m.fp) {
+        // Structure unchanged → keep the node (and its buttons); only the live
+        // uPnL/ROE text may have moved.
+        _patchCardLive(card, m);
+      } else if (card) {
+        // Structure changed (SL status, size after a partial close, fresh KI
+        // verdict, active-symbol switch …) → rebuild just this card in place.
+        const fresh = _buildCardEl(m.html);
+        card.parentNode.replaceChild(fresh, card);
+        card = fresh;
+      } else {
+        // New position → create; temp-append, reordered below.
+        card = _buildCardEl(m.html);
+        el.appendChild(card);
+      }
+      cardFor[m.key] = card;
     });
 
-    // "KI: Position bewerten" — advisory reevaluation of this OPEN position.
-    // Never places/moves/closes anything; purely informational.
-    el.querySelectorAll(".cp-reeval-btn").forEach(function (btn) {
-      btn.addEventListener("click", function (e) {
-        e.stopPropagation(); // never let this bubble into the card's click-to-open-chart
-        runReevaluate(btn.getAttribute("data-sym"));
-      });
+    // Remove cards whose position closed (no longer in the model set) so a
+    // stale card never lingers.
+    Object.keys(existing).forEach(function (k) {
+      if (!cardFor[k]) existing[k].remove();
     });
-    // A cached reevaluate result (from a previous render) may already be a
-    // categorized "⚠" provider error — wire its "KI wechseln" button too.
-    wireKiSwitchButtons(el);
 
-    // K4: clicking a position card opens that coin's chart (goToSymbol).
-    // Event delegation on the panel so it survives re-renders; ignore clicks
-    // that land on a button or other interactive element inside the card
-    // (e.g. the partial-close buttons) so those keep their own behavior.
-    el.querySelectorAll(".pos-cockpit").forEach(function (card) {
-      card.addEventListener("click", function (e) {
-        if (e.target.closest("button, a, input, select, textarea")) return;
-        const sym = card.getAttribute("data-sym");
-        if (sym) goToSymbol(sym);
-      });
+    // Enforce the desired order (active first) without destroying nodes.
+    models.forEach(function (m, i) {
+      const card = cardFor[m.key];
+      const at = el.children[i];
+      if (at !== card) el.insertBefore(card, at || null);
     });
   }
 
@@ -2662,8 +2859,10 @@
       // would be fine too, but this avoids reshuffling the whole panel.
       const out2 = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
       if (out2) {
+        // The card's "KI wechseln" button (if this result is a provider error)
+        // is handled by the #positions-body delegated listener — no per-element
+        // wiring needed here anymore (T34).
         out2.innerHTML = reevalResultHtml(key);
-        wireKiSwitchButtons(out2);
       }
       const btn2 = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
       if (btn2) {
@@ -5065,11 +5264,24 @@
     const bar = $("symbol-tabs");
     const addBtn = $("tab-add-btn");
     if (!bar || !addBtn) return;
+    const inChart = state.activeView !== "overview";
+    const active = String(state.symbol || "").toUpperCase();
+    // A3-10/V3-07: the tab bar was rebuilt on every 30s poll. Fingerprint the
+    // only things that change its markup — view, active symbol, tab order and
+    // each tab's long/short dot — and skip the rebuild entirely when nothing
+    // moved, so a poll no longer thrashes the bar (or drops a mid-click).
+    const fp =
+      (inChart ? "C" : "O") + "|" + active + "|" +
+      state.openTabs
+        .map(function (s) {
+          return s + ":" + (tabPositionSide(s) || "");
+        })
+        .join(",");
+    if (state._symbolTabsFp === fp) return;
+    state._symbolTabsFp = fp;
     bar.querySelectorAll(".symbol-tab").forEach(function (el) {
       el.remove();
     });
-    const inChart = state.activeView !== "overview";
-    const active = String(state.symbol || "").toUpperCase();
 
     // Fixed, non-closable overview tab in position 1
     const ov = document.createElement("button");
@@ -5432,45 +5644,32 @@
     );
   }
 
-  /** Build one mini-tile DOM node for `sym`. Extracted from renderOverviewGrid
-   *  so it can be reused for BOTH the positions group and the watchlist group
-   *  (V3-06). Unchanged rendering logic; adds an honest error badge when
-   *  state.overviewErrors has an entry for this symbol (V3-02). */
-  function buildMiniTile(sym, chartColors, cs) {
+  /** Compute the render model for one overview tile: price/change/pnl badges,
+   *  marks, candles, plus two fingerprints — dataFp (badges/price) and canvasFp
+   *  (candles+marks). Shared by buildMiniTile (create) and updateMiniTile
+   *  (in-place patch) so both read one source of truth. */
+  function _miniTileModel(sym, chartColors, cs) {
     const key = sym.toUpperCase();
     const d = state.overviewData[key] || {};
     const pos = positionFor(sym);
     const isWatch = state.watchlist.indexOf(key) !== -1 && !pos;
     const err = state.overviewErrors && state.overviewErrors[key];
-
-    const tile = document.createElement("div");
-    tile.className =
-      "mini-tile" +
-      (pos ? " pos " + String(pos.side || "").toLowerCase() : "") +
-      (err ? " mini-tile-error" : "");
-    tile.setAttribute("data-symbol", key);
-
     const last = Number(d.last_price);
     const chg = Number(d.change_pct);
     const chgCls = Number.isFinite(chg) ? (chg >= 0 ? "pos-pos" : "pos-neg") : "";
     const chgTxt = Number.isFinite(chg) ? (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%" : "—";
 
-    let pnlHtml = "";
+    let pnl = null;
     if (pos) {
-      // `cs` is the ACTIVE chart symbol's contractSize. Reusing it to
-      // recompute PnL for every tile would be wrong on MEXC, where coins
-      // can have different contract sizes (F-10). Only the active
-      // symbol's own tile may use that local recompute (correct cs, and
-      // it doubles as a live refresh against the streaming price); every
-      // other tile uses the exchange's own unrealized_pnl straight from
-      // /api/account instead of guessing with another symbol's cs.
+      // `cs` is the ACTIVE chart symbol's contractSize. Reusing it to recompute
+      // PnL for every tile would be wrong on MEXC (different contract sizes,
+      // F-10). Only the active symbol's own tile uses that local recompute;
+      // every other tile uses the exchange's own unrealized_pnl.
       const isActiveSym = symMatch(sym, state.symbol);
-      let pnl = null;
       if (isActiveSym && Number.isFinite(last)) {
         const entry = Number(pos.entry_price);
         const vol = Number(pos.hold_vol);
         const short = String(pos.side || "").toLowerCase() === "short";
-        // F-10: prefer this position's own contract_size for the live recompute.
         const pcsRaw = Number(pos.contract_size);
         const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : cs;
         if (Number.isFinite(entry) && Number.isFinite(vol)) {
@@ -5479,51 +5678,109 @@
       } else {
         pnl = Number(pos.unrealized_pnl);
       }
-      if (Number.isFinite(pnl)) {
-        const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
-        pnlHtml =
-          '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
-      }
     }
 
-    tile.innerHTML =
-      (isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
-      '<div class="mini-head"><span class="mini-sym">' + escapeHtml(key) + "</span>" +
-      '<span class="mini-price">' + (Number.isFinite(last) ? fmt(last, 6) : "—") + "</span></div>" +
-      '<div class="mini-badges">' + pnlHtml +
-      '<span class="mini-chg ' + chgCls + '">' + chgTxt + "</span></div>" +
-      // V3-02: a failed tile says so — never a silently frozen chart.
-      (err
-        ? '<div class="mini-err-badge" title="' + escapeHtml(err) + '">⚠ ' +
-          escapeHtml(err) + "</div>"
-        : "") +
-      '<canvas class="mini-canvas"></canvas>';
-
-    const cv = tile.querySelector(".mini-canvas");
     const marks = [];
     if (pos) {
-      // A3-01: `key` is the tile's own display/watchlist symbol, which on
-      // Hyperliquid may still be a typed full pair even though `pos` (found
-      // via the HL-aware symMatch) canonically keys tradeMarkers by bare
-      // coin — route through markerKey() so a manual SL/TP still draws.
+      // A3-01: route through markerKey() so a manual SL/TP still draws even when
+      // the tile's display symbol is a typed full pair on Hyperliquid.
       const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
       marks.push({ price: Number(pos.entry_price), color: chartColors.level });
       if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: chartColors.short });
       if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: chartColors.long });
     }
+    const candles = d.candles || [];
+    const lastC = candles.length ? candles[candles.length - 1] : null;
+    const canvasFp = [
+      candles.length,
+      lastC ? lastC.time : "",
+      lastC ? lastC.close : "",
+      marks.map(function (m) { return Number.isFinite(m.price) ? m.price : "-"; }).join(","),
+    ].join("|");
+    const dataFp = [
+      Number.isFinite(last) ? fmt(last, 6) : "-",
+      chgTxt,
+      pnl != null && Number.isFinite(pnl) ? fmt(pnl, 2) : "-",
+      canvasFp,
+    ].join("~");
+
+    return {
+      key: key, d: d, pos: pos, isWatch: isWatch, err: err,
+      last: last, chgCls: chgCls, chgTxt: chgTxt, pnl: pnl,
+      marks: marks, candles: candles, canvasFp: canvasFp, dataFp: dataFp,
+    };
+  }
+
+  function _miniPnlHtml(pnl) {
+    if (pnl == null || !Number.isFinite(pnl)) return "";
+    const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
+    return '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
+  }
+
+  /** Build one mini-tile DOM node for `sym`. Reused for BOTH the positions group
+   *  and the watchlist group (V3-06). Carries data-datafp/data-canvasfp so a
+   *  later poll can patch badges/price in place and only redraw the canvas when
+   *  candle data actually changed (A3-10/V3-07). */
+  function buildMiniTile(sym, chartColors, cs) {
+    const m = _miniTileModel(sym, chartColors, cs);
+    const tile = document.createElement("div");
+    tile.className =
+      "mini-tile" +
+      (m.pos ? " pos " + String(m.pos.side || "").toLowerCase() : "") +
+      (m.err ? " mini-tile-error" : "");
+    tile.setAttribute("data-symbol", m.key);
+    tile.setAttribute("data-datafp", m.dataFp);
+    tile.setAttribute("data-canvasfp", m.canvasFp);
+
+    tile.innerHTML =
+      (m.isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
+      '<div class="mini-head"><span class="mini-sym">' + escapeHtml(m.key) + "</span>" +
+      '<span class="mini-price">' + (Number.isFinite(m.last) ? fmt(m.last, 6) : "—") + "</span></div>" +
+      '<div class="mini-badges">' + _miniPnlHtml(m.pnl) +
+      '<span class="mini-chg ' + m.chgCls + '">' + m.chgTxt + "</span></div>" +
+      // V3-02: a failed tile says so — never a silently frozen chart.
+      (m.err
+        ? '<div class="mini-err-badge" title="' + escapeHtml(m.err) + '">⚠ ' +
+          escapeHtml(m.err) + "</div>"
+        : "") +
+      '<canvas class="mini-canvas"></canvas>';
+
+    const cv = tile.querySelector(".mini-canvas");
     // Draw after insertion so the canvas has a measured width.
     requestAnimationFrame(function () {
-      drawMiniCandles(cv, d.candles || [], marks);
+      drawMiniCandles(cv, m.candles, m.marks);
     });
 
     tile.addEventListener("click", function (e) {
       if (e.target.closest(".mini-remove")) {
-        removeWatch(key);
+        removeWatch(m.key);
         return;
       }
-      goToSymbol(key, { newTab: true });
+      goToSymbol(m.key, { newTab: true });
     });
     return tile;
+  }
+
+  /** A3-10/V3-07: patch an existing tile's price/change/PnL in place and redraw
+   *  its canvas ONLY when the candle/marks data changed — no DOM rebuild while
+   *  the grid structure (which coins, which group) is unchanged. */
+  function updateMiniTile(tile, m) {
+    if (tile.getAttribute("data-datafp") === m.dataFp) return;
+    tile.setAttribute("data-datafp", m.dataFp);
+    const priceEl = tile.querySelector(".mini-price");
+    if (priceEl) priceEl.textContent = Number.isFinite(m.last) ? fmt(m.last, 6) : "—";
+    const badges = tile.querySelector(".mini-badges");
+    if (badges) {
+      badges.innerHTML =
+        _miniPnlHtml(m.pnl) + '<span class="mini-chg ' + m.chgCls + '">' + m.chgTxt + "</span>";
+    }
+    if (tile.getAttribute("data-canvasfp") !== m.canvasFp) {
+      tile.setAttribute("data-canvasfp", m.canvasFp);
+      const cv = tile.querySelector(".mini-canvas");
+      requestAnimationFrame(function () {
+        drawMiniCandles(cv, m.candles, m.marks);
+      });
+    }
   }
 
   /** V3-06: positions are their own group at the TOP of the grid, sorted by
@@ -5536,11 +5793,13 @@
     if (!grid) return;
     const syms = overviewSymbols();
     if (!syms.length) {
-      grid.innerHTML =
-        '<div class="overview-empty">Keine offenen Positionen. Coins über „+ Beobachten" hinzufügen.</div>';
+      if (state._gridStructFp !== "EMPTY") {
+        state._gridStructFp = "EMPTY";
+        grid.innerHTML =
+          '<div class="overview-empty">Keine offenen Positionen. Coins über „+ Beobachten" hinzufügen.</div>';
+      }
       return;
     }
-    grid.innerHTML = "";
     const cs = contractSize();
 
     const posSyms = [];
@@ -5557,6 +5816,27 @@
       if (rb == null) return -1;
       return rb - ra;
     });
+
+    // A3-10/V3-07: the grid was rebuilt from scratch on every poll. Fingerprint
+    // its STRUCTURE — group membership, order, per-tile error state — and when
+    // it's unchanged just patch each tile's price/PnL/canvas in place instead
+    // of tearing the whole grid down.
+    const errOf = function (s) {
+      return (state.overviewErrors && state.overviewErrors[s.toUpperCase()]) || "";
+    };
+    const structFp =
+      "P:" + posSyms.map(function (s) { return s.toUpperCase() + ":" + errOf(s); }).join(",") +
+      "|W:" + watchSyms.map(function (s) { return s.toUpperCase() + ":" + errOf(s); }).join(",");
+    if (state._gridStructFp === structFp && grid.querySelector(".mini-tile")) {
+      posSyms.concat(watchSyms).forEach(function (s) {
+        const m = _miniTileModel(s, chartColors, cs);
+        const tile = grid.querySelector('.mini-tile[data-symbol="' + m.key + '"]');
+        if (tile) updateMiniTile(tile, m);
+      });
+      return;
+    }
+    state._gridStructFp = structFp;
+    grid.innerHTML = "";
 
     function addGroupHead(label) {
       const head = document.createElement("div");
