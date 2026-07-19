@@ -565,16 +565,11 @@
       const stops = (state.openOrders && state.openOrders.stop_orders) || [];
       stops.forEach(function (s) {
         if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
-        const trg = Number(
-          s.stopLossPrice != null ? s.stopLossPrice
-          : s.takeProfitPrice != null ? s.takeProfitPrice
-          : s.triggerPrice != null ? s.triggerPrice : s.price
-        );
-        if (!Number.isFinite(trg) || trg <= 0) return;
-        // classify by side relative to entry
-        const below = trg < entry;
-        if (short ? !below : below) sl = trg; // SL is adverse side
-        else tp = trg;
+        // T41b: one frontend source for SL/TP classification (field → label →
+        // geometry), mirroring app/orders/protection.py.
+        const c = classifyTriggers(s, short ? "short" : "long", entry);
+        if (c.sl != null) sl = c.sl;
+        if (c.tp != null) tp = c.tp;
       });
       // Fallback for MANUAL mode (no exchange trigger): the SL/TP the trader
       // set at entry, remembered on confirm. This is the ONE place the manual
@@ -613,10 +608,7 @@
       const vol = Number(p.hold_vol) || 0;
       // F-10: this position's own contract_size drives the $ risk band; fall
       // back to the active chart symbol's contractSize only if it's missing.
-      const csRaw = Number(p.contract_size);
-      const cs = Number.isFinite(csRaw) && csRaw > 0
-        ? csRaw
-        : Number((state.market && state.market.contract && state.market.contract.contractSize) || 1);
+      const cs = positionContractSize(p.contract_size, contractSize());
       // $ risk = distance * vol * contractSize
       const riskAmt =
         sl != null ? Math.abs(entry - sl) * vol * cs : null;
@@ -640,7 +632,8 @@
         const amt = Math.abs(entry - price) * vol * cs;
         let extra = " · " + (label === "SL" ? "−" : "+") + fmt(amt, 2);
         if (label === "TP" && riskAmt && riskAmt > 0) {
-          extra += " · " + fmt(amt / riskAmt, 1) + "R";
+          const rm = rMultiple(price, entry, sl);
+          if (rm != null) extra += " · " + fmt(rm, 1) + "R";
         }
         ctx.fillStyle = colorLine;
         ctx.font = "10px 'IBM Plex Mono', monospace";
@@ -695,8 +688,8 @@
         const risk = Math.abs(drag.entry - drag.newSl) * (drag.vol || 0) * (drag.cs || 1);
         let lbl = "SL→ " + fmt(drag.newSl, 4) + " · −" + fmt(risk, 2);
         if (Number.isFinite(drag.tp) && drag.tp != null && risk > 0) {
-          const reward = Math.abs(drag.tp - drag.entry) * (drag.vol || 0) * (drag.cs || 1);
-          lbl += " · " + fmt(reward / risk, 1) + "R";
+          const rm = rMultiple(drag.tp, drag.entry, drag.newSl);
+          if (rm != null) lbl += " · " + fmt(rm, 1) + "R";
         }
         // wrong-side hint so the trader sees the drop will be rejected
         const wrongSide = drag.side === "long" ? drag.newSl >= drag.entry : drag.newSl <= drag.entry;
@@ -979,14 +972,9 @@
       !(state.proposalSymbol && !symMatch(state.proposalSymbol, state.symbol));
     if (show) {
       // R-multiple labels: how much reward per unit of risk each TP pays
-      const risk =
-        p.entry_price && p.stop_loss
-          ? Math.abs(Number(p.entry_price) - Number(p.stop_loss))
-          : null;
       const tpTitle = function (name, tp) {
-        if (!risk || tp == null) return name;
-        const r = Math.abs(Number(tp) - Number(p.entry_price)) / risk;
-        return name + " +" + r.toFixed(1) + "R";
+        const r = rMultiple(tp, p.entry_price, p.stop_loss);
+        return r == null ? name : name + " +" + r.toFixed(1) + "R";
       };
       // Core trade — hidden once applied to the ticket (ticket lines take over)
       if (!state.proposalApplied) {
@@ -1029,9 +1017,8 @@
       );
       // Break-even incl. ~round-trip taker fees (0.06% total) so "SL to BE"
       // actually covers costs, not just the raw entry.
-      if (Number.isFinite(entry) && entry > 0) {
-        const feeRt = 0.0006;
-        const be = short ? entry * (1 - feeRt) : entry * (1 + feeRt);
+      const be = breakEvenPrice(entry, short);
+      if (be != null) {
         addChartLine(specs, be, chartColors.level, 1, "BE≈");
       }
       // Liquidation — the survival line; keeps its numeric axis label.
@@ -1063,8 +1050,12 @@
       }
       if (!drew) {
         const px = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-        const t = String(s.orderType || "").toLowerCase();
-        const isTp = t.indexOf("take") >= 0 || t.indexOf("tp") === 0;
+        // T41b: shared label classifier (mirrors app/orders/protection.py) —
+        // the combined "tpsl" order carries a STOP and now correctly draws as
+        // "SL aktiv", not "TP aktiv" (the old `indexOf("tp") === 0` prefix
+        // rule mislabeled it). No side/entry here, so an unlabeled trigger
+        // stays SL for visibility (never fabricated as a favourable TP line).
+        const isTp = classifyTriggerLabel(s.orderType) === "tp";
         addChartLine(
           specs,
           px,
@@ -1093,8 +1084,7 @@
       if (Number.isFinite(entry) && entry > 0) {
         out.push(entry);
         const short = String(p.side || "").toLowerCase() === "short";
-        const feeRt = 0.0006;
-        out.push(short ? entry * (1 - feeRt) : entry * (1 + feeRt)); // BE≈
+        out.push(breakEvenPrice(entry, short)); // BE≈
       }
       const liq = Number(p.liquidate_price);
       if (Number.isFinite(liq) && liq > 0) out.push(liq);
@@ -1457,8 +1447,8 @@
       // uPnL/ROE stops jumping every 30s between this tick-derived value and the
       // account poll's mark-derived one. Stale/missing offset → +0 (raw tick).
       const mpx = px + _markOffsetFor(sym);
-      const pnl = (mpx - entry) * vol * cs * (short ? -1 : 1);
-      const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+      const pnl = computePnl(mpx, entry, vol, cs, short);
+      const roe = computeRoe(pnl, im);
       const cls = "cp-pnl js-upnl-big " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
       const big = cp.querySelector(".js-upnl-big");
       if (big) {
@@ -2103,8 +2093,7 @@
     if (!Number.isFinite(sl) || !sl || !Number.isFinite(entry) || !Number.isFinite(vol) || !vol) {
       return null;
     }
-    const pcsRaw = Number(p.contract_size);
-    const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : contractSize();
+    const pcs = positionContractSize(p.contract_size, contractSize());
     return Math.abs(entry - sl) * Math.abs(vol) * pcs;
   }
 
@@ -2207,9 +2196,10 @@
     if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(price) || price <= 0) {
       return null;
     }
-    const posLong = String(pos.side || "").toLowerCase() !== "short";
-    const below = price < entry;
-    return (posLong ? below : !below) ? "SL" : "TP";
+    // T41b: same side+entry geometry the shared classifier uses (loss side of
+    // entry = SL). A reduce-only price is a bare limit (no field/label), so
+    // classifyTriggers falls straight through to geometry.
+    return classifyTriggers({ price: price }, pos.side, entry).tp != null ? "TP" : "SL";
   }
 
   /** Order-side tag that understands reduce-only closes. A reduce-only BUY
@@ -2274,36 +2264,21 @@
     const ordersKnown = !!(oo && oo.stop_orders && !oo.stops_error);
     const stops = (oo && oo.stop_orders) || [];
     const entry = Number(p.entry_price);
-    const hasEntry = Number.isFinite(entry) && entry > 0;
     const short = String(p.side || "").toLowerCase() === "short";
+    // T41b: SL/TP classification is now the ONE frontend source classifyTriggers
+    // (trade-math.js), mirroring app/orders/protection.py — explicit field
+    // first, then orderType label, then side+entry geometry. It keeps this
+    // module's break-even nuance (a trigger within ~0.1% of entry is a
+    // break-even STOP, F-12b — a real BE stop must not read as unprotected)
+    // and, like the backend, never fabricates an SL for an unresolvable
+    // trigger. The prior inline label rule (`indexOf("tp") === 0`) mis-read
+    // MEXC's combined "tpsl" (a stop) as a take-profit; the shared classifier
+    // fixes that, so a tpsl-protected position no longer reads "no stop-loss".
     stops.forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, p.symbol)) return;
-      const slField = Number(s.stopLossPrice);
-      const tpField = Number(s.takeProfitPrice);
-      // 1) Explicit SL/TP field always wins (MEXC create body echoes these).
-      if (Number.isFinite(slField) && slField > 0) { sl = slField; return; }
-      if (Number.isFinite(tpField) && tpField > 0) { tp = tpField; return; }
-      // 2) Trigger price + orderType label (Hyperliquid: "Stop"/"Take Profit").
-      const trg = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-      if (!Number.isFinite(trg) || trg <= 0) return;
-      const t = String(s.orderType || "").toLowerCase();
-      if (t.indexOf("take") >= 0 || t.indexOf("tp") === 0) { tp = trg; return; }
-      if (t.indexOf("stop") >= 0 || t.indexOf("sl") === 0) { sl = trg; return; }
-      // 3) No field/label available → classify by side vs entry (mirrors the
-      // backend's _classify_unlabeled_trigger): a stop sits on the LOSS side
-      // of entry, a take-profit on the PROFIT side. A trigger at/very near
-      // entry is a break-even stop — it IS protection, so classify it as SL
-      // rather than "unknown" (a real breakeven stop must not read as
-      // unprotected). If side/entry can't be resolved, leave it unknown
-      // rather than guessing SL (F-12b: a fabricated SL can mask an actually
-      // unprotected position, same as a fabricated "unprotected" can hide a
-      // real breakeven stop).
-      if (!hasEntry) return;
-      const beTolerance = entry * 0.001; // within ~0.1% of entry = breakeven
-      if (Math.abs(trg - entry) <= beTolerance) { sl = trg; return; }
-      const below = trg < entry;
-      if (short ? !below : below) sl = trg;
-      else tp = trg;
+      const c = classifyTriggers(s, short ? "short" : "long", entry);
+      if (c.sl != null) sl = c.sl;
+      if (c.tp != null) tp = c.tp;
     });
     const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
     let manual = false;
@@ -2415,15 +2390,14 @@
     const entry = Number(active.entry_price);
     const vol = Number(active.hold_vol);
     // F-10: use this position's own contract_size when present.
-    const csRaw = Number(active.contract_size);
-    const cs = Number.isFinite(csRaw) && csRaw > 0 ? csRaw : contractSize();
+    const cs = positionContractSize(active.contract_size, contractSize());
     const im = Number(active.margin != null ? active.margin : active.im);
     const px = Number(state.lastPx);
     let pnl = active.unrealized_pnl != null ? Number(active.unrealized_pnl) : null;
     if (Number.isFinite(px) && Number.isFinite(entry) && Number.isFinite(vol)) {
-      pnl = (px - entry) * vol * cs * (short ? -1 : 1);
+      pnl = computePnl(px, entry, vol, cs, short);
     }
-    const roe = pnl != null && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const roe = computeRoe(pnl, im);
     const prot = findPositionProtection(active);
     const liq = Number(active.liquidate_price);
     let liqPct = null;
@@ -2494,10 +2468,9 @@
     const vol = Number(active.hold_vol);
     const im = Number(active.margin != null ? active.margin : active.im);
     if (!Number.isFinite(entry) || !Number.isFinite(vol)) return;
-    const csRaw = Number(active.contract_size);
-    const cs = Number.isFinite(csRaw) && csRaw > 0 ? csRaw : contractSize();
-    const pnl = (Number(px) - entry) * vol * cs * (short ? -1 : 1);
-    const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const cs = positionContractSize(active.contract_size, contractSize());
+    const pnl = computePnl(px, entry, vol, cs, short);
+    const roe = computeRoe(pnl, im);
     const big = inst.querySelector(".ir-bigpnl");
     const numEl = inst.querySelector(".js-ir-pnl");
     if (numEl) numEl.textContent = (pnl >= 0 ? "+" : "") + fmt(pnl, 2);
@@ -2692,7 +2665,7 @@
     const pnl = Number(p.unrealized_pnl);
     const pnlCls = Number.isFinite(pnl) && pnl !== 0 ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
     const im = Number(p.im);
-    const roe = Number.isFinite(pnl) && Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
+    const roe = computeRoe(pnl, im);
     const sideVal = String(p.side || "").toLowerCase() === "short" ? "short" : "long";
     const isActive = symMatch(p.symbol, state.symbol);
     // `cs` is the ACTIVE chart symbol's contractSize — correct only for it.
@@ -2714,7 +2687,7 @@
           : Number.isFinite(posIm) && posIm > 0 && Number.isFinite(posLev) && posLev > 0
             ? posIm * posLev
             : null;
-    const posCs = hasPosCs ? posCsRaw : cs;
+    const posCs = positionContractSize(p.contract_size, cs);
     // N3-01: mark price + liq-distance-% + raw price-%, all volatile-per-tick
     // (patched in place, see globalFp below — never gate the structural fp on
     // these or the card would skip re-render on a pure price move).
@@ -2745,14 +2718,7 @@
     // banner HTML avoids coupling the two concerns.
     const hasSl = findPositionProtection(p).sl != null;
     // Break-even stop incl. ~round-trip taker fees (0.06% total).
-    const beEntry = Number(p.entry_price);
-    const beFeeRt = 0.0006;
-    const bePrice =
-      Number.isFinite(beEntry) && beEntry > 0
-        ? sideVal === "short"
-          ? beEntry * (1 - beFeeRt)
-          : beEntry * (1 + beFeeRt)
-        : null;
+    const bePrice = breakEvenPrice(p.entry_price, sideVal === "short");
     // Computed once, reused for BOTH the HTML and the fingerprint so the SL
     // banner / reeval block can't drift between what's shown and what's hashed.
     const slHtml = slStatusBanner(p);
@@ -3337,10 +3303,10 @@
           const slPx = Number(s.stopLossPrice);
           const tpPx = Number(s.takeProfitPrice);
           const trgPx = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-          const t = String(s.orderType || "").toLowerCase();
-          const isTp =
-            (Number.isFinite(tpPx) && tpPx > 0 && !(Number.isFinite(slPx) && slPx > 0)) ||
-            t.indexOf("take") >= 0;
+          // T41b: shared classifier (field → label, mirrors protection.py). No
+          // position side/entry in this list, so geometry is skipped; an
+          // unlabeled trigger reads as SL (never a fabricated TP).
+          const isTp = classifyTriggers(s).tp != null;
           const px = Number.isFinite(slPx) && slPx > 0 ? slPx
             : Number.isFinite(tpPx) && tpPx > 0 ? tpPx
             : trgPx;
@@ -3494,7 +3460,7 @@
         const sym = String(p.symbol || "").toUpperCase();
         if (!sym) return;
         const vol = Number(p.hold_vol);
-        const cs = Number(p.contract_size) || 1;
+        const cs = positionContractSize(p.contract_size, 1);
         const entry = Number(p.entry_price);
         const pnl = Number(p.unrealized_pnl);
         if (
@@ -5497,14 +5463,10 @@
     const fmtN = (v) => (v == null || v === "" ? "—" : fmt(v, 6));
 
     // R-multiples for the TP tiles (reward per unit of risk)
-    const risk =
-      p.entry_price != null && p.stop_loss != null
-        ? Math.abs(Number(p.entry_price) - Number(p.stop_loss))
-        : null;
-    const rMult = (tp) =>
-      risk && tp != null && p.entry_price != null
-        ? "+" + fmt(Math.abs(Number(tp) - Number(p.entry_price)) / risk, 1) + "R"
-        : "";
+    const rMult = (tp) => {
+      const r = rMultiple(tp, p.entry_price, p.stop_loss);
+      return r == null ? "" : "+" + fmt(r, 1) + "R";
+    };
 
     // Header: big action badge + symbol
     let html =
@@ -6688,10 +6650,9 @@
         const entry = Number(pos.entry_price);
         const vol = Number(pos.hold_vol);
         const short = String(pos.side || "").toLowerCase() === "short";
-        const pcsRaw = Number(pos.contract_size);
-        const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : cs;
+        const pcs = positionContractSize(pos.contract_size, cs);
         if (Number.isFinite(entry) && Number.isFinite(vol)) {
-          pnl = (last - entry) * vol * pcs * (short ? -1 : 1);
+          pnl = computePnl(last, entry, vol, pcs, short);
         }
       } else {
         pnl = Number(pos.unrealized_pnl);
@@ -7336,15 +7297,12 @@
       const stops = (state.openOrders && state.openOrders.stop_orders) || [];
       stops.forEach(function (s) {
         if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
-        const trg = Number(
-          s.stopLossPrice != null ? s.stopLossPrice
-          : s.takeProfitPrice != null ? s.takeProfitPrice
-          : s.triggerPrice != null ? s.triggerPrice : s.price
-        );
-        if (!Number.isFinite(trg) || trg <= 0) return;
-        const below = trg < entry;
-        if (short ? !below : below) sl = trg; // adverse side = SL
-        else tp = trg;
+        // T41b: shared SL/TP classifier (field → label → geometry) — same
+        // source _drawTradeZones uses, so the draggable SL is the SAME stop the
+        // zone overlay draws (mirrors app/orders/protection.py).
+        const c = classifyTriggers(s, short ? "short" : "long", entry);
+        if (c.sl != null) sl = c.sl;
+        if (c.tp != null) tp = c.tp;
       });
       const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
       if (mk) {
@@ -7353,10 +7311,7 @@
       }
       if (sl == null || !(sl > 0)) continue; // no stop → nothing to drag
       const vol = Number(p.hold_vol) || 0;
-      const csRaw = Number(p.contract_size);
-      const cs = Number.isFinite(csRaw) && csRaw > 0
-        ? csRaw
-        : Number((state.market && state.market.contract && state.market.contract.contractSize) || 1);
+      const cs = positionContractSize(p.contract_size, contractSize());
       return { symbol: p.symbol, side: short ? "short" : "long", entry, sl, vol, cs, tp };
     }
     return null;

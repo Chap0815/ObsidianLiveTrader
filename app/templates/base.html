@@ -24,6 +24,13 @@
      globals app.js can call by bare name — same-origin /static under CSP
      'self', matching the app.js tag pattern (no nonce needed for src). #}
   <script src="/static/utils.js?v={{ asset_version|default('r22') }}"></script>
+  {# A3-06 (T41b): pure money-math (PnL, ROE, break-even, R-multiple,
+     contract-size fallback, SL/TP trigger-classification) extracted to
+     trade-math.js — the ONE frontend source per formula, mirroring the
+     backend classifier app/orders/protection.py. Classic script loaded AFTER
+     utils.js and IMMEDIATELY BEFORE app.js so its functions are globals app.js
+     calls by bare name (same tag pattern as utils.js). #}
+  <script src="/static/trade-math.js?v={{ asset_version|default('r22') }}"></script>
   <script src="/static/app.js?v={{ asset_version|default('r22') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
