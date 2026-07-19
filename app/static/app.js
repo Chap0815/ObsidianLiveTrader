@@ -2796,8 +2796,6 @@
   /* ── Trade markers (E7): real executions on the time axis ───────────── */
   async function loadFills() {
     if (!state.symbol) return null;
-    // Only HL has a fill-history API today; skip the request entirely on MEXC.
-    if (!(state.health && state.health.exchange === "hyperliquid")) return null;
     // Sequence guard: a fast coin switch can leave an in-flight request from
     // the previous symbol resolving AFTER the new symbol's own request,
     // silently overwriting state.fills with stale data (markers flicker).
@@ -2811,7 +2809,12 @@
       if (!res.ok) return null;
       const data = await res.json();
       if (reqSeq !== state._fillsSeq) return null; // superseded by a newer call
-      state.fills = Array.isArray(data.fills) ? data.fills : [];
+      // C3-01: feature-detect via the endpoint's own `supported` flag
+      // instead of hardcoding "only HL has fills" — the backend already
+      // reports supported=false for any exchange client without a working
+      // user_fills, so MEXC (and any future exchange) works through this
+      // SAME code path with no frontend special-case.
+      state.fills = data.supported && Array.isArray(data.fills) ? data.fills : [];
       applyTradeMarkers();
       try { renderTrades(); } catch (_) {}
       return data;

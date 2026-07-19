@@ -528,6 +528,57 @@ class MexcClient:
             return data
         return list(data or []) if data else []
 
+    # C3-01: page size / page cap for user_fills paging (mirrors the
+    # history_orders pattern above — widen past a single page only as far as
+    # `limit` actually needs).
+    _FILLS_PAGE_SIZE = 100
+    _FILLS_MAX_PAGES = 5
+
+    async def user_fills(
+        self, symbol: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Recent executions (deals) for the account, newest first.
+
+        Read-only GET .../order/list/order_deals — MEXC's fill-history
+        equivalent of Hyperliquid's userFills. Normalized to the SAME shape
+        the UI/marker layer consumes (see normalize_mexc_fill /
+        hyperliquid.client.user_fills): symbol, px, sz, side, time(ms), dir,
+        closed_pnl, oid, fee. Paged like history_orders (widen only as far
+        as `limit` needs, capped at _FILLS_MAX_PAGES pages).
+        """
+        page_size = min(max(int(limit), 1), self._FILLS_PAGE_SIZE)
+        raw_rows: list[Any] = []
+        for page_num in range(1, self._FILLS_MAX_PAGES + 1):
+            params: dict[str, Any] = {"page_num": page_num, "page_size": page_size}
+            if symbol:
+                params["symbol"] = symbol
+            data = await self._request(
+                "GET",
+                "/api/v1/private/order/list/order_deals",
+                params=params,
+                private=True,
+            )
+            if isinstance(data, dict) and "resultList" in data:
+                page_rows = list(data.get("resultList") or [])
+            elif isinstance(data, list):
+                page_rows = data
+            else:
+                page_rows = [data] if data else []
+            raw_rows.extend(page_rows)
+            if len(page_rows) < page_size or len(raw_rows) >= limit:
+                break
+
+        out: list[dict[str, Any]] = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                out.append(normalize_mexc_fill(row))
+            except (TypeError, ValueError):
+                continue  # graceful degrade: skip, never fabricate a fill
+        out.sort(key=lambda r: r["time"], reverse=True)
+        return out[: max(1, int(limit))]
+
     # Known MEXC futures stop/plan-order list paths across doc revisions.
     # NEEDS LIVE VERIFICATION: tried in order, first that responds wins.
     _STOP_ORDER_PATHS = (
@@ -772,6 +823,70 @@ def _opt_float(v: Any) -> float | None:
     if v is None:
         return None
     return float(v)
+
+
+# C3-01: MEXC deal `side` codes (same codes place_order takes) -> the same
+# free-text "Open Long"/"Close Short"-style dir Hyperliquid's user_fills
+# emits, so classifyFillDir() in the frontend needs no MEXC special-case.
+# NOTE: MEXC deals carry no liquidation flag — a forced-liquidation close
+# still normalizes to a plain "Close ..." dir here (never fabricated as
+# "Liquidated ..."), so classifyFillDir will bucket it as "close", not "liq".
+_MEXC_FILL_DIR = {
+    1: "Open Long",
+    2: "Close Short",
+    3: "Open Short",
+    4: "Close Long",
+}
+
+
+def _first_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    """First present, non-null, numeric-parseable value across candidate
+    field names (MEXC doc revisions vary the exact key)."""
+    for k in keys:
+        if k in row and row[k] is not None:
+            try:
+                return float(row[k])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
+    """Map one MEXC order_deals row to the SAME normalized fill shape
+    Hyperliquid's user_fills produces (see hyperliquid/client.py): symbol,
+    px, sz, side, time(ms), dir, closed_pnl, oid, fee. Raises
+    TypeError/ValueError if px/sz/time can't be resolved — callers must skip
+    that row rather than fabricate a fill.
+    """
+    px = _first_float(row, ("price", "dealPrice", "avgPrice"))
+    sz = _first_float(row, ("vol", "dealVol", "dealVolume"))
+    t = _first_float(row, ("timestamp", "dealTime", "createTime", "time"))
+    if px is None or sz is None or t is None:
+        raise ValueError("MEXC deal row missing px/sz/time")
+
+    side_i: int | None
+    try:
+        side_i = int(row.get("side"))
+    except (TypeError, ValueError):
+        side_i = None
+    # MEXC side 1 (open long) / 2 (close short) both execute as a buy;
+    # 3 (open short) / 4 (close long) both execute as a sell — mirrors
+    # Hyperliquid's literal B/S trade-side semantics, not open/close intent.
+    side = "sell" if side_i in (3, 4) else "buy"
+
+    closed_pnl = _first_float(row, ("profit", "closedPnl", "realizedPnl"))
+
+    return {
+        "symbol": str(row.get("symbol") or ""),
+        "px": px,
+        "sz": sz,
+        "side": side,
+        "time": int(t),
+        "dir": _MEXC_FILL_DIR.get(side_i or -1, ""),
+        "closed_pnl": closed_pnl,
+        "oid": row.get("orderId"),
+        "fee": _first_float(row, ("fee",)) or 0.0,
+    }
 
 
 def _f(v: Any, default: float = 0.0) -> float:

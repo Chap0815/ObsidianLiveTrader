@@ -266,3 +266,93 @@ async def test_mexc_open_stop_orders_caches_working_path():
     calls.clear()
     await c.open_stop_orders("BTC_USDT")
     assert calls == [working_path]
+
+
+# --- Task 32 (C3-01): user_fills() — MEXC fill-marker parity ---
+
+
+@pytest.mark.asyncio
+async def test_mexc_user_fills_normalizes_shape_like_hyperliquid():
+    """MEXC's order_deals rows (numeric side code, `profit` per deal) must
+    normalize to the EXACT same shape Hyperliquid's user_fills produces
+    (symbol, px, sz, side, time(ms), dir, closed_pnl, oid, fee) — the shared
+    frontend marker pipeline (classifyFillDir etc.) has no MEXC special-case
+    and only works if the fields line up field-for-field."""
+    raw_rows = [
+        {
+            "id": "9001",
+            "symbol": "BTC_USDT",
+            "side": 1,  # open long -> buy
+            "vol": 0.5,
+            "price": 65000.5,
+            "fee": 0.02,
+            "feeCurrency": "USDT",
+            "timestamp": 1710000005000,
+            "profit": 0,
+            "orderId": "555",
+        },
+        {
+            "id": "9002",
+            "symbol": "BTC_USDT",
+            "side": 4,  # close long -> sell
+            "vol": 0.5,
+            "price": 66000.0,
+            "fee": 0.03,
+            "timestamp": 1710000009000,
+            "profit": 500.25,
+            "orderId": "556",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/private/order/list/order_deals"
+        return httpx.Response(200, json={"resultList": raw_rows})
+
+    c = _client_with_handler(handler)
+    out = await c.user_fills(symbol="BTC_USDT", limit=100)
+
+    assert len(out) == 2
+    # Newest first (time descending), same ordering contract as HL.
+    assert out[0]["time"] == 1710000009000
+    assert out[0]["symbol"] == "BTC_USDT"
+    assert out[0]["px"] == 66000.0
+    assert out[0]["sz"] == 0.5
+    assert out[0]["side"] == "sell"
+    assert "close" in out[0]["dir"].lower()
+    assert out[0]["closed_pnl"] == 500.25
+    assert out[0]["oid"] == "556"
+    assert out[0]["fee"] == 0.03
+
+    opened = out[1]
+    assert opened["side"] == "buy"
+    assert "open" in opened["dir"].lower()
+    assert opened["closed_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_mexc_user_fills_skips_unparseable_rows():
+    """A row missing price/vol must be dropped, not raise/crash the whole call
+    — graceful degrade, never a fabricated fill (same page/handler as above,
+    kept as one Task-32 test group covering shape normalization end to end)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resultList": [
+                    {"symbol": "BTC_USDT", "side": 1, "timestamp": 1},  # no price/vol
+                    {
+                        "symbol": "BTC_USDT",
+                        "side": 1,
+                        "vol": 1.0,
+                        "price": 100.0,
+                        "timestamp": 2,
+                    },
+                ]
+            },
+        )
+
+    c = _client_with_handler(handler)
+    out = await c.user_fills(symbol="BTC_USDT")
+    assert len(out) == 1
+    assert out[0]["time"] == 2
