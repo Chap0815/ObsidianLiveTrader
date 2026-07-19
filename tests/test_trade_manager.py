@@ -296,3 +296,55 @@ def test_be_none_when_entry_non_positive_no_crash():
         mgmt=mgmt, now_ms=0, settings=_settings(),
     )
     assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+# ── Review nits (2026-07-19): self-defeating BE, robustness ─────────────────
+
+def test_be_above_mark_refused_for_tiny_r1_long():
+    """Important review fix: a tight initial stop makes r1 small enough that the
+    fee buffer pushes BE PAST the current price. A long stop above mark would
+    trigger instantly / be rejected — evaluate_rules must refuse it."""
+    # entry 100, initial_sl 99.95 → r1 0.05; mark 100.055 == +1.1R.
+    # BE = 100 * 1.0006 = 100.06, which is ABOVE mark 100.055 → must be refused.
+    mgmt = _mgmt(entry=100.0, initial_sl=99.95, r1=0.05,
+                 armed_rules={"auto_be": True})
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=99.95, mark=100.055,
+        mgmt=mgmt, now_ms=0, settings=_settings(),
+    )
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+def test_be_above_mark_refused_for_tiny_r1_short():
+    # short entry 100, initial_sl 100.05 → r1 0.05; mark 99.945 == +1.1R.
+    # BE = 100 * 0.9994 = 99.94, which is BELOW mark 99.945 → must be refused.
+    mgmt = _mgmt(entry=100.0, initial_sl=100.05, r1=0.05,
+                 armed_rules={"auto_be": True})
+    actions = evaluate_rules(
+        side="short", entry=100.0, current_sl=100.05, mark=99.945,
+        mgmt=mgmt, now_ms=0, settings=_settings(),
+    )
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+def test_non_dict_armed_and_alert_state_no_crash():
+    """A corrupt JSON column deserializing to a non-dict must not crash the
+    money-path function — armed_rules/last_alert_state coerce to {}."""
+    mgmt = _mgmt(armed_rules=None, last_alert_state=None,
+                 invalidation_price=95.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=110.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(),
+    )
+    # armed coerced to {} → no auto-BE; no crash on the thesis/time-stop .get.
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+def test_unknown_side_yields_no_actions():
+    """A mislabeled side must not be silently treated as short — do nothing."""
+    mgmt = _mgmt(armed_rules={"auto_be": True}, invalidation_price=95.0)
+    actions = evaluate_rules(
+        side="buy", entry=100.0, current_sl=90.0, mark=110.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(),
+    )
+    assert actions == []

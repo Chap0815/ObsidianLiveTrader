@@ -82,7 +82,15 @@ def evaluate_rules(
     persists any state change derived from the returned actions.
     """
     actions: list[Action] = []
+    if side not in ("long", "short"):
+        return actions  # unknown/mislabeled side → do nothing (fail-safe, never guess)
     direction = 1 if side == "long" else -1
+
+    # Defensive: a corrupt JSON column could deserialize to a non-dict; coerce so
+    # a `.get` can never crash this money-path function on its own (the fail-safe
+    # monitor loop would also catch it, but the pure function should be robust).
+    armed = mgmt.armed_rules if isinstance(mgmt.armed_rules, dict) else {}
+    alert_state = mgmt.last_alert_state if isinstance(mgmt.last_alert_state, dict) else {}
 
     # R is only available with a finite, strictly positive r1. Otherwise all
     # R-based signals (auto-BE, time-stop-R gate) are unavailable — no crash.
@@ -92,19 +100,24 @@ def evaluate_rules(
 
     # ── Auto-BE (autonomous) ────────────────────────────────────────────────
     if (
-        mgmt.armed_rules.get("auto_be")
+        armed.get("auto_be")
         and not mgmt.be_done
         and unreal_r is not None
         and unreal_r >= settings.tm_be_trigger_r
     ):
         be = break_even_price(entry, side == "short", settings.tm_be_fee_rt)
-        if be is not None and _is_more_protective(side, be, current_sl):
+        # Emit only if BE (a) tightens the stop AND (b) sits on the correct side
+        # of the current price. A tiny-r1 position (fee buffer > +1R distance)
+        # would otherwise get a BE past mark — long stop above price / short stop
+        # below price — that triggers instantly or is rejected by the exchange.
+        be_on_right_side = be is not None and (be < mark if side == "long" else be > mark)
+        if be is not None and be_on_right_side and _is_more_protective(side, be, current_sl):
             reason = f"auto-BE @ +{unreal_r:.2f}R"
             actions.append(MoveSlToBe(be, reason))
 
     # ── Thesis-invalidation alarm (advisory, R-independent) ──────────────────
     inval = mgmt.invalidation_price
-    if inval is not None and not mgmt.last_alert_state.get("thesis"):
+    if inval is not None and not alert_state.get("thesis"):
         crossed = mark <= inval if direction == 1 else mark >= inval
         if crossed:
             actions.append(
@@ -121,7 +134,7 @@ def evaluate_rules(
     # ── Time-stop alarm (advisory, needs R) ─────────────────────────────────
     time_ms = settings.tm_time_stop_hours * 3_600_000
     if (
-        not mgmt.last_alert_state.get("time_stop")
+        not alert_state.get("time_stop")
         and (now_ms - mgmt.opened_at_ms) >= time_ms
         and unreal_r is not None
         and unreal_r < settings.tm_time_stop_min_r
