@@ -89,6 +89,23 @@ def ensure_env(*, merge: bool = True, auto_token: bool = True) -> dict[str, str]
                 ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8", newline="\n")
                 current = _parse_env(_read(ENV_PATH))
 
+        # W3-02: SETUP_COMPLETE MUST be present. A .env without it defaults the
+        # marker to false (fail-safe), which would re-open the UNAUTHENTICATED
+        # /setup save — and that save OVERWRITES the entire hand-maintained
+        # .env. Idempotent: add it only if the key is absent (never touch or
+        # duplicate an existing value, incl. a deliberate SETUP_COMPLETE=false
+        # bootstrap). The generic merge above already covers this once the key
+        # ships in .env.example; this is the explicit, template-independent guard.
+        current_text = _read(ENV_PATH)
+        if "SETUP_COMPLETE" not in _parse_env(current_text):
+            lines = current_text.splitlines()
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append("SETUP_COMPLETE=true")
+            ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            print("Added missing SETUP_COMPLETE=true (W3-02 setup lock)")
+            current = _parse_env(_read(ENV_PATH))
+
     # B-08: .env traegt echte Secrets (auto-generierter LOCAL_API_TOKEN) —
     # ACL wie bei allen anderen Schreibpfaden verengen (best-effort).
     try:

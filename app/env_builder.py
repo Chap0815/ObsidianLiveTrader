@@ -297,7 +297,9 @@ def build_full_env(answers: dict) -> str:
     lines += [
         f"MAX_NOTIONAL_USDT={a.get('max_notional_usdt', 500)}",
         "RISK_SLIPPAGE_PCT=0.05",
-        "MAX_PRICE_DRIFT_PCT=0.5",
+        # W3-12: MAX_PRICE_DRIFT_PCT is deliberately NOT written — its field
+        # default (1.0) IS the balanced value, so writing a stale 0.5 here would
+        # silently tighten the drift gate below what the profile intends.
         "MARKET_ENTRY_SLIPPAGE_PCT=0.15",
         "ALLOW_CROSS_MARGIN=false",
         "ALLOW_UNPROTECTED_ENTRY=false",

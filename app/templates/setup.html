@@ -57,11 +57,16 @@
           <div id="fields-hl" class="setup-fields">
             <label>
               <span>Private Key (API/Agent-Wallet, beginnt mit 0x)</span>
-              <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" />
+              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
+                <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" style="flex:1" />
+                <button type="button" class="btn-ghost key-eye" data-target="hl-private-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+              </span>
+              <small class="field-feedback" id="hl-private-key-fb" aria-live="polite"></small>
             </label>
             <label>
               <span>Haupt-Wallet-Adresse <em class="label-note">nur bei Agent-Key nötig</em></span>
               <input type="text" id="hl-account-address" placeholder="0x… (optional)" spellcheck="false" />
+              <small class="field-feedback" id="hl-account-address-fb" aria-live="polite"></small>
             </label>
             <p class="hint muted">Tipp: Lege in der Hyperliquid-UI unter „API" einen Agent-Key an — der kann handeln, aber nie abheben.</p>
           </div>
@@ -76,11 +81,17 @@
           <div id="fields-mexc" class="setup-fields hidden">
             <label>
               <span>MEXC API Key</span>
-              <input type="password" id="mexc-api-key" spellcheck="false" />
+              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
+                <input type="password" id="mexc-api-key" spellcheck="false" style="flex:1" />
+                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+              </span>
             </label>
             <label>
               <span>MEXC API Secret</span>
-              <input type="password" id="mexc-api-secret" spellcheck="false" />
+              <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
+                <input type="password" id="mexc-api-secret" spellcheck="false" style="flex:1" />
+                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-secret" aria-label="Anzeigen/verbergen">Zeigen</button>
+              </span>
             </label>
             <p class="hint muted">Im MEXC-Account: Trade erlauben, Withdraw/Transfer deaktivieren.</p>
           </div>
@@ -103,11 +114,14 @@
           </label>
           <label id="field-llm-key">
             <span id="llm-key-label">Anthropic API Key</span>
-            <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" />
+            <span class="key-row" style="display:flex;gap:.4rem;align-items:center">
+              <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" style="flex:1" />
+              <button type="button" class="btn-ghost key-eye" data-target="llm-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+            </span>
           </label>
           <label id="field-llm-model">
             <span>Modell</span>
-            <input type="text" id="llm-model" value="claude-opus-4-8" spellcheck="false" />
+            <input type="text" id="llm-model" value="{{ default_models['claude'] }}" spellcheck="false" />
           </label>
           <div class="setup-row" id="field-llm-test">
             <button type="button" id="btn-test-key" class="btn-ghost">Key testen</button>
@@ -116,7 +130,7 @@
           <div id="fields-ollama" class="setup-fields hidden">
             <label>
               <span>Ollama-Modell</span>
-              <input type="text" id="ollama-model" value="llama3.1" spellcheck="false" />
+              <input type="text" id="ollama-model" value="{{ default_models['ollama'] }}" spellcheck="false" />
             </label>
             <p class="hint muted">Voraussetzung: <code>ollama serve</code> läuft lokal (Port 11434).</p>
           </div>
@@ -133,21 +147,15 @@
         <div class="panel-head"><h2>3 · Risiko-Profil</h2></div>
         <div class="setup-body">
           <div class="choice-grid" role="radiogroup" aria-label="Risiko-Profil">
+            {# W3-09: Kartentexte serverseitig aus RISK_PROFILES generiert —
+               nie wieder Drift zwischen angezeigtem und erzwungenem RRR/Cap. #}
+            {% for card in risk_cards %}
             <label class="choice-card">
-              <input type="radio" name="risk_profile" value="conservative" checked />
-              <span class="choice-title">Konservativ</span>
-              <span class="choice-desc">1% Risiko · Hebel ≤ 20 · RRR 2.0 erzwungen · enger Notional-Cap.</span>
+              <input type="radio" name="risk_profile" value="{{ card.value }}"{% if loop.first %} checked{% endif %} />
+              <span class="choice-title">{{ card.title }}</span>
+              <span class="choice-desc">{{ card.desc }}.</span>
             </label>
-            <label class="choice-card">
-              <input type="radio" name="risk_profile" value="balanced" />
-              <span class="choice-title">Ausgewogen</span>
-              <span class="choice-desc">5% Risiko · Hebel ≤ 50 · RRR 2.0 als Warnung · lockerer Cap.</span>
-            </label>
-            <label class="choice-card">
-              <input type="radio" name="risk_profile" value="free" />
-              <span class="choice-title">Frei</span>
-              <span class="choice-desc">15% Risiko · Hebel ≤ 100 · RRR 1.5 Warnung · kein Equity-Cap.</span>
-            </label>
+            {% endfor %}
             <label class="choice-card">
               <input type="radio" name="risk_profile" value="custom" />
               <span class="choice-title">Eigene Limits</span>
@@ -216,7 +224,7 @@
 
       <button type="submit" id="btn-save" class="btn-submit">Konfiguration speichern &amp; starten</button>
       <p id="setup-error" class="error-text hidden" role="alert"></p>
-      <p id="setup-ok" class="hint hidden">Gespeichert — Terminal startet…</p>
+      <p id="setup-ok" class="hint hidden">Gespeichert — Dashboard öffnet…</p>
     </form>
   </main>
 
@@ -225,12 +233,10 @@
       "use strict";
       function $(id) { return document.getElementById(id); }
 
-      var DEFAULT_MODELS = {
-        claude: "claude-opus-4-8",
-        xai: "grok-4",
-        openai: "gpt-5.1",
-        ollama: "llama3.1",
-      };
+      // W3-07: ONE model truth — injected from the server DEFAULT_MODELS
+      // (env_builder), never a duplicated hardcoded JS list. tojson is
+      // <script>-safe (escapes </, <, > to unicode).
+      var DEFAULT_MODELS = {{ default_models | tojson }};
       var keyLabels = {
         claude: "Anthropic API Key",
         xai: "xAI API Key",
@@ -283,6 +289,32 @@
       syncExchange();
       syncRisk();
       syncLlm();
+
+      // W3-08: per-field show/hide toggle for the secret inputs.
+      document.querySelectorAll(".key-eye").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var inp = $(btn.getAttribute("data-target"));
+          if (!inp) return;
+          var show = inp.type === "password";
+          inp.type = show ? "text" : "password";
+          btn.textContent = show ? "Verbergen" : "Zeigen";
+        });
+      });
+
+      // W3-08: on-blur 0x+Hex format check with inline feedback.
+      function hexCheck(inputId, fbId, re, hint) {
+        var inp = $(inputId), fb = $(fbId);
+        if (!inp || !fb) return;
+        inp.addEventListener("blur", function () {
+          var v = inp.value.trim();
+          if (!v) { fb.textContent = ""; fb.removeAttribute("style"); return; }
+          var ok = re.test(v);
+          fb.textContent = ok ? "✓ Format ok" : hint;
+          fb.style.color = ok ? "#3fae6b" : "#d9534f";
+        });
+      }
+      hexCheck("hl-private-key", "hl-private-key-fb", /^0x[0-9a-fA-F]{64}$/, "Erwartet: 0x + 64 Hex-Zeichen");
+      hexCheck("hl-account-address", "hl-account-address-fb", /^0x[0-9a-fA-F]{40}$/, "Erwartet: 0x + 40 Hex-Zeichen");
 
       function providerModel() {
         var p = $("llm-provider").value;

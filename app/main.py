@@ -757,13 +757,64 @@ def _setup_needed() -> bool:
     if not ENV_PATH.exists():
         return True
     try:
-        return not get_settings().setup_complete
+        s = get_settings()
+        # W3-02: setup is complete when the marker is set OR real exchange keys
+        # are present. The unauthenticated /setup save OVERWRITES the entire
+        # real .env, so any configured install (working keys, or a copied
+        # .env.example that ships SETUP_COMPLETE=true) must NEVER re-open that
+        # window. Fail-safe: only a truly unconfigured .env keeps setup open.
+        if s.setup_complete or exchange_ready(s):
+            return False
+        return True
     except Exception:
         # .env EXISTS but can't be parsed: fail CLOSED (audit L-1). Re-opening
         # the unauthenticated /setup write path on a configured-but-broken
         # install would let a local process overwrite keys; a broken .env must
         # be fixed/deleted manually instead.
         return False
+
+
+def _setup_template_context() -> dict:
+    """W3-07/W3-09: ONE source of truth for setup.html defaults.
+
+    Model default ids come straight from the env_builder ``DEFAULT_MODELS``
+    (the same map the builder/config write), and the risk-profile card texts
+    are generated from ``RISK_PROFILES`` so a displayed RRR / leverage / cap can
+    never drift from the value the server actually enforces.
+    """
+    from app.config import RISK_PROFILES
+    from app.env_builder import DEFAULT_MODELS
+
+    labels = {
+        "conservative": "Konservativ",
+        "balanced": "Ausgewogen",
+        "free": "Frei",
+    }
+
+    def _n(x) -> str:
+        f = float(x)
+        return str(int(f)) if f.is_integer() else str(f)
+
+    cards: list[dict] = []
+    for key in ("conservative", "balanced", "free"):
+        p = RISK_PROFILES[key]
+        rrr = float(p["min_rrr"])
+        rrr_txt = f"RRR {rrr} {'erzwungen' if p.get('strict_rrr') else 'als Warnung'}"
+        cap = float(p["max_notional_pct_of_equity"])
+        cap_txt = (
+            "kein Equity-Cap" if cap == 0 else f"Notional-Cap {_n(cap / 100)}× Equity"
+        )
+        desc = " · ".join(
+            [
+                f"{_n(p['max_risk_pct'])}% Risiko",
+                f"Hebel ≤ {_n(p['max_leverage'])}",
+                rrr_txt,
+                cap_txt,
+            ]
+        )
+        cards.append({"value": key, "title": labels[key], "desc": desc})
+
+    return {"default_models": dict(DEFAULT_MODELS), "risk_cards": cards}
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -776,7 +827,8 @@ async def setup_page(request: Request):
     import secrets as _secrets
 
     nonce = _secrets.token_urlsafe(16)
-    resp = templates.TemplateResponse(request, "setup.html", {"csp_nonce": nonce})
+    ctx = {"csp_nonce": nonce, **_setup_template_context()}
+    resp = templates.TemplateResponse(request, "setup.html", ctx)
     resp.headers["Content-Security-Policy"] = build_csp(script_nonce=nonce)
     return resp
 
