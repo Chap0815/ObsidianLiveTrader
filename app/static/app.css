@@ -765,6 +765,26 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .acct-val.pnl-pos { color: var(--long); }
 .acct-val.pnl-neg { color: var(--short); }
 
+/* ── Account-Puls (V3-01): the overview's FIRST element — Equity,
+   Tages-PnL, Σ uPnL, Σ Risiko, Margin-% — money before news/charts. ── */
+.acct-pulse {
+  display: flex; flex-wrap: wrap; gap: var(--space-4);
+  padding: var(--space-2h) var(--space-3); margin-bottom: var(--space-3);
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius); font-family: var(--mono);
+}
+.pulse-item { display: flex; flex-direction: column; gap: 2px; min-width: 90px; }
+.pulse-lbl {
+  font-size: var(--fs-xs); color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.pulse-val {
+  font-size: var(--fs-lg); font-weight: 700; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.pulse-val.pnl-pos { color: var(--long); }
+.pulse-val.pnl-neg { color: var(--short); }
+
 /* ── Stale price-feed banner (U-02): feed dark + WS down → manual-SL
    monitoring is effectively off, so this must read as an alarm, not a
    passive status line. ── */
@@ -1871,6 +1891,25 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .mini-remove:hover { opacity: 1; color: var(--short); background: var(--bg-inset); }
 .overview-empty { color: var(--muted); font-size: var(--fs-base); padding: 20px var(--space-1); }
 
+/* V3-06: full-width group headers ("Positionen · nach Risiko" / "Watchlist")
+   inside the auto-fill grid. */
+.overview-group-head {
+  grid-column: 1 / -1; margin: var(--space-2) 0 2px;
+  font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint);
+}
+.overview-group-head:first-child { margin-top: 0; }
+
+/* V3-02: a tile whose /api/mini fetch failed says so — never a silently
+   frozen chart on stale candles. */
+.mini-tile-error { border-color: var(--short); }
+.mini-err-badge {
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--short);
+  background: color-mix(in srgb, var(--short) 12%, transparent);
+  border-radius: var(--radius-sm); padding: 2px var(--space-1h); margin-bottom: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* Projekt J: crypto news desk above the mini-chart tiles.
    Top 1–3 headlines are featured as "lead" cards; the rest sit in a tighter
    compact list below — a curated desk, not a flat log. */
@@ -1882,6 +1921,18 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   margin: 0 0 var(--space-2h); font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600;
   letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
 }
+
+/* V3-04: news header + stale/error honesty markers. */
+.news-head { display: flex; align-items: center; gap: var(--space-2); }
+.news-head .overview-subhead { margin: 0; }
+.news-stale-badge {
+  font-family: var(--mono); font-size: var(--fs-xs); font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--short);
+  background: color-mix(in srgb, var(--short) 14%, transparent);
+  border: 1px solid var(--short); border-radius: var(--radius-sm);
+  padding: 1px var(--space-1h);
+}
+.news-empty.news-error { color: var(--short); }
 
 /* Lead cards — bigger sans headline, source · time, subtle accent hairline. */
 .news-leads {

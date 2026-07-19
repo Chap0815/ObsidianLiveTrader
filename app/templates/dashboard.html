@@ -378,6 +378,15 @@
 </main>
 
 <section id="overview-view" class="overview hidden" aria-label="Markt-Übersicht">
+  <!-- V3-01: Account-Puls — the FIRST thing the command center shows is
+       money (equity/PnL/risk), not news. -->
+  <div id="acct-pulse" class="acct-pulse" aria-label="Account-Puls">
+    <div class="pulse-item"><span class="pulse-lbl">Equity</span><span class="pulse-val" id="pulse-equity">—</span></div>
+    <div class="pulse-item"><span class="pulse-lbl">Tages-PnL</span><span class="pulse-val" id="pulse-day-pnl">—</span></div>
+    <div class="pulse-item"><span class="pulse-lbl">Σ uPnL</span><span class="pulse-val" id="pulse-upnl">—</span></div>
+    <div class="pulse-item"><span class="pulse-lbl">Σ Risiko</span><span class="pulse-val" id="pulse-risk">—</span></div>
+    <div class="pulse-item"><span class="pulse-lbl">Margin</span><span class="pulse-val" id="pulse-margin">—</span></div>
+  </div>
   <div class="overview-head">
     <h2>Übersicht</h2>
     <form id="watch-add" class="watch-add" autocomplete="off">
@@ -386,7 +395,8 @@
     </form>
   </div>
   <div id="overview-news" class="overview-news" aria-label="Krypto-Nachrichten"></div>
-  <h3 class="overview-subhead">Positionen &amp; Watchlist</h3>
+  <!-- Group headers ("Positionen · nach Risiko" / "Watchlist") are rendered
+       dynamically by renderOverviewGrid() (V3-06). -->
   <div id="overview-grid" class="overview-grid"></div>
 </section>
 

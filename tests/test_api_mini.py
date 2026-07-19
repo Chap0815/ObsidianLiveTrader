@@ -106,3 +106,50 @@ def test_mini_per_symbol_error_isolated():
     body = r.json()
     assert [x["symbol"] for x in body["results"]] == ["BTC_USDT"]
     assert len(body["errors"]) == 1 and body["errors"][0].startswith("ETH_USDT:")
+
+
+def test_mini_cache_ttl_skips_upstream_refetch():
+    """V3-03: a second call for the same symbols/tf/limit within the TTL must
+    be served from the in-memory cache — no second round of upstream
+    client.klines() calls (mirrors the /api/news cache-hit contract)."""
+    mock = _mock_client({"BTC_USDT": _candles([100.0, 101.0])})
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        r1 = client.get("/api/mini", params={"symbols": "BTC_USDT", "limit": 2})
+        r2 = client.get("/api/mini", params={"symbols": "BTC_USDT", "limit": 2})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json() == r2.json()
+    assert mock.klines.await_count == 1  # only the FIRST call hit the exchange
+
+
+def test_mini_cache_preserves_errors():
+    """A cached payload must still carry per-symbol errors — a cache hit must
+    not silently swallow a failure that was present on the cache-filling
+    request (V3-02: errors are passed through, never dropped)."""
+    def _mk():
+        mock = MagicMock()
+
+        async def klines(symbol, interval, limit_hint=200):
+            if symbol == "ETH_USDT":
+                raise RuntimeError("boom")
+            return _candles([1.0, 1.1])
+
+        mock.klines = AsyncMock(side_effect=klines)
+        return mock
+
+    mock = _mk()
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        r1 = client.get(
+            "/api/mini", params={"symbols": "BTC_USDT,ETH_USDT", "limit": 2}
+        )
+        r2 = client.get(
+            "/api/mini", params={"symbols": "BTC_USDT,ETH_USDT", "limit": 2}
+        )
+    assert r1.json() == r2.json()
+    body2 = r2.json()
+    assert [x["symbol"] for x in body2["results"]] == ["BTC_USDT"]
+    assert len(body2["errors"]) == 1 and body2["errors"][0].startswith("ETH_USDT:")
+    assert mock.klines.await_count == 2  # BTC + ETH fetched once each, not re-fetched

@@ -65,10 +65,13 @@
     activeView: "chart", // "chart" | "overview" (E5)
     watchlist: [], // overview watch coins (localStorage-backed)
     overviewData: {}, // symbol -> {last_price, change_pct, candles}
+    overviewErrors: {}, // symbol -> error string (V3-02: surfaced per-tile, never swallowed)
     _overviewTimer: null,
     _miniBusy: false, // in-flight /api/mini fetch guard
     _miniLast: 0, // ms timestamp of the last successful /api/mini fetch
     newsItems: [], // /api/news headlines for the overview
+    newsErrors: [], // /api/news per-feed errors (V3-04)
+    newsStale: false, // /api/news served a stale cached payload (V3-04)
     _newsBusy: false, // in-flight /api/news fetch guard
     _newsLast: 0, // ms timestamp of the last successful /api/news fetch
     reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
@@ -1859,15 +1862,13 @@
   /** Compact equity breakdown in the side-rail (below the ticket). Pulls from
    *  the already-fetched /api/account snapshot: equity, aggregate unrealized
    *  PnL and used margin summed over open positions, plus free margin. */
-  function renderAccounts(data) {
-    const acct = data || state.account || {};
-    const eqEl = $("acct-equity");
-    if (!eqEl) return;
-    const c = ccy();
-    const eq = Number(acct.equity_usdt);
-    eqEl.textContent = Number.isFinite(eq) ? fmt(eq, 2) + " " + c : "—";
-
-    const positions = (acct.positions || []).filter(function (p) {
+  /** Shared equity/uPnL/margin aggregation over open positions — the SINGLE
+   *  source of truth for both the Konto side-panel (renderAccounts) and the
+   *  overview Account-Puls bar (V3-01, renderAcctPulse). A second, divergent
+   *  calc in the pulse would drift from the panel, so both read this. */
+  function acctAggregate(acct) {
+    const a = acct || {};
+    const positions = (a.positions || []).filter(function (p) {
       return Math.abs(Number(p.hold_vol) || 0) > 0;
     });
     let upnl = 0, haveUpnl = false, used = 0, haveUsed = false;
@@ -1877,23 +1878,138 @@
       const im = Number(p.im != null ? p.im : p.margin);
       if (Number.isFinite(im)) { used += im; haveUsed = true; }
     });
+    const eq = Number(a.equity_usdt);
+    const free = Number(a.available_usdt);
+    return {
+      positions: positions,
+      equity: Number.isFinite(eq) ? eq : null,
+      free: Number.isFinite(free) ? free : null,
+      upnl: haveUpnl ? upnl : null,
+      used: haveUsed ? used : null,
+    };
+  }
+
+  function renderAccounts(data) {
+    const acct = data || state.account || {};
+    const eqEl = $("acct-equity");
+    if (!eqEl) return;
+    const c = ccy();
+    const agg = acctAggregate(acct);
+    eqEl.textContent = agg.equity != null ? fmt(agg.equity, 2) + " " + c : "—";
 
     const upnlEl = $("acct-upnl");
     if (upnlEl) {
-      if (haveUpnl) {
-        upnlEl.textContent = (upnl >= 0 ? "+" : "") + fmt(upnl, 2) + " " + c;
+      if (agg.upnl != null) {
+        upnlEl.textContent = (agg.upnl >= 0 ? "+" : "") + fmt(agg.upnl, 2) + " " + c;
         upnlEl.className =
-          "acct-val " + (upnl > 0 ? "pnl-pos" : upnl < 0 ? "pnl-neg" : "");
+          "acct-val " + (agg.upnl > 0 ? "pnl-pos" : agg.upnl < 0 ? "pnl-neg" : "");
       } else {
         upnlEl.textContent = "—";
         upnlEl.className = "acct-val";
       }
     }
-    const free = Number(acct.available_usdt);
     const freeEl = $("acct-free");
-    if (freeEl) freeEl.textContent = Number.isFinite(free) ? fmt(free, 2) + " " + c : "—";
+    if (freeEl) freeEl.textContent = agg.free != null ? fmt(agg.free, 2) + " " + c : "—";
     const usedEl = $("acct-used");
-    if (usedEl) usedEl.textContent = haveUsed ? fmt(used, 2) + " " + c : "—";
+    if (usedEl) usedEl.textContent = agg.used != null ? fmt(agg.used, 2) + " " + c : "—";
+
+    renderAcctPulse(acct, agg);
+  }
+
+  var DAY_EQUITY_KEY = "obsidian_day_equity";
+
+  /** Client-local "since first equity read today" baseline for the pulse's
+   *  Tages-PnL. NOT the exchange's true realized daily PnL (a deposit or
+   *  withdrawal would distort it) — there is no backend endpoint tracking
+   *  historical equity, and adding one is out of scope for this display task
+   *  (V3-01). Returns null (→ "—" in the UI) rather than fabricate a number
+   *  when equity itself isn't known. */
+  function dayPnl(equity) {
+    if (!Number.isFinite(equity)) return null;
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      const raw = localStorage.getItem(DAY_EQUITY_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && parsed.date === today && Number.isFinite(parsed.equity)) {
+        return equity - parsed.equity;
+      }
+      localStorage.setItem(DAY_EQUITY_KEY, JSON.stringify({ date: today, equity: equity }));
+      return 0;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Best-effort per-position risk in USDT: |entry − known SL| × volume ×
+   *  contract size. Requires a known SL (synced open-order stop or a manual
+   *  tradeMarkers entry) — returns null rather than guess when it isn't
+   *  known yet. Shared by the Account-Puls Σ-Risiko tile (V3-01) and the
+   *  overview grid's risk-first position sort (V3-06) so both read the same
+   *  number instead of two calcs quietly drifting apart. */
+  function positionRiskUsdt(p) {
+    if (!p) return null;
+    const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
+    const sl = mk && Number(mk.sl);
+    const entry = Number(p.entry_price);
+    const vol = Number(p.hold_vol);
+    if (!Number.isFinite(sl) || !sl || !Number.isFinite(entry) || !Number.isFinite(vol) || !vol) {
+      return null;
+    }
+    const pcsRaw = Number(p.contract_size);
+    const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : contractSize();
+    return Math.abs(entry - sl) * Math.abs(vol) * pcs;
+  }
+
+  /** V3-01: Account-Puls — Equity · Tages-PnL · Σ uPnL · Σ Risiko · Margin-%,
+   *  the FIRST thing the overview shows (money before news). Degrades to "—"
+   *  per field when the underlying data isn't available, never NaN. */
+  function renderAcctPulse(acct, agg) {
+    const a = agg || acctAggregate(acct);
+    const c = ccy();
+
+    const eqEl = $("pulse-equity");
+    if (eqEl) eqEl.textContent = a.equity != null ? fmt(a.equity, 2) + " " + c : "—";
+
+    const dpEl = $("pulse-day-pnl");
+    if (dpEl) {
+      const dp = a.equity != null ? dayPnl(a.equity) : null;
+      if (dp != null) {
+        dpEl.textContent = (dp >= 0 ? "+" : "") + fmt(dp, 2) + " " + c;
+        dpEl.className = "pulse-val " + (dp > 0 ? "pnl-pos" : dp < 0 ? "pnl-neg" : "");
+      } else {
+        dpEl.textContent = "—";
+        dpEl.className = "pulse-val";
+      }
+    }
+
+    const upEl = $("pulse-upnl");
+    if (upEl) {
+      if (a.upnl != null) {
+        upEl.textContent = (a.upnl >= 0 ? "+" : "") + fmt(a.upnl, 2) + " " + c;
+        upEl.className = "pulse-val " + (a.upnl > 0 ? "pnl-pos" : a.upnl < 0 ? "pnl-neg" : "");
+      } else {
+        upEl.textContent = "—";
+        upEl.className = "pulse-val";
+      }
+    }
+
+    const riskEl = $("pulse-risk");
+    if (riskEl) {
+      let risk = 0, haveRisk = false;
+      (a.positions || []).forEach(function (p) {
+        const r = positionRiskUsdt(p);
+        if (r != null) { risk += r; haveRisk = true; }
+      });
+      riskEl.textContent = haveRisk ? fmt(risk, 2) + " " + c : "—";
+    }
+
+    const mgEl = $("pulse-margin");
+    if (mgEl) {
+      mgEl.textContent =
+        a.used != null && a.equity != null && a.equity > 0
+          ? fmt((a.used / a.equity) * 100, 1) + "%"
+          : "—";
+    }
   }
 
   function updateEquity(data) {
@@ -5075,13 +5191,28 @@
   }
 
   /** Render cached headlines. EVERY feed string goes through escapeHtml
-   *  (feeds are untrusted), links are http(s)-whitelisted + noopener. */
+   *  (feeds are untrusted), links are http(s)-whitelisted + noopener.
+   *  V3-04: a "Veraltet" marker in the header when the server served a stale
+   *  cached payload (all feeds down), and an honest error message instead of
+   *  "keine Schlagzeilen" when there are zero items AND feed errors — a total
+   *  outage must never read like a quiet news day. */
   function renderNews() {
     const box = $("overview-news");
     if (!box) return;
+    const staleBadge = state.newsStale
+      ? '<span class="news-stale-badge" title="Feeds gerade nicht erreichbar — letzter bekannter Stand">Veraltet</span>'
+      : "";
+    const head =
+      '<div class="news-head"><h3 class="overview-subhead">Nachrichten</h3>' +
+      staleBadge + "</div>";
     const all = state.newsItems || [];
     if (!all.length) {
-      box.innerHTML = '<div class="news-empty">Keine aktuellen Schlagzeilen.</div>';
+      const errs = state.newsErrors || [];
+      const body = errs.length
+        ? '<div class="news-empty news-error">Newsfeeds nicht erreichbar: ' +
+          escapeHtml(errs.join("; ")) + "</div>"
+        : '<div class="news-empty">Keine aktuellen Schlagzeilen.</div>';
+      box.innerHTML = head + body;
       return;
     }
     // Curated desk, not a log: a handful of items, the freshest featured.
@@ -5171,7 +5302,7 @@
       .map(function (it) { return card(it, "row"); })
       .join("");
 
-    let html = '<div class="news-leads">' + leads + "</div>";
+    let html = head + '<div class="news-leads">' + leads + "</div>";
     if (rest) html += '<div class="news-rest">' + rest + "</div>";
     box.innerHTML = html;
   }
@@ -5192,6 +5323,11 @@
       if (res.ok) {
         const data = await res.json();
         state.newsItems = data.items || [];
+        // V3-04: surface data.errors/stale instead of swallowing them — a
+        // total feed outage must read as an honest error/stale marker, never
+        // as a quiet "no headlines".
+        state.newsErrors = data.errors || [];
+        state.newsStale = !!data.stale;
         state._newsLast = Date.now();
       }
     } catch (e) {
@@ -5202,10 +5338,13 @@
     if (state.activeView === "overview") renderNews();
   }
 
-  /** Hardened against double-fetches: a busy guard plus a 10s min-interval so
-   *  the account poll (30s) and the overview timer (30s) landing close
-   *  together can't fire two /api/mini requests back to back. Reuses the
-   *  cached candles (fresh position/PnL badges still redraw from state.account). */
+  /** Hardened against double-fetches: a busy guard plus a ~60s min-interval
+   *  (V3-03) so the account poll (30s) and the overview timer (30s) landing
+   *  close together can't fire two /api/mini requests back to back. Reuses
+   *  the cached candles (fresh position/PnL badges still redraw from
+   *  state.account). The server additionally caches /api/mini for
+   *  MINI_CACHE_TTL_S, so a fresh tab/second browser hitting the same
+   *  symbols within that window doesn't re-fetch from the exchange either. */
   async function refreshOverview() {
     if (state.activeView !== "overview") return; // never redraw in background
     const syms = overviewSymbols();
@@ -5215,11 +5354,16 @@
     }
     if (state._miniBusy) return;
     const now = Date.now();
-    if (now - (state._miniLast || 0) < 10000 && Object.keys(state.overviewData).length) {
+    // V3-03: candle-refresh cadence relaxed to ~60s (was 10s) — the server
+    // now caches /api/mini for MINI_CACHE_TTL_S anyway, and the mini-charts
+    // don't need faster-than-a-minute candles. Position/PnL badges still
+    // redraw on every call below via the cached candles + fresh state.account.
+    if (now - (state._miniLast || 0) < 60000 && Object.keys(state.overviewData).length) {
       renderOverviewGrid(); // fresh enough — reuse cached candles, update PnL badges
       return;
     }
     state._miniBusy = true;
+    let fetchFailed = false;
     try {
       const res = await fetch(
         "/api/mini?symbols=" + encodeURIComponent(syms.join(",")) + "&tf=15m&limit=96"
@@ -5229,12 +5373,38 @@
         (data.results || []).forEach(function (r) {
           state.overviewData[String(r.symbol || "").toUpperCase()] = r;
         });
+        // V3-02: data.errors used to be swallowed entirely — a failed coin's
+        // tile just kept showing its last candles with no indication
+        // anything was wrong. Map "SYM: reason" entries onto overviewErrors
+        // so the tile can show an honest error badge instead, and clear the
+        // entry for any requested symbol that came back clean this round.
+        const errBySym = {};
+        (data.errors || []).forEach(function (e) {
+          const m = /^([^:]+):\s*([\s\S]*)$/.exec(String(e || ""));
+          if (m) errBySym[m[1].trim().toUpperCase()] = m[2].trim();
+        });
+        syms.forEach(function (s) {
+          if (errBySym[s]) state.overviewErrors[s] = errBySym[s];
+          else delete state.overviewErrors[s];
+        });
         state._miniLast = Date.now();
+      } else {
+        fetchFailed = true;
       }
     } catch (e) {
       console.error("refreshOverview", e);
+      fetchFailed = true;
     } finally {
       state._miniBusy = false;
+    }
+    if (fetchFailed) {
+      // Total outage: a tile with no candle data yet must say so rather than
+      // sit blank/frozen with no explanation. A tile that already has data
+      // keeps showing it (better a slightly stale chart than none), but a
+      // fresh request must not fail silently.
+      syms.forEach(function (s) {
+        if (!state.overviewData[s]) state.overviewErrors[s] = "Abruf fehlgeschlagen";
+      });
     }
     if (state.activeView === "overview") renderOverviewGrid();
   }
@@ -5247,6 +5417,104 @@
     );
   }
 
+  /** Build one mini-tile DOM node for `sym`. Extracted from renderOverviewGrid
+   *  so it can be reused for BOTH the positions group and the watchlist group
+   *  (V3-06). Unchanged rendering logic; adds an honest error badge when
+   *  state.overviewErrors has an entry for this symbol (V3-02). */
+  function buildMiniTile(sym, chartColors, cs) {
+    const key = sym.toUpperCase();
+    const d = state.overviewData[key] || {};
+    const pos = positionFor(sym);
+    const isWatch = state.watchlist.indexOf(key) !== -1 && !pos;
+    const err = state.overviewErrors && state.overviewErrors[key];
+
+    const tile = document.createElement("div");
+    tile.className =
+      "mini-tile" +
+      (pos ? " pos " + String(pos.side || "").toLowerCase() : "") +
+      (err ? " mini-tile-error" : "");
+    tile.setAttribute("data-symbol", key);
+
+    const last = Number(d.last_price);
+    const chg = Number(d.change_pct);
+    const chgCls = Number.isFinite(chg) ? (chg >= 0 ? "pos-pos" : "pos-neg") : "";
+    const chgTxt = Number.isFinite(chg) ? (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%" : "—";
+
+    let pnlHtml = "";
+    if (pos) {
+      // `cs` is the ACTIVE chart symbol's contractSize. Reusing it to
+      // recompute PnL for every tile would be wrong on MEXC, where coins
+      // can have different contract sizes (F-10). Only the active
+      // symbol's own tile may use that local recompute (correct cs, and
+      // it doubles as a live refresh against the streaming price); every
+      // other tile uses the exchange's own unrealized_pnl straight from
+      // /api/account instead of guessing with another symbol's cs.
+      const isActiveSym = symMatch(sym, state.symbol);
+      let pnl = null;
+      if (isActiveSym && Number.isFinite(last)) {
+        const entry = Number(pos.entry_price);
+        const vol = Number(pos.hold_vol);
+        const short = String(pos.side || "").toLowerCase() === "short";
+        // F-10: prefer this position's own contract_size for the live recompute.
+        const pcsRaw = Number(pos.contract_size);
+        const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : cs;
+        if (Number.isFinite(entry) && Number.isFinite(vol)) {
+          pnl = (last - entry) * vol * pcs * (short ? -1 : 1);
+        }
+      } else {
+        pnl = Number(pos.unrealized_pnl);
+      }
+      if (Number.isFinite(pnl)) {
+        const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
+        pnlHtml =
+          '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
+      }
+    }
+
+    tile.innerHTML =
+      (isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
+      '<div class="mini-head"><span class="mini-sym">' + escapeHtml(key) + "</span>" +
+      '<span class="mini-price">' + (Number.isFinite(last) ? fmt(last, 6) : "—") + "</span></div>" +
+      '<div class="mini-badges">' + pnlHtml +
+      '<span class="mini-chg ' + chgCls + '">' + chgTxt + "</span></div>" +
+      // V3-02: a failed tile says so — never a silently frozen chart.
+      (err
+        ? '<div class="mini-err-badge" title="' + escapeHtml(err) + '">⚠ ' +
+          escapeHtml(err) + "</div>"
+        : "") +
+      '<canvas class="mini-canvas"></canvas>';
+
+    const cv = tile.querySelector(".mini-canvas");
+    const marks = [];
+    if (pos) {
+      // A3-01: `key` is the tile's own display/watchlist symbol, which on
+      // Hyperliquid may still be a typed full pair even though `pos` (found
+      // via the HL-aware symMatch) canonically keys tradeMarkers by bare
+      // coin — route through markerKey() so a manual SL/TP still draws.
+      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
+      marks.push({ price: Number(pos.entry_price), color: chartColors.level });
+      if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: chartColors.short });
+      if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: chartColors.long });
+    }
+    // Draw after insertion so the canvas has a measured width.
+    requestAnimationFrame(function () {
+      drawMiniCandles(cv, d.candles || [], marks);
+    });
+
+    tile.addEventListener("click", function (e) {
+      if (e.target.closest(".mini-remove")) {
+        removeWatch(key);
+        return;
+      }
+      goToSymbol(key, { newTab: true });
+    });
+    return tile;
+  }
+
+  /** V3-06: positions are their own group at the TOP of the grid, sorted by
+   *  known risk (largest first) — money at stake leads, not insertion order.
+   *  Positions without a known risk yet (no SL synced) sort after those with
+   *  a number, so the group stays stable instead of jumping around. */
   function renderOverviewGrid() {
     const chartColors = getChartColors();
     const grid = $("overview-grid");
@@ -5259,86 +5527,41 @@
     }
     grid.innerHTML = "";
     const cs = contractSize();
-    syms.forEach(function (sym) {
-      const key = sym.toUpperCase();
-      const d = state.overviewData[key] || {};
-      const pos = positionFor(sym);
-      const isWatch = state.watchlist.indexOf(key) !== -1 && !pos;
 
-      const tile = document.createElement("div");
-      tile.className = "mini-tile" + (pos ? " pos " + String(pos.side || "").toLowerCase() : "");
-      tile.setAttribute("data-symbol", key);
-
-      const last = Number(d.last_price);
-      const chg = Number(d.change_pct);
-      const chgCls = Number.isFinite(chg) ? (chg >= 0 ? "pos-pos" : "pos-neg") : "";
-      const chgTxt = Number.isFinite(chg) ? (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%" : "—";
-
-      let pnlHtml = "";
-      if (pos) {
-        // `cs` is the ACTIVE chart symbol's contractSize. Reusing it to
-        // recompute PnL for every tile would be wrong on MEXC, where coins
-        // can have different contract sizes (F-10). Only the active
-        // symbol's own tile may use that local recompute (correct cs, and
-        // it doubles as a live refresh against the streaming price); every
-        // other tile uses the exchange's own unrealized_pnl straight from
-        // /api/account instead of guessing with another symbol's cs.
-        const isActiveSym = symMatch(sym, state.symbol);
-        let pnl = null;
-        if (isActiveSym && Number.isFinite(last)) {
-          const entry = Number(pos.entry_price);
-          const vol = Number(pos.hold_vol);
-          const short = String(pos.side || "").toLowerCase() === "short";
-          // F-10: prefer this position's own contract_size for the live recompute.
-          const pcsRaw = Number(pos.contract_size);
-          const pcs = Number.isFinite(pcsRaw) && pcsRaw > 0 ? pcsRaw : cs;
-          if (Number.isFinite(entry) && Number.isFinite(vol)) {
-            pnl = (last - entry) * vol * pcs * (short ? -1 : 1);
-          }
-        } else {
-          pnl = Number(pos.unrealized_pnl);
-        }
-        if (Number.isFinite(pnl)) {
-          const pc = pnl >= 0 ? "pos-pos" : "pos-neg";
-          pnlHtml =
-            '<span class="mini-pnl ' + pc + '">' + (pnl >= 0 ? "+" : "") + fmt(pnl, 2) + "</span>";
-        }
-      }
-
-      tile.innerHTML =
-        (isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
-        '<div class="mini-head"><span class="mini-sym">' + escapeHtml(key) + "</span>" +
-        '<span class="mini-price">' + (Number.isFinite(last) ? fmt(last, 6) : "—") + "</span></div>" +
-        '<div class="mini-badges">' + pnlHtml +
-        '<span class="mini-chg ' + chgCls + '">' + chgTxt + "</span></div>" +
-        '<canvas class="mini-canvas"></canvas>';
-
-      const cv = tile.querySelector(".mini-canvas");
-      const marks = [];
-      if (pos) {
-        // A3-01: `key` is the tile's own display/watchlist symbol, which on
-        // Hyperliquid may still be a typed full pair even though `pos` (found
-        // via the HL-aware symMatch) canonically keys tradeMarkers by bare
-        // coin — route through markerKey() so a manual SL/TP still draws.
-        const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
-        marks.push({ price: Number(pos.entry_price), color: chartColors.level });
-        if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: chartColors.short });
-        if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: chartColors.long });
-      }
-      // Draw after insertion so the canvas has a measured width.
-      requestAnimationFrame(function () {
-        drawMiniCandles(cv, d.candles || [], marks);
-      });
-
-      tile.addEventListener("click", function (e) {
-        if (e.target.closest(".mini-remove")) {
-          removeWatch(key);
-          return;
-        }
-        goToSymbol(key, { newTab: true });
-      });
-      grid.appendChild(tile);
+    const posSyms = [];
+    const watchSyms = [];
+    syms.forEach(function (s) {
+      if (positionFor(s)) posSyms.push(s);
+      else watchSyms.push(s);
     });
+    posSyms.sort(function (a, b) {
+      const ra = positionRiskUsdt(positionFor(a));
+      const rb = positionRiskUsdt(positionFor(b));
+      if (ra == null && rb == null) return 0;
+      if (ra == null) return 1;
+      if (rb == null) return -1;
+      return rb - ra;
+    });
+
+    function addGroupHead(label) {
+      const head = document.createElement("div");
+      head.className = "overview-group-head";
+      head.textContent = label;
+      grid.appendChild(head);
+    }
+
+    if (posSyms.length) {
+      addGroupHead("Positionen · nach Risiko (" + posSyms.length + ")");
+      posSyms.forEach(function (s) {
+        grid.appendChild(buildMiniTile(s, chartColors, cs));
+      });
+    }
+    if (watchSyms.length) {
+      addGroupHead("Watchlist (" + watchSyms.length + ")");
+      watchSyms.forEach(function (s) {
+        grid.appendChild(buildMiniTile(s, chartColors, cs));
+      });
+    }
   }
 
   function drawMiniCandles(cv, candles, marks) {
@@ -5374,7 +5597,9 @@
       return pad + ((hi - p) / (hi - lo)) * plotH;
     };
     // Faint raster so each tile reads like a real chart, not a sparkline.
-    ctx.strokeStyle = "rgba(160,150,190,0.10)";
+    // V3-05: token color via getChartColors()/getComputedStyle (T26 helper),
+    // not a hardcoded hex/rgba literal.
+    ctx.strokeStyle = chartColorAlpha(chartColors.level, 0.10);
     ctx.lineWidth = 1;
     const hLines = 4;
     for (let g = 1; g < hLines; g++) {

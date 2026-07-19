@@ -104,6 +104,12 @@ STATIC_DIR = BASE / "static"
 
 log = logging.getLogger("app.main")
 
+# V3-03: /api/mini in-memory cache TTL. Same shape as NEWS_CACHE_TTL below
+# (timestamp, payload) tuples on app.state) — /api/mini was the only overview
+# read endpoint with no cache at all, so a browser tab + a second tab/poll
+# landing within a few seconds fired the exchange twice for identical data.
+MINI_CACHE_TTL_S = 18.0
+
 # /api/analyze in-memory result cache TTL (LLM-credit saver). Advisory only —
 # never consulted by the order/gate path (see analyze() below).
 ANALYZE_CACHE_TTL_S = 120.0
@@ -377,6 +383,10 @@ async def lifespan(app: FastAPI):
     # Singleflight lock for /api/news: concurrent cache-miss callers await
     # one in-flight refresh instead of each firing a full feed-fetch batch.
     app.state.news_lock = _asyncio.Lock()
+    # V3-03: /api/mini cache + its singleflight lock — fresh/empty on every
+    # process start, same as the other in-memory caches on this state object.
+    app.state.mini_cache = {}
+    app.state.mini_lock = _asyncio.Lock()
     # L2X-01: PER-KEY singleflight for /api/analyze. A single global lock would
     # serialize DIFFERENT coins (two tabs → ~2x latency at Grok p50 ~15s). This
     # dict maps a cache_key -> [asyncio.Lock, refcount]: identical in-flight
@@ -936,6 +946,11 @@ async def mini(
     Public data only: OHLC candles + last price + window change. No indicators,
     structure, funding or private data — deliberately cheaper than /api/market
     so the overview can load a dozen coins at once. Touches no risk gates.
+
+    V3-03: cached in-memory for MINI_CACHE_TTL_S, same (timestamp, payload)
+    shape + singleflight lock as /api/news below — a cache-miss refresh is
+    shared by every concurrent caller for that exact (symbols, tf, limit) key
+    instead of each firing its own exchange round-trip.
     """
     raw = [s for s in (symbols or "").split(",") if s.strip()]
     syms: list[str] = []
@@ -954,43 +969,66 @@ async def mini(
     if not syms:
         return {"results": [], "errors": invalid_errors}
 
-    client = _exchange_client(request)
-    if client is None:
-        raise HTTPException(status_code=503, detail="Exchange client not initialized")
+    cache_key = (tuple(syms), tf, limit)
+    cache = getattr(request.app.state, "mini_cache", None)
+    if cache is None:
+        cache = {}
+        request.app.state.mini_cache = cache
+    hit = cache.get(cache_key)
+    if hit and _time.monotonic() - hit[0] < MINI_CACHE_TTL_S:
+        return hit[1]
 
-    async def one(sym: str):
-        candles = await client.klines(sym, tf, limit_hint=limit)
-        cs = candles[-limit:]
-        out = [
-            {
-                "time": c.time,
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-            }
-            for c in cs
-        ]
-        last = out[-1]["close"] if out else None
-        first = out[0]["close"] if out else None
-        change = (
-            round((last - first) / first * 100.0, 2)
-            if last is not None and first not in (None, 0)
-            else None
+    lock = getattr(request.app.state, "mini_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.mini_lock = lock
+
+    async with lock:
+        # Re-check: another caller may have already refreshed this exact key
+        # while we were waiting for the lock (singleflight, mirrors /api/news).
+        hit = cache.get(cache_key)
+        if hit and _time.monotonic() - hit[0] < MINI_CACHE_TTL_S:
+            return hit[1]
+
+        client = _exchange_client(request)
+        if client is None:
+            raise HTTPException(status_code=503, detail="Exchange client not initialized")
+
+        async def one(sym: str):
+            candles = await client.klines(sym, tf, limit_hint=limit)
+            cs = candles[-limit:]
+            out = [
+                {
+                    "time": c.time,
+                    "open": c.open,
+                    "high": c.high,
+                    "low": c.low,
+                    "close": c.close,
+                }
+                for c in cs
+            ]
+            last = out[-1]["close"] if out else None
+            first = out[0]["close"] if out else None
+            change = (
+                round((last - first) / first * 100.0, 2)
+                if last is not None and first not in (None, 0)
+                else None
+            )
+            return {"symbol": sym, "last_price": last, "change_pct": change, "candles": out}
+
+        gathered = await asyncio.gather(
+            *(one(s) for s in syms), return_exceptions=True
         )
-        return {"symbol": sym, "last_price": last, "change_pct": change, "candles": out}
-
-    gathered = await asyncio.gather(
-        *(one(s) for s in syms), return_exceptions=True
-    )
-    results: list[dict] = []
-    errors: list[str] = list(invalid_errors)
-    for sym, r in zip(syms, gathered):
-        if isinstance(r, Exception):
-            errors.append(f"{sym}: {r}")
-        else:
-            results.append(r)
-    return {"results": results, "errors": errors}
+        results: list[dict] = []
+        errors: list[str] = list(invalid_errors)
+        for sym, r in zip(syms, gathered):
+            if isinstance(r, Exception):
+                errors.append(f"{sym}: {r}")
+            else:
+                results.append(r)
+        payload = {"results": results, "errors": errors}
+        cache[cache_key] = (_time.monotonic(), payload)
+        return payload
 
 
 # --- Crypto news (public RSS, no API key) ---------------------------------
