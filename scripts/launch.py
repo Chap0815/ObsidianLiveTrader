@@ -10,6 +10,7 @@ WICHTIG — Python-Isolation:
 Usage:
   py -3 scripts/launch.py
   py -3 scripts/launch.py --setup
+  py -3 scripts/launch.py --setup-cli
   py -3 scripts/launch.py --skip-setup
   py -3 scripts/launch.py --no-browser
   py -3 scripts/launch.py --skip-install
@@ -17,13 +18,45 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
-import os
-import subprocess
 import sys
-import time
-import webbrowser
-from pathlib import Path
+
+# W3-03: Versions-Gate MUSS als allererstes laufen — noch vor jedem Import,
+# der auf einem zu alten Python (3.9/3.10) crashen könnte. Nur `sys` wird
+# dafür gebraucht (stdlib, seit jeher vorhanden). Erst danach folgen die
+# restlichen Imports.
+
+
+def _check_python_version(version_info: tuple | None = None) -> None:
+    """Bricht mit einer klaren deutschen Meldung ab, falls Python < 3.11.
+
+    `version_info` ist injizierbar für Tests; im Normalbetrieb wird
+    `sys.version_info` verwendet.
+    """
+    vi = version_info if version_info is not None else sys.version_info
+    if tuple(vi[:2]) < (3, 11):
+        found = f"{vi[0]}.{vi[1]}"
+        msg = (
+            "FEHLER: Dieses Projekt benötigt Python 3.11 oder neuer "
+            f"(gefunden: Python {found}).\n"
+            "Bitte ein aktuelles Python installieren: "
+            "https://www.python.org/downloads/\n"
+            "Windows-Tipp: falls 'python' den Microsoft-Store öffnet, ist das "
+            "der Store-Stub — echtes Python 3.11+ separat installieren und "
+            "sicherstellen, dass 'py -3' bzw. 'python' danach darauf zeigt."
+        )
+        print(msg)
+        raise SystemExit(1)
+
+
+_check_python_version()
+
+import argparse  # noqa: E402
+import os  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+import webbrowser  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_DIR = ROOT / ".venv"
@@ -55,10 +88,13 @@ def _run(
     *,
     check: bool = True,
     env: dict[str, str] | None = None,
+    error_hint: str | None = None,
 ) -> int:
     print(">", " ".join(str(c) for c in cmd))
     r = subprocess.run(cmd, cwd=str(ROOT), env=env)
     if check and r.returncode != 0:
+        if error_hint:
+            print(f"FEHLER: {error_hint} (Exit-Code {r.returncode})")
         raise SystemExit(r.returncode)
     return r.returncode
 
@@ -94,13 +130,39 @@ def ensure_venv(vpy: Path) -> Path:
     print("Erzeuge Projekt-.venv (einmalig, isoliert von System-Python) …")
     print(f"  System-Python nur für: python -m venv  →  {_system_python()}")
     # System interpreter is ONLY allowed for creating the venv module
-    _run([_system_python(), "-m", "venv", str(VENV_DIR)])
+    _run(
+        [_system_python(), "-m", "venv", str(VENV_DIR)],
+        error_hint=(
+            "venv-Erstellung fehlgeschlagen — prüfe Python-Installation und "
+            "Schreibrechte im Projektordner."
+        ),
+    )
     if not vpy.is_file():
         raise SystemExit(f"venv python missing after create: {vpy}")
     if not _is_project_venv(vpy):
         raise SystemExit(f"venv path check failed: {vpy}")
     print(f"venv erstellt: {vpy}")
     return vpy
+
+
+def _select_requirements_file() -> Path | None:
+    """W3-05: `requirements.lock` (exakte Pins) bevorzugen, sonst Fallback auf
+    `requirements.txt` (offene Ranges)."""
+    lock = ROOT / "requirements.lock"
+    if lock.is_file():
+        return lock
+    txt = ROOT / "requirements.txt"
+    if txt.is_file():
+        return txt
+    return None
+
+
+def _deps_marker_state(req: Path) -> str:
+    """Marker-Inhalt: Dateiname + mtime des TATSÄCHLICH benutzten Files, damit
+    ein Wechsel lock<->txt immer neu installiert (nicht nur eine mtime, sonst
+    würde ein neu aufgetauchtes requirements.lock übersehen, solange die
+    marker-mtime jünger als beide Dateien ist)."""
+    return f"{req.name}:{req.stat().st_mtime}"
 
 
 def ensure_deps(vpy: Path, *, skip: bool) -> None:
@@ -113,16 +175,22 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         )
 
     marker = VENV_DIR / ".deps_installed"
-    req = ROOT / "requirements.txt"
-    if not req.is_file():
-        print("No requirements.txt — skip install")
-        return
-    if marker.is_file() and marker.stat().st_mtime >= req.stat().st_mtime:
-        print("Dependencies already installed in .venv (marker up to date)")
+    req = _select_requirements_file()
+    if req is None:
+        print("No requirements.lock/requirements.txt — skip install")
         return
 
-    print("Installiere requirements NUR in .venv (nicht global) …")
+    state = _deps_marker_state(req)
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == state:
+        print(f"Dependencies already installed in .venv (marker up to date: {req.name})")
+        return
+
+    print(f"Installiere requirements ({req.name}) NUR in .venv (nicht global) …")
     env = _venv_env()
+    pip_error_hint = (
+        "pip-Install fehlgeschlagen — prüfe Internetverbindung/Proxy; für "
+        "einen Offline-Retry ohne Install '--skip-install' verwenden."
+    )
     # Explicit: python.exe from .venv + -m pip + --require-virtualenv
     _run(
         [
@@ -135,6 +203,7 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
             "pip",
         ],
         env=env,
+        error_hint=pip_error_hint,
     )
     _run(
         [
@@ -147,8 +216,9 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
             str(req),
         ],
         env=env,
+        error_hint=pip_error_hint,
     )
-    marker.write_text("ok\n", encoding="utf-8")
+    marker.write_text(state, encoding="utf-8")
     print("pip fertig — nur .venv betroffen.")
 
 
@@ -239,12 +309,32 @@ def read_exchange_banner() -> str:
     return "MEXC"
 
 
-def main() -> None:
+def _port_in_use(host: str, port: int) -> bool:
+    """W3-11: advisory pre-check — a closed/free port must never block a
+    legitimate start. Only a clear 'something is listening' (connect
+    succeeds) counts as in-use; anything inconclusive (DNS error, timeout,
+    OS error) returns False so the normal startup proceeds."""
+    check_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            result = s.connect_ex((check_host, port))
+            return result == 0
+    except OSError:
+        return False
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Launch Local Futures Trader")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--skip-install", action="store_true")
+    # W3-10: expliziter Alias — vorher matchte "--setup" nur zufällig per
+    # argparse-Präfix-Abkürzung auf "--setup-cli"; sobald ein zweites
+    # "--setup-*"-Flag dazukäme, würde das brechen ("ambiguous option").
     p.add_argument(
+        "--setup",
         "--setup-cli",
+        dest="setup_cli",
         action="store_true",
         help="Headless-Einrichtung im Terminal statt im Browser",
     )
@@ -258,6 +348,11 @@ def main() -> None:
         "nächsten Start (laufendes uvicorn kann nicht neu binden).",
     )
     p.add_argument("--reload", action="store_true", help="uvicorn --reload (dev)")
+    return p
+
+
+def main() -> None:
+    p = _build_arg_parser()
     args = p.parse_args()
 
     os.chdir(ROOT)
@@ -295,6 +390,20 @@ def main() -> None:
     print("Trading:  DISARMED until TRADING_ENABLED=true in .env")
     print("Ctrl+C to stop.")
     print()
+
+    # W3-11: Port-Pre-Check — der häufigste "Fehler" ist gar keiner: der
+    # Nutzer hat den Server schon laufen (z. B. zweiter Doppelklick auf
+    # start.bat) und würde sonst einen englischen uvicorn-Bind-Traceback
+    # sehen. Rein advisory: bei Unklarheit wird normal weitergestartet.
+    if _port_in_use(host, port):
+        print(f"Läuft bereits auf Port {port} — Browser öffnen, kein zweiter Start nötig.")
+        print(f"  URL: {url}")
+        if not args.no_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        raise SystemExit(0)
 
     if not args.no_browser:
 
