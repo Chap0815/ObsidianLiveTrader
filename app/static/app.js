@@ -1926,7 +1926,15 @@
    *  when equity itself isn't known. */
   function dayPnl(equity) {
     if (!Number.isFinite(equity)) return null;
-    const today = new Date().toISOString().slice(0, 10);
+    // LOKALES Kalenderdatum (nicht UTC): der Tages-Baseline soll um die
+    // Mitternacht des Nutzers zuruecksetzen, nicht um UTC-Mitternacht.
+    const d = new Date();
+    const today =
+      d.getFullYear() +
+      "-" +
+      String(d.getMonth() + 1).padStart(2, "0") +
+      "-" +
+      String(d.getDate()).padStart(2, "0");
     try {
       const raw = localStorage.getItem(DAY_EQUITY_KEY);
       const parsed = raw ? JSON.parse(raw) : null;
@@ -1973,8 +1981,15 @@
     const dpEl = $("pulse-day-pnl");
     if (dpEl) {
       const dp = a.equity != null ? dayPnl(a.equity) : null;
+      // Ehrlichkeit (V3-01): das ist KEIN echtes realisiertes Tages-PnL, sondern
+      // eine lokale Naeherung (Equity jetzt minus erster Kontostand-Abruf heute).
+      // Ein-/Auszahlungen verzerren sie. Daher "≈"-Praefix + Tooltip, damit die
+      // Zahl nicht wie eine belastbare Boersen-Groesse gelesen wird.
+      dpEl.title =
+        "Naeherung: Equity jetzt minus erstem Kontostand-Abruf heute. " +
+        "KEIN echtes realisiertes PnL — Ein-/Auszahlungen verzerren den Wert.";
       if (dp != null) {
-        dpEl.textContent = (dp >= 0 ? "+" : "") + fmt(dp, 2) + " " + c;
+        dpEl.textContent = "≈ " + (dp >= 0 ? "+" : "") + fmt(dp, 2) + " " + c;
         dpEl.className = "pulse-val " + (dp > 0 ? "pnl-pos" : dp < 0 ? "pnl-neg" : "");
       } else {
         dpEl.textContent = "—";
