@@ -346,7 +346,9 @@ async def test_mexc_user_fills_skips_unparseable_rows():
                         "side": 1,
                         "vol": 1.0,
                         "price": 100.0,
-                        "timestamp": 2,
+                        # realistischer ms-Timestamp: _to_ms laesst ms unveraendert
+                        # (idempotent), konvertiert nur Sekunden-Payloads hoch.
+                        "timestamp": 1_700_000_000_000,
                     },
                 ]
             },
@@ -355,4 +357,4 @@ async def test_mexc_user_fills_skips_unparseable_rows():
     c = _client_with_handler(handler)
     out = await c.user_fills(symbol="BTC_USDT")
     assert len(out) == 1
-    assert out[0]["time"] == 2
+    assert out[0]["time"] == 1_700_000_000_000

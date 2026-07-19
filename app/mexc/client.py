@@ -881,7 +881,11 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
         "px": px,
         "sz": sz,
         "side": side,
-        "time": int(t),
+        # _to_ms ist idempotent fuer ms-Werte, konvertiert Sekunden->ms. MEXCs
+        # Deal-Zeitformat ist nicht live-verifiziert; der Marker-Layer erwartet
+        # ms -> defensiv durch _to_ms, damit ein Sekunden-Payload die Marker
+        # nicht still auf 1970 setzt.
+        "time": _to_ms(t),
         "dir": _MEXC_FILL_DIR.get(side_i or -1, ""),
         "closed_pnl": closed_pnl,
         "oid": row.get("orderId"),
