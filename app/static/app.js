@@ -57,6 +57,8 @@
     _gridStructFp: null, // last overview-grid structure fingerprint
     proposalSymbol: null,
     proposalApplied: false,
+    proposalAt: null, // ms timestamp of the underlying analysis (U2-04 drift header)
+    _proposalDriftTimer: null,
     showAiLines: true,
     openOrders: null,
     scanBusy: false,
@@ -1654,10 +1656,16 @@
         }
       } catch (_) {}
       if (state.proposalSymbol && !symMatch(state.proposalSymbol, symbol)) {
-        state.proposal = null;
-        state.proposalSymbol = null;
+        // U2-05: a stale proposal must not leave the OLD panel/Apply button
+        // standing — renderProposal(null) tears down the rendered panel html,
+        // the drift timer and the TP2/TP3 reminder in one place and disables
+        // Apply, instead of only clearing the two state fields here (which
+        // left the previous coin's HTML on screen with a live-looking button
+        // that silently did nothing).
+        try { renderProposal(null); } catch (_) { setApplyEnabled(false); }
+      } else {
+        try { drawProposalLines(); } catch (_) {}
       }
-      try { drawProposalLines(); } catch (_) {}
       try { drawTradeZones(); } catch (_) {}
       // Also drop the old coin's position/order price lines now — they re-filter
       // by symMatch but linger until the next fetch resolves (audit F3).
@@ -1668,6 +1676,7 @@
       // and the risk readout until overwritten (audit F2).
       ["ticket-entry", "ticket-price", "ticket-sl", "ticket-tp1", "ticket-tp2", "ticket-tp3"]
         .forEach(function (id) { const el = $(id); if (el) el.value = ""; });
+      _clearTpLadderReminder();
       try { updateRiskReadout(); } catch (_) {}
     }
     // Sequence guard: fast coin switches can let an older fetch resolve AFTER a
@@ -4889,8 +4898,16 @@
       body.innerHTML = "Noch keine Analyse. Klicke Analysieren.";
       state.proposal = null;
       state.proposalSymbol = null;
+      state.proposalAt = null;
       drawProposalLines();
       setApplyEnabled(false);
+      // U2-05: a stale proposal must not leave behind a TP2/TP3 reminder or
+      // a still-ticking drift timer for a panel that no longer exists.
+      if (state._proposalDriftTimer) {
+        clearInterval(state._proposalDriftTimer);
+        state._proposalDriftTimer = null;
+      }
+      _clearTpLadderReminder();
       return;
     }
 
@@ -4899,6 +4916,11 @@
     state.proposal = p;
     state.proposalSymbol = data.symbol || state.symbol;
     state.proposalApplied = false;
+    // U2-04: the age shown must reflect the ORIGINAL analysis time, not the
+    // moment this render runs — a cache hit (data.cached_age_s) or the "neu"
+    // refresh button both re-render an already-aged proposal.
+    state.proposalAt =
+      Date.now() - (data.cached_age_s != null ? Number(data.cached_age_s) * 1000 : 0);
     const stayOut = p.action === "STAY_OUT";
     setApplyEnabled(!stayOut);
     drawProposalLines();
@@ -4929,6 +4951,26 @@
           "gecacht vor " + escapeHtml(String(data.cached_age_s != null ? data.cached_age_s : 0)) + "s" +
           ' <button type="button" class="an-cache-refresh">neu</button></span>'
         : "") +
+      "</div>";
+
+    // U2-03/U2-04: subtle sub-header — resolved provider/model (so a silent
+    // fallback is visible) on the left, live age/drift on the right. The
+    // drift span itself is filled in by updateProposalDriftDisplay() right
+    // after render (and on a timer) — it needs state.lastPx, which can move
+    // between renders, so it is NOT baked into this static html string.
+    const providerLabel = _llmProviderLabel(data.provider);
+    html +=
+      '<div class="an-subhead">' +
+      (providerLabel || data.model
+        ? '<span class="an-provider-badge" title="Von der KI-Analyse tatsächlich verwendeter Provider/Modell">' +
+          escapeHtml(providerLabel) +
+          (data.model ? " · " + escapeHtml(String(data.model)) : "") +
+          "</span>" +
+          (data.provider_fallback
+            ? '<span class="an-fallback-flag" title="Konfigurierter Provider war nicht einsatzbereit — automatischer Fallback auf diesen Provider">⚠ Fallback</span>'
+            : "")
+        : "") +
+      '<span id="proposal-drift" class="an-drift"></span>' +
       "</div>";
 
     // Multi-timeframe trend row (inspired by the MTF signal tables)
@@ -5010,12 +5052,18 @@
     // Reasoning
     html += '<div class="an-reason">' + escapeHtml(p.rationale || "") + "</div>";
 
+    // U2-01: "Größe (KI)" — the conviction-tier sizing note from Task 14b
+    // (high -> full risk budget / medium -> ~1/2 / low -> ~1/4). Was computed
+    // by the LLM but never surfaced anywhere in the panel.
+    const sizingNote = !stayOut ? String(p.position_sizing_note || "").trim() : "";
+
     // Management (structured invalidation price first, then any free-text)
     const invPx = Number(p.invalidation_price);
     const hasInvPx = Number.isFinite(invPx) && invPx > 0;
-    if (mgmt.move_sl_to_be || mgmt.early_invalidation || hasInvPx) {
+    if (sizingNote || mgmt.move_sl_to_be || mgmt.early_invalidation || hasInvPx) {
       html +=
         '<div class="an-mgmt">' +
+        (sizingNote ? '<div><b>Größe (KI):</b> ' + escapeHtml(sizingNote) + "</div>" : "") +
         (mgmt.move_sl_to_be ? '<div><b>SL→BE:</b> ' + escapeHtml(mgmt.move_sl_to_be) + "</div>" : "") +
         (hasInvPx
           ? '<div><b>Invalidierung:</b> ' + fmtN(invPx) +
@@ -5034,6 +5082,59 @@
         runAnalyze(true);
       });
     }
+
+    // U2-04: live drift (age + entry-vs-lastPx) — filled in immediately, then
+    // refreshed on a timer (mirrors the scan-age display pattern) so it keeps
+    // moving with state.lastPx between analyses instead of freezing at the
+    // value computed at analysis time.
+    if (state._proposalDriftTimer) clearInterval(state._proposalDriftTimer);
+    updateProposalDriftDisplay();
+    state._proposalDriftTimer = setInterval(updateProposalDriftDisplay, 15000);
+  }
+
+  const PROPOSAL_DRIFT_STALE_MIN = 5;
+  const PROPOSAL_DRIFT_STALE_PCT = 0.5;
+
+  /** Refresh just the "Analyse Nm alt · Preis ±X%" header on the
+   *  already-rendered proposal panel (called on a timer + right after
+   *  render) — never rebuilds the whole panel. Past either staleness
+   *  threshold the line turns amber with a "neu analysieren" hint (U2-04). */
+  function updateProposalDriftDisplay() {
+    const el = $("proposal-drift");
+    if (!el) return;
+    const p = state.proposal;
+    if (!p || state.proposalAt == null) {
+      el.textContent = "";
+      el.classList.remove("an-drift-stale");
+      return;
+    }
+    const ageMin = (Date.now() - state.proposalAt) / 60000;
+    const ageLabel = ageMin < 1 ? "gerade eben" : Math.floor(ageMin) + " min alt";
+    let driftPct = null;
+    if (p.entry_price != null && state.lastPx != null && Number(p.entry_price) > 0) {
+      driftPct =
+        ((Number(state.lastPx) - Number(p.entry_price)) / Number(p.entry_price)) * 100;
+    }
+    const driftLabel = driftPct != null ? (driftPct >= 0 ? "+" : "") + fmt(driftPct, 2) + " %" : "—";
+    const stale =
+      ageMin > PROPOSAL_DRIFT_STALE_MIN ||
+      (driftPct != null && Math.abs(driftPct) > PROPOSAL_DRIFT_STALE_PCT);
+    el.textContent =
+      "Analyse " + ageLabel + " · Preis " + driftLabel + (stale ? " · neu analysieren" : "");
+    el.classList.toggle("an-drift-stale", stale);
+  }
+
+  /** U2-03: human label for the resolved LLM provider (mirrors the llm-label
+   *  mapping used for the health-check dot). Falls back to the raw string
+   *  (still escaped by the caller) so an unrecognized provider never renders
+   *  as nothing. */
+  function _llmProviderLabel(provider) {
+    const p = String(provider || "").trim().toLowerCase();
+    if (p === "xai" || p === "grok") return "xAI";
+    if (p === "claude" || p === "anthropic") return "Claude";
+    if (p === "openai" || p === "codex") return "OpenAI";
+    if (p === "ollama" || p === "local") return "Ollama";
+    return provider ? String(provider) : "";
   }
 
   function _trendLabel(t) {
@@ -5224,21 +5325,72 @@
     }
 
     syncTicketSegments();
+    // Both notices below share the single-slot toast. Collect them and emit ONE
+    // combined toast at the end — otherwise the second showToast() overwrites
+    // the first and a warning is silently lost (e.g. the LIMIT notice would
+    // vanish behind the TP2/TP3 notice in the common tiered-TP + pullback case).
+    const applyNotices = [];
     // The proposal turned the ticket into a LIMIT order (pullback entry). Make
     // that unmistakable — otherwise the trader sends a resting limit thinking
     // they are in the market now (exactly the AVAX confusion).
     if (typeEl && typeEl.value === "limit" && p.entry_price != null) {
-      showToast(
+      applyNotices.push(
         "⏳ Als LIMIT bei " + fmt(p.entry_price, 4) + " übernommen — die Order " +
           "wartet, bis der Kurs dieses Niveau erreicht. Für sofortigen Einstieg " +
-          'auf „Market" wechseln.',
-        null
+          'auf „Market" wechseln.'
       );
     }
+
+    // U2-02: the ticket only has ONE take-profit field — TP1 goes into it as
+    // before, but TP2/TP3 must never just silently vanish. Surface them as a
+    // read-only reminder line in the ticket + a toast, instead of building a
+    // full multi-TP order feature.
+    if (p.tp2 != null || p.tp3 != null) {
+      const parts = [];
+      if (p.tp2 != null) parts.push("TP2 " + fmt(p.tp2, 6));
+      if (p.tp3 != null) parts.push("TP3 " + fmt(p.tp3, 6));
+      const reminderEl = _ensureTpLadderReminderEl();
+      if (reminderEl) {
+        reminderEl.textContent =
+          "KI-Leiter zusätzlich: " + parts.join(" · ") +
+          " — nicht als Order übernommen, ggf. manuell nachziehen.";
+        reminderEl.classList.remove("hidden");
+      }
+      applyNotices.push("TP2/TP3 nicht als Order übernommen — siehe Hinweis im Ticket.");
+    } else {
+      _clearTpLadderReminder();
+    }
+
+    if (applyNotices.length) {
+      showToast(applyNotices.join("   ·   "), null);
+    }
+
     // Core KI lines are now represented by the ticket lines — keep only levels
     state.proposalApplied = true;
     drawProposalLines();
     drawTicketLines();
+  }
+
+  /** Read-only "TP2/TP3 not applied" line under the ticket's TP field
+   *  (U2-02). Created lazily so no template change is needed; idempotent —
+   *  a repeat call reuses the same element instead of stacking duplicates. */
+  function _ensureTpLadderReminderEl() {
+    let el = $("tp-ladder-reminder");
+    if (el) return el;
+    const anchor = $("risk-readout") || $("order-form");
+    if (!anchor || !anchor.parentNode) return null;
+    el = document.createElement("p");
+    el.id = "tp-ladder-reminder";
+    el.className = "hint muted tp-ladder-reminder hidden";
+    anchor.parentNode.insertBefore(el, anchor);
+    return el;
+  }
+
+  function _clearTpLadderReminder() {
+    const el = $("tp-ladder-reminder");
+    if (!el) return;
+    el.textContent = "";
+    el.classList.add("hidden");
   }
 
   async function runAnalyze(force) {

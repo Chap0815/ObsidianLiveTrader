@@ -1495,6 +1495,25 @@ async def analyze(
             ),
         )
 
+    # U2-03: expose the RESOLVED provider/model actually used, so a silent
+    # fallback (configured provider has no key -> auto-resolved to a
+    # different one, see Settings.resolved_llm_provider) is visible in the
+    # UI instead of only in a startup log line. _llm_settings() above already
+    # applied either the hot-swap override or that auto-resolution, so
+    # s.llm_provider here IS the provider this call will run on. Only flag
+    # `provider_fallback` when the resolution silently deviated from the
+    # .env-configured default — a deliberate hot-swap via the dropdown is not
+    # a "fallback".
+    # Normalize the .env value through the SAME alias map resolved_llm_provider
+    # uses (grok->xai, anthropic->claude, ...), otherwise a configured alias like
+    # LLM_PROVIDER=grok stays "grok" while the resolved provider is "xai" and the
+    # badge fires a spurious "fallback" on a perfectly healthy config.
+    _provider_aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
+    _cfg_raw = (get_settings().llm_provider or "claude").strip().lower()
+    _configured_provider = _provider_aliases.get(_cfg_raw, _cfg_raw)
+    _llm_override = getattr(request.app.state, "llm_override", None)
+    provider_fallback = _llm_override is None and s.llm_provider != _configured_provider
+
     client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
@@ -1688,6 +1707,11 @@ async def analyze(
             "proposal": proposal_dict,
             "annotations": annotations,
             "last_price": market_api.get("last_price"),
+            # U2-03: resolved provider/model + fallback flag (see above) so
+            # the panel can show which KI actually produced this proposal.
+            "provider": s.llm_provider,
+            "model": _journal_model_for_provider(s),
+            "provider_fallback": provider_fallback,
         }
         cache = getattr(request.app.state, "analyze_cache", None)
         if cache is None:

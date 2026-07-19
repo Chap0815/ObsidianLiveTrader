@@ -2587,6 +2587,39 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   color: var(--violet);
 }
 
+/* U2-01..U2-04: dezente sub-header row under the main action/symbol badges —
+   resolved provider/model on the left (so a silent fallback is visible), live
+   drift/age on the right. Deliberately quiet: this is metadata, not signal. */
+.an-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-family: var(--sans);
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  margin: -4px 0 12px;
+}
+
+.an-provider-badge {
+  font-family: var(--mono);
+}
+
+.an-fallback-flag {
+  margin-left: var(--space-2);
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.an-drift {
+  font-variant-numeric: tabular-nums;
+}
+
+.an-drift-stale {
+  color: var(--warn);
+  font-weight: 600;
+}
+
 .proposal-action {
   display: inline-block;
   font-family: var(--mono);
