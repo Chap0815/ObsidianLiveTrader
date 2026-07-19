@@ -1,0 +1,94 @@
+/**
+ * Obsidian Live Trader — pure presentation/format helpers (A3-01).
+ *
+ * MODULE-LOADING CHOICE (deliberate, documented): this is a CLASSIC script,
+ * NOT `<script type="module">`. It is loaded in base.html IMMEDIATELY BEFORE
+ * app.js so its top-level `function …` declarations become GLOBAL functions on
+ * the shared script scope. app.js (a classic IIFE) references these by bare
+ * name (`fmt(x)`, `escapeHtml(s)`, …); with classic scripts that bare name
+ * resolves to the global defined here — so NO call sites in app.js change.
+ *
+ * Rationale for NOT using ES modules: `type="module"` would change execution
+ * timing (deferred), give each file its own scope (forcing import/export at
+ * every call site) and risk CSP / inline-handler breakage. A classic
+ * load-before-app.js keeps behavior byte-identical.
+ *
+ * INVARIANT: only genuinely PURE helpers belong here — output depends solely on
+ * arguments, with NO `state.` access, NO module-scoped app vars, and NO
+ * `$()`/getElementById DOM lookups. Stateful/DOM-bound helpers (markerKey, ccy,
+ * …) MUST stay in app.js.
+ */
+
+function fmt(n, digits) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const d = digits != null ? digits : 4;
+  return Number(n).toLocaleString("de-DE", {
+    maximumFractionDigits: d,
+    minimumFractionDigits: 0,
+  });
+}
+
+function fmtPct(rate) {
+  if (rate == null || Number.isNaN(Number(rate))) return "—";
+  // funding often as fraction (e.g. 0.0001) → show bps-ish percent
+  return (Number(rate) * 100).toFixed(4) + "%";
+}
+
+/** MEXC candle time is ms; Lightweight Charts wants seconds. */
+function toChartTime(ms) {
+  const t = Number(ms);
+  if (!Number.isFinite(t)) return null;
+  return t > 1e12 ? Math.floor(t / 1000) : Math.floor(t);
+}
+
+function tfSeconds(tf) {
+  const m = {
+    "5m": 300,
+    "15m": 900,
+    "1H": 3600,
+    "4H": 14400,
+    "1D": 86400,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+  };
+  return m[tf] || 900;
+}
+
+function barOpenTimeSec(tsMsOrSec, tf) {
+  let sec = Number(tsMsOrSec);
+  if (!Number.isFinite(sec)) sec = Date.now() / 1000;
+  if (sec > 1e12) sec = Math.floor(sec / 1000);
+  else sec = Math.floor(sec);
+  const bucket = tfSeconds(tf);
+  return Math.floor(sec / bucket) * bucket;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return "gerade eben";
+  const m = Math.floor(s / 60);
+  if (m < 60) return "vor " + m + " Min";
+  const h = Math.floor(m / 60);
+  if (h < 24) return "vor " + h + " Std";
+  const d = Math.floor(h / 24);
+  return "vor " + d + " Tag" + (d === 1 ? "" : "en");
+}
+
+function numOrNull(el) {
+  if (!el || el.value === "" || el.value == null) return null;
+  const n = Number(el.value);
+  return Number.isFinite(n) ? n : null;
+}

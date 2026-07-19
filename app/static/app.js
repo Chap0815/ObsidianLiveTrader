@@ -102,7 +102,34 @@
     // SAME state.journalFilter still applied).
     journalFilter: null, // {field: "setup_confidence"|"action"|"provider", value: string}
     _journalWired: false, // #journal-body delegated listener attached once
+    // A3-04: formerly dynamically-created top-level fields — enumerated
+    // exhaustively (grep `\bstate\.<name>\s*=`) and pre-declared here so a
+    // typo can no longer mint a silent new field once the state is sealed.
+    fundingNextSettle: null, // next funding settlement ts (ms/sec) or null
+    journalClearBusy: false, // journal reset in flight (double-submit guard)
+    wsRetry: 0, // WS reconnect backoff counter
+    _chartKey: null, // last-drawn chart identity (symbol|tf) — change guard
+    _chartResizeObserver: null, // ResizeObserver on the chart container
+    _fillAggById: null, // Map: fill id -> aggregated fill (marker tooltips)
+    _fillsSeq: 0, // fills fetch sequence guard (drop superseded responses)
+    _fundingCdTimer: null, // funding-countdown setInterval handle
+    _lastSlRecon: 0, // ms ts of the last SL reconciliation (5s throttle)
+    _markerTooltipEl: null, // hover tooltip DOM node (created once)
+    _marketSeq: 0, // /api/market fetch sequence guard
+    _ordersSeq: 0, // open-orders fetch sequence guard
+    _rtKey: null, // last realtime-wiring chart identity
+    _scanAgeTimer: null, // scanner staleness setInterval handle
+    _ticketLinesLastDraw: 0, // ms ts of the last ticket-line redraw (throttle)
+    _ttlTimer: null, // preview TTL countdown setInterval handle
+    _wsReconnect: null, // WS reconnect setTimeout handle
+    _zonesRafPending: false, // zones redraw rAF coalescing flag
   };
+  // A3-04: freeze the SET of top-level keys. Nested objects (slAlarm[sym],
+  // reevalBusy[sym], _markOffset[sym], _lineSpecs.*, tradeMarkers[sym], …)
+  // stay mutable — seal only prevents adding/removing TOP-LEVEL state keys, so
+  // every existing `state.foo.bar = …` and `state.foo[key] = …` keeps working.
+  // Verified: no `state[dynamicVar] = …`, no `Object.assign(state, …)` exists.
+  Object.seal(state);
 
   function $(id) {
     return document.getElementById(id);
@@ -152,27 +179,8 @@
       : "Preview → Confirm";
   }
 
-  function fmt(n, digits) {
-    if (n == null || Number.isNaN(Number(n))) return "—";
-    const d = digits != null ? digits : 4;
-    return Number(n).toLocaleString("de-DE", {
-      maximumFractionDigits: d,
-      minimumFractionDigits: 0,
-    });
-  }
-
-  function fmtPct(rate) {
-    if (rate == null || Number.isNaN(Number(rate))) return "—";
-    // funding often as fraction (e.g. 0.0001) → show bps-ish percent
-    return (Number(rate) * 100).toFixed(4) + "%";
-  }
-
-  /** MEXC candle time is ms; Lightweight Charts wants seconds. */
-  function toChartTime(ms) {
-    const t = Number(ms);
-    if (!Number.isFinite(t)) return null;
-    return t > 1e12 ? Math.floor(t / 1000) : Math.floor(t);
-  }
+  // A3-01: fmt, fmtPct, toChartTime moved to utils.js (pure format helpers,
+  // loaded as globals before app.js). Call sites unchanged.
 
   /** C3-11: LWC v4 renders epoch timestamps as UTC by default — for a DE
    *  user (UTC+2) the axis and crosshair are hours off the wall clock, and
@@ -1322,28 +1330,8 @@
     updateStaleBanner(); // U-02: WS status changes here too, so re-check
   }
 
-  function tfSeconds(tf) {
-    const m = {
-      "5m": 300,
-      "15m": 900,
-      "1H": 3600,
-      "4H": 14400,
-      "1D": 86400,
-      "1h": 3600,
-      "4h": 14400,
-      "1d": 86400,
-    };
-    return m[tf] || 900;
-  }
-
-  function barOpenTimeSec(tsMsOrSec, tf) {
-    let sec = Number(tsMsOrSec);
-    if (!Number.isFinite(sec)) sec = Date.now() / 1000;
-    if (sec > 1e12) sec = Math.floor(sec / 1000);
-    else sec = Math.floor(sec);
-    const bucket = tfSeconds(tf);
-    return Math.floor(sec / bucket) * bucket;
-  }
+  // A3-01: tfSeconds, barOpenTimeSec moved to utils.js (pure helpers, loaded
+  // as globals before app.js). Call sites unchanged.
 
   /** Manual positions carry NO exchange stop. When the live price reaches the
    *  SL zone, warn LOUDLY — but only while the browser is open. Dedup per
@@ -5772,14 +5760,8 @@
     );
   }
 
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
+  // A3-01: escapeHtml moved to utils.js (pure helper, loaded as a global
+  // before app.js). Call sites unchanged.
 
   /** Focus the KI dropdown so the trader can switch provider in one click
    *  (used by the "⚠" credit/rate-limit error affordance below). */
@@ -6450,19 +6432,8 @@
     return out;
   }
 
-  function relTime(iso) {
-    if (!iso) return "";
-    const t = Date.parse(iso);
-    if (!Number.isFinite(t)) return "";
-    const s = Math.max(0, (Date.now() - t) / 1000);
-    if (s < 60) return "gerade eben";
-    const m = Math.floor(s / 60);
-    if (m < 60) return "vor " + m + " Min";
-    const h = Math.floor(m / 60);
-    if (h < 24) return "vor " + h + " Std";
-    const d = Math.floor(h / 24);
-    return "vor " + d + " Tag" + (d === 1 ? "" : "en");
-  }
+  // A3-01: relTime moved to utils.js (pure helper, loaded as a global before
+  // app.js). Call sites unchanged.
 
   /** Render cached headlines. EVERY feed string goes through escapeHtml
    *  (feeds are untrusted), links are http(s)-whitelisted + noopener.
@@ -8063,11 +8034,8 @@
     }
   }
 
-  function numOrNull(el) {
-    if (!el || el.value === "" || el.value == null) return null;
-    const n = Number(el.value);
-    return Number.isFinite(n) ? n : null;
-  }
+  // A3-01: numOrNull moved to utils.js (pure helper, loaded as a global before
+  // app.js). Call sites unchanged.
 
   /** T3-09: a native <input type=number> simply refuses a de-DE formatted
    *  paste like "61.234,56" — a comma is not a legal character in a number

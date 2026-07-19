@@ -19,6 +19,11 @@
   {# F-19: the local auth token is delivered as an HttpOnly session cookie
      (set by the server on this page), not injected into the DOM. Same-origin
      fetch/WebSocket send it automatically. #}
+  {# A3-01: pure format helpers extracted to utils.js. Classic script (NOT a
+     module) loaded IMMEDIATELY BEFORE app.js so its top-level functions are
+     globals app.js can call by bare name — same-origin /static under CSP
+     'self', matching the app.js tag pattern (no nonce needed for src). #}
+  <script src="/static/utils.js?v={{ asset_version|default('r22') }}"></script>
   <script src="/static/app.js?v={{ asset_version|default('r22') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
