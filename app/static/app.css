@@ -5,6 +5,18 @@
    Type: IBM Plex Mono (data) + IBM Plex Sans (UI).
    ============================================================ */
 
+/* T49 — IBM Plex vendored locally (WOFF2, latin subset) so NO external font
+   request fires on first-start/setup and the CSP needs no Google Fonts host.
+   Weights match the former Google Fonts link (Sans + Mono, 400/500/600);
+   font-display:swap keeps text visible during load, falling back to the
+   system stack in --sans/--mono until the local file paints. */
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 400; font-display: swap; src: url("/static/fonts/ibm-plex-sans-400.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 500; font-display: swap; src: url("/static/fonts/ibm-plex-sans-500.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 600; font-display: swap; src: url("/static/fonts/ibm-plex-sans-600.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("/static/fonts/ibm-plex-mono-400.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url("/static/fonts/ibm-plex-mono-500.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 600; font-display: swap; src: url("/static/fonts/ibm-plex-mono-600.woff2") format("woff2"); }
+
 :root {
   /* Obsidian Remake — refined volcanic glass. Monochrome base; colour = meaning.
      Deeper elevation steps, indigo-violet arrowhead as the ONLY interactive

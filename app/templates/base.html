@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Obsidian Live Trader{% endblock %}</title>
   <link rel="icon" href="/static/obsidian.ico" sizes="any" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  {# T49: IBM Plex is vendored locally (@font-face in app.css → /static/fonts),
+     so there is NO external font request on first-start/setup and the CSP needs
+     no Google Fonts host. #}
   <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r22') }}" />
   {# S3-14: wrapped in a block so a page that doesn't need the chart lib
      (e.g. setup.html) can override it to empty instead of paying for an

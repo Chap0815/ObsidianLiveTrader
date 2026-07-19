@@ -37,9 +37,11 @@ def build_csp(script_nonce: str | None = None) -> str:
     per-response nonce so only that exact block runs.
 
     style-src keeps 'unsafe-inline' because lightweight-charts injects inline
-    styles dynamically (a nonce cannot cover those) and the page links the
-    Google Fonts stylesheet. connect-src 'self' covers same-origin fetch and
-    the same-origin ws:// WebSocket handshake.
+    styles dynamically (a nonce cannot cover those). Fonts are now vendored
+    locally under /static/fonts (IBM Plex WOFF2), so no external font host is
+    allowed — font-src is 'self' only and no Google Fonts origin appears in
+    style-src (T49: no external request on first-start/setup). connect-src
+    'self' covers same-origin fetch and the same-origin ws:// handshake.
     """
     script_src = "'self'"
     if script_nonce:
@@ -47,8 +49,8 @@ def build_csp(script_nonce: str | None = None) -> str:
     directives = [
         "default-src 'self'",
         f"script-src {script_src}",
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-        "font-src 'self' https://fonts.gstatic.com data:",
+        "style-src 'self' 'unsafe-inline'",
+        "font-src 'self'",
         "img-src 'self' data:",
         "connect-src 'self'",
         "object-src 'none'",

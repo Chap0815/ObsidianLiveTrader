@@ -43,9 +43,12 @@ def test_dashboard_has_strict_csp(dashboard_app):
     # script-src must be exactly 'self' with NO unsafe-inline (the key control).
     assert _directive(csp, "script-src") == "script-src 'self'"
     assert "'unsafe-inline'" not in _directive(csp, "script-src")
-    # style/font/connect allowances the page actually needs.
-    assert "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com" in csp
-    assert "https://fonts.gstatic.com" in _directive(csp, "font-src")
+    # style/font/connect allowances the page actually needs. Fonts are vendored
+    # locally (T49) — NO external font host is allowed anymore.
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert _directive(csp, "font-src") == "font-src 'self'"
+    assert "googleapis.com" not in csp
+    assert "gstatic.com" not in csp
     assert "connect-src 'self'" in csp
     assert "default-src 'self'" in csp
     assert "object-src 'none'" in csp
