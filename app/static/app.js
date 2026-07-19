@@ -380,6 +380,17 @@
     } catch (_) {
       /* older LWC */
     }
+
+    // C3-04a: fill-marker hover tooltip (perf-critical handler — see the
+    // block comment above handleMarkerCrosshairMove). try/catch only
+    // guards against a hypothetical older LWC build without the API; the
+    // vendored v4.2.0 bundle supports it.
+    try {
+      state.chart.subscribeCrosshairMove(handleMarkerCrosshairMove);
+    } catch (_) {
+      /* older LWC without hoveredObjectId support */
+    }
+
     sizeTradeOverlay();
   }
 
@@ -2868,9 +2879,28 @@
       );
     }
 
+    // C3-04a: aggregate-map for the hover tooltip (id -> group detail). Same
+    // key as the marker's own `id` below, so subscribeCrosshairMove's
+    // hoveredObjectId resolves here in O(1) — no re-walking of state.fills
+    // or groupList on every crosshair move.
+    const aggById = new Map();
+
     const markers = groupList.map(function (g) {
       const buy = g.side === "buy";
       const avgPx = g.sz > 0 ? g.notional / g.sz : 0;
+      const id = g.time + "|" + g.side; // matches the groups Map key above
+      // A bucket with ANY open fill is treated as an entry (full color) even
+      // if it also contains a close fill — the entry is what must stand out.
+      const closeOnly = g.anyClose && !g.anyOpen;
+      aggById.set(id, {
+        time: g.time,
+        sz: g.sz,
+        avgPx: avgPx,
+        side: g.side,
+        closeOnly: closeOnly,
+        anyLiq: g.anyLiq,
+        closedPnl: g.closedPnl,
+      });
       // C3-02: a liquidation or position flip is the worst-case event on the
       // chart — it must never be mistaken for a deliberate, well-colored
       // entry. Own shape/color/text, always labeled, independent of
@@ -2879,15 +2909,13 @@
       if (g.anyLiq) {
         return {
           time: g.time,
+          id: id,
           position: buy ? "belowBar" : "aboveBar",
           color: chartColors.liq,
           shape: "square",
           text: "LIQ", // exempt from the text-count cap (see textCandidates above)
         };
       }
-      // A bucket with ANY open fill is treated as an entry (full color) even
-      // if it also contains a close fill — the entry is what must stand out.
-      const closeOnly = g.anyClose && !g.anyOpen;
       const color = closeOnly
         ? buy
           ? chartColorAlpha(chartColors.long, 0.45) // dimmed: close of a long
@@ -2897,6 +2925,7 @@
           : chartColors.short;
       const marker = {
         time: g.time,
+        id: id,
         position: buy ? "belowBar" : "aboveBar",
         color: color,
         shape: buy ? "arrowUp" : "arrowDown",
@@ -2914,11 +2943,141 @@
       return marker;
     });
 
+    state._fillAggById = aggById;
+
     try {
       state.candleSeries.setMarkers(markers);
     } catch (e) {
       console.error("setMarkers", e);
     }
+    // The hovered marker (if any) may no longer exist post-rebuild (fills
+    // poll every 30s, a symbol switch replaces the set outright) — resolve
+    // against the fresh map rather than blindly hiding, so a still-hovered
+    // marker's tooltip doesn't flicker on every routine poll.
+    syncMarkerTooltipAfterRebuild();
+  }
+
+  /* ── C3-04a: fill-marker hover tooltip ──────────────────────────────
+     subscribeCrosshairMove fires on EVERY crosshair move (every mouse
+     move over the chart), so the handler below is kept to the minimum:
+     one Map.get() by id, and a DOM write ONLY when the hovered id
+     actually changes (_hoverTooltipId guard) — no loop over fills/
+     groupList, no getComputedStyle. Only the tooltip's on-screen
+     position (a plain style.left/top write) updates on every move;
+     content (innerHTML) is rebuilt solely on an id transition. */
+  let _hoverTooltipId = null; // id of the marker whose tooltip is currently shown, or null
+  let _hoverTooltipW = 0; // cached offsetWidth/Height of the tooltip at last content-build,
+  let _hoverTooltipH = 0; // reused for clamping so the per-move path never re-reads layout
+
+  function ensureMarkerTooltipEl() {
+    if (state._markerTooltipEl) return state._markerTooltipEl;
+    const wrap = $("chart-wrap");
+    if (!wrap) return null;
+    const el = document.createElement("div");
+    el.className = "marker-tooltip hidden";
+    wrap.appendChild(el);
+    state._markerTooltipEl = el;
+    return el;
+  }
+
+  function hideMarkerTooltip() {
+    _hoverTooltipId = null;
+    const el = state._markerTooltipEl;
+    if (el) el.classList.add("hidden");
+  }
+
+  /** Rebuild the tooltip's content + cached size for `id`/`agg`. Only ever
+   *  called on an id transition (crosshair) or a routine re-poll while the
+   *  same marker is still hovered (applyTradeMarkers) — never per move. */
+  function showMarkerTooltip(id, agg) {
+    const el = ensureMarkerTooltipEl();
+    if (!el) return;
+    const buy = agg.side === "buy";
+    const dirLabel = agg.anyLiq
+      ? "LIQ"
+      : buy
+        ? agg.closeOnly
+          ? "Close Short"
+          : "Open/Add Long"
+        : agg.closeOnly
+          ? "Close Long"
+          : "Open/Add Short";
+    let html =
+      '<div class="mt-row">' + escapeHtml(chartLocalTime(agg.time, true)) + "</div>" +
+      '<div class="mt-row">' + escapeHtml(dirLabel) + "</div>" +
+      '<div class="mt-row">Größe: ' + escapeHtml(fmt(agg.sz, 4)) + "</div>" +
+      '<div class="mt-row">VWAP: ' + escapeHtml(fmt(agg.avgPx, 4)) + "</div>";
+    // C3-08: realized PnL only means something on a close-only bucket —
+    // an open/add has none yet (mirrors the marker-text rule above).
+    if (agg.closeOnly) {
+      const pnlCls = agg.closedPnl >= 0 ? "mt-pnl-pos" : "mt-pnl-neg";
+      const pnlTxt = (agg.closedPnl >= 0 ? "+" : "") + fmt(agg.closedPnl, 2);
+      html +=
+        '<div class="mt-row">PnL: <span class="' + pnlCls + '">' +
+        escapeHtml(pnlTxt) +
+        "</span></div>";
+    }
+    el.innerHTML = html;
+    el.classList.remove("hidden");
+    _hoverTooltipId = id;
+    _hoverTooltipW = el.offsetWidth;
+    _hoverTooltipH = el.offsetHeight;
+  }
+
+  /** Called after every applyTradeMarkers rebuild (symbol switch or the
+   *  30s fills poll) — the currently-hovered id may no longer exist (or
+   *  its numbers may have moved slightly). Resolve against the fresh map:
+   *  gone → hide; still there → refresh content so it doesn't go stale. */
+  function syncMarkerTooltipAfterRebuild() {
+    if (_hoverTooltipId === null) return;
+    const agg = state._fillAggById && state._fillAggById.get(_hoverTooltipId);
+    if (!agg) {
+      hideMarkerTooltip();
+      return;
+    }
+    showMarkerTooltip(_hoverTooltipId, agg);
+  }
+
+  /** Cheap per-move path: cursor-relative placement using the tooltip size
+   *  cached at last content-build (no layout read here), clamped inside
+   *  #chart-wrap so it can never render offscreen near the chart edges. */
+  function positionMarkerTooltip(point) {
+    const el = state._markerTooltipEl;
+    if (!el || !point) return;
+    const wrap = $("chart-wrap");
+    const wrapW = wrap ? wrap.clientWidth : 0;
+    const wrapH = wrap ? wrap.clientHeight : 0;
+    const gap = 14; // small offset so the tooltip doesn't sit under the cursor
+    let left = point.x + gap;
+    let top = point.y + gap;
+    if (wrapW && left + _hoverTooltipW > wrapW) left = point.x - _hoverTooltipW - gap;
+    if (wrapH && top + _hoverTooltipH > wrapH) top = point.y - _hoverTooltipH - gap;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    el.style.left = left + "px";
+    el.style.top = top + "px";
+  }
+
+  /** subscribeCrosshairMove handler — see perf note in the block comment
+   *  above. `param.hoveredObjectId` is whatever `id` we gave the marker in
+   *  applyTradeMarkers, so this is a single Map.get(), never a re-scan of
+   *  state.fills/groupList. */
+  function handleMarkerCrosshairMove(param) {
+    const id =
+      param && param.hoveredObjectId != null ? String(param.hoveredObjectId) : null;
+    if (id == null) {
+      if (_hoverTooltipId !== null) hideMarkerTooltip();
+      return;
+    }
+    const agg = state._fillAggById && state._fillAggById.get(id);
+    if (!agg) {
+      if (_hoverTooltipId !== null) hideMarkerTooltip();
+      return;
+    }
+    if (id !== _hoverTooltipId) {
+      showMarkerTooltip(id, agg);
+    }
+    positionMarkerTooltip(param.point);
   }
 
   /** Reference entry price for size/risk math: limit price (LIMIT orders

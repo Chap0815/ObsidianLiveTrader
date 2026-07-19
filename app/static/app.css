@@ -1199,6 +1199,37 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   z-index: 3;
 }
 
+/* C3-04a: fill-marker hover tooltip. Absolutely positioned inside
+   #chart-wrap (already position:relative) and tracked to the cursor in
+   JS; pointer-events:none so it never steals the crosshair/marker hit
+   test it exists to describe. z-index above .trade-overlay so it's
+   never occluded by the SL/TP field canvas. */
+.marker-tooltip {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  left: 0;
+  top: 0;
+  background: #1c1830;
+  border: 1px solid #3a3560;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: "IBM Plex Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #d8d5e6;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.marker-tooltip .mt-pnl-pos {
+  color: var(--long);
+}
+
+.marker-tooltip .mt-pnl-neg {
+  color: var(--short);
+}
+
 .placeholder {
   padding: var(--space-4) var(--space-3);
   color: var(--muted);
