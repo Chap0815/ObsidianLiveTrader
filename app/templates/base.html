@@ -19,6 +19,12 @@
   {# F-19: the local auth token is delivered as an HttpOnly session cookie
      (set by the server on this page), not injected into the DOM. Same-origin
      fetch/WebSocket send it automatically. #}
+  {# A3-02 (Task 43): shared state store. Classic script loaded FIRST — BEFORE
+     utils.js/trade-math.js/api.js/app.js — so its top-level `state` and
+     `PERSIST` are globals every later script references by bare name. `state`
+     used to live inside app.js's IIFE; loading it first makes it the ONE object
+     all modules see (api.js reads PERSIST.TOKEN; app.js references `state`). #}
+  <script src="/static/store.js?v={{ asset_version|default('r22') }}"></script>
   {# A3-01: pure format helpers extracted to utils.js. Classic script (NOT a
      module) loaded IMMEDIATELY BEFORE app.js so its top-level functions are
      globals app.js can call by bare name — same-origin /static under CSP

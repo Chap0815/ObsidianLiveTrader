@@ -11,9 +11,9 @@
  * INVARIANT — STATE-FREE: this file is loaded BEFORE app.js, so app.js's sealed
  * `state` object is NOT in scope here and MUST NOT be referenced. The former
  * `state.localToken ||` fallback in authHeaders is replaced by a module-level
- * `_localToken` (default "" — `state.localToken` was ALWAYS "" at runtime; it is
- * declared in the state literal but never assigned anywhere in app.js, so the
- * effective token source has always been the localStorage lookup below). An
+ * `_localToken` (default "" — the former `state.localToken` was ALWAYS "" at
+ * runtime; it was never assigned anywhere and has since been removed from the
+ * state literal, so the effective token source is the localStorage lookup below). An
  * explicit override hook (`setLocalToken`) preserves the old escape hatch.
  *
  * AUTH/CSRF CONTRACT (preserved byte-identical): same-origin requests carry the
@@ -22,9 +22,9 @@
  * JSON content-type is forced for non-GET/HEAD when a body is sent.
  */
 
-// Optional non-browser auth token. Mirrors the former (always-empty)
-// state.localToken; nothing in app.js currently sets it, so behavior is
-// identical to before. Kept STATE-FREE on purpose (see header).
+// Optional non-browser auth token. Replaces the former (always-empty, now
+// removed) state.localToken; only setLocalToken()/localStorage set a token, so
+// behavior is identical to before. Kept STATE-FREE on purpose (see header).
 var _localToken = "";
 function setLocalToken(tok) {
   _localToken = tok || "";
@@ -40,11 +40,17 @@ function authHeaders(extra) {
   // cookie (sent automatically on same-origin requests), so we no longer
   // read it from the DOM. An explicit override/localStorage token is still
   // honored as a fallback for non-browser use.
+  // A3-11 (Task 43): read the ONE canonical token key. store.js (loaded FIRST)
+  // migrates the legacy alias ("local_api_token") into this canonical key once
+  // at load, so an existing user's token is preserved without a second lookup
+  // here. PERSIST.TOKEN is a store.js global; the literal is a load-order-safe
+  // fallback (identical value) in case store.js hasn't defined it yet.
+  const canonKey =
+    (typeof PERSIST !== "undefined" && PERSIST && PERSIST.TOKEN) ||
+    "mexc_local_token";
   const tok =
     _localToken ||
-    (typeof localStorage !== "undefined" &&
-      (localStorage.getItem("mexc_local_token") ||
-        localStorage.getItem("local_api_token"))) ||
+    (typeof localStorage !== "undefined" && localStorage.getItem(canonKey)) ||
     "";
   if (tok) h["X-Local-Token"] = tok;
   return h;

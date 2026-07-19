@@ -5,130 +5,12 @@
 (function () {
   "use strict";
 
-  const state = {
-    symbol: "BTC_USDT",
-    tf: "15m",
-    htf: "1H",
-    chart: null,
-    candleSeries: null,
-    ema20Series: null,
-    ema50Series: null,
-    volumeSeries: null,
-    priceLines: [],
-    health: null,
-    account: null,
-    proposal: null,
-    analyzeBusy: false,
-    previewToken: null,
-    previewSummary: null,
-    orderBusy: false,
-    closeBusy: false,
-    slBusy: false, // SL→BE move in flight (double-submit guard)
-    _slDrag: null, // C3-04b: active SL-line drag {symbol,side,entry,sl,newSl,vol,cs,tp}
-    _slHoverGeom: null, // C3-04b: SL geometry under the cursor (hit-zone hover)
-    _slOverlayOn: false, // C3-04b: overlay currently interactive (±4px hit zone)
-    _slDragWired: false, // C3-04b: pointer/keys wired once (initChart runs once, belt+braces)
-    historyClearBusy: false, // history reset in flight
-    _cancelBusy: {}, // per-order cancel guards (F6/F7)
-    llmLabel: "KI", // active provider label for the analyze spinner
-    apiAllowed: null,
-    market: null,
-    ws: null,
-    wsStatus: "off",
-    liveBar: null, // { time, open, high, low, close } chart seconds
-    lastPx: null,
-    _lastTickTs: null, // ms timestamp of the last live price update (U-02 stale-feed banner)
-    _lastAppPingTs: 0, // ms timestamp of the last client app-ping sent (Task 4/E3-01)
-    _lastPongTs: null, // ms timestamp of the last app-pong received — socket-alive proof, NOT price data
-    // Chart line groups (KI-Analyse, echte Positionen, offene Orders/Trigger)
-    proposalLines: [],
-    positionLines: [],
-    orderLines: [],
-    // C3-12: last-applied (price,title,color,style,width,axisLabel) spec set per
-    // line group — lets each draw diff and only touch lines that actually
-    // changed (applyOptions) instead of remove+recreate every poll (flicker).
-    _lineSpecs: { proposal: [], position: [], order: [], ticket: [] },
-    // T34 re-render hygiene: fingerprint guards so a poll only rebuilds DOM
-    // when something the user sees actually changed.
-    _positionsWired: false, // #positions-body delegated listener attached once
-    _positionsFp: null, // last positions render fingerprint
-    _symbolTabsFp: null, // last symbol-tab bar fingerprint
-    _gridStructFp: null, // last overview-grid structure fingerprint
-    proposalSymbol: null,
-    proposalApplied: false,
-    proposalAt: null, // ms timestamp of the underlying analysis (U2-04 drift header)
-    _proposalDriftTimer: null,
-    showAiLines: true,
-    openOrders: null,
-    scanBusy: false,
-    scanResults: null,
-    showZones: true,
-    tradeEntryTimes: {}, // symbol -> entry candle time (seconds), for zone start
-    tradeMarkers: {}, // symbol -> {sl, tp, side, manual} for manual-mode zones
-    slAlarm: {}, // symbol -> already-alarmed flag for manual-SL touch (Task 4)
-    _markOffset: {}, // E3-06: symbol -> {offset, ts} exchange Mark−Last basis (added to live ticks)
-    sltpMode: "price",
-    sizeMode: "position", // "position" = field is notional; "margin" = field is margin
-    triggerMode: "auto", // auto = exchange SL/TP; manual = trader manages exit
-    allSymbols: [], // full coin pool for the search dropdown
-    openTabs: [], // watched coins in the chart tab bar (localStorage-backed)
-    _pendingNewTab: false, // set by "+" tab / scanner so the next switch opens a new tab
-    fills: [], // account executions of the active symbol (chart markers)
-    activeView: "chart", // "chart" | "overview" (E5)
-    watchlist: [], // overview watch coins (localStorage-backed)
-    overviewData: {}, // symbol -> {last_price, change_pct, candles}
-    overviewErrors: {}, // symbol -> error string (V3-02: surfaced per-tile, never swallowed)
-    _overviewTimer: null,
-    _miniBusy: false, // in-flight /api/mini fetch guard
-    _miniLast: 0, // ms timestamp of the last successful /api/mini fetch
-    newsItems: [], // /api/news headlines for the overview
-    newsErrors: [], // /api/news per-feed errors (V3-04)
-    newsStale: false, // /api/news served a stale cached payload (V3-04)
-    _newsBusy: false, // in-flight /api/news fetch guard
-    _newsLast: 0, // ms timestamp of the last successful /api/news fetch
-    reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
-    reevalResults: {}, // symbol -> last /api/reevaluate response (or {error}), survives re-renders
-    // Task 40 (N3-14 Stufe 1): Trades-tab sub-view — "roundtrips" (folded HL
-    // fills) or "fills" (raw per-fill ledger, the pre-existing view).
-    tradesSubTab: "roundtrips",
-    _tradesWired: false, // #trades-body delegated listener attached once
-    journalStats: null,
-    journalEntries: [],
-    // Task 40 (N3-17): active breakdown-row filter chip applied to the
-    // journal Entries table, or null when no filter is active. Cleared
-    // explicitly (clear button / re-clicking the active row) — never
-    // silently reset by a data refresh (loadJournal re-renders with the
-    // SAME state.journalFilter still applied).
-    journalFilter: null, // {field: "setup_confidence"|"action"|"provider", value: string}
-    _journalWired: false, // #journal-body delegated listener attached once
-    // A3-04: formerly dynamically-created top-level fields — enumerated
-    // exhaustively (grep `\bstate\.<name>\s*=`) and pre-declared here so a
-    // typo can no longer mint a silent new field once the state is sealed.
-    fundingNextSettle: null, // next funding settlement ts (ms/sec) or null
-    journalClearBusy: false, // journal reset in flight (double-submit guard)
-    wsRetry: 0, // WS reconnect backoff counter
-    _chartKey: null, // last-drawn chart identity (symbol|tf) — change guard
-    _chartResizeObserver: null, // ResizeObserver on the chart container
-    _fillAggById: null, // Map: fill id -> aggregated fill (marker tooltips)
-    _fillsSeq: 0, // fills fetch sequence guard (drop superseded responses)
-    _fundingCdTimer: null, // funding-countdown setInterval handle
-    _lastSlRecon: 0, // ms ts of the last SL reconciliation (5s throttle)
-    _markerTooltipEl: null, // hover tooltip DOM node (created once)
-    _marketSeq: 0, // /api/market fetch sequence guard
-    _ordersSeq: 0, // open-orders fetch sequence guard
-    _rtKey: null, // last realtime-wiring chart identity
-    _scanAgeTimer: null, // scanner staleness setInterval handle
-    _ticketLinesLastDraw: 0, // ms ts of the last ticket-line redraw (throttle)
-    _ttlTimer: null, // preview TTL countdown setInterval handle
-    _wsReconnect: null, // WS reconnect setTimeout handle
-    _zonesRafPending: false, // zones redraw rAF coalescing flag
-  };
-  // A3-04: freeze the SET of top-level keys. Nested objects (slAlarm[sym],
-  // reevalBusy[sym], _markOffset[sym], _lineSpecs.*, tradeMarkers[sym], …)
-  // stay mutable — seal only prevents adding/removing TOP-LEVEL state keys, so
-  // every existing `state.foo.bar = …` and `state.foo[key] = …` keeps working.
-  // Verified: no `state[dynamicVar] = …`, no `Object.assign(state, …)` exists.
-  Object.seal(state);
+  // A3-02 (Task 43): the sealed `state` object + its `Object.seal` now live in
+  // store.js (a classic global script loaded FIRST in base.html, before
+  // utils.js). app.js references that ONE global `state` by bare name — it no
+  // longer declares its own (a local `const state` here would SHADOW the store
+  // and re-split the single source of truth). PERSIST (localStorage key table)
+  // is likewise a store.js global. All `state.X` call sites below are unchanged.
 
   function $(id) {
     return document.getElementById(id);
@@ -139,7 +21,7 @@
   // — call sites below reference them by bare name, unchanged. The per-resource
   // abort helpers apiFetchAbortable / abortResource also live there. The former
   // `state.localToken` fallback is now api.js's module-level `_localToken`
-  // (always "" at runtime — the field was never assigned in app.js).
+  // (the former field was always "" at runtime, never assigned, now removed).
 
   function updateOrderButtonsEnabled() {
     const btn = $("btn-send-order");
@@ -2037,7 +1919,7 @@
     renderAcctPulse(acct, agg);
   }
 
-  var DAY_EQUITY_KEY = "obsidian_day_equity";
+  var DAY_EQUITY_KEY = PERSIST.DAY_EQUITY; // A3-02: routed via store.js PERSIST table
 
   /** Client-local "since first equity read today" baseline for the pulse's
    *  Tages-PnL. NOT the exchange's true realized daily PnL (a deposit or
@@ -3219,8 +3101,8 @@
     const reqSeq = (state._ordersSeq || 0) + 1;
     state._ordersSeq = reqSeq;
     try {
-      const sym =
-        ($("symbol-input") && $("symbol-input").value) || state.symbol || "";
+      // A3-11: bind to the ACTIVE symbol (state) — never the raw input text.
+      const sym = state.symbol || "";
       // Fetch ALL coins in one call: the active symbol is shown in detail, the
       // rest as a compact "also open on…" overview so you never forget a
       // resting order/stop on another coin while looking at this chart.
@@ -4124,7 +4006,7 @@
       }
     }
     state.sizeMode = next;
-    try { localStorage.setItem("obsidian_size_mode", next); } catch (_) {}
+    try { localStorage.setItem(PERSIST.SIZE_MODE, next); } catch (_) {}
     document.querySelectorAll(".size-mode-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-size-mode") === next);
     });
@@ -4195,7 +4077,7 @@
     }
   }
 
-  var TRADE_MARKERS_KEY = "obsidian_trade_markers";
+  var TRADE_MARKERS_KEY = PERSIST.TRADE_MARKERS; // A3-02: routed via store.js PERSIST table
   // Snapshot of the last localStorage state we reconciled against. Needed so
   // saveTradeMarkers() can tell "we intentionally deleted this key (prune)"
   // apart from "we simply never learned about this key" — without it, every
@@ -4484,8 +4366,8 @@
       const data = await res.json().catch(function () {
         return {};
       });
-      const curSymbol =
-        ($("symbol-input") && $("symbol-input").value) || state.symbol || "";
+      // A3-11: compare against the ACTIVE symbol (state), not the input text.
+      const curSymbol = state.symbol || "";
       if (!symMatch(reqSymbol, curSymbol)) {
         // Symbol changed while this sizing request was in flight — discard
         // the stale result instead of writing it into the new ticket.
@@ -5917,10 +5799,10 @@
       return;
     }
     const btn = $("btn-analyze");
-    const symbol =
-      ($("symbol-input") && $("symbol-input").value) || state.symbol || "BTC_USDT";
-    const active = document.querySelector(".tf-btn.active");
-    const tf = active ? active.getAttribute("data-tf") : state.tf;
+    // A3-11: symbol/tf come from state (the single source of truth) — never the
+    // raw input text nor the .tf-btn.active DOM class.
+    const symbol = state.symbol || "BTC_USDT";
+    const tf = state.tf || "15m";
     const htf = state.htf || "1H";
 
     state.analyzeBusy = true;
@@ -6033,7 +5915,7 @@
       state.allSymbols = data.symbols.map(function (s) {
         return String(s).toUpperCase();
       });
-      ensureSymbolOption($("symbol-input") && $("symbol-input").value);
+      ensureSymbolOption(state.symbol); // A3-11: active symbol from state
       renderSymbolTabs();
     } catch (err) {
       console.error("loadSymbols", err);
@@ -6140,13 +6022,18 @@
       saveOpenTabs();
     }
 
+    // A3-11: update state FIRST (single source of truth), THEN reflect to the
+    // DOM. loadMarket() re-affirms state.symbol, but setting it here makes the
+    // active symbol authoritative the instant the switch begins. (The tab-rename
+    // above still ran against the PREVIOUS state.symbol, as it must.)
+    state.symbol = sym;
     const input = $("symbol-input");
     if (input) {
       input.value = sym;
       input.dataset.touched = "1";
     }
-    const activeTf = document.querySelector(".tf-btn.active");
-    const tf = activeTf ? activeTf.getAttribute("data-tf") : state.tf || "15m";
+    // tf is read from state (the single source), NOT the .tf-btn.active class.
+    const tf = state.tf || "15m";
     loadMarket(sym, tf, state.htf || "1H");
     loadOpenOrders();
     loadAccount();
@@ -6158,6 +6045,28 @@
    *  other-coin rows, closeOpenTab). Routes everything through goToSymbol. */
   function switchSymbol(sym) {
     goToSymbol(sym);
+  }
+
+  /** A3-11: the ONE writer of state.tf. Updates state (single source of truth)
+   *  FIRST, derives the paired HTF, reflects the active button to the DOM
+   *  (output only), then reloads the active symbol at the new tf. Every tf entry
+   *  point (the .tf-btn bar) routes through here — nothing reads .tf-btn.active
+   *  as a competing truth anymore. */
+  function setTf(tf) {
+    tf = String(tf || state.tf || "15m");
+    state.tf = tf;
+    // HTF always higher than LTF when possible (same mapping as before).
+    let htf = "1H";
+    if (tf === "5m" || tf === "15m") htf = "1H";
+    else if (tf === "1H") htf = "4H";
+    else if (tf === "4H") htf = "1D";
+    else if (tf === "1D") htf = "1D";
+    state.htf = htf;
+    // Reflect state → DOM (input/output only): mark exactly the active button.
+    document.querySelectorAll(".tf-btn").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-tf") === tf);
+    });
+    loadMarket(state.symbol, state.tf, state.htf);
   }
 
   function wireSymbolPicker() {
@@ -6201,7 +6110,7 @@
   /* ── Chart-Tab-Leiste ─────────────────────────────────────── */
   function loadOpenTabs() {
     try {
-      const raw = localStorage.getItem("obsidian_open_tabs");
+      const raw = localStorage.getItem(PERSIST.OPEN_TABS);
       const arr = raw ? JSON.parse(raw) : null;
       state.openTabs =
         Array.isArray(arr) && arr.length ? arr : [state.symbol || "BTC_USDT"];
@@ -6212,7 +6121,7 @@
 
   function saveOpenTabs() {
     try {
-      localStorage.setItem("obsidian_open_tabs", JSON.stringify(state.openTabs));
+      localStorage.setItem(PERSIST.OPEN_TABS, JSON.stringify(state.openTabs));
     } catch (_) {}
   }
 
@@ -6321,7 +6230,7 @@
   /* ── Overview tab (E5): static mini-charts, ~30s snapshot refresh ────── */
   function loadWatchlist() {
     try {
-      const raw = localStorage.getItem("obsidian_watchlist");
+      const raw = localStorage.getItem(PERSIST.WATCHLIST);
       const arr = raw ? JSON.parse(raw) : null;
       state.watchlist = Array.isArray(arr) ? arr : [];
     } catch (_) {
@@ -6330,7 +6239,7 @@
   }
   function saveWatchlist() {
     try {
-      localStorage.setItem("obsidian_watchlist", JSON.stringify(state.watchlist));
+      localStorage.setItem(PERSIST.WATCHLIST, JSON.stringify(state.watchlist));
     } catch (_) {}
   }
   function addWatch(sym) {
@@ -7775,7 +7684,7 @@
       });
     });
     try {
-      const savedSize = localStorage.getItem("obsidian_size_mode");
+      const savedSize = localStorage.getItem(PERSIST.SIZE_MODE);
       if (savedSize === "margin" || savedSize === "position") state.sizeMode = savedSize;
     } catch (_) {}
     document.querySelectorAll(".size-mode-btn").forEach(function (btn) {
@@ -7793,27 +7702,19 @@
     wireTicketSegments();
     wireSymbolPicker();
     wireSymbolTabs();
+    // A3-11: the .tf-btn bar routes through setTf() — the ONE writer of
+    // state.tf. It updates state first, then reflects the active button + HTF.
     document.querySelectorAll(".tf-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
-        document.querySelectorAll(".tf-btn").forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        const tf = btn.getAttribute("data-tf");
-        // HTF always higher than LTF when possible
-        let htf = "1H";
-        if (tf === "5m" || tf === "15m") htf = "1H";
-        else if (tf === "1H") htf = "4H";
-        else if (tf === "4H") htf = "1D";
-        else if (tf === "1D") htf = "1D";
-        loadMarket($("symbol-input").value, tf, htf);
+        setTf(btn.getAttribute("data-tf"));
       });
     });
 
     const loadBtn = $("btn-load");
     if (loadBtn) {
       loadBtn.addEventListener("click", () => {
-        const active = document.querySelector(".tf-btn.active");
-        const tf = active ? active.getAttribute("data-tf") : state.tf;
-        loadMarket($("symbol-input").value, tf, state.htf);
+        // A3-11: reload the ACTIVE symbol/tf from state (single source of truth).
+        loadMarket(state.symbol, state.tf, state.htf);
       });
     }
 
@@ -8066,8 +7967,11 @@
   }
 
   function readTicket() {
-    const symbol =
-      ($("symbol-input") && $("symbol-input").value) || state.symbol || "BTC_USDT";
+    // A3-11 (trade-safety): the ticket binds to the ACTIVE symbol in state —
+    // NOT the raw #symbol-input text. Typing a symbol without pressing Enter and
+    // hitting Preview/Confirm therefore acts on the ACTIVE coin, never a stray
+    // half-typed one. goToSymbol() is the only writer of state.symbol.
+    const symbol = state.symbol || "BTC_USDT";
     const side = ($("ticket-side") && $("ticket-side").value) || "long";
     const orderType = ($("ticket-type") && $("ticket-type").value) || "market";
     // Derive contract vol from the USDT notional right before reading it
@@ -8748,16 +8652,20 @@
     // E5 start behavior: the overview tab is active on load. The big chart,
     // its /api/market snapshot and the realtime WS start ONLY when the user
     // opens a coin tab / tile (goToSymbol → showChart → loadMarket).
-    const symbol =
-      (h && h.default_symbol) ||
-      ($("symbol-input") && $("symbol-input").value) ||
-      "BTC";
-    const active = document.querySelector(".tf-btn.active");
-    state.tf = active ? active.getAttribute("data-tf") : "15m";
-    state.htf = "1H";
+    // A3-11 boot seed: state is the single source of truth. state.symbol/tf/htf
+    // already carry the store.js defaults (tf "15m" matches the template's
+    // default-active .tf-btn); the server hint overrides only the symbol. Seed
+    // state, then reflect it TO the DOM (input value + active tf button) — the
+    // DOM is never read back as a competing truth.
+    const symbol = (h && h.default_symbol) || state.symbol || "BTC";
+    state.tf = state.tf || "15m";
+    state.htf = state.htf || "1H";
     state.symbol = String(symbol).toUpperCase().trim();
     const bootInput = $("symbol-input");
     if (bootInput) bootInput.value = state.symbol;
+    document.querySelectorAll(".tf-btn").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-tf") === state.tf);
+    });
     loadOpenTabs(); // needs state.symbol as fallback seed
     sizeTradeOverlay();
 
