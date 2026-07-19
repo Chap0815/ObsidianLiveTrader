@@ -5094,7 +5094,7 @@
         (p.tp2 != null ? _tile("Take-Profit 2", fmtN(p.tp2), rMult(p.tp2), "tile-tp") : "") +
         (p.tp3 != null ? _tile("Take-Profit 3", fmtN(p.tp3), rMult(p.tp3), "tile-tp") : "") +
         _tile("Chance/Risiko", p.rrr != null ? "1 : " + fmt(p.rrr, 2) : "—",
-              p.rrr != null && p.rrr >= 2 ? "solide" : "knapp", "tile-rrr");
+              p.rrr != null && p.rrr >= minRrr() ? "solide" : "knapp", "tile-rrr");
     }
     html += "</div>";
     if (!stayOut && p.trigger_entry_zone) {

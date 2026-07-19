@@ -19,6 +19,7 @@ def test_env_example_copy_does_not_reopen_setup(tmp_path, monkeypatch):
     example ships ``SETUP_COMPLETE=true`` as an ACTIVE line, and the hardened
     ``_setup_needed()`` also skips setup when real exchange keys are present.
     """
+    import app.main as main
     from app.config import Settings
     from app.exchange_factory import exchange_ready
     from app.main import ENV_PATH
@@ -43,8 +44,16 @@ def test_env_example_copy_does_not_reopen_setup(tmp_path, monkeypatch):
     p.write_text(example, encoding="utf-8")
     s = Settings(_env_file=str(p))
     assert s.setup_complete is True
-    # Mirrors the hardened _setup_needed() decision: complete marker OR ready keys.
-    assert (s.setup_complete or exchange_ready(s)) is True
+    # Sanity: the example ships no real keys, so the "complete" verdict must come
+    # from the SETUP_COMPLETE marker, not from exchange_ready guessing keys.
+    assert exchange_ready(s) is False
+
+    # Exercise the REAL _setup_needed() against the copied file (not a re-implemented
+    # mirror): point main.ENV_PATH at the copy and feed it the parsed Settings, so a
+    # regression in its branching/exception handling is actually caught.
+    monkeypatch.setattr(main, "ENV_PATH", p)
+    monkeypatch.setattr(main, "get_settings", lambda: s)
+    assert main._setup_needed() is False
 
 
 def test_setup_defaults_come_from_server():
