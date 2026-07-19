@@ -32,7 +32,6 @@
     _cancelBusy: {}, // per-order cancel guards (F6/F7)
     llmLabel: "KI", // active provider label for the analyze spinner
     apiAllowed: null,
-    localToken: "", // optional: set window.LOCAL_API_TOKEN or localStorage mexc_local_token
     market: null,
     ws: null,
     wsStatus: "off",
@@ -135,39 +134,12 @@
     return document.getElementById(id);
   }
 
-  function authHeaders(extra) {
-    const h = Object.assign({}, extra || {});
-    // Only force JSON content-type when body is present (POST/PUT)
-    if (!h["Content-Type"] && extra && extra["Content-Type"]) {
-      h["Content-Type"] = extra["Content-Type"];
-    }
-    // F-19: the auth token is normally delivered via an HttpOnly session
-    // cookie (sent automatically on same-origin requests), so we no longer
-    // read it from the DOM. An explicit state/localStorage token is still
-    // honored as a fallback for non-browser use.
-    const tok =
-      state.localToken ||
-      (typeof localStorage !== "undefined" &&
-        (localStorage.getItem("mexc_local_token") ||
-          localStorage.getItem("local_api_token"))) ||
-      "";
-    if (tok) h["X-Local-Token"] = tok;
-    return h;
-  }
-
-  function apiFetch(url, opts) {
-    opts = opts || {};
-    const method = (opts.method || "GET").toUpperCase();
-    const headers = authHeaders(opts.headers || {});
-    if (method !== "GET" && method !== "HEAD" && !headers["Content-Type"]) {
-      headers["Content-Type"] = "application/json";
-    }
-    // F-19: same-origin so the HttpOnly auth cookie is sent automatically.
-    return fetch(
-      url,
-      Object.assign({}, opts, { headers: headers, credentials: "same-origin" })
-    );
-  }
+  // A3-07 (Task 42): authHeaders / apiFetch moved to api.js (the pure,
+  // STATE-FREE network core), loaded as a global classic script BEFORE app.js
+  // — call sites below reference them by bare name, unchanged. The per-resource
+  // abort helpers apiFetchAbortable / abortResource also live there. The former
+  // `state.localToken` fallback is now api.js's module-level `_localToken`
+  // (always "" at runtime — the field was never assigned in app.js).
 
   function updateOrderButtonsEnabled() {
     const btn = $("btn-send-order");
@@ -1698,6 +1670,11 @@
     // of the previous coin is evaluated against the new symbol's SL (audit F2).
     if (!silent && _prevSym && _prevSym !== symbol) {
       stopRealtime();
+      // A3-08: a real coin switch aborts an in-flight /api/analyze of the OLD
+      // coin so a discarded LLM call stops wasting tokens (the market read is
+      // superseded by this call's own apiFetchAbortable("market", …) below).
+      // READ resource only — order/modify-sl/cancel never route through here.
+      try { abortResource("analyze"); } catch (_) {}
       // Clear the previous coin's chart overlays IMMEDIATELY so no stale marker,
       // zone, or KI-proposal of the old symbol lingers on the new chart until
       // the new data loads (UB-2 "AVAX marker im BTC-Chart" / UB-3 "Tab-Wechsel
@@ -1760,8 +1737,12 @@
 
     let res;
     try {
-      res = await fetch(url);
+      // A3-08: abortable READ — a newer market load (fast tf/coin switch)
+      // aborts this one so a stale snapshot never lands.
+      res = await apiFetchAbortable("market", url);
     } catch (err) {
+      // Superseded by a newer load (abort) — silent, not a real error.
+      if (err && err.name === "AbortError") return null;
       console.error("loadMarket network error", err);
       setChartMeta(symbol, tf, htf, "error");
       return null;
@@ -1780,7 +1761,17 @@
       return null;
     }
 
-    const data = await res.json();
+    // A3-08: guard the parse — a truncated/aborted body must not throw an
+    // unhandled rejection out of loadMarket.
+    let data;
+    try {
+      data = await res.json();
+    } catch (err) {
+      if (err && err.name === "AbortError") return null;
+      console.error("loadMarket parse error", err);
+      if (!silent) setChartMeta(symbol, tf, htf, "parse error");
+      return null;
+    }
     // A newer loadMarket (coin/tf switch) started while we awaited → this
     // response is stale; drop it so it can't overwrite the current chart.
     if (reqSeq !== state._marketSeq) return null;
@@ -1923,7 +1914,7 @@
 
   async function loadHealth() {
     try {
-      const res = await fetch("/api/health");
+      const res = await apiFetch("/api/health");
       if (!res.ok) throw new Error("health " + res.status);
       const h = await res.json();
       state.health = h;
@@ -5976,7 +5967,9 @@
     const reqSymbol = symU;
 
     try {
-      const res = await apiFetch("/api/analyze", {
+      // A3-08: abortable READ — a coin switch (loadMarket) aborts this
+      // in-flight analyze so a discarded LLM call stops burning tokens.
+      const res = await apiFetchAbortable("analyze", "/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -6011,6 +6004,9 @@
       renderProposal(data);
       loadHistory();
     } catch (err) {
+      // A3-08: an aborted analyze (coin switch) is intentional — the panel was
+      // already torn down by loadMarket; don't surface it as a network error.
+      if (err && err.name === "AbortError") return;
       console.error("runAnalyze", err);
       showProposalError("Netzwerkfehler: " + (err && err.message ? err.message : err));
     } finally {
@@ -6031,7 +6027,7 @@
 
   async function loadSymbols() {
     try {
-      const res = await fetch("/api/symbols");
+      const res = await apiFetch("/api/symbols");
       const data = await res.json();
       if (!Array.isArray(data.symbols) || !data.symbols.length) return;
       state.allSymbols = data.symbols.map(function (s) {
@@ -6526,7 +6522,7 @@
     }
     state._newsBusy = true;
     try {
-      const res = await fetch("/api/news");
+      const res = await apiFetch("/api/news");
       if (res.ok) {
         const data = await res.json();
         state.newsItems = data.items || [];
@@ -6572,7 +6568,7 @@
     state._miniBusy = true;
     let fetchFailed = false;
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         "/api/mini?symbols=" + encodeURIComponent(syms.join(",")) + "&tf=15m&limit=96"
       );
       if (res.ok) {

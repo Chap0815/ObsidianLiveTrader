@@ -31,6 +31,13 @@
      utils.js and IMMEDIATELY BEFORE app.js so its functions are globals app.js
      calls by bare name (same tag pattern as utils.js). #}
   <script src="/static/trade-math.js?v={{ asset_version|default('r22') }}"></script>
+  {# A3-07/A3-08 (Task 42): pure, STATE-FREE network core — authHeaders,
+     apiFetch, and the per-resource AbortController helpers (apiFetchAbortable /
+     abortResource). Classic script loaded AFTER trade-math.js and IMMEDIATELY
+     BEFORE app.js so its functions are globals app.js calls by bare name (same
+     tag pattern as utils.js / trade-math.js). Loading BEFORE app.js is why it
+     must not reference app.js's `state` — the state object is not yet defined. #}
+  <script src="/static/api.js?v={{ asset_version|default('r22') }}"></script>
   <script src="/static/app.js?v={{ asset_version|default('r22') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
