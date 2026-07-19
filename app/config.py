@@ -239,6 +239,16 @@ class Settings(BaseSettings):
     journal_window_hours: int = 24
     journal_min_sample: int = 20
 
+    # Trade-Management-Layer: break-even + time-stop monitor. Defensive
+    # defaults so the monitor/rules can `getattr` these safely; validators
+    # reject NaN/Inf/out-of-bounds so gate comparisons never fail-open.
+    tm_enabled: bool = True
+    tm_monitor_interval_s: int = 20
+    tm_be_trigger_r: float = 1.0
+    tm_be_fee_rt: float = 0.0006
+    tm_time_stop_hours: float = 4.0
+    tm_time_stop_min_r: float = 0.5
+
     @model_validator(mode="after")
     def _apply_risk_profile(self):
         """Fill preset values for any risk field NOT explicitly set in .env.
@@ -492,6 +502,53 @@ class Settings(BaseSettings):
         if not math.isfinite(v) or not (0 <= v <= 60):
             raise ValueError(
                 f"SL_VERIFY_DELAY_S must be a finite number in [0, 60] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_monitor_interval_s")
+    @classmethod
+    def tm_monitor_interval_s_ok(cls, v: int) -> int:
+        if not (5 <= int(v) <= 300):
+            raise ValueError(
+                f"TM_MONITOR_INTERVAL_S must be an integer in [5, 300] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("tm_be_trigger_r")
+    @classmethod
+    def tm_be_trigger_r_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0.1 <= v <= 10):
+            raise ValueError(
+                f"TM_BE_TRIGGER_R must be a finite number in [0.1, 10] (got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_be_fee_rt")
+    @classmethod
+    def tm_be_fee_rt_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 0.01):
+            raise ValueError(
+                f"TM_BE_FEE_RT must be a finite number in [0, 0.01] (got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_time_stop_hours")
+    @classmethod
+    def tm_time_stop_hours_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0.25 <= v <= 168):
+            raise ValueError(
+                f"TM_TIME_STOP_HOURS must be a finite number in [0.25, 168] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_time_stop_min_r")
+    @classmethod
+    def tm_time_stop_min_r_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (-5 <= v <= 10):
+            raise ValueError(
+                f"TM_TIME_STOP_MIN_R must be a finite number in [-5, 10] "
                 f"(got {v!r})"
             )
         return v

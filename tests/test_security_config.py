@@ -86,6 +86,34 @@ def test_risk_floats_accept_valid_values():
     assert s2.max_notional_usdt == 0.0
 
 
+def test_tm_settings_defaults():
+    """Trade-Management-Layer defaults are safe-by-default and readable."""
+    s = Settings()
+    assert s.tm_enabled is True
+    assert s.tm_monitor_interval_s == 20
+    assert s.tm_be_trigger_r == 1.0
+    assert s.tm_be_fee_rt == 0.0006
+    assert s.tm_time_stop_hours == 4.0
+    assert s.tm_time_stop_min_r == 0.5
+
+
+def test_tm_settings_reject_out_of_bounds_and_nan():
+    """TM_* numeric fields must reject NaN/Inf and out-of-bounds values so
+    the monitor's gate comparisons never fail-open."""
+    with pytest.raises(ValidationError):
+        Settings(tm_monitor_interval_s=1)  # < 5
+    with pytest.raises(ValidationError):
+        Settings(tm_monitor_interval_s=301)  # > 300
+    with pytest.raises(ValidationError):
+        Settings(tm_be_trigger_r=float("nan"))
+    with pytest.raises(ValidationError):
+        Settings(tm_be_fee_rt=float("inf"))
+    with pytest.raises(ValidationError):
+        Settings(tm_time_stop_hours=0.1)  # < 0.25
+    with pytest.raises(ValidationError):
+        Settings(tm_time_stop_min_r=-10.0)  # < -5
+
+
 def test_llm_base_urls_https_allowlist():
     with pytest.raises(ValidationError):
         Settings(anthropic_base_url="https://evil.example.com")
