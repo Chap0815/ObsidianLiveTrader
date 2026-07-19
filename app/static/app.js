@@ -89,6 +89,19 @@
     _newsLast: 0, // ms timestamp of the last successful /api/news fetch
     reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
     reevalResults: {}, // symbol -> last /api/reevaluate response (or {error}), survives re-renders
+    // Task 40 (N3-14 Stufe 1): Trades-tab sub-view — "roundtrips" (folded HL
+    // fills) or "fills" (raw per-fill ledger, the pre-existing view).
+    tradesSubTab: "roundtrips",
+    _tradesWired: false, // #trades-body delegated listener attached once
+    journalStats: null,
+    journalEntries: [],
+    // Task 40 (N3-17): active breakdown-row filter chip applied to the
+    // journal Entries table, or null when no filter is active. Cleared
+    // explicitly (clear button / re-clicking the active row) — never
+    // silently reset by a data refresh (loadJournal re-renders with the
+    // SAME state.journalFilter still applied).
+    journalFilter: null, // {field: "setup_confidence"|"action"|"provider", value: string}
+    _journalWired: false, // #journal-body delegated listener attached once
   };
 
   function $(id) {
@@ -878,6 +891,18 @@
       return ca !== "" && ca === cb;
     }
     return na === nb;
+  }
+
+  /** Task 40 (N3-14): same exchange lookup as symMatch, exposed standalone —
+   *  round-trip folding of fills is HL-only for now (MEXC stays Stufe 2/out
+   *  of scope per the task brief), gated on this instead of hardcoding. */
+  function isHlExchange() {
+    let ex = state.health && state.health.exchange;
+    if (!ex) {
+      const lbl = $("exchange-label");
+      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
+    }
+    return ex === "hyperliquid";
   }
 
   /** Canonical key for state.tradeMarkers (A3-01). MUST resolve to the same
@@ -4699,9 +4724,25 @@
     }
   }
 
+  /** Human label for a journal-filter field (used by the filter chip text). */
+  function _journalFieldLabel(field) {
+    switch (field) {
+      case "setup_confidence": return "Confidence";
+      case "action": return "Action";
+      case "provider": return "Provider";
+      default: return field || "";
+    }
+  }
+
   /** One {name -> {wins, losses, sample, win_rate, avg_realized_rrr, low_sample}}
-   *  breakdown as a compact table; "" when there is nothing to show (empty DB). */
-  function renderJournalBreakdown(title, groups) {
+   *  breakdown as a compact table; "" when there is nothing to show (empty DB).
+   *  Task 40 (N3-17): each row is now clickable — `field` names the Entries-
+   *  table column the row's key `k` maps to 1:1 (the group key IS the raw
+   *  DB value, e.g. by_confidence's "low"/"medium"/"high" === entries[].
+   *  setup_confidence verbatim), so clicking just sets that as the active
+   *  filter chip. Delegated click handling lives on #journal-body
+   *  (onJournalBodyClick); this fn only marks the row up. */
+  function renderJournalBreakdown(title, groups, field) {
     const keys = Object.keys(groups || {});
     if (!keys.length) return "";
     let html = '<div class="journal-breakdown">';
@@ -4712,8 +4753,18 @@
       "</tr></thead><tbody>";
     for (const k of keys) {
       const g = groups[k] || {};
+      const isActive =
+        !!state.journalFilter &&
+        state.journalFilter.field === field &&
+        state.journalFilter.value === k;
+      const rowStyle = isActive
+        ? "cursor:pointer;background:var(--accent-dim,rgba(127,127,127,0.18));"
+        : "cursor:pointer;";
       html +=
-        '<tr class="' + (g.low_sample ? "low-sample" : "") + '">' +
+        '<tr class="' + (g.low_sample ? "low-sample" : "") + '" ' +
+        'data-jf-field="' + escapeHtml(field) + '" data-jf-value="' + escapeHtml(k) + '" ' +
+        'title="Klicken: Entries-Tabelle auf ' + escapeHtml(_journalFieldLabel(field)) +
+        " = " + escapeHtml(k) + ' filtern" style="' + rowStyle + '">' +
         "<td>" + escapeHtml(k) + "</td>" +
         "<td>" + fmt(g.sample, 0) + "</td>" +
         "<td>" +
@@ -4791,9 +4842,9 @@
         " · Skipped: " + fmt(tot.skipped, 0) +
         "</div>";
 
-      html += renderJournalBreakdown("Nach Confidence", stats.by_confidence);
-      html += renderJournalBreakdown("Nach Action", stats.by_action);
-      html += renderJournalBreakdown("Nach Provider", stats.by_provider);
+      html += renderJournalBreakdown("Nach Confidence", stats.by_confidence, "setup_confidence");
+      html += renderJournalBreakdown("Nach Action", stats.by_action, "action");
+      html += renderJournalBreakdown("Nach Provider", stats.by_provider, "provider");
 
       const caveats = Array.isArray(stats.caveats) ? stats.caveats : [];
       if (caveats.length) {
@@ -4807,47 +4858,104 @@
     }
 
     if (entries.length) {
-      html +=
-        '<table class="history-table journal-table"><thead><tr>' +
-        "<th>Zeit</th><th>Symbol</th><th>Action</th><th>Conf</th><th>Entry</th>" +
-        "<th>SL</th><th>TP1</th><th>RRR</th><th>Outcome</th>" +
-        "</tr></thead><tbody>";
-      for (const e of entries) {
-        const st = e.status || "PENDING";
+      // Task 40 (N3-17): a clicked breakdown row (renderJournalBreakdown)
+      // sets state.journalFilter — apply it here as a client-side filter on
+      // the Entries table. Survives a data refresh (loadJournal re-renders
+      // with the SAME state.journalFilter still set) and clears cleanly via
+      // the chip's ✕ button or re-clicking the already-active row
+      // (onJournalBodyClick toggles it off).
+      const activeFilter = state.journalFilter;
+      const filteredEntries = activeFilter
+        ? entries.filter(function (e) {
+            return String((e && e[activeFilter.field]) || "") === activeFilter.value;
+          })
+        : entries;
+
+      if (activeFilter) {
         html +=
-          "<tr>" +
-          "<td>" + escapeHtml(shortIso(e.created_at)) + "</td>" +
-          "<td>" + escapeHtml(e.symbol || "—") + "</td>" +
-          '<td class="hist-action action-' +
-          escapeHtml(e.action || "") +
-          '">' +
-          escapeHtml(e.action || "—") +
-          "</td>" +
-          "<td>" + escapeHtml(e.setup_confidence || "—") + "</td>" +
-          "<td>" + (e.entry_price != null ? fmt(e.entry_price, 4) : "—") + "</td>" +
-          "<td>" + (e.stop_loss != null ? fmt(e.stop_loss, 4) : "—") + "</td>" +
-          "<td>" + (e.tp1 != null ? fmt(e.tp1, 4) : "—") + "</td>" +
-          "<td>" + (e.rrr != null ? fmt(e.rrr, 2) : "—") + "</td>" +
-          "<td>" +
-          '<span class="journal-badge journal-badge-' +
-          escapeHtml(st) +
-          '">' +
-          escapeHtml(st) +
-          "</span>" +
-          (e.ambiguous
-            ? ' <span class="journal-ambiguous" title="tp1 und SL im selben Candle — pessimistisch als LOSS gewertet">~</span>'
-            : "") +
-          "</td>" +
-          "</tr>";
+          '<div class="muted" style="display:flex;align-items:center;gap:8px;margin:2px 0 8px;">' +
+          "<span>Filter: <b>" + escapeHtml(_journalFieldLabel(activeFilter.field)) + " = " +
+          escapeHtml(activeFilter.value) + "</b> (" + fmt(filteredEntries.length, 0) +
+          " von " + fmt(entries.length, 0) + ")</span>" +
+          '<button type="button" data-jf-clear="1" style="cursor:pointer;border:1px solid currentColor;' +
+          'background:none;border-radius:10px;padding:0 8px;font:inherit;color:inherit;">' +
+          "✕ Filter löschen</button>" +
+          "</div>";
       }
-      html += "</tbody></table>";
+
+      if (filteredEntries.length) {
+        html +=
+          '<table class="history-table journal-table"><thead><tr>' +
+          "<th>Zeit</th><th>Symbol</th><th>Action</th><th>Conf</th><th>Entry</th>" +
+          "<th>SL</th><th>TP1</th><th>RRR</th><th>Outcome</th>" +
+          "</tr></thead><tbody>";
+        for (const e of filteredEntries) {
+          const st = e.status || "PENDING";
+          html +=
+            "<tr>" +
+            "<td>" + escapeHtml(shortIso(e.created_at)) + "</td>" +
+            "<td>" + escapeHtml(e.symbol || "—") + "</td>" +
+            '<td class="hist-action action-' +
+            escapeHtml(e.action || "") +
+            '">' +
+            escapeHtml(e.action || "—") +
+            "</td>" +
+            "<td>" + escapeHtml(e.setup_confidence || "—") + "</td>" +
+            "<td>" + (e.entry_price != null ? fmt(e.entry_price, 4) : "—") + "</td>" +
+            "<td>" + (e.stop_loss != null ? fmt(e.stop_loss, 4) : "—") + "</td>" +
+            "<td>" + (e.tp1 != null ? fmt(e.tp1, 4) : "—") + "</td>" +
+            "<td>" + (e.rrr != null ? fmt(e.rrr, 2) : "—") + "</td>" +
+            "<td>" +
+            '<span class="journal-badge journal-badge-' +
+            escapeHtml(st) +
+            '">' +
+            escapeHtml(st) +
+            "</span>" +
+            (e.ambiguous
+              ? ' <span class="journal-ambiguous" title="tp1 und SL im selben Candle — pessimistisch als LOSS gewertet">~</span>'
+              : "") +
+            "</td>" +
+            "</tr>";
+        }
+        html += "</tbody></table>";
+      } else {
+        html += '<p class="muted history-empty">Keine Einträge für diesen Filter.</p>';
+      }
     } else {
       html += '<p class="muted history-empty">Noch keine Journal-Einträge.</p>';
     }
 
     html += "</div>";
     body.className = "journal-body";
+    if (!state._journalWired) {
+      body.addEventListener("click", onJournalBodyClick);
+      state._journalWired = true;
+    }
     body.innerHTML = html;
+  }
+
+  /** Delegated click handler for #journal-body (Task 40 / N3-17): a
+   *  breakdown-row click sets/toggles the Entries-table filter chip; the
+   *  chip's ✕ clears it. Read-only — only re-renders from already-cached
+   *  state.journalStats/state.journalEntries, no re-fetch, no writes. */
+  function onJournalBodyClick(ev) {
+    const clearBtn = ev.target.closest("[data-jf-clear]");
+    if (clearBtn) {
+      state.journalFilter = null;
+      renderJournal(state.journalStats, state.journalEntries);
+      return;
+    }
+    const row = ev.target.closest("[data-jf-field]");
+    if (!row) return;
+    const field = row.getAttribute("data-jf-field");
+    const value = row.getAttribute("data-jf-value");
+    if (!field) return;
+    const same =
+      state.journalFilter &&
+      state.journalFilter.field === field &&
+      state.journalFilter.value === value;
+    state.journalFilter = same ? null : { field: field, value: value };
+    renderJournal(state.journalStats, state.journalEntries);
   }
 
   /** loadJournal: fetch both /api/journal/stats and /api/journal, then render.
@@ -4880,36 +4988,281 @@
     }
   }
 
-  /** Trades tab: executed fills (state.fills) as a compact ledger. Reuses the
-   *  same fill objects that drive the chart markers, newest first. HL-only
-   *  today (loadFills no-ops on MEXC) → empty state elsewhere. */
-  function renderTrades() {
-    const el = $("trades-body");
-    if (!el) return;
-    const fills = Array.isArray(state.fills) ? state.fills.slice() : [];
-    if (!fills.length) {
-      el.className = "trades-body muted";
-      el.innerHTML =
-        '<div class="trades-empty">Noch keine ausgeführten Trades für ' +
-        escapeHtml(String(state.symbol || "—").split("_")[0]) +
-        ".</div>";
-      return;
+  /** Task 40 (N3-14 Stufe 1): fold a symbol's fill ledger into ROUND-TRIPS
+   *  (flat → position → flat) instead of the raw per-fill list — a real
+   *  trade log, not a request log. Pure client-side reconstruction from the
+   *  `side`/`sz`/`px`/`fee`/`closed_pnl` fields already on each fill; no
+   *  backend endpoint involved.
+   *
+   *  Pairing basis: reconstruct the SIGNED running position from side+sz
+   *  alone (buy = +sz, sell = -sz) — this is exact regardless of the
+   *  free-text `dir` label, so laddered partial fills (many small adds/
+   *  reduces) net out correctly. A round-trip starts the instant the
+   *  position leaves 0 and ends the instant it returns to 0:
+   *    - 0 → nonzero: opens a new round-trip.
+   *    - same-sign, |pos| growing: an ADD (entry side).
+   *    - same-sign, |pos| shrinking (incl. exactly to 0): a REDUCE/CLOSE
+   *      (exit side) — its closed_pnl is real exchange-reported realized
+   *      PnL for that reduction, summed as-is (never recomputed/guessed).
+   *    - sign flip in ONE fill (e.g. long 1 → sell 2 → short 1): the fill
+   *      is split proportionally by size — the |prevPos| portion closes
+   *      the old round-trip (closed_pnl attributed there in full, since
+   *      that IS what it was realized on), the remainder opens a new one;
+   *      the fill's fee is split by the same size fraction (the fairest
+   *      available basis — a single execution has one fee for the whole
+   *      fill, no per-portion fee is reported).
+   *  A same-symbol re-open (flat → open again later) is automatically a
+   *  SEPARATE round-trip: nothing merges across a 0-crossing.
+   *
+   *  Honesty guards (never fabricate a number):
+   *   - `fills` is capped to the last 100 executions (backend limit) — if
+   *     the WINDOW'S OLDEST fill doesn't classify as an "open" via the
+   *     backend's own `dir` field, the true entry happened before the
+   *     window and the reconstructed entry size/price for that first
+   *     round-trip is incomplete. Flagged `truncatedStart` and called out
+   *     in the UI rather than presented as a clean full round-trip.
+   *   - a position still open at the end of the window is NOT a closed
+   *     round-trip (no realized PnL exists for it yet) — returned
+   *     separately as `openTrade`, rendered as a plain note, never given a
+   *     fabricated PnL figure.
+   */
+  function foldFillsToRoundTrips(fills) {
+    const sorted = (fills || [])
+      .filter(function (f) { return Number.isFinite(Number(f.sz)) && Math.abs(Number(f.sz)) > 0; })
+      .slice()
+      .sort(function (a, b) { return (Number(a.time) || 0) - (Number(b.time) || 0); });
+
+    const EPS = 1e-9;
+    const closed = [];
+    let open = null; // in-progress round-trip accumulator
+    let pos = 0; // signed running position size
+    let firstProcessed = false;
+
+    function newRt(startTime, sideSign) {
+      return {
+        side: sideSign > 0 ? "long" : "short",
+        startTime: startTime,
+        endTime: null,
+        entrySz: 0,
+        entryNotional: 0,
+        exitSz: 0,
+        exitNotional: 0,
+        pnl: 0,
+        fee: 0,
+        fillCount: 0,
+        isLiq: false,
+        truncatedStart: false,
+      };
     }
-    fills.sort(function (a, b) {
+
+    sorted.forEach(function (f) {
+      const sz = Math.abs(Number(f.sz) || 0);
+      if (!(sz > 0)) return;
+      const px = Number(f.px) || 0;
+      const fee = Number(f.fee) || 0;
+      const pnl = Number(f.closed_pnl) || 0;
+      const delta = f.side === "buy" ? sz : -sz;
+      const prevPos = pos;
+      const newPos = prevPos + delta;
+      const cls = classifyFillDir(f.dir);
+      const isFirst = !firstProcessed;
+      firstProcessed = true;
+
+      if (Math.abs(prevPos) < EPS) {
+        // Flat → nonzero: opens a new round-trip.
+        open = newRt(f.time, newPos);
+        if (isFirst && cls !== "open") open.truncatedStart = true;
+        // A genuine open reports closed_pnl≈0. A NONZERO closed_pnl on an
+        // "opening" fill means the fetched fill window began mid-position (the
+        // real position was already open before the window) → this fill was
+        // misclassified as an open. Capture the real PnL instead of silently
+        // dropping it, and flag the round-trip so the UI never claims "no PnL".
+        if (Math.abs(pnl) > EPS) open.truncatedStart = true;
+        if (cls === "liq") open.isLiq = true;
+        open.entrySz += sz;
+        open.entryNotional += sz * px;
+        open.pnl += pnl;
+        open.fee += fee;
+        open.fillCount++;
+        pos = newPos;
+        return;
+      }
+
+      const flip = (prevPos > 0 && newPos < -EPS) || (prevPos < 0 && newPos > EPS);
+      if (!open) open = newRt(f.time, prevPos); // defensive: should not happen once flat-start is seeded
+
+      if (flip) {
+        const closeSz = Math.abs(prevPos);
+        const openSz = Math.max(0, sz - closeSz);
+        const closeFrac = sz > 0 ? closeSz / sz : 0;
+        const openFrac = 1 - closeFrac;
+        if (cls === "liq") open.isLiq = true;
+        open.exitSz += closeSz;
+        open.exitNotional += closeSz * px;
+        open.pnl += pnl; // whole reported closed_pnl belongs to the closed leg
+        open.fee += fee * closeFrac;
+        open.fillCount++;
+        open.endTime = f.time;
+        closed.push(open);
+        open = newRt(f.time, newPos);
+        open.entrySz += openSz;
+        open.entryNotional += openSz * px;
+        open.fee += fee * openFrac;
+        open.fillCount++;
+        pos = newPos;
+        return;
+      }
+
+      const growing = Math.abs(newPos) > Math.abs(prevPos) + EPS;
+      if (growing) {
+        // Same-sign add to the existing round-trip's entry side. An add should
+        // not realize PnL; a nonzero closed_pnl here means the window began
+        // mid-position → capture it and flag truncation instead of dropping it.
+        if (Math.abs(pnl) > EPS) open.truncatedStart = true;
+        open.entrySz += sz;
+        open.entryNotional += sz * px;
+        open.pnl += pnl;
+        open.fee += fee;
+        open.fillCount++;
+        pos = newPos;
+        return;
+      }
+
+      // Same-sign reduce (partial or exactly-to-zero close).
+      if (cls === "liq") open.isLiq = true;
+      open.exitSz += sz;
+      open.exitNotional += sz * px;
+      open.pnl += pnl;
+      open.fee += fee;
+      open.fillCount++;
+      pos = newPos;
+      if (Math.abs(newPos) < EPS) {
+        pos = 0;
+        open.endTime = f.time;
+        closed.push(open);
+        open = null;
+      }
+    });
+
+    closed.reverse(); // newest first, matching the rest of the panel
+    return { closed: closed, openTrade: open };
+  }
+
+  /** Small unstyled sub-tab button (no dedicated CSS class exists for this —
+   *  Task 40 is app.js-only, no CSS touched — so the active/inactive look is
+   *  applied inline instead of adding a class the stylesheet doesn't know). */
+  function _rtSubtabBtn(key, label, active) {
+    const style = active
+      ? "color:var(--text,inherit);border-bottom-color:var(--accent,currentColor);font-weight:600;"
+      : "color:var(--muted,inherit);border-bottom-color:transparent;";
+    return (
+      '<button type="button" data-rt-subtab="' + escapeHtml(key) + '" ' +
+      'aria-pressed="' + (active ? "true" : "false") + '" ' +
+      'style="background:none;border:none;border-bottom:2px solid;margin:0 ' +
+      '10px 0 0;padding:4px 2px;cursor:pointer;font:inherit;' + style + '">' +
+      escapeHtml(label) +
+      "</button>"
+    );
+  }
+
+  /** Round-trip table for the "Trades" tab (Task 40 / N3-14 Stufe 1). */
+  function renderRoundTripsHtml(fills, symLabel) {
+    const folded = foldFillsToRoundTrips(fills);
+    let html = "";
+    if (!folded.closed.length) {
+      html +=
+        '<div class="trades-empty">Noch keine abgeschlossenen Round-Trips für ' +
+        escapeHtml(symLabel) + ".</div>";
+    } else {
+      html +=
+        '<table class="history-table rt-table"><thead><tr>' +
+        "<th>Zeit</th><th>Seite</th><th>Größe</th><th>Entry Ø</th><th>Exit Ø</th>" +
+        "<th>PnL</th><th>Fees</th><th>Netto</th><th>Fills</th><th></th>" +
+        "</tr></thead><tbody>";
+      folded.closed.forEach(function (rt) {
+        const entryPx = rt.entrySz > 0 ? rt.entryNotional / rt.entrySz : 0;
+        const exitPx = rt.exitSz > 0 ? rt.exitNotional / rt.exitSz : 0;
+        const net = rt.pnl - rt.fee;
+        const pnlCls = rt.pnl > 0 ? "pnl-pos" : rt.pnl < 0 ? "pnl-neg" : "";
+        const netCls = net > 0 ? "pnl-pos" : net < 0 ? "pnl-neg" : "";
+        const t0 = Number(rt.startTime);
+        const timeTxt =
+          Number.isFinite(t0) && t0 > 0
+            ? escapeHtml(relTime(new Date(t0).toISOString()))
+            : "—";
+        const flags = [];
+        if (rt.isLiq) {
+          flags.push('<span class="hist-err" title="Round-Trip enthält eine Liquidation">LIQ</span>');
+        }
+        if (rt.truncatedStart) {
+          flags.push(
+            '<span class="muted" title="Position begann vor dem geladenen Fill-Fenster ' +
+            '(letzte 100 Fills) — Seite kann invertiert und PnL/Beträge ' +
+            'unvollständig sein">Fenster-Anfang ⚠</span>'
+          );
+        }
+        html +=
+          "<tr>" +
+          "<td>" + timeTxt + "</td>" +
+          '<td><span class="side-tag ' + (rt.side === "long" ? "tag-long" : "tag-short") + '">' +
+          (rt.side === "long" ? "LONG" : "SHORT") + "</span></td>" +
+          "<td>" + fmt(rt.entrySz, 4) + "</td>" +
+          "<td>" + fmt(entryPx, 4) + "</td>" +
+          "<td>" + (rt.exitSz > 0 ? fmt(exitPx, 4) : "—") + "</td>" +
+          '<td class="' + pnlCls + '">' + (rt.pnl >= 0 ? "+" : "") + fmt(rt.pnl, 2) + "</td>" +
+          "<td>" + fmt(rt.fee, 2) + "</td>" +
+          '<td class="' + netCls + '">' + (net >= 0 ? "+" : "") + fmt(net, 2) + "</td>" +
+          "<td>" + fmt(rt.fillCount, 0) + "</td>" +
+          "<td>" + flags.join(" ") + "</td>" +
+          "</tr>";
+      });
+      html += "</tbody></table>";
+    }
+    if (folded.openTrade && folded.openTrade.entrySz > 0) {
+      const ot = folded.openTrade;
+      const t0 = Number(ot.startTime);
+      const otPnl = Number(ot.pnl) || 0;
+      const otHasPnl = Math.abs(otPnl) > 1e-9;
+      const sinceTxt =
+        Number.isFinite(t0) && t0 > 0
+          ? ", seit " + escapeHtml(relTime(new Date(t0).toISOString()))
+          : "";
+      const head =
+        "Aktuell offene Position (" +
+        fmt(ot.fillCount, 0) + " Fill" + (ot.fillCount === 1 ? "" : "s") + sinceTxt + ")";
+      let msg;
+      if (ot.truncatedStart || otHasPnl) {
+        // Window began mid-position: side/totals may be off, and a real PnL was
+        // already booked before the window. NEVER claim "noch kein Realized-PnL".
+        msg =
+          head + ". ⚠ Fill-Fenster beginnt mitten in der Position — Seite und " +
+          "Beträge ggf. unvollständig" +
+          (otHasPnl
+            ? "; im Fenster bereits realisiert: " + (otPnl >= 0 ? "+" : "") + fmt(otPnl, 2)
+            : "") + ".";
+      } else {
+        msg = head + " — noch kein Realized-PnL, Position läuft weiter.";
+      }
+      html += '<div class="trades-empty">' + msg + "</div>";
+    }
+    return html;
+  }
+
+  /** Raw per-fill ledger — the pre-existing "Trades" view (C3-08), unchanged,
+   *  now just extracted into its own render fn so it can sit behind the
+   *  "Einzel-Fills" sub-tab next to the new round-trip view. */
+  function renderFillsListHtml(fills) {
+    const sorted = fills.slice().sort(function (a, b) {
       return (Number(b.time) || 0) - (Number(a.time) || 0);
     });
-    el.className = "trades-body";
-    el.innerHTML =
+    return (
       '<div class="trades-list">' +
-      fills
+      sorted
         .map(function (f) {
           const side = f.side === "buy" ? "buy" : "sell";
           const sym = String(f.symbol || state.symbol || "—").split("_")[0];
           const t = Number(f.time);
           const iso = Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null;
-          // C3-08: realized PnL is delivered per-fill by the backend
-          // (closed_pnl) but was never rendered anywhere — the panel could
-          // say a position was closed, not whether that was a win or a loss.
           const pnl = Number(f.closed_pnl);
           const hasPnl = Number.isFinite(pnl) && pnl !== 0;
           const pnlCls = hasPnl ? (pnl > 0 ? "pnl-pos" : "pnl-neg") : "";
@@ -4927,7 +5280,67 @@
           );
         })
         .join("") +
-      "</div>";
+      "</div>"
+    );
+  }
+
+  /** Delegated click handler for #trades-body — only the sub-tab toggle
+   *  lives here (read-only view switch, no order/SL path touched). */
+  function onTradesBodyClick(ev) {
+    const btn = ev.target.closest("[data-rt-subtab]");
+    if (!btn) return;
+    const key = btn.getAttribute("data-rt-subtab");
+    if (key !== "roundtrips" && key !== "fills") return;
+    if (state.tradesSubTab === key) return;
+    state.tradesSubTab = key;
+    renderTrades();
+  }
+
+  /** Trades tab: executed fills (state.fills) as a compact ledger, PLUS
+   *  (Task 40 / N3-14 Stufe 1) a folded round-trip view — a real trade log
+   *  with realized PnL/fees per round-trip, not just a list of executions.
+   *  Round-trip folding is HL-only for now (MEXC stays Stufe 2, out of
+   *  scope per the task brief) even though MEXC's /api/fills already
+   *  reports supported=true — the raw fill ledger still works there. */
+  function renderTrades() {
+    const el = $("trades-body");
+    if (!el) return;
+    if (!state._tradesWired) {
+      el.addEventListener("click", onTradesBodyClick);
+      state._tradesWired = true;
+    }
+    const symLabel = String(state.symbol || "—").split("_")[0];
+    const fills = Array.isArray(state.fills)
+      ? state.fills.filter(function (f) { return symMatch(f.symbol, state.symbol); })
+      : [];
+    if (!fills.length) {
+      el.className = "trades-body muted";
+      el.innerHTML =
+        '<div class="trades-empty">Noch keine ausgeführten Trades für ' +
+        escapeHtml(symLabel) + ".</div>";
+      return;
+    }
+
+    const hl = isHlExchange();
+    const sub = hl && state.tradesSubTab === "fills" ? "fills" : hl ? "roundtrips" : "fills";
+    let html = "";
+    if (hl) {
+      html +=
+        '<div style="display:flex;border-bottom:1px solid var(--hairline,currentColor);margin-bottom:8px;">' +
+        _rtSubtabBtn("roundtrips", "Round-Trips", sub === "roundtrips") +
+        _rtSubtabBtn("fills", "Einzel-Fills", sub === "fills") +
+        "</div>";
+    } else {
+      html +=
+        '<div class="trades-empty" style="padding-bottom:0;">' +
+        "Round-Trip-Auswertung aktuell nur für Hyperliquid (MEXC folgt in Stufe 2) " +
+        "— Einzel-Fills unten." +
+        "</div>";
+    }
+    html += sub === "roundtrips" ? renderRoundTripsHtml(fills, symLabel) : renderFillsListHtml(fills);
+
+    el.className = "trades-body";
+    el.innerHTML = html;
   }
 
   /** Tabbed data panel: toggle the active pane, contextual action buttons and
