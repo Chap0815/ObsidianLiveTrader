@@ -67,6 +67,7 @@
     tradeEntryTimes: {}, // symbol -> entry candle time (seconds), for zone start
     tradeMarkers: {}, // symbol -> {sl, tp, side, manual} for manual-mode zones
     slAlarm: {}, // symbol -> already-alarmed flag for manual-SL touch (Task 4)
+    _markOffset: {}, // E3-06: symbol -> {offset, ts} exchange Mark−Last basis (added to live ticks)
     sltpMode: "price",
     sizeMode: "position", // "position" = field is notional; "margin" = field is margin
     triggerMode: "auto", // auto = exchange SL/TP; manual = trader manages exit
@@ -1234,6 +1235,22 @@
   const STALE_PRICE_MS = 30000; // E3-01: no price tick for this long => feed considered stale, PERIOD
   const APP_PING_INTERVAL_MS = 10000; // Task 4: client app-ping cadence, piggybacked on the 5s poll tick
   const APP_PONG_TIMEOUT_MS = 25000; // Task 4: no pong for this long => socket is dead, force reconnect
+  const MARK_OFFSET_TTL_MS = 90000; // E3-06: a Mark−Last offset older than ~3 account polls is stale => fall back to the raw tick
+
+  /** E3-06: the exchange Mark−Last offset stored for `sym` on the last account
+   *  poll, or 0 when unknown/stale. The exchange computes uPnL/ROE from its MARK
+   *  price; the live WS feed is the LAST-traded tick — so without this the card
+   *  jumps every 30s between the tick-derived value and the poll's mark-derived
+   *  one. Adding this offset to the live tick makes the streamed value track the
+   *  mark. Fails safe: a missing or stale (> TTL) offset returns 0 (raw tick),
+   *  never a wrong correction. */
+  function _markOffsetFor(sym) {
+    const rec = state._markOffset && state._markOffset[String(sym || "").toUpperCase()];
+    if (!rec) return 0;
+    if (Date.now() - Number(rec.ts || 0) > MARK_OFFSET_TTL_MS) return 0; // stale → raw tick
+    const off = Number(rec.offset);
+    return Number.isFinite(off) ? off : 0;
+  }
 
   /** U-02/E3-01: manual-SL protection (checkManualSlAlarm) and uPnL only ever
    *  fire from a live price tick — so if the feed goes dark, nothing
@@ -1319,7 +1336,15 @@
       const sl = Number(mk.sl);
       if (!Number.isFinite(sl) || sl <= 0) return;
       const short = String(p.side || "").toLowerCase() === "short";
-      const touched = short ? px >= sl : px <= sl;
+      // E3-06 SAFETY: the alarm must fail TOWARD alerting. We test BOTH the raw
+      // last-traded tick AND the mark-corrected price and fire on the UNION — so
+      // the Mark/Last offset can only make the alarm trigger EARLIER, never
+      // suppress it. A missing/stale offset makes markPx == px (raw-only), so a
+      // bad offset can never silence a real touch.
+      const rawTouched = short ? px >= sl : px <= sl;
+      const markPx = px + _markOffsetFor(p.symbol);
+      const markTouched = short ? markPx >= sl : markPx <= sl;
+      const touched = rawTouched || markTouched;
       if (touched && !state.slAlarm[key]) {
         state.slAlarm[key] = true;
         showToast(
@@ -1331,6 +1356,16 @@
           '.pos-cockpit[data-sym="' + key + '"] .cp-sl-status'
         );
         if (banner) banner.classList.add("cp-sl-alarm");
+        // E3-06 reconciliation: a touch may mean the exchange SL (or the trader
+        // on another device) just closed the position. Pull a fresh account
+        // snapshot NOW so a position closed externally stops re-firing this
+        // alarm within seconds instead of lingering "open" for up to 30s.
+        // Throttled so a price flapping across the SL can't hammer /api/account.
+        const _now = Date.now();
+        if (_now - (state._lastSlRecon || 0) > 5000) {
+          state._lastSlRecon = _now;
+          try { loadAccount(); } catch (_) { /* fire-and-forget reconciliation */ }
+        }
       } else if (!touched) {
         state.slAlarm[key] = false;
         const banner = document.querySelector(
@@ -1405,7 +1440,11 @@
       const sym = cp.getAttribute("data-sym");
       if (!symMatch(sym, state.symbol)) return; // px is for the active symbol only
       if (!Number.isFinite(entry) || !Number.isFinite(vol)) return;
-      const pnl = (px - entry) * vol * cs * (short ? -1 : 1);
+      // E3-06: correct the live last-traded tick toward the exchange MARK so
+      // uPnL/ROE stops jumping every 30s between this tick-derived value and the
+      // account poll's mark-derived one. Stale/missing offset → +0 (raw tick).
+      const mpx = px + _markOffsetFor(sym);
+      const pnl = (mpx - entry) * vol * cs * (short ? -1 : 1);
       const roe = Number.isFinite(im) && im > 0 ? (pnl / im) * 100 : null;
       const cls = "cp-pnl js-upnl-big " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
       const big = cp.querySelector(".js-upnl-big");
@@ -2609,7 +2648,10 @@
   function _positionMarkPrice(p) {
     const active = symMatch(p.symbol, state.symbol);
     const live = Number(state.lastPx);
-    if (active && Number.isFinite(live) && live > 0) return live;
+    // E3-06: for the active symbol the live tick is corrected toward the
+    // exchange MARK (same offset _updateLivePnl applies) so the Mark cell,
+    // price-%, liq-% and the streamed uPnL all agree — no 30s jump.
+    if (active && Number.isFinite(live) && live > 0) return live + _markOffsetFor(p.symbol);
     const d = state.overviewData && state.overviewData[String(p.symbol || "").toUpperCase()];
     const last = d && Number(d.last_price);
     return Number.isFinite(last) && last > 0 ? last : null;
@@ -2744,6 +2786,14 @@
       sideTag(p.side) +
       '<span class="cp-sym">' + escapeHtml(p.symbol || "—") + "</span>" +
       '<span class="cp-lev">' + escapeHtml(String(p.leverage != null ? p.leverage : "—")) + "×</span>" +
+      // N3-06: the active card streams live via the WS; every other card is only
+      // as fresh as the 30s account poll — a subtle "·30s" so a foreign coin that
+      // is actually up to 30s old never masquerades as live. Static literal (no
+      // per-tick timestamp) so it stays in the STRUCTURAL fp — which already
+      // folds isActive — and can't churn the volatile fp or flicker the patcher.
+      (isActive
+        ? ""
+        : '<span class="cp-fresh" title="Nicht live — Momentaufnahme, bis zu 30 s alt (Konto-Poll)">·30s</span>') +
       "</div>" +
       slHtml +
       '<div class="cp-pnl js-upnl-big ' + pnlCls + '">' +
@@ -3410,6 +3460,60 @@
     cancelOrder(orderId);
   }
 
+  /** E3-06: derive and store the exchange Mark−Last offset per symbol from the
+   *  account snapshot. The payload carries no mark price, but the exchange's
+   *  `unrealized_pnl` IS computed from the mark, so we back the mark out:
+   *
+   *      pnl = (mark − entry) · vol · cs · (short ? −1 : 1)
+   *   ⇒ mark = entry + pnl / (vol · cs · sign)
+   *
+   *  The reference "last" is the live WS tick for the active symbol (or the
+   *  overview tile's last for others). offset = mark − last, later ADDED to the
+   *  live tick. Guards: skips non-finite/zero inputs, and clamps out absurd
+   *  offsets (> 5% of price — a real mark/last basis is tiny) so a data glitch
+   *  can never inject a large, alarm-distorting correction. On skip the prior
+   *  value simply ages out via the TTL and we fall back to the raw tick. */
+  function updateMarkOffsets(data) {
+    try {
+      state._markOffset = state._markOffset || {};
+      const positions = (data && data.positions) || [];
+      positions.forEach(function (p) {
+        const sym = String(p.symbol || "").toUpperCase();
+        if (!sym) return;
+        const vol = Number(p.hold_vol);
+        const cs = Number(p.contract_size) || 1;
+        const entry = Number(p.entry_price);
+        const pnl = Number(p.unrealized_pnl);
+        if (
+          !Number.isFinite(vol) || vol === 0 ||
+          !Number.isFinite(cs) || cs === 0 ||
+          !Number.isFinite(entry) || entry <= 0 ||
+          !Number.isFinite(pnl)
+        ) return;
+        const sign = String(p.side || "").toLowerCase() === "short" ? -1 : 1;
+        const impliedMark = entry + pnl / (vol * cs * sign);
+        if (!Number.isFinite(impliedMark) || impliedMark <= 0) return;
+        // Reference last-traded price: the active symbol has a live WS tick;
+        // other symbols fall back to their overview tile's last (if fetched).
+        let refLast = null;
+        if (symMatch(p.symbol, state.symbol) && Number.isFinite(Number(state.lastPx)) && Number(state.lastPx) > 0) {
+          refLast = Number(state.lastPx);
+        } else {
+          const d = state.overviewData && state.overviewData[sym];
+          const l = d && Number(d.last_price);
+          if (Number.isFinite(l) && l > 0) refLast = l;
+        }
+        if (refLast == null) return; // no reference → keep prior (ages out via TTL)
+        const offset = impliedMark - refLast;
+        if (!Number.isFinite(offset)) return;
+        if (Math.abs(offset) > refLast * 0.05) return; // absurd basis → ignore (bad data)
+        state._markOffset[sym] = { offset: offset, ts: Date.now() };
+      });
+    } catch (e) {
+      console.error("updateMarkOffsets", e);
+    }
+  }
+
   async function loadAccount() {
     let data;
     try {
@@ -3440,6 +3544,7 @@
       return state.account;
     }
     state.account = data;
+    updateMarkOffsets(data); // E3-06: refresh per-symbol Mark−Last basis before any render
     pruneTradeMarkers();
     // Data application and drawing are isolated: a cosmetic drawing error must
     // NEVER cascade into blanking equity/positions.
@@ -8240,6 +8345,19 @@
       loadAccount();
       loadOpenOrders();
       loadFills();
+      // E3-05: the chart poll and overview timer were skipped while hidden.
+      // They self-schedule via setInterval so they re-arm on their own, but the
+      // next fire can be up to a full interval away — kick an immediate silent
+      // catch-up now so returning to the tab is never stale.
+      if (state.activeView === "chart" && state.symbol && state._chartKey) {
+        try {
+          loadMarket(state.symbol, state.tf || "15m", state.htf || "1H", { silent: true });
+        } catch (_) { /* next interval tick will retry */ }
+      }
+      if (state.activeView === "overview") {
+        try { refreshOverview(); } catch (_) {}
+        try { refreshNews(); } catch (_) {}
+      }
     });
     // Live chart poll, adaptive:
     //  - WS live: ticks stream in real time already; full refresh
@@ -8276,6 +8394,16 @@
           }
         }
       }
+      // E3-05: skip the full /api/market snapshot poll while the tab is hidden
+      // (a background tab was pulling the whole market ~every 15s — up to ~17k
+      // requests/night for nothing). This guard sits AFTER the WS app-ping
+      // watchdog and updateStaleBanner above ON PURPOSE: the WebSocket, its
+      // tick-driven uPnL, and the manual-SL alarm MUST keep running while
+      // hidden — only the HTTP snapshot poll is gated. The visibilitychange
+      // handler fires an immediate silent loadMarket on return so the chart
+      // isn't stale; this setInterval keeps ticking either way (no re-arm
+      // needed — it self-fires on the next interval, it does not setTimeout).
+      if (document.hidden) return;
       if (!state.symbol) return;
       if (state.activeView !== "chart") return; // chart hidden (overview active) → skip background loads
       if (!state._chartKey) return; // overview start: no chart loaded yet → no market polling
@@ -8316,6 +8444,7 @@
     }
     // Snapshot refresh, only while the overview tab is visible (no background work).
     state._overviewTimer = setInterval(function () {
+      if (document.hidden) return; // E3-05: no snapshot polls into a hidden tab
       if (state.activeView === "overview") {
         refreshOverview();
         refreshNews(); // internally throttled to 5 min
