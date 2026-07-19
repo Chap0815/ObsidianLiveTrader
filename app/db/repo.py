@@ -25,6 +25,24 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+# Task 4 (trade-management-layer spec §4/§5): a position is treated as the
+# SAME open trade across upserts as long as entry_snap hasn't moved beyond a
+# small tolerance (mark noise / re-fetch jitter). Anything larger means the
+# position was closed and a new one opened at a different entry -> the r1
+# baseline must reset (never silently inherit a stale 1R from a prior trade).
+_ENTRY_TOLERANCE_REL = 0.001  # 0.1% relative
+_ENTRY_TOLERANCE_ABS_FLOOR = 1e-6
+
+
+def _entry_deviated(old_entry: float, new_entry: float) -> bool:
+    tolerance = max(abs(old_entry) * _ENTRY_TOLERANCE_REL, _ENTRY_TOLERANCE_ABS_FLOOR)
+    return abs(new_entry - old_entry) > tolerance
+
+
 def _dumps(obj: Any) -> str | None:
     if obj is None:
         return None
@@ -40,6 +58,13 @@ def _loads(raw: str | None) -> Any:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return raw
+
+
+def _decode_position_mgmt_row(d: dict[str, Any]) -> dict[str, Any]:
+    """Decode the JSON TEXT columns (armed_rules / last_alert_state) to dicts."""
+    d["armed_rules"] = _loads(d.get("armed_rules")) or {}
+    d["last_alert_state"] = _loads(d.get("last_alert_state")) or {}
+    return d
 
 
 class Database:
@@ -670,3 +695,198 @@ class Database:
                 "proposals": max(0, proposals_deleted),
                 "orders": max(0, orders_deleted),
             }
+
+    # ── Trade-Management-Layer: position_management (Task 4) ───────────
+    # Durable baseline (entry/initial SL/1R/opened_at/thesis-invalidation) +
+    # arming + alert-debounce state per open position. A dedicated table that
+    # survives clear_history()/clear_journal() (neither touches it -- see
+    # above; both only DELETE FROM proposals/orders/journal_entries).
+    #
+    # Identity = (symbol, side); at most one OPEN row per identity is enforced
+    # by the partial UNIQUE index in schema.py. upsert_position_mgmt() is the
+    # single write path that creates/refreshes/resets that OPEN row so the
+    # invariant never has to be re-checked by callers.
+
+    async def upsert_position_mgmt(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        entry_snap: float,
+        initial_sl_snap: float,
+        r1: float,
+        opened_at: int | None,
+        invalidation_price: float | None,
+    ) -> int:
+        """Insert the OPEN record for (symbol, side) or refresh the existing one.
+
+        If there is no OPEN record yet, OR the existing OPEN record's
+        entry_snap has moved beyond `_entry_deviated`'s tolerance, this is
+        treated as a NEW position: be_done, armed_rules and last_alert_state
+        all reset to their defaults (fresh baseline; the user must re-arm --
+        default is alarm-only, never silently inherit an old arming/1R).
+        Otherwise the existing row is updated in place (arming/be_done/alert
+        state preserved) and its id is returned unchanged.
+        """
+        now = _now_ms()
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, entry_snap FROM position_management
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (symbol, side),
+            )
+            existing = await cur.fetchone()
+
+            if existing is not None and not _entry_deviated(
+                float(existing["entry_snap"]), entry_snap
+            ):
+                await conn.execute(
+                    """
+                    UPDATE position_management
+                    SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
+                        invalidation_price = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        entry_snap, initial_sl_snap, r1, opened_at,
+                        invalidation_price, now, existing["id"],
+                    ),
+                )
+                await conn.commit()
+                return int(existing["id"])
+
+            if existing is not None:
+                # Entry deviated beyond tolerance -> same (symbol, side) but a
+                # NEW position: reset arming/be_done/alert-state, fresh
+                # baseline, reuse the row (keeps the partial-unique invariant
+                # trivially satisfied -- no delete+insert race).
+                await conn.execute(
+                    """
+                    UPDATE position_management
+                    SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
+                        invalidation_price = ?, armed_rules = '{}', be_done = 0,
+                        last_alert_state = '{}', status = 'OPEN', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        entry_snap, initial_sl_snap, r1, opened_at,
+                        invalidation_price, now, existing["id"],
+                    ),
+                )
+                await conn.commit()
+                return int(existing["id"])
+
+            cur = await conn.execute(
+                """
+                INSERT INTO position_management
+                  (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                   invalidation_price, armed_rules, be_done, last_alert_state,
+                   status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?)
+                """,
+                (
+                    symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                    invalidation_price, now, now,
+                ),
+            )
+            await conn.commit()
+            return int(cur.lastrowid or 0)
+
+    async def get_open_position_mgmt(
+        self, symbol: str, side: str
+    ) -> dict[str, Any] | None:
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT * FROM position_management
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (symbol, side),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return _decode_position_mgmt_row(dict(row))
+
+    async def list_open_position_mgmt(self) -> list[dict[str, Any]]:
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT * FROM position_management WHERE status = 'OPEN' ORDER BY id ASC"
+            )
+            rows = await cur.fetchall()
+            return [_decode_position_mgmt_row(dict(r)) for r in rows]
+
+    async def set_armed_rules(
+        self, symbol: str, side: str, rules: dict[str, Any]
+    ) -> None:
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET armed_rules = ?, updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_dumps(rules) or "{}", _now_ms(), symbol, side),
+            )
+            await conn.commit()
+
+    async def mark_be_done(self, symbol: str, side: str) -> None:
+        """Idempotent: setting be_done=1 again on an already-done row is a no-op."""
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET be_done = 1, updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_now_ms(), symbol, side),
+            )
+            await conn.commit()
+
+    async def set_alert_state(
+        self, symbol: str, side: str, state: dict[str, Any]
+    ) -> None:
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET last_alert_state = ?, updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_dumps(state) or "{}", _now_ms(), symbol, side),
+            )
+            await conn.commit()
+
+    async def close_position_mgmt(self, symbol: str, side: str) -> None:
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET status = 'CLOSED', updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_now_ms(), symbol, side),
+            )
+            await conn.commit()
+
+    async def disarm_all(self) -> int:
+        """Kill-switch (spec §3.5): empty armed_rules on every OPEN row so no
+        auto-action fires again until the user re-arms. Returns the count of
+        rows affected (0 when nothing was armed/open)."""
+        async with self._acquire() as conn:
+            cur = await conn.execute(
+                """
+                UPDATE position_management
+                SET armed_rules = '{}', updated_at = ?
+                WHERE status = 'OPEN'
+                """,
+                (_now_ms(),),
+            )
+            affected = cur.rowcount if cur.rowcount is not None else 0
+            await conn.commit()
+            return max(0, affected)

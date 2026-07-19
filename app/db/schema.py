@@ -84,6 +84,38 @@ CREATE INDEX IF NOT EXISTS idx_journal_status  ON journal_entries(status);
 CREATE INDEX IF NOT EXISTS idx_journal_action     ON journal_entries(action);
 CREATE INDEX IF NOT EXISTS idx_journal_confidence  ON journal_entries(setup_confidence);
 CREATE INDEX IF NOT EXISTS idx_journal_provider    ON journal_entries(provider);
+
+-- Trade-Management-Layer (Task 4, 2026-07-19 design spec §5): durable baseline
+-- per open position (entry/initial SL/1R/opened_at/thesis-invalidation) plus
+-- arming + debounce state. A dedicated table (NOT proposals/journal_entries)
+-- because it must survive /api/history/clear and /api/journal/clear -- those
+-- only DELETE FROM proposals/orders/journal_entries (see Database.clear_history
+-- / clear_journal), never touching this table.
+CREATE TABLE IF NOT EXISTS position_management (
+  id                 INTEGER PRIMARY KEY,
+  symbol             TEXT    NOT NULL,
+  side               TEXT    NOT NULL,          -- 'long'|'short'
+  entry_snap         REAL    NOT NULL,
+  initial_sl_snap    REAL    NOT NULL,
+  r1                 REAL    NOT NULL,           -- |entry_snap - initial_sl_snap|, fixed at arm/first-sight
+  opened_at          INTEGER,                    -- ms epoch, best-effort
+  invalidation_price REAL,                       -- from latest proposal for symbol, nullable
+  armed_rules        TEXT    NOT NULL DEFAULT '{}',  -- JSON: {"auto_be": true, ...}
+  be_done            INTEGER NOT NULL DEFAULT 0,
+  last_alert_state   TEXT    NOT NULL DEFAULT '{}',  -- JSON: debounce state per alert kind
+  status             TEXT    NOT NULL DEFAULT 'OPEN', -- OPEN | CLOSED
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL
+);
+
+-- Partial unique index: at most ONE OPEN row per (symbol, side). CLOSED rows
+-- are kept as history and are exempt (a symbol/side can have many CLOSED rows
+-- over time, but the invariant only needs to hold for the live OPEN record).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_position_mgmt_open_unique
+  ON position_management(symbol, side)
+  WHERE status = 'OPEN';
+
+CREATE INDEX IF NOT EXISTS idx_position_mgmt_status ON position_management(status);
 """
 
 
