@@ -193,6 +193,74 @@ async def test_assets_raises_when_cache_too_stale_on_error():
         await c.assets()
 
 
+# ── _to_thread transient-429 retry (read paths retry, money path NEVER) ───────
+
+
+class _Boom(Exception):
+    """Mimics the SDK ClientError enough for _is_rate_limited (has .status_code)."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"({status_code}, None, 'null')")
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+async def test_to_thread_retries_read_path_on_429(monkeypatch):
+    """A read/data call that 429s must be retried with backoff and succeed once
+    the transient burst clears — this is what rides out a market-scan 429."""
+    import app.hyperliquid.client as mod
+
+    monkeypatch.setattr(mod, "_RATE_LIMIT_BACKOFF_S", 0.0)  # no real sleep in test
+    c = _client(MagicMock())
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _Boom(429)
+        return "ok"
+
+    assert await c._to_thread(fn) == "ok"
+    assert calls["n"] == 3  # two 429s absorbed, third attempt succeeds
+
+
+@pytest.mark.asyncio
+async def test_to_thread_never_retries_money_path_on_429(monkeypatch):
+    """A money-path call (place/modify/cancel) must NEVER be auto-resent on 429 —
+    the first send may already have landed; a retry could double the order."""
+    import app.hyperliquid.client as mod
+
+    monkeypatch.setattr(mod, "_RATE_LIMIT_BACKOFF_S", 0.0)
+    c = _client(MagicMock())
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise _Boom(429)
+
+    with pytest.raises(HyperliquidError):
+        await c._to_thread(fn, money_path=True)
+    assert calls["n"] == 1  # exactly one attempt, no resend
+
+
+@pytest.mark.asyncio
+async def test_to_thread_does_not_retry_non_429(monkeypatch):
+    """Only 429 is transient. A 500/other error fails fast — no retry storm."""
+    import app.hyperliquid.client as mod
+
+    monkeypatch.setattr(mod, "_RATE_LIMIT_BACKOFF_S", 0.0)
+    c = _client(MagicMock())
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise _Boom(500)
+
+    with pytest.raises(HyperliquidError):
+        await c._to_thread(fn)
+    assert calls["n"] == 1
+
+
 # ── H-2: totalNtlPos is notional exposure, not unrealized PnL ─────────────────
 
 

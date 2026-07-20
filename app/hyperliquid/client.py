@@ -68,6 +68,22 @@ _USER_STATE_TTL_S = 2.0
 # beyond it we fail honestly rather than trust arbitrarily stale money data.
 _USER_STATE_MAX_STALE_S = 8.0
 
+# Transient-429 retry for READ/data paths only (see _to_thread). A market scan
+# (candle/meta fan-out over the whole universe) or a boot burst briefly trips
+# Hyperliquid's CloudFront 429; a short exponential backoff + retry rides it out
+# instead of surfacing a 502. NEVER applied to the money path (place/modify/
+# cancel): a 429 there might follow a send that actually landed, so a silent
+# resend could double the order — those fail honestly.
+_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF_S = 0.5  # 0.5s, 1.0s, 2.0s (exp) → ~3.5s worst-case
+
+
+def _is_rate_limited(e: Exception) -> bool:
+    """True iff the SDK exception is a Hyperliquid 429 (rate limit)."""
+    if getattr(e, "status_code", None) == 429:
+        return True
+    return "429" in str(e)
+
 
 def round_hl_price(px: float, sz_decimals: int) -> float:
     """Round price to Hyperliquid tick rules.
@@ -362,12 +378,26 @@ class HyperliquidClient:
         loop = asyncio.get_running_loop()
         executor = self._executor_trade if money_path else self._executor_data
         call = functools.partial(fn, *args, **kwargs) if (args or kwargs) else fn
-        try:
-            return await loop.run_in_executor(executor, call)
-        except HyperliquidError:
-            raise
-        except Exception as e:
-            raise HyperliquidError(f"hyperliquid api: {e}") from e
+        attempts = 0
+        while True:
+            try:
+                return await loop.run_in_executor(executor, call)
+            except HyperliquidError:
+                raise
+            except Exception as e:
+                # Transient 429 → short exponential backoff + retry, but ONLY on a
+                # read/data path. A money-path call (place/modify/cancel) must
+                # NEVER be auto-resent on 429: the first send may already have
+                # landed and a retry could double it. Money path fails honestly.
+                if (
+                    not money_path
+                    and attempts < _RATE_LIMIT_RETRIES
+                    and _is_rate_limited(e)
+                ):
+                    await asyncio.sleep(_RATE_LIMIT_BACKOFF_S * (2**attempts))
+                    attempts += 1
+                    continue
+                raise HyperliquidError(f"hyperliquid api: {e}") from e
 
     def _load_meta_sync(self) -> dict[str, Any]:
         now = time.time()
