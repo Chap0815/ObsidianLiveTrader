@@ -1,10 +1,30 @@
-# Obsidian Live Trader (Hyperliquid + MEXC)
+# Obsidian Live Trader
 
-Lokale FastAPI-App für **Hyperliquid** (Default: **Testnet**) und optional **MEXC USDT-M**: Marktdaten, KI-Analyse (Claude / Grok / Codex / Ollama), Markt-Scanner, Orders nur nach **Apply → Preview → Confirm**.
+Ein **lokales Trading-Cockpit** für Krypto-Perpetual-Futures auf **Hyperliquid** (Default: Testnet) und optional **MEXC USDT-M**. Es bündelt Live-Chart + Marktdaten, eine **KI-Setup-Analyse** (Grok / Claude / Codex / Ollama), einen **Markt-Scanner** und einen **server-seitigen Trade-Management-Monitor** — und stellt **eine** Regel über alles: **nichts wird platziert ohne dein bewusstes „Preview → Confirm".**
 
-**Warnung:** Kein Paper-Mode im App-Sinne. Hyperliquid-**Testnet** nutzt Spielgeld; Mainnet und MEXC sind echt. Default: `TRADING_ENABLED=false`.
+> ⚠️ **Kein Paper-Mode.** Hyperliquid-**Testnet** ist Spielgeld (zum Üben) — **Mainnet und MEXC sind echtes Geld.** Auslieferungs-Default: `TRADING_ENABLED=false` (entschärft). Real gehandelt wird erst nach bewusstem Scharfschalten (+ bei Mainnet einer Extra-Bestätigung).
 
-### Hyperliquid Testnet (empfohlen zum Üben)
+**Was die App kann:**
+- 📈 **Chart + Kontext in Echtzeit** — Kerzen, EMA/RSI, Support/Resistance, Funding, Open Interest.
+- 🤖 **KI-Analyse** — Entry/SL/TP-Vorschlag mit Begründung, einem **Pre-Mortem** (der wahrscheinlichste Fehlergrund vor dem Einstieg) und einer an der **eigenen realen Trefferquote kalibrierten** Confidence (ehrlich, blockt aber nie).
+- 🔎 **Markt-Scanner** — screent die aktivsten Coins in einem günstigen LLM-Call und listet Setups mit Score.
+- 🛡️ **Harte Risk-Gates** — Risiko-%, RRR, Notional-Cap, **Stop-Pflicht**, Preis-Drift — geprüft bei **jedem** Preview *und* Confirm; die KI umgeht nie ein Gate.
+- ⚙️ **Trade-Management-Monitor** — pro Position scharfschaltbares **Auto-Break-Even** (bei +1R Stop auf BE) und **Auto-Trailing** (ATR-Chandelier), dazu Thesis-Invalidierungs- und Time-Stop-Alarme + globaler Kill-Switch. Bewegt einen Stop **nur enger, nie loser**.
+- 📓 **KI-Schattenbuch (Journal)** — misst still mit, was funktioniert (nach Setup-Typ & Marktregime), ohne je eine Entscheidung zu erzwingen.
+
+## Inhalt
+
+- [Schnellstart (Testnet)](#schnellstart-testnet)
+- [Dein erster Trade — Schritt für Schritt](#dein-erster-trade--schritt-für-schritt)
+- [Trade-Management nutzen (Auto-BE / Trailing)](#trade-management-nutzen-auto-be--trailing)
+- [Setup & Einrichtungsassistent](#setup-launcher--einrichtungsassistent)
+- [Umgebungsvariablen (`.env`)](#umgebungsvariablen-env) · [Wechsel auf Mainnet](#wechsel-auf-mainnet)
+- [Betrieb (Update / Backup / Security)](#betrieb) · [Tests](#tests)
+- [API-Kurzüberblick](#api-kurzüberblick) · [Projektstruktur](#projektstruktur-auszug) · [Risiken](#risiken-live-trading)
+
+## Schnellstart (Testnet)
+
+**In ~5 Minuten mit Spielgeld startklar:**
 
 1. UI: https://app.hyperliquid-testnet.xyz — Wallet connect, Faucet für Test-USDC  
 2. API Wallet / Agent Key erzeugen (kann **nicht** withdrawen)  
@@ -19,6 +39,33 @@ Lokale FastAPI-App für **Hyperliquid** (Default: **Testnet**) und optional **ME
    ```
 4. `.\start.bat` → Chart mit BTC Testnet-Preis  
 5. Smoke: `.\.venv\Scripts\python.exe scripts\hl_spike.py` und `.\.venv\Scripts\python.exe scripts\hl_spike.py --with-account`
+
+---
+
+## Dein erster Trade — Schritt für Schritt
+
+Die App handelt **nie** von selbst. Jeder Trade läuft über dieselbe Kette (auf Testnet gefahrlos üben):
+
+1. **Coin laden** — im Dropdown ein Symbol wählen (z. B. `BTC`). Chart, Indikatoren und Struktur erscheinen.
+2. **Optional scannen** — Button **Scan**: ein günstiges Modell screent die aktivsten Coins und listet Setups mit Score. Klick auf ein Ergebnis öffnet den Coin und startet direkt die Analyse.
+3. **Analysieren** — Button **Analyse**: die KI liefert einen Vorschlag (Entry/SL/TP als Chart-Linien, RRR, Begründung, **Pre-Mortem** und die kalibrierte Confidence). Der Provider ist per Dropdown umschaltbar (produktiv meist Grok).
+4. **Übernehmen** — **In Ticket übernehmen** füllt das Order-Ticket (bei `STAY_OUT` bleibt es gesperrt — die KI rät gerade ab). Size/Hebel/Limit kannst du anpassen.
+5. **Preview** — **Vorschau**: die Risk-Gates prüfen den Ticket (Risiko-%, RRR, Notional, **Stop-Pflicht**, Drift). Bei OK bekommst du ein **Einmal-Token**; sonst zeigt das Modal genau, welches Gate blockt.
+6. **Confirm** — **nur wenn scharf** (`TRADING_ENABLED=true`): **Bestätigen** platziert die Order; der Stop-Loss wird nach dem Place auf der Börse **verifiziert** (schlägt das fehl → Auto-Flatten). Ohne Scharfschaltung endet der Ablauf hier gefahrlos.
+7. **Managen** — offene Position (Entry/Liq) und aktive SL/TP-Trigger erscheinen als Chart-Linien; pro Position gibt es Schließen, SL-nachziehen und die Trade-Management-Toggles (siehe unten).
+
+> Merksatz: **Die KI umgeht keine Gates.** Jeder Ticket wird bei Preview **und** Confirm neu validiert — die Analyse ist ein Vorschlag, kein Auto-Trade.
+
+## Trade-Management nutzen (Auto-BE / Trailing)
+
+Ein Monitor läuft server-seitig mit (solange die App läuft) und überwacht offene Positionen. **Standard = nur Alarme.** Pro Position kannst du auf der Positionskarte einzelne Auto-Regeln **scharfschalten** (⚡-Toggles, **nur auf Hyperliquid**):
+
+- **⚡ Auto-BE** — sobald die Position **+1R** (= ein initiales Risiko) im Plus ist, zieht die App den Stop-Loss selbst auf **Break-Even**. Feuert einmal, bewegt den Stop nur in Schutzrichtung.
+- **⚡ Auto-Trail** — nach Erreichen der Schwelle zieht die App den Stop dynamisch nach (ATR-Chandelier, `high_water ∓ ATR·Faktor`), immer nur enger, nie loser. Läuft wiederholt.
+- **Alarme** (immer an, kein Handeln): **Thesis-Invalidierung** (Preis kreuzt den Invalidierungspunkt der KI-These) und **Time-Stop** (Position läuft lange, geht aber nicht auf).
+- **Kill-Switch** — der Button **Alle Auto-Regeln entschärfen** stoppt sofort jede autonome Aktion an allen Positionen.
+
+Alle Auto-Aktionen laufen über denselben abgesicherten `modify-sl`-Pfad (erst neuen Stop platzieren + verifizieren, dann alten canceln — **nie ungeschützt**) und landen im Alarm-Feed („App hat SL auf BE gezogen"). Ohne Scharfschaltung passiert nichts außer Alarmen. Schwellen sind über die `TM_*`-Variablen einstellbar (siehe [Umgebungsvariablen](#umgebungsvariablen-env)).
 
 ---
 
@@ -251,28 +298,6 @@ Browser: http://127.0.0.1:8787
 
 ---
 
-## Flow (kein Autotrade)
-
-0. **Erststart** — ohne `.env` öffnet sich automatisch der Setup-Assistent (`/setup`):
-   Börse → KI → Risiko, erzeugt die `.env` und sperrt sich danach selbst.
-1. **Laden** — Chart + Indikatoren + Struktur (`GET /api/market/{symbol}`); Coin per Dropdown.
-2. **Markt scannen** *(optional)* — `POST /api/scan`: ein günstiges Modell (`SCANNER_MODEL`,
-   Default Sonnet) screent die Top-Volumen-Coins in EINEM Call und listet Setups mit Score.
-   Klick auf ein Ergebnis öffnet den Coin und startet die Detail-Analyse.
-3. **Analyse** — KI-Proposal (`POST /api/analyze`) über `LLM_PROVIDER`
-   (Claude / Grok / Codex / Ollama, Hot-Swap per Dropdown; produktiv meist Grok); Entry/SL/TP + Levels
-   werden als Linien im Chart gezeichnet (TP mit R-Multiple).
-4. **Proposal übernehmen** — füllt das Order-Ticket (disabled bei `STAY_OUT`).
-5. **Order prüfen (Preview)** — Risk-Gates (`POST /api/orders/preview`); bei OK einmaliges Token.
-6. **Confirm LIVE** — nur wenn `TRADING_ENABLED=true` (`POST /api/orders/confirm`); Place mit
-   `externalOid`, SL wird nach dem Place auf der Börse verifiziert (sonst Auto-Flatten).
-7. **Nach dem Trade** — Position (Entry/Liq) und aktive SL/TP-Trigger erscheinen als
-   Chart-Linien; Schließen-Button pro Position; Historie (`GET /api/history`).
-
-Die KI **umgeht keine Gates**. Jeder Ticket wird bei Preview UND Confirm neu validiert.
-
----
-
 ## Manuelle Checkliste
 
 1. **Health** — `GET /api/health`: `ok`, `trading_enabled=false` (default), Keys-Flags.
@@ -359,13 +384,18 @@ Vor dem Scharfschalten (`TRADING_ENABLED=true`) den Place/Cancel-Pfad mit Trade-
 | POST | `/api/orders/confirm` | Live Place |
 | POST | `/api/orders/cancel` | Cancel by id |
 | POST | `/api/orders/close` | Position market-schließen (armed only) |
+| POST | `/api/orders/modify-sl` | Stop-Loss nachziehen (place→verify→cancel, never-unprotected) |
 | GET | `/api/orders/open` | Offene Orders + SL/TP-Trigger |
+| POST | `/api/positions/arm` | Auto-Regel pro Position scharfschalten (`{auto_be, auto_trail}`) |
+| GET | `/api/positions/alerts` | Trade-Management-Alarm- + Auto-Aktions-Feed (Polling) |
+| POST | `/api/positions/killswitch` | Alle Auto-Regeln sofort entschärfen |
+| POST | `/api/analyze` · `/api/reevaluate` | KI-Proposal / offene These neu bewerten |
 | POST | `/api/scan` | Markt-Scanner (Top-Coins, 1 LLM-Call) |
 | GET/POST | `/api/llm` | KI-Provider lesen / hot-swappen |
 | GET | `/api/symbols` | Coin-Liste (Cache + Fallback) |
-| POST | `/api/sizing/suggest` | 1 %-Risiko-Größe |
-| GET | `/api/history` | Letzte Proposals + Orders |
-| GET/POST | `/setup`, `/api/setup` | Erststart-Assistent (nur ohne `.env`) |
+| POST | `/api/sizing/suggest` | Risiko-basierte Größen-Empfehlung |
+| GET | `/api/history` · `/api/journal` | Letzte Proposals/Orders · KI-Schattenbuch-Statistik |
+| GET/POST | `/setup`, `/api/setup` | Erststart-Assistent (nur ohne Keys) |
 
 ---
 
@@ -373,16 +403,24 @@ Vor dem Scharfschalten (`TRADING_ENABLED=true`) den Place/Cancel-Pfad mit Trade-
 
 ```
 app/
-  main.py           # FastAPI routes + lifespan
-  config.py         # Settings aus .env
-  mexc/             # HMAC client
-  analysis/         # Indicators + structure
-  llm/              # Grok client + prompts
-  risk/             # Gates + sizing
-  orders/           # Preview/confirm tokens + service
-  db/               # SQLite schema + repo
-  static/ templates/
-data/trader.db      # Runtime audit (gitignored)
-scripts/mexc_spike.py
-tests/
+  main.py           # FastAPI-Routen + Lifespan (Background-Tasks: Journal-Resolver, Trade-Monitor)
+  config.py         # Settings aus .env (mit Validatoren)
+  models.py         # Pydantic-Modelle (OrderTicket, TradeProposal …)
+  security.py       # CSP, Loopback-/Token-Guard, Symbol-Normalisierung
+  hyperliquid/      # Hyperliquid-Client (SDK-Wrapper) + Fehlerklassen
+  mexc/             # MEXC-USDT-M-Client (HMAC) + Fehlerklassen
+  analysis/         # Indikatoren (ATR/RSI/EMA), Struktur, Markt-Kontext
+  llm/              # LLM-Clients + Prompts + Scanner + Confidence-Recalibration
+  risk/             # Risk-Gates + Sizing
+  orders/           # service.py (Place/Modify-SL/Close), monitor.py (Trade-Management-Loop),
+                    #   trade_manager.py (reine Regeln), be_math.py, protection.py, tokens.py
+  journal/          # KI-Schattenbuch: Resolver + Statistik (Wilson-CI)
+  db/               # SQLite-Schema + Repository (Proposals/Orders/Journal/Position-Mgmt)
+  realtime/         # Hyperliquid-WebSocket-Proxy
+  static/           # store.js → utils.js → trade-math.js → api.js → app.js  (+ app.css, Fonts)
+  templates/        # base.html, dashboard.html, setup.html
+scripts/            # launch.py, setup_wizard.py, hl_spike.py, mexc_spike.py
+tests/              # pytest — alles gemockt, keine echten Keys / Live-Orders
+docs/superpowers/   # Design-Specs + Bau-Pläne (Historie)
+data/trader.db      # Runtime-Audit + Journal (gitignored)
 ```
