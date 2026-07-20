@@ -114,6 +114,32 @@ def test_tm_settings_reject_out_of_bounds_and_nan():
         Settings(tm_time_stop_min_r=-10.0)  # < -5
 
 
+def test_tm_trail_settings_defaults():
+    """Auto-Trailing (ATR) defaults are safe-by-default and readable."""
+    s = Settings()
+    assert s.tm_trail_atr_mult == 2.0
+    assert s.tm_trail_activation_r == 1.0
+    assert s.tm_trail_atr_period == 14
+    assert s.tm_trail_atr_tf == "15m"
+
+
+def test_tm_trail_settings_reject_out_of_bounds_nan_and_invalid_tf():
+    """TM_TRAIL_* fields must reject NaN/Inf/out-of-bounds/unknown timeframes
+    so the trailing rule's gate comparisons never fail-open."""
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_atr_mult=float("nan"))
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_atr_mult=0.1)  # < 0.5
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_activation_r=float("inf"))
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_activation_r=-1.0)  # < 0
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_atr_period=1)  # < 2
+    with pytest.raises(ValidationError):
+        Settings(tm_trail_atr_tf="3m")  # not in allowed set
+
+
 def test_llm_base_urls_https_allowlist():
     with pytest.raises(ValidationError):
         Settings(anthropic_base_url="https://evil.example.com")

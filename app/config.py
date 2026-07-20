@@ -249,6 +249,14 @@ class Settings(BaseSettings):
     tm_time_stop_hours: float = 4.0
     tm_time_stop_min_r: float = 0.5
 
+    # Auto-Trailing (ATR/Chandelier). Same defensive posture as the tm_*
+    # fields above: validators reject NaN/Inf/out-of-bounds/unknown so gate
+    # comparisons can never fail-open.
+    tm_trail_atr_mult: float = 2.0
+    tm_trail_activation_r: float = 1.0
+    tm_trail_atr_period: int = 14
+    tm_trail_atr_tf: str = "15m"
+
     @model_validator(mode="after")
     def _apply_risk_profile(self):
         """Fill preset values for any risk field NOT explicitly set in .env.
@@ -552,6 +560,46 @@ class Settings(BaseSettings):
                 f"(got {v!r})"
             )
         return v
+
+    @field_validator("tm_trail_atr_mult")
+    @classmethod
+    def tm_trail_atr_mult_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0.5 <= v <= 10):
+            raise ValueError(
+                f"TM_TRAIL_ATR_MULT must be a finite number in [0.5, 10] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_trail_activation_r")
+    @classmethod
+    def tm_trail_activation_r_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 10):
+            raise ValueError(
+                f"TM_TRAIL_ACTIVATION_R must be a finite number in [0, 10] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_trail_atr_period")
+    @classmethod
+    def tm_trail_atr_period_ok(cls, v: int) -> int:
+        if not (2 <= int(v) <= 100):
+            raise ValueError(
+                f"TM_TRAIL_ATR_PERIOD must be an integer in [2, 100] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("tm_trail_atr_tf")
+    @classmethod
+    def tm_trail_atr_tf_ok(cls, v: str) -> str:
+        allowed = {"5m", "15m", "1h", "4h"}
+        x = (v or "").strip().lower()
+        if x not in allowed:
+            raise ValueError(
+                f"TM_TRAIL_ATR_TF must be one of {sorted(allowed)} (got {v!r})"
+            )
+        return x
 
     @model_validator(mode="after")
     def armed_requires_local_token(self) -> "Settings":
