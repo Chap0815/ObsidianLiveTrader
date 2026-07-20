@@ -169,6 +169,48 @@ def test_analyze_degenerate_buy_missing_levels_logs_skipped(tmp_path, monkeypatc
     get_settings.cache_clear()
 
 
+def test_analyze_recalibrates_display_but_never_blocks(tmp_path, monkeypatch):
+    """Block 2/TP2 Task P2 wiring: with a TERRIBLE realized high-tier hit-rate,
+    /api/analyze must (a) downgrade the DISPLAYED confidence + shrink the sizing
+    SUGGESTION, but (b) NEVER change `action` / force STAY_OUT, and keep the raw
+    setup_confidence visible on the proposal."""
+    _env(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    # A terrible high-group hit-rate (0 % Wilson-LB over n=40).
+    terrible_stats = {
+        "by_confidence": {"high": {"sample": 40, "win_rate_ci95": [0.0, 0.15]}}
+    }
+
+    with TestClient(app) as tc:
+        client = MagicMock()
+        client.account_snapshot = AsyncMock(
+            return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+        )
+        tc.app.state.mexc = client
+        b, snap_p, ctx = _client_ctx()
+        with b, snap_p, ctx, patch(
+            "app.main.analyze_with_llm", new=AsyncMock(return_value=_buy_proposal())
+        ), patch(
+            "app.main._journal_stats_for_recal",
+            new=AsyncMock(return_value=terrible_stats),
+        ):
+            r = tc.post("/api/analyze", json={"symbol": "BTC_USDT"})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        # (a) action UNCHANGED — no veto, no STAY_OUT forced.
+        assert data["proposal"]["action"] == "BUY"
+        # (b) raw KI tier still visible on the proposal.
+        assert data["proposal"]["setup_confidence"] == "high"
+        # (c) calibrated overlay downgraded + sizing suggestion shrunk.
+        assert data["confidence_calibrated"] == "medium"
+        assert data["size_factor"] == 0.5
+        assert data["calibration_note"] and "kalibriert: medium" in data["calibration_note"]
+        assert data["position_sizing_note_calibrated"]
+    get_settings.cache_clear()
+
+
 def test_analyze_still_200_when_journal_write_raises(tmp_path, monkeypatch):
     _env(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient

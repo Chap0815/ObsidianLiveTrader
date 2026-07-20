@@ -257,6 +257,13 @@ class Settings(BaseSettings):
     tm_trail_atr_period: int = 14
     tm_trail_atr_tf: str = "15m"
 
+    # Block 2/TP2 Task P2: minimum resolved sample a confidence group needs
+    # before the server-side Confidence-Recalibration may downgrade its DISPLAY
+    # + shrink its sizing SUGGESTION. Advisory/measurement only — NEVER blocks,
+    # vetoes, forces STAY_OUT, or tightens a gate. Below this n the raw KI tier
+    # is shown unchanged (no overfit on a tiny sample).
+    tm_recal_min_sample: int = 20
+
     @model_validator(mode="after")
     def _apply_risk_profile(self):
         """Fill preset values for any risk field NOT explicitly set in .env.
@@ -587,6 +594,15 @@ class Settings(BaseSettings):
         if not (2 <= int(v) <= 100):
             raise ValueError(
                 f"TM_TRAIL_ATR_PERIOD must be an integer in [2, 100] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("tm_recal_min_sample")
+    @classmethod
+    def tm_recal_min_sample_ok(cls, v: int) -> int:
+        if not (1 <= int(v) <= 1000):
+            raise ValueError(
+                f"TM_RECAL_MIN_SAMPLE must be an integer in [1, 1000] (got {v!r})"
             )
         return int(v)
 

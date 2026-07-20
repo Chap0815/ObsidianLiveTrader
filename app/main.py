@@ -42,6 +42,7 @@ from app.llm.client import (
 )
 
 from app.llm.prompts import build_system_prompt
+from app.llm.recalibration import recalibrate
 from app.mexc.client import empty_account
 from app.mexc.errors import MexcError
 from app.models import (
@@ -102,6 +103,28 @@ async def _journal_track_record(request: "Request", s) -> dict | None:
         return build_track_record(stats, min_sample=s.journal_min_sample)
     except Exception:
         log.debug("track_record build failed (advisory, ignored)", exc_info=True)
+        return None
+
+
+async def _journal_stats_for_recal(request: "Request", s) -> dict | None:
+    """Block 2/TP2 Task P2: the FULL stats block (build_stats_response) the
+    server-side Confidence-Recalibration reads its per-tier Wilson-LB from.
+    Reuses db.journal_stats (one aggregate, no LLM call). Fully soft-failing —
+    ANY problem returns None so recalibrate() falls back to the RAW KI tier and
+    analyze is NEVER broken. This layer only adjusts DISPLAY + sizing SUGGESTION;
+    it never blocks/vetoes/forces STAY_OUT/changes action."""
+    if not getattr(s, "journal_enabled", True):
+        return None
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return None
+    try:
+        from app.journal.stats import build_stats_response
+
+        raw = await db.journal_stats()
+        return build_stats_response(raw, min_sample=s.journal_min_sample)
+    except Exception:
+        log.debug("recal stats build failed (advisory, ignored)", exc_info=True)
         return None
 
 
@@ -1716,6 +1739,23 @@ async def analyze(
             pass
         proposal_dict = proposal.model_dump()
 
+        # Block 2/TP2 Task P2 — server-side Confidence-Recalibration. AFTER the
+        # LLM call, deterministically adjust the DISPLAYED confidence + the
+        # sizing SUGGESTION from the KI's OWN realized hit-rate (Wilson LOWER
+        # bound, only at n >= tm_recal_min_sample). USER'S HARD LINE: this NEVER
+        # blocks/vetoes/forces STAY_OUT/changes `action`/tightens a gate — it
+        # only sets advisory DISPLAY fields + a size multiplier. The raw
+        # `setup_confidence` and raw `position_sizing_note` stay visible on the
+        # proposal. Fully fail-safe: no journal/stats -> raw output (size 1.0).
+        recal_stats = await _journal_stats_for_recal(request, s)
+        recal = recalibrate(
+            emitted_confidence=str(proposal_dict.get("setup_confidence") or "medium"),
+            setup_type=_journal_setup_type(proposal),
+            regime=regime_tag(market_regime, atr_pct),
+            stats=recal_stats,
+            min_sample=s.tm_recal_min_sample,
+        )
+
         # Audit trail (Task 8) — soft-fail so analyze still returns on DB issues
         db: Database | None = getattr(request.app.state, "db", None)
         if db is not None:
@@ -1803,6 +1843,21 @@ async def analyze(
             "provider": s.llm_provider,
             "model": _journal_model_for_provider(s),
             "provider_fallback": provider_fallback,
+            # Block 2/TP2 Task P2 — advisory Confidence-Recalibration (display +
+            # sizing SUGGESTION only, NEVER a block/veto). The raw KI
+            # `setup_confidence`/`position_sizing_note` remain on `proposal`
+            # above; these are the calibrated overlay the UI can surface.
+            "confidence_calibrated": recal["calibrated_confidence"],
+            "calibration_note": recal["note"],
+            "size_factor": recal["size_factor"],
+            "position_sizing_note_calibrated": (
+                (
+                    f"{str(proposal_dict.get('position_sizing_note') or '').strip()} "
+                    f"· kalibriert x{recal['size_factor']:g} (Empfehlung reduziert)"
+                ).strip()
+                if recal["size_factor"] < 1.0
+                else None
+            ),
         }
         cache = getattr(request.app.state, "analyze_cache", None)
         if cache is None:
