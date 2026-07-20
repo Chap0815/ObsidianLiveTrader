@@ -44,6 +44,7 @@ class MgmtBaseline:
     armed_rules: dict = field(default_factory=dict)
     be_done: bool = False
     last_alert_state: dict = field(default_factory=dict)
+    high_water: float | None = None
 
 
 @dataclass
@@ -75,6 +76,7 @@ def evaluate_rules(
     mgmt: MgmtBaseline,
     now_ms: int,
     settings,
+    atr: float | None = None,
 ) -> list[Action]:
     """Evaluate all management rules for one position. Pure; returns actions.
 
@@ -114,6 +116,30 @@ def evaluate_rules(
         if be is not None and be_on_right_side and _is_more_protective(side, be, current_sl):
             reason = f"auto-BE @ +{unreal_r:.2f}R"
             actions.append(MoveSlToBe(be, reason))
+
+    # ── Auto-Trailing (autonomous, Chandelier) ──────────────────────────────
+    # Independent of Auto-BE: both can fire in one call, each through the same
+    # protective guard. No be_done latch — the trail fires repeatedly, but every
+    # emitted move is monotonically tightening, so it can never loosen a stop.
+    high_water = mgmt.high_water
+    hw_ok = isinstance(high_water, (int, float)) and math.isfinite(high_water)
+    atr_ok = isinstance(atr, (int, float)) and math.isfinite(atr) and atr > 0
+    if (
+        armed.get("auto_trail")
+        and unreal_r is not None
+        and unreal_r >= settings.tm_trail_activation_r
+        and atr_ok
+        and hw_ok
+    ):
+        offset = settings.tm_trail_atr_mult * atr
+        trail = high_water - offset if side == "long" else high_water + offset
+        # Same discipline as Auto-BE: emit only if it (a) tightens the stop AND
+        # (b) sits on the correct side of mark (long trail < mark, short > mark),
+        # so the trail can never be placed past price where it would trigger
+        # instantly or be rejected.
+        trail_on_right_side = trail < mark if side == "long" else trail > mark
+        if trail_on_right_side and _is_more_protective(side, trail, current_sl):
+            actions.append(MoveSlToBe(trail, "auto-trail"))
 
     # ── Thesis-invalidation alarm (advisory, R-independent) ──────────────────
     inval = mgmt.invalidation_price

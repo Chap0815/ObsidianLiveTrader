@@ -27,6 +27,8 @@ def _settings(**over):
         tm_be_fee_rt=0.0006,
         tm_time_stop_hours=4.0,
         tm_time_stop_min_r=0.5,
+        tm_trail_activation_r=1.0,
+        tm_trail_atr_mult=2.0,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -42,6 +44,7 @@ def _mgmt(**over):
         armed_rules={},
         be_done=False,
         last_alert_state={},
+        high_water=None,
     )
     base.update(over)
     return MgmtBaseline(**base)
@@ -348,3 +351,154 @@ def test_unknown_side_yields_no_actions():
         mgmt=mgmt, now_ms=0, settings=_settings(),
     )
     assert actions == []
+
+
+# ── Auto-Trailing (ATR / Chandelier) ────────────────────────────────────────
+# Money-critical second autonomous action. Chandelier trail:
+#   long:  trail = high_water - tm_trail_atr_mult * atr
+#   short: trail = high_water + tm_trail_atr_mult * atr
+# Emitted ONLY if it tightens the stop (_is_more_protective) AND sits on the
+# correct side of mark. No be_done latch — fires repeatedly.
+
+def _trails(actions):
+    return [a for a in actions if isinstance(a, MoveSlToBe) and a.reason == "auto-trail"]
+
+
+def test_trail_does_not_fire_below_activation_r():
+    # activation_r=2.0; mark 119 == +1.9R → below → no trail.
+    mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=119.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(tm_trail_activation_r=2.0),
+        atr=5.0,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_fires_at_activation_r_long():
+    # activation_r=2.0; mark 120 == +2.0R. hw 125, atr 5, mult 2 → trail 115.
+    # 115 > current_sl 90 (tightens) and 115 < mark 120 → fires.
+    mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=120.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(tm_trail_activation_r=2.0),
+        atr=5.0,
+    )
+    trails = _trails(actions)
+    assert len(trails) == 1
+    assert math.isclose(trails[0].new_sl, 115.0, rel_tol=1e-12)
+
+
+def test_trail_fires_short():
+    # short entry 100, r1 10, mark 75 == +2.5R. hw 75 (the low), atr 5, mult 2
+    # → trail 85. 85 < current_sl 90 (tightens for short) and 85 > mark 75 → fires.
+    mgmt = _mgmt(entry=100.0, initial_sl=110.0, r1=10.0,
+                 armed_rules={"auto_trail": True}, high_water=75.0)
+    actions = evaluate_rules(
+        side="short", entry=100.0, current_sl=90.0, mark=75.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    trails = _trails(actions)
+    assert len(trails) == 1
+    assert math.isclose(trails[0].new_sl, 85.0, rel_tol=1e-12)
+
+
+def test_trail_refused_when_not_more_protective_long():
+    # trail 115 would LOOSEN a current_sl already at 118 → refused (tighten-only).
+    mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=118.0, mark=125.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_refused_when_not_more_protective_short():
+    # short trail 85 would LOOSEN (raise) a current_sl already at 80 → refused.
+    mgmt = _mgmt(entry=100.0, initial_sl=110.0, r1=10.0,
+                 armed_rules={"auto_trail": True}, high_water=75.0)
+    actions = evaluate_rules(
+        side="short", entry=100.0, current_sl=80.0, mark=75.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_refused_wrong_side_of_mark_long():
+    # hw 125 near mark 120, tiny atr 0.1, mult 2 → trail 124.8, ABOVE mark 120.
+    # A long stop above price triggers instantly → must be refused even though it
+    # tightens vs current_sl 90.
+    mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=120.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=0.1,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_no_move_when_atr_missing_or_non_finite():
+    for bad in (None, 0.0, -1.0, float("nan"), float("inf")):
+        mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=125.0)
+        actions = evaluate_rules(
+            side="long", entry=100.0, current_sl=90.0, mark=125.0,
+            mgmt=mgmt, now_ms=0, settings=_settings(), atr=bad,
+        )
+        assert not _trails(actions), f"atr={bad!r} must not trail"
+
+
+def test_trail_no_move_when_high_water_none():
+    mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=None)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=125.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_no_move_when_high_water_non_finite():
+    for bad in (float("nan"), float("inf")):
+        mgmt = _mgmt(armed_rules={"auto_trail": True}, high_water=bad)
+        actions = evaluate_rules(
+            side="long", entry=100.0, current_sl=90.0, mark=125.0,
+            mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+        )
+        assert not _trails(actions)
+
+
+def test_trail_never_fires_when_unarmed():
+    # auto_trail not armed → even at +5R with valid atr/hw, no trail.
+    mgmt = _mgmt(armed_rules={}, high_water=150.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=150.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    assert not _trails(actions)
+
+
+def test_trail_default_atr_none_keeps_existing_callers_working():
+    # atr param omitted (default None) → no trail, no crash. Auto-BE still fires.
+    mgmt = _mgmt(armed_rules={"auto_be": True, "auto_trail": True},
+                 high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=120.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(),
+    )
+    assert not _trails(actions)
+    assert [a for a in actions if isinstance(a, MoveSlToBe) and a.reason.startswith("auto-BE")]
+
+
+def test_auto_be_and_auto_trail_both_fire_through_guard():
+    # Both armed. mark 120 == +2R. BE ~100.06 tightens vs current_sl 90 → fires.
+    # Trail = hw 125 - 2*5 = 115, tightens vs 90 and < mark 120 → fires too.
+    # Neither suppresses the other; both pass the protective guard.
+    mgmt = _mgmt(armed_rules={"auto_be": True, "auto_trail": True},
+                 high_water=125.0)
+    actions = evaluate_rules(
+        side="long", entry=100.0, current_sl=90.0, mark=120.0,
+        mgmt=mgmt, now_ms=0, settings=_settings(), atr=5.0,
+    )
+    moves = [a for a in actions if isinstance(a, MoveSlToBe)]
+    reasons = {m.reason.split(" ")[0] for m in moves}
+    assert "auto-trail" in reasons
+    assert any(r.startswith("auto-BE") for r in reasons)
+    assert len(moves) == 2
