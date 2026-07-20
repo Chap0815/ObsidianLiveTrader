@@ -170,6 +170,10 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `TM_BE_FEE_RT` | `0.0006` | Round-Trip-Fee-Puffer für die Break-Even-Berechnung; `[0, 0.01]` |
 | `TM_TIME_STOP_HOURS` | `4.0` | Time-Stop-Alarm, wenn die Position so lange läuft; `[0.25, 168]` |
 | `TM_TIME_STOP_MIN_R` | `0.5` | Time-Stop-Alarm nur, wenn die Position unter diesem R steht; `[-5, 10]` |
+| `TM_TRAIL_ATR_MULT` | `2.0` | Auto-Trail: Chandelier-Abstand = dieses Vielfache des ATR; `[0.5, 10]` |
+| `TM_TRAIL_ACTIVATION_R` | `1.0` | Auto-Trail aktiviert erst ab diesem unrealisierten R; `[0, 10]` |
+| `TM_TRAIL_ATR_PERIOD` | `14` | ATR-Periode (Wilder) für den Trail; `[2, 100]` |
+| `TM_TRAIL_ATR_TF` | `15m` | Timeframe der ATR-Kerzen für den Trail; eine von `5m, 15m, 1h, 4h` |
 
 **Trade-Management-Layer (v1):** ein server-seitiger Monitor läuft mit dem Prozess
 und überwacht offene Positionen. Standard = nur **Alarme** (Thesis-Invalidierung,
@@ -178,11 +182,21 @@ dann zieht die App den Stop-Loss bei `+TM_BE_TRIGGER_R` R selbst auf Break-Even.
 Auto-BE ist **Hyperliquid-only**, feuert **einmal** pro Position, bewegt den Stop
 **nur in Schutzrichtung** (nie lockern) und läuft über den bestehenden
 `modify-sl`-Pfad (never-unprotected, `trade_lock`, Audit). Endpunkte (alle
-`require_local_token`): `POST /api/positions/arm` `{symbol, side, rules:{auto_be:bool}}`,
+`require_local_token`): `POST /api/positions/arm` `{symbol, side, rules:{auto_be:bool, auto_trail:bool}}`,
 `GET /api/positions/alerts` (Polling-Feed für UI), `POST /api/positions/killswitch`
 (entschärft sofort ALLE Positionen). Bekannte Grenzen (Spec §10): App-Neustart
 mitten im Trade nimmt den aktuellen SL als Baseline; ein Close→Reopen bei nahezu
 identischem Entry innerhalb der 2-Zyklen-Absenz-Grace kann die alte Baseline erben.
+
+**Trade-Management-Layer (v2 — Auto-Trailing):** zusätzlich zu Auto-BE kann pro
+Position **Auto-Trail** scharfgeschaltet werden — ein ATR-Chandelier-Trailing-Stop
+(`high_water ∓ TM_TRAIL_ATR_MULT · ATR`), der ab `TM_TRAIL_ACTIVATION_R` R greift.
+Wie Auto-BE ist er **opt-in pro Position**, **Hyperliquid-only**, bewegt den Stop
+**nur in Schutzrichtung** (nie lockern) und läuft über denselben `modify-sl`-Pfad.
+Er feuert **wiederholt** (kein Einmal-Latch), jeder Zug ist monoton enger. Der
+Time-Stop bleibt reiner **Alarm** (kein autonomes Schließen). Kosten: **+1
+`klines`-Fetch pro scharfgeschalteter Trail-Position und Zyklus** (pro Symbol/TF
+gecacht).
 
 ### Wechsel auf Mainnet
 

@@ -401,3 +401,27 @@ async def test_multi_move_applies_only_most_protective(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 1  # BE was eligible → latched even though trail won
     assert "auto_trail" in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_atr_cache_dedups_klines_within_cycle(monkeypatch, db_path):
+    """Cost guard: two auto_trail-armed positions on the SAME symbol fetch klines
+    only ONCE per cycle — the (symbol, tf) ATR cache dedups the fetch."""
+    from unittest.mock import AsyncMock as _AM
+
+    db = Database(db_path)
+    await db.init()
+    for side, isl in (("long", 98.0), ("short", 102.0)):
+        await db.upsert_position_mgmt(
+            "BTC_USDT", side, entry_snap=100.0, initial_sl_snap=isl, r1=2.0,
+            opened_at=NOW_MS, invalidation_price=None,
+        )
+        await db.set_armed_rules("BTC_USDT", side, {"auto_trail": True})
+    _install_spy(monkeypatch)
+    client = FakeClient([_pos(side="long"), _pos(side="short")], mark=102.5, is_hl=True)
+    client.klines = _AM(return_value=_flat_candles(tr=1.0))
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    # Both positions are auto_trail-armed on the same symbol/tf → exactly ONE fetch.
+    assert client.klines.await_count == 1
