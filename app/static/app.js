@@ -4937,6 +4937,196 @@
     }
   }
 
+  /* ── Kalibrierungs-Dashboard ────────────────────────────────────────────
+   *  Reuses the already-tested /api/journal/stats payload and renders a
+   *  CALIBRATION view of it: does the KI's confidence carry information (does
+   *  "high" actually win more than "low"?), plus expectancy by setup & regime.
+   *  Forward statistics from real shadow-trades — NOT a backtest. Read-only,
+   *  never touches the order/gate path. */
+
+  const _CAL_CONF_ORDER = { low: 0, medium: 1, high: 2 };
+  // Noise floor: match the backend's journal_min_sample (20) — the same n below
+  // which the rest of the system flags rates as noise and the recalibrator stays
+  // inert. A verdict on fewer samples would contradict the UI's own low_sample
+  // dimming and the Wilson-LB it teaches the user to trust.
+  const _CAL_MIN_SAMPLE = 20;
+
+  /** Wilson LOWER bound (ci95[0]) — the honest floor the recalibrator uses. */
+  function _calWilsonLo(g) {
+    const ci = g && Array.isArray(g.win_rate_ci95) ? g.win_rate_ci95 : null;
+    return ci ? ci[0] : null;
+  }
+
+  /** One breakdown table (n · Win-Rate · Wilson-LB · Ø R). `opts.order` sorts by
+   *  a fixed key map (confidence low→high); `opts.sortByExpectancy` sorts by Ø R
+   *  desc. Read-only, no click-filtering (unlike the Journal breakdown). */
+  function renderCalibrationBreakdown(title, groups, opts) {
+    opts = opts || {};
+    const keys = Object.keys(groups || {});
+    if (!keys.length) return "";
+    if (opts.order) {
+      keys.sort(function (a, b) {
+        const oa = opts.order[a] == null ? 99 : opts.order[a];
+        const ob = opts.order[b] == null ? 99 : opts.order[b];
+        return oa - ob;
+      });
+    } else if (opts.sortByWilsonLo) {
+      // Sort by the Wilson LOWER bound, NOT the point-estimate R: a 1-sample
+      // +2R group must not rank above a 30-sample proven group. Low/absent LB
+      // (tiny n → wide interval) sinks to the bottom automatically.
+      keys.sort(function (a, b) {
+        const la = _calWilsonLo(groups[a]);
+        const lb = _calWilsonLo(groups[b]);
+        return (lb == null ? -1 : lb) - (la == null ? -1 : la);
+      });
+    }
+    let html = '<div class="journal-breakdown"><h4>' + escapeHtml(title) + "</h4>";
+    html +=
+      '<table class="journal-breakdown-table"><thead><tr>' +
+      "<th></th><th>n</th><th>Win-Rate</th><th>Wilson-LB</th><th>Ø R brutto</th>" +
+      "</tr></thead><tbody>";
+    for (const k of keys) {
+      const g = groups[k] || {};
+      const lo = _calWilsonLo(g);
+      html +=
+        '<tr class="' + (g.low_sample ? "low-sample" : "") + '">' +
+        "<td>" + escapeHtml(k) + "</td>" +
+        "<td>" + fmt(g.sample, 0) + "</td>" +
+        "<td>" + (g.win_rate != null ? fmt(g.win_rate * 100, 1) + "%" : "—") + "</td>" +
+        "<td>" + (lo != null ? fmt(lo * 100, 1) + "%" : "—") + "</td>" +
+        "<td>" + (g.avg_realized_rrr != null ? fmt(g.avg_realized_rrr, 2) : "—") + "</td>" +
+        "</tr>";
+    }
+    html += "</tbody></table></div>";
+    return html;
+  }
+
+  /** The core calibration check, done HONESTLY: only judge when BOTH tiers clear
+   *  the noise floor (n≥20) AND their Wilson 95% intervals DON'T overlap. A raw
+   *  point-estimate comparison (high.win_rate > low.win_rate) at small n is noise
+   *  that would flip on a single trade and contradict the Wilson-LB the rest of
+   *  the UI teaches to trust. Returns {cls, text} or null (no verdict shown). */
+  function _calibrationVerdict(byConf) {
+    const hi = byConf && byConf.high;
+    const lo = byConf && byConf.low;
+    const hiN = (hi && hi.sample) || 0;
+    const loN = (lo && lo.sample) || 0;
+    if (hiN < _CAL_MIN_SAMPLE || loN < _CAL_MIN_SAMPLE) return null;
+    const hiCi = Array.isArray(hi.win_rate_ci95) ? hi.win_rate_ci95 : null;
+    const loCi = Array.isArray(lo.win_rate_ci95) ? lo.win_rate_ci95 : null;
+    if (!hiCi || !loCi || hi.win_rate == null || lo.win_rate == null) return null;
+    const hiWr = fmt(hi.win_rate * 100, 1);
+    const loWr = fmt(lo.win_rate * 100, 1);
+    // Non-overlapping intervals: high's lower bound clears low's upper bound.
+    if (hiCi[0] > loCi[1]) {
+      return {
+        cls: "cal-ok",
+        text:
+          "✓ Kalibriert: high (" + hiWr + "%) schlägt low (" + loWr +
+          "%) — die Wilson-Intervalle überlappen nicht, die KI-Confidence trägt Information.",
+      };
+    }
+    // Symmetric: high provably WORSE than low.
+    if (hiCi[1] < loCi[0]) {
+      return {
+        cls: "cal-warn",
+        text:
+          "⚠ Fehlkalibriert: high (" + hiWr + "%) liegt nachweislich UNTER low (" +
+          loWr + "%). Die aktive Rekalibrierung (ab n≥20) stuft solche high-Setups runter.",
+      };
+    }
+    return {
+      cls: "cal-neutral",
+      text:
+        "○ Noch nicht unterscheidbar: high (" + hiWr + "%) vs low (" + loWr +
+        "%) — die Wilson-Intervalle überlappen, die Stichprobe reicht noch nicht für ein Urteil.",
+    };
+  }
+
+  /** Render the Kalibrierung tab from a /api/journal/stats payload. */
+  function renderCalibration(stats) {
+    const body = $("calibration-body");
+    if (!body) return;
+    const ov = (stats && stats.overall) || {};
+    const sample = ov.sample || 0;
+
+    if (!stats || !stats.overall || !sample) {
+      body.className = "placeholder";
+      body.textContent =
+        "Noch keine aufgelösten Trades — sobald genug Journal-Einträge WIN/LOSS " +
+        "haben, erscheint hier deine echte Trefferquote nach Confidence, Setup und Regime.";
+      return;
+    }
+
+    const ci = Array.isArray(ov.win_rate_ci95) ? ov.win_rate_ci95 : null;
+    let html = '<div class="journal-content calibration-content">';
+    html +=
+      '<p class="muted calibration-intro">Vorwärts-Statistik aus deinen echten ' +
+      "(Shadow-)Trades — kein Backtest. <b>Wilson-LB</b> = unterer 95%-Konfidenzrand " +
+      "der Trefferquote (die ehrliche Untergrenze; kleine n lesen sich automatisch " +
+      "vorsichtig). Gruppen-<b>Ø R ist brutto</b> (Fees/Slippage nur im Netto-" +
+      "Gesamtwert unten). Ein Urteil „kalibriert“ erscheint erst ab n≥20 pro Stufe " +
+      "und nicht-überlappenden Intervallen. Korrelierte Journal-Einträge sind " +
+      "möglich → die Intervalle sind eher etwas zu eng.</p>";
+
+    html +=
+      '<div class="journal-stats"><div class="journal-overall' +
+      (ov.low_sample ? " low-sample" : "") + '">' +
+      '<span class="journal-stat"><b>Gesamt-Win-Rate:</b> ' +
+      (ov.win_rate != null ? fmt(ov.win_rate * 100, 1) + "%" : "—") +
+      " (n=" + fmt(sample, 0) + ")" +
+      (ci && ci[0] != null ? " · Wilson-LB " + fmt(ci[0] * 100, 1) + "%" : "") + "</span>" +
+      '<span class="journal-stat"><b>Ø realized R:</b> ' +
+      (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
+      (ov.avg_realized_rrr_net != null ? " (netto " + fmt(ov.avg_realized_rrr_net, 2) + ")" : "") +
+      "</span>" +
+      (ov.low_sample ? '<span class="journal-lowflag">zu wenig Daten</span>' : "") +
+      "</div></div>";
+
+    const verdict = _calibrationVerdict(stats.by_confidence);
+    if (verdict) {
+      html +=
+        '<div class="calibration-verdict ' + verdict.cls +
+        '">' + escapeHtml(verdict.text) + "</div>";
+    }
+
+    html += renderCalibrationBreakdown("Nach Confidence (Kalibrierungs-Check)", stats.by_confidence, { order: _CAL_CONF_ORDER });
+    html += renderCalibrationBreakdown("Nach Setup", stats.by_setup, { sortByWilsonLo: true });
+    html += renderCalibrationBreakdown("Nach Regime", stats.by_regime, { sortByWilsonLo: true });
+
+    const caveats = Array.isArray(stats.caveats) ? stats.caveats : [];
+    if (caveats.length) {
+      html += '<ul class="journal-caveats muted">';
+      for (const c of caveats) html += "<li>" + escapeHtml(String(c)) + "</li>";
+      html += "</ul>";
+    }
+    html += "</div>";
+    body.className = "journal-body calibration-body";
+    body.innerHTML = html;
+  }
+
+  /** loadCalibration: reuse /api/journal/stats, render the calibration view.
+   *  Soft-fail like loadJournal — measurement-only, never throws. */
+  async function loadCalibration() {
+    const body = $("calibration-body");
+    try {
+      const res = await apiFetch("/api/journal/stats");
+      if (!res.ok) throw new Error("calibration stats " + res.status);
+      const stats = await res.json();
+      state.calibrationData = stats;
+      renderCalibration(stats);
+      return stats;
+    } catch (err) {
+      console.error("loadCalibration", err);
+      if (body) {
+        body.className = "placeholder";
+        body.textContent =
+          "Kalibrierungs-Fehler: " + (err && err.message ? err.message : err);
+      }
+      return null;
+    }
+  }
+
   /** Task 40 (N3-14 Stufe 1): fold a symbol's fill ledger into ROUND-TRIPS
    *  (flat → position → flat) instead of the raw per-fill list — a real
    *  trade log, not a request log. Pure client-side reconstruction from the
@@ -5318,6 +5508,8 @@
       loadFills();
     } else if (name === "journal") {
       loadJournal();
+    } else if (name === "calibration") {
+      loadCalibration();
     }
   }
 
@@ -8202,6 +8394,13 @@
       });
     }
 
+    const calBtn = $("btn-calibration-refresh");
+    if (calBtn) {
+      calBtn.addEventListener("click", () => {
+        loadCalibration();
+      });
+    }
+
     const jrnClearBtn = $("btn-journal-clear");
     if (jrnClearBtn) {
       jrnClearBtn.addEventListener("click", () => clearJournal());
@@ -8928,6 +9127,8 @@
     loadHistory,
     loadJournal,
     renderJournal,
+    loadCalibration,
+    renderCalibration,
     runAnalyze,
     applyProposalToTicket,
     renderProposal,

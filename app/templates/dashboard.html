@@ -187,10 +187,12 @@
       <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="history">Historie</button>
       <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="trades">Trades</button>
       <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="journal">Journal</button>
+      <button type="button" class="data-tab" role="tab" aria-selected="false" data-tab="calibration">Kalibrierung</button>
       <div class="data-tab-actions">
         <button type="button" id="btn-orders-refresh" class="btn btn-ghost data-act hidden" data-for="orders" title="Orders neu laden">↻</button>
         <button type="button" id="btn-history-refresh" class="btn btn-ghost data-act hidden" data-for="history" title="Historie neu laden">Aktualisieren</button>
         <button type="button" id="btn-journal-refresh" class="btn btn-ghost data-act hidden" data-for="journal" title="Journal neu laden">Aktualisieren</button>
+        <button type="button" id="btn-calibration-refresh" class="btn btn-ghost data-act hidden" data-for="calibration" title="Kalibrierung neu laden">Aktualisieren</button>
         <button
           type="button"
           id="btn-history-clear"
@@ -239,6 +241,9 @@
       </div>
       <div class="data-pane hidden" role="tabpanel" aria-label="Journal" data-pane="journal">
         <div id="journal-body" class="placeholder">Lade Journal…</div>
+      </div>
+      <div class="data-pane hidden" role="tabpanel" aria-label="Kalibrierung" data-pane="calibration">
+        <div id="calibration-body" class="placeholder">Lade Kalibrierung…</div>
       </div>
     </div>
   </section>

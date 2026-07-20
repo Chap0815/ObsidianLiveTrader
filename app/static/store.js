@@ -151,6 +151,7 @@ var state = {
   // SAME state.journalFilter still applied).
   journalFilter: null, // {field: "setup_confidence"|"action"|"provider", value: string}
   _journalWired: false, // #journal-body delegated listener attached once
+  calibrationData: null, // last /api/journal/stats payload for the Kalibrierung tab
   // A3-04: formerly dynamically-created top-level fields — enumerated
   // exhaustively (grep `\bstate\.<name>\s*=`) and pre-declared here so a
   // typo can no longer mint a silent new field once the state is sealed.

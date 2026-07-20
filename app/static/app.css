@@ -3401,6 +3401,32 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   font-style: italic;
 }
 
+/* Kalibrierungs-Tab: Intro + Verdikt-Banner (reuse journal breakdown tables). */
+.calibration-intro {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+.calibration-verdict {
+  margin: var(--space-2) 0;
+  padding: var(--space-2);
+  border-radius: 6px;
+  border-left: 3px solid var(--border, #444);
+  font-size: var(--fs-sm);
+}
+.calibration-verdict.cal-ok {
+  background: rgba(46, 160, 67, 0.12);
+  border-left-color: #2ea043;
+}
+.calibration-verdict.cal-warn {
+  background: rgba(210, 153, 34, 0.14);
+  border-left-color: #d29922;
+}
+.calibration-verdict.cal-neutral {
+  background: rgba(127, 127, 127, 0.10);
+  border-left-color: var(--muted, #888);
+}
+
 .journal-caveats {
   margin: var(--space-1) 0 0;
   padding-left: 16px;
