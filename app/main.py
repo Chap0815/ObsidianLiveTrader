@@ -564,6 +564,18 @@ async def lifespan(app: FastAPI):
             resolver_task = _asyncio.create_task(run_resolver_loop(app))
         except Exception:
             log.warning("journal resolver failed to start", exc_info=True)
+    # Trade-Management monitor: second background task (spec §2), started only
+    # when tm_enabled. Money-executing (autonomous SL→BE via the modify-sl
+    # path); fail-safe per cycle. Cancelled+awaited on shutdown exactly like the
+    # resolver above.
+    monitor_task = None
+    if getattr(s, "tm_enabled", True):
+        try:
+            from app.orders.monitor import run_trade_monitor_loop
+
+            monitor_task = _asyncio.create_task(run_trade_monitor_loop(app))
+        except Exception:
+            log.warning("trade monitor failed to start", exc_info=True)
     try:
         yield
     finally:
@@ -571,6 +583,12 @@ async def lifespan(app: FastAPI):
             resolver_task.cancel()
             try:
                 await resolver_task
+            except (_asyncio.CancelledError, Exception):
+                pass
+        if monitor_task is not None:
+            monitor_task.cancel()
+            try:
+                await monitor_task
             except (_asyncio.CancelledError, Exception):
                 pass
         aclose = getattr(client, "aclose", None)
