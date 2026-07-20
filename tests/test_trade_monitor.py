@@ -59,9 +59,16 @@ def _make_app(db, client):
     return app
 
 
-def _install_spy(monkeypatch):
-    """Replace the service seam with a spy exposing an AsyncMock modify_stop_loss."""
-    svc = SimpleNamespace(modify_stop_loss=AsyncMock(return_value={"status": "ok"}))
+def _install_spy(monkeypatch, result=None):
+    """Replace the service seam with a spy exposing an AsyncMock modify_stop_loss.
+
+    Default return mirrors a CONFIRMED-resting modify (``verified=True``) — the
+    only return the monitor may treat as success (C2). Pass ``result`` to inject
+    an unverified/soft-failure return.
+    """
+    if result is None:
+        result = {"status": "modify_sl_ok", "verified": True}
+    svc = SimpleNamespace(modify_stop_loss=AsyncMock(return_value=result))
     monkeypatch.setattr(monitor, "_make_order_service", lambda app, client, settings: svc)
     return svc
 
@@ -425,3 +432,121 @@ async def test_atr_cache_dedups_klines_within_cycle(monkeypatch, db_path):
 
     # Both positions are auto_trail-armed on the same symbol/tf → exactly ONE fetch.
     assert client.klines.await_count == 1
+
+
+# ── C2: modify_stop_loss SOFT-failure return must not latch a false be_done ───
+
+
+@pytest.mark.asyncio
+async def test_unverified_modify_does_not_latch_be(monkeypatch, db_path):
+    """C2: a NON-exception but UNVERIFIED modify return
+    (``verified=False`` / "modify_sl_unverified_old_kept") means the NEW stop is
+    NOT confirmed resting and the OLD looser stop is still held. The monitor must
+    NOT latch be_done, must NOT write the "App hat SL auf BE gezogen" feed, must
+    write an honest non-"done" feed, and auto-BE must stay ELIGIBLE next cycle
+    (re-attempting) — counting toward the attempt cap so it can't hammer forever."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)  # entry 100, r1=2, auto_be
+    svc = _install_spy(
+        monkeypatch,
+        result={"verified": False, "status": "modify_sl_unverified_old_kept"},
+    )
+    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))  # +1.25R
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()  # it TRIED to move
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 0  # NOT latched on an unverified move
+    assert "auto_be" not in row["last_alert_state"]  # no false "moved" feed
+    assert "auto_be_error" in row["last_alert_state"]  # honest error feed instead
+    assert row["last_alert_state"]["auto_be_error"]["halted"] is False
+
+    # Still eligible next cycle → it re-attempts (auto-BE not stuck done).
+    await monitor._run_one_cycle(app, NOW_MS + 20_000)
+    assert svc.modify_stop_loss.await_count == 2
+    row2 = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row2["be_done"] == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_modify_latches_be(monkeypatch, db_path):
+    """C2 companion: a VERIFIED modify return (``verified=True``) DOES latch
+    be_done and writes the "moved" feed — the confirmed-success path."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    svc = _install_spy(
+        monkeypatch, result={"verified": True, "status": "modify_sl_ok"}
+    )
+    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 1  # latched on a CONFIRMED move
+    assert "auto_be" in row["last_alert_state"]
+    assert "auto_be_error" not in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_unverified_trail_move_writes_no_done_feed(monkeypatch, db_path):
+    """C2 for trailing: an unverified trail return must NOT write the
+    "App hat SL nachgezogen (Trail)" feed (a false "done") — honest error only."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(
+        monkeypatch,
+        result={"verified": False, "status": "modify_sl_unverified_old_kept"},
+    )
+    client = FakeClient([_pos()], mark=110.0, is_hl=True)  # hw 110 → trail 108
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert "auto_trail" not in row["last_alert_state"]  # no false "moved" feed
+    assert "auto_be_error" in row["last_alert_state"]
+    assert row["be_done"] == 0  # trailing never latches anyway
+
+
+# ── C3: a same-price reopen within the absence grace gets a fresh baseline ─────
+
+
+@pytest.mark.asyncio
+async def test_reopen_after_absence_resets_be_and_high_water(monkeypatch, db_path):
+    """C3: when a position vanishes for < grace cycles (record NOT closed) and
+    then REAPPEARS at ~the same entry, the fresh position must NOT inherit the old
+    be_done latch or a stale high_water. Reappearance-after-absence resets both."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_be": True})
+    # Simulate the PRIOR trade's finished state on the still-open record.
+    await db.mark_be_done("BTC_USDT", "long")
+    await db.update_high_water("BTC_USDT", "long", 130.0)  # stale extreme
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=101.0, is_hl=True)  # +0.5R, below +1R
+    app = _make_app(db, client)
+
+    # One ABSENT cycle (below grace=2 → record survives, state untouched).
+    client._positions = []
+    await monitor._run_one_cycle(app, NOW_MS)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row is not None  # not closed yet (transient tolerance)
+    assert row["be_done"] == 1  # still stale — absence alone doesn't reset
+
+    # REAPPEARS at the same entry → reopen → baseline reset BEFORE processing.
+    client._positions = [_pos()]
+    await monitor._run_one_cycle(app, NOW_MS + 20_000)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row is not None
+    assert row["be_done"] == 0  # stale BE latch cleared → auto-BE eligible again
+    # high_water re-seeded to entry (100) then advanced to the live mark (101),
+    # NOT the stale 130 from the prior trade.
+    assert row["high_water"] == pytest.approx(101.0)
+    svc.modify_stop_loss.assert_not_awaited()  # +0.5R < +1R → no move yet

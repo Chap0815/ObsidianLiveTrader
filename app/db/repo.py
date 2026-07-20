@@ -943,6 +943,32 @@ class Database:
             )
             await conn.commit()
 
+    async def reset_position_mgmt_baseline(self, symbol: str, side: str) -> None:
+        """Re-arm/reopen fresh baseline: zero ``be_done`` and re-seed
+        ``high_water`` to ``entry_snap`` on the OPEN record for (symbol, side).
+
+        Used when a position REAPPEARS after an absence (a potential same-price
+        reopen the entry-deviation check in upsert_position_mgmt can't catch,
+        because entry_snap barely moved) so a fresh position never inherits a
+        stale BE latch or a stale trail high-water from the prior trade. Only the
+        one-shot-BE latch + the Chandelier high-water are reset; the frozen risk
+        baseline (entry_snap/initial_sl_snap/r1) and the user's armed_rules are
+        deliberately preserved (a reopen at ~the same entry keeps the same risk
+        geometry and the same arming intent). Idempotent no-op if no OPEN record
+        exists. high_water=entry_snap mirrors the fresh-baseline seed in
+        upsert_position_mgmt (never claims a more favorable extreme than entry).
+        """
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET be_done = 0, high_water = entry_snap, updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_now_ms(), symbol, side),
+            )
+            await conn.commit()
+
     async def set_alert_state(
         self, symbol: str, side: str, state: dict[str, Any]
     ) -> None:

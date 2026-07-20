@@ -350,7 +350,7 @@ async def _process_position(
                     state_dirty = True
             else:
                 try:
-                    await service.modify_stop_loss(
+                    result = await service.modify_stop_loss(
                         symbol=symbol, side=side, new_sl=chosen.new_sl
                     )
                 except Exception as e:  # noqa: BLE001 — must not abort the cycle
@@ -376,29 +376,78 @@ async def _process_position(
                     state_dirty = True
                     # Do NOT latch be_done — leave it armed to retry until the cap.
                 else:
-                    # Success: clear the retry cap (both BE and repeated trailing
-                    # reset it) + a visible auto-action feed entry.
-                    attempts.pop(akey, None)
-                    if be_eligible:
-                        # Resulting stop is >= break-even → latch the one-shot BE.
-                        await db.mark_be_done(symbol, side)
-                    if is_be_move:
-                        alert_state["auto_be"] = {
-                            "active": True,
-                            "reason": chosen.reason,
-                            "new_sl": chosen.new_sl,
-                            "message": f"App hat SL auf BE gezogen ({chosen.reason}).",
-                            "ts": now_ms,
-                        }
+                    # C2: modify_stop_loss signals SOFT failures via its RETURN
+                    # dict, NOT an exception: verified=False on
+                    # "modify_sl_unverified_old_kept" / "modify_sl_unknown_old_kept"
+                    # means the NEW (BE/trail) stop is NOT confirmed resting and the
+                    # exchange still holds the OLD looser/initial stop. A non-raising
+                    # call is therefore NOT proof of success — only ``verified is
+                    # True`` is. Gate the be_done latch AND the "moved" feed on that
+                    # flag; otherwise state+UI would falsely claim BE while the
+                    # position rests on the initial stop → stopped out at a LOSS at
+                    # entry, and auto-BE would never retry (not mgmt.be_done).
+                    verified = (
+                        isinstance(result, dict) and result.get("verified") is True
+                    )
+                    if verified:
+                        # Confirmed resting: clear the retry cap (both BE and
+                        # repeated trailing reset it) + a visible auto-action feed.
+                        attempts.pop(akey, None)
+                        if be_eligible:
+                            # Resulting stop is >= break-even → latch one-shot BE.
+                            await db.mark_be_done(symbol, side)
+                        if is_be_move:
+                            alert_state["auto_be"] = {
+                                "active": True,
+                                "reason": chosen.reason,
+                                "new_sl": chosen.new_sl,
+                                "message": (
+                                    f"App hat SL auf BE gezogen ({chosen.reason})."
+                                ),
+                                "ts": now_ms,
+                            }
+                        else:
+                            alert_state["auto_trail"] = {
+                                "active": True,
+                                "reason": chosen.reason,
+                                "new_sl": chosen.new_sl,
+                                "message": "App hat SL nachgezogen (Trail).",
+                                "ts": now_ms,
+                            }
+                        state_dirty = True
                     else:
-                        alert_state["auto_trail"] = {
+                        # UNVERIFIED soft failure: new stop NOT confirmed, old stop
+                        # still held. Do NOT latch be_done (auto-BE stays eligible
+                        # next cycle) and NEVER write a "moved"/"done" feed. Emit an
+                        # HONEST feed and count it toward the attempt cap so an
+                        # endlessly-unverified move can't hammer the exchange forever
+                        # (I-1) — same bound the exception path enforces.
+                        n = attempts.get(akey, 0) + 1
+                        attempts[akey] = n
+                        status = (
+                            result.get("status")
+                            if isinstance(result, dict)
+                            else "unverified"
+                        )
+                        log.warning(
+                            "auto-mgmt modify_stop_loss UNVERIFIED for %s %s "
+                            "(%d/%d): %s",
+                            symbol,
+                            side,
+                            n,
+                            _BE_MAX_ATTEMPTS,
+                            status,
+                        )
+                        alert_state["auto_be_error"] = {
                             "active": True,
-                            "reason": chosen.reason,
-                            "new_sl": chosen.new_sl,
-                            "message": "App hat SL nachgezogen (Trail).",
+                            "halted": n >= _BE_MAX_ATTEMPTS,
+                            "message": (
+                                f"Auto-Management: SL-Move NICHT bestaetigt "
+                                f"({n}/{_BE_MAX_ATTEMPTS}, {status}) — Retry."
+                            ),
                             "ts": now_ms,
                         }
-                    state_dirty = True
+                        state_dirty = True
 
     if state_dirty:
         await db.set_alert_state(symbol, side, alert_state)
@@ -500,12 +549,30 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
     except Exception:
         service = None
 
+    absence = _absence_counts(app)
     live_keys: set[tuple[Any, Any]] = set()
     for pos in positions:
         symbol = pos.get("symbol") if isinstance(pos, dict) else None
         side = pos.get("side") if isinstance(pos, dict) else None
         if symbol and side in ("long", "short"):
-            live_keys.add((symbol, side))
+            key = (symbol, side)
+            live_keys.add(key)
+            # C3: a position that was ABSENT on a prior cycle (absence>0) and is now
+            # back is a POTENTIAL same-price reopen within the close grace — the
+            # mgmt record was never closed, so the non-deviated frozen upsert path
+            # would let a FRESH position inherit be_done=True + a stale high_water
+            # (auto-BE never re-fires → stopped at a LOSS; trail uses a stale
+            # extreme). Treat reappearance-after-absence as a reopen: reset the
+            # baseline BEFORE processing so the fresh position re-arms cleanly. A
+            # normal continuous cycle (NO prior absence) never resets → the
+            # transient-glitch tolerance and the monotonic high-water are preserved.
+            if absence.pop(key, 0) > 0:
+                try:
+                    await db.reset_position_mgmt_baseline(symbol, side)
+                except Exception:
+                    log.warning(
+                        "trade monitor: reopen baseline reset failed", exc_info=True
+                    )
         try:
             await _process_position(app, db, client, settings, service, pos, now_ms)
         except Exception:
@@ -517,7 +584,6 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
     # a later re-open starts a fresh baseline). Only after _CLOSE_GRACE_CYCLES
     # CONSECUTIVE absences (I-2): a transient empty/partial snapshot must not
     # silently wipe a user's arming — a single glitchy cycle is forgiven.
-    absence = _absence_counts(app)
     attempts = _be_attempts(app)
     try:
         for row in await db.list_open_position_mgmt():
