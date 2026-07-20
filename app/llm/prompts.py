@@ -297,6 +297,11 @@ Rules:
    beyond the stop-loss. This early-invalidation level is SEPARATE from the
    decision_policy stop-anchor veto — see the invalidation-vs-stop-anchor rule
    defined there.
+   pre_mortem: before entry, name the SINGLE most likely reason THIS specific
+   trade fails (e.g. "HTF resistance at 1.92 rejects before tp1 triggers",
+   not a generic "the market could reverse"). One concise sentence, tied to
+   the actual levels/structure/regime above. Null only when action is
+   STAY_OUT.
 8. You are NOT placing orders. Your JSON is a suggestion for a human trader.
 9. setup_confidence and conviction_score are DERIVED per the CONFIDENCE
    DERIVATION table in decision_policy (do NOT anchor on "medium"). They are a
@@ -375,7 +380,8 @@ JSON schema:
   "confluences": [{"type": "string", "evidence": "string"}],
   "alternative_scenario": "string|null (if wrong, the counter-thesis)",
   "time_horizon": "scalp|intraday|swing|null",
-  "rationale": "short objective text"
+  "rationale": "short objective text",
+  "pre_mortem": "string|null (the ONE most likely reason this trade fails)"
 }
 </output_schema>
 """

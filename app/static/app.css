@@ -2625,6 +2625,24 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   white-space: pre-wrap;
 }
 
+.an-premortem {
+  /* Block 2/TP2 Task P3: distinct from .an-reason (analyst prose) and
+     .an-mgmt (accent-bordered facts) -- warn-toned so the one named failure
+     reason reads as a caution, not a data field or an action item. */
+  font-family: var(--sans);
+  font-size: var(--fs-md);
+  line-height: 1.55;
+  color: var(--muted);
+  padding: var(--space-2h) var(--space-3);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border-radius: var(--radius);
+  border-left: 2px solid var(--warn);
+  margin-bottom: 12px;
+  max-width: 62ch;
+}
+
+.an-premortem b { color: var(--warn); font-weight: 600; }
+
 .an-mgmt {
   display: flex;
   flex-direction: column;

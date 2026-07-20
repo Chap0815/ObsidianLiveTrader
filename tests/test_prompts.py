@@ -92,3 +92,16 @@ def test_schema_has_confluences_and_new_fields():
     p = build_system_prompt()
     for name in ("confluences", "conviction_score", "alternative_scenario", "time_horizon"):
         assert name in p, name
+
+
+def test_schema_has_pre_mortem():
+    """Block 2/TP2 Task P3: pre_mortem is an Optional TradeProposal field
+    (backward-compat: a proposal without it still parses) and is documented
+    in the prompt's <output_schema> block."""
+    from app.models import TradeProposal
+
+    assert "pre_mortem" in TradeProposal.model_fields
+    tp = TradeProposal(htf_trend="ranging", ltf_trend="ranging", action="STAY_OUT")
+    assert tp.pre_mortem is None
+    p = build_system_prompt()
+    assert "pre_mortem" in p

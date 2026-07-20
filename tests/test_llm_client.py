@@ -554,6 +554,14 @@ async def test_xai_schema_has_additional_properties_false(monkeypatch):
     # e.g. an empty/absent $defs.
     assert "$defs" in schema
     assert len(schema["$defs"]) >= 2
+    # Block 2/TP2 Task P3: pre_mortem must be DECLARED (so grok can emit it)
+    # but expressed as a nullable type, not dropped from `required` --
+    # _assert_all_objects_strict above already proves every property
+    # (pre_mortem included) is in `required`; this pins the nullable shape
+    # so a model that omits the reasoning still returns valid JSON (null),
+    # instead of the strict schema forcing a non-empty string.
+    pm = schema["properties"]["pre_mortem"]
+    assert {"type": "null"} in pm.get("anyOf", [])
 
     # Direct unit coverage of the helper itself on a synthetic schema that
     # mirrors the two shapes _strictify_schema must handle: a top-level

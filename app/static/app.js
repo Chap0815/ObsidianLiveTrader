@@ -5795,6 +5795,14 @@
     // Reasoning
     html += '<div class="an-reason">' + escapeHtml(p.rationale || "") + "</div>";
 
+    // Block 2/TP2 Task P3: Pre-Mortem — the KI's own named top failure
+    // reason for THIS trade, before entry. Purely display/advisory: only
+    // rendered when present, never affects any control/enable state below.
+    if (p.pre_mortem) {
+      html += '<div class="an-premortem"><b>Pre-Mortem · grösstes Risiko:</b> ' +
+        escapeHtml(p.pre_mortem) + "</div>";
+    }
+
     // U2-01: "Größe (KI)" — the conviction-tier sizing note from Task 14b
     // (high -> full risk budget / medium -> ~1/2 / low -> ~1/4). Was computed
     // by the LLM but never surfaced anywhere in the panel.

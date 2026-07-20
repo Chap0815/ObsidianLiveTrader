@@ -187,6 +187,12 @@ class TradeProposal(BaseModel):
     # Intended holding horizon (P2-08). Null when the LLM leaves it unset.
     time_horizon: TimeHorizon | None = None
     rationale: str = ""
+    # Block 2/TP2 Task P3: the ONE most likely reason THIS specific trade
+    # fails, named before entry (not a generic disclaimer). Purely additive/
+    # advisory display field -- optional so a response that omits it (older
+    # prompt version, model slip) still parses; never read by any gate,
+    # sizing or decision path.
+    pre_mortem: str | None = None
 
 
 class AnalyzeRequest(BaseModel):

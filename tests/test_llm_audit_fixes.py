@@ -251,6 +251,31 @@ def test_prompt_schema_mentions_invalidation_fields():
     assert "invalidation_tf" in prompt
 
 
+# --- Block 2/TP2 Task P3: pre_mortem (additive, advisory) -------------------
+
+
+def test_pre_mortem_absent_still_parses():
+    """VALID_BUY has no pre_mortem key -- backward-compat: an LLM response
+    from before this field existed (or one that omits it) must still parse,
+    with pre_mortem defaulting to None. Advisory-only: action is unaffected."""
+    p = parse_proposal(json.dumps(VALID_BUY))
+    assert p.pre_mortem is None
+    assert p.action == "BUY"
+
+
+def test_pre_mortem_present_flows_through_model_dump():
+    """When the LLM does provide pre_mortem, it parses and survives
+    model_dump() unchanged (main.py's analyze response is a straight
+    proposal.model_dump() passthrough) -- purely additive, no other field
+    is touched."""
+    payload = dict(VALID_BUY)
+    payload["pre_mortem"] = "HTF resistance at 68000 rejects before tp1 triggers"
+    p = parse_proposal(json.dumps(payload))
+    assert p.pre_mortem == "HTF resistance at 68000 rejects before tp1 triggers"
+    assert p.model_dump()["pre_mortem"] == p.pre_mortem
+    assert p.action == "BUY"
+
+
 def test_prompt_no_longer_calls_low_rrr_tradeable_unconditionally():
     """Regression for the RRR/prompt contradiction: the prompt must not tell
     the LLM a below-minimum-RRR setup is simply 'tradeable' without
