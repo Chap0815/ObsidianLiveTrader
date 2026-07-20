@@ -102,6 +102,10 @@ Python 3.11+ empfohlen.
 
 **Python-Isolation:** `start.bat` / `launch.py` installieren Pakete **nur** in `.\.venv` (`python -m pip --require-virtualenv`). Die System-/Haupt-Python wird höchstens für `python -m venv` genutzt, nie für globale `pip install`.
 
+**Existiert das `.venv` bereits, braucht `start.bat` gar kein System-`python`** — es nutzt dann direkt `.\.venv\Scripts\python.exe`. Nur beim *allerersten* Anlegen des venv muss ein `py`/`python` im PATH sein.
+
+> **Troubleshooting — „Python nicht gefunden. Bitte Python 3.11+ installieren", obwohl Python (z. B. 3.12) installiert ist:** Dann ist `py`/`python` nur nicht im PATH auffindbar (häufig: Installation ohne „py launcher"/„Add to PATH", oder der Microsoft-Store-Platzhalter). **Sofort-Workaround** (venv vorhanden): `.\.venv\Scripts\python.exe -m app` bzw. `.\.venv\Scripts\python.exe scripts\launch.py`. **Dauerhaft:** Python 3.11+ mit angehaktem „py launcher" + „Add python.exe to PATH" (Reparatur-Installation reicht), oder den Store-Alias unter *Einstellungen → Apps → App-Ausführungsaliase* für `python.exe`/`python3.exe` abschalten; danach `py -3 --version` prüfen.
+
 ---
 
 ## Umgebungsvariablen (`.env`)

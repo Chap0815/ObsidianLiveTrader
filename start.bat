@@ -8,6 +8,16 @@ echo.
 
 set "BOOTSTRAP="
 
+REM Ein bereits vorhandenes Projekt-.venv direkt nutzen — dann braucht start.bat
+REM KEIN System-py/python. (Haeufige Falle: Python 3.12 ist installiert, aber
+REM nicht als py/python im PATH auffindbar; das venv existiert trotzdem.) Der
+REM System-Python-Bootstrap unten laeuft dann nur noch beim allerersten Start,
+REM wenn das .venv erst angelegt werden muss.
+if exist ".venv\Scripts\python.exe" (
+  set "BOOTSTRAP=.venv\Scripts\python.exe"
+  goto run
+)
+
 REM WICHTIG: "if errorlevel N" (statt "if %ERRORLEVEL%==0") verwenden — in
 REM einem verschachtelten Klammerblock wuerde %ERRORLEVEL% beim Parsen des
 REM GESAMTEN aeusseren if/else einmalig eingesetzt ("eingefroren") und damit
@@ -51,6 +61,7 @@ REM Bootstrap: nur launch.py starten. launch.py erzeugt .venv und installiert
 REM ausschliesslich dorthin (python -m pip --require-virtualenv). launch.py
 REM prueft zusaetzlich als Allererstes die Python-Version (>=3.11) selbst.
 
+:run
 if /I "%~1"=="setup" (
   !BOOTSTRAP! scripts\launch.py --setup %2 %3 %4
 ) else (
