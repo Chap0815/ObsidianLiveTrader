@@ -35,3 +35,6 @@ docs/superpowers/HANDOFF-*.md
 docs/NACHT_AUDIT_LOG.md
 docs/NACHT_AUDIT_PROMPT.md
 docs/OPTIMIERUNG_PLAN.md
+
+# Windows-Verknuepfungen (maschinenspezifische absolute Pfade) — via scripts/create-shortcut.ps1 erzeugen
+*.lnk
