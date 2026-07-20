@@ -174,6 +174,7 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `TM_TRAIL_ACTIVATION_R` | `1.0` | Auto-Trail aktiviert erst ab diesem unrealisierten R; `[0, 10]` |
 | `TM_TRAIL_ATR_PERIOD` | `14` | ATR-Periode (Wilder) für den Trail; `[2, 100]` |
 | `TM_TRAIL_ATR_TF` | `15m` | Timeframe der ATR-Kerzen für den Trail; eine von `5m, 15m, 1h, 4h` |
+| `TM_RECAL_MIN_SAMPLE` | `20` | Confidence-Rekalibrierung: Mindest-Samples je Tier, bevor die reale Trefferquote die *angezeigte* Confidence/Sizing-Empfehlung anpasst; `[1, 1000]` |
 
 **Trade-Management-Layer (v1):** ein server-seitiger Monitor läuft mit dem Prozess
 und überwacht offene Positionen. Standard = nur **Alarme** (Thesis-Invalidierung,
@@ -197,6 +198,18 @@ Er feuert **wiederholt** (kein Einmal-Latch), jeder Zug ist monoton enger. Der
 Time-Stop bleibt reiner **Alarm** (kein autonomes Schließen). Kosten: **+1
 `klines`-Fetch pro scharfgeschalteter Trail-Position und Zyklus** (pro Symbol/TF
 gecacht).
+
+**KI-Kalibrierung & Ehrlichkeit (advisory, ändert NIE eine Entscheidung):** Der
+Analyze-Pfad kennzeichnet jeden Trade mit einem **Regime-Tag** (BTC-Trend ×
+Volatilität) im Journal für spätere Segmentierung (`by_regime`). Aus der eigenen
+realen Trefferquote (Wilson-**Untergrenze**, ab `TM_RECAL_MIN_SAMPLE` Samples)
+**rekalibriert** die App die *angezeigte* Confidence und die *Sizing-Empfehlung*
+(Downgrade + kleinere Empfehlung bei schwacher Quote) — die rohe KI-`setup_confidence`
+bleibt sichtbar, und es wird **nie** ein Trade geblockt oder `action` geändert
+(zusätzliche Response-Felder `confidence_calibrated`/`calibration_note`/`size_factor`;
+der echte Order-/Gate-Pfad ist unberührt). Jede Analyse nennt zudem ein
+**Pre-Mortem** (`pre_mortem`): den einen wahrscheinlichsten Grund, warum der Trade
+scheitert — vor dem Einstieg.
 
 ### Wechsel auf Mainnet
 
