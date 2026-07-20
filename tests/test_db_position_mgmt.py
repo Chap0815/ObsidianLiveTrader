@@ -43,11 +43,14 @@ async def test_upsert_inserts_then_updates_same_open_row(db_path):
     assert first["be_done"] == 0
 
     # Same entry (within tolerance) -> update the SAME OPEN record, not a new one.
+    # The BASELINE stays FROZEN (spec §4): initial_sl_snap/r1 must NOT drift to
+    # the re-sighted stop, so "+1R" keeps measuring from the original risk.
     await db.upsert_position_mgmt(**_base_kwargs(entry_snap=100.0005, initial_sl_snap=98.5))
     rows = await db.list_open_position_mgmt()
     assert len(rows) == 1
     assert rows[0]["id"] == first["id"]
-    assert rows[0]["initial_sl_snap"] == 98.5
+    assert rows[0]["initial_sl_snap"] == 98.0  # frozen, NOT the re-sighted 98.5
+    assert rows[0]["r1"] == 2.0  # frozen
 
 
 @pytest.mark.asyncio

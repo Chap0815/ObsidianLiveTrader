@@ -743,17 +743,19 @@ class Database:
             if existing is not None and not _entry_deviated(
                 float(existing["entry_snap"]), entry_snap
             ):
+                # Non-deviated re-sighting: the BASELINE (entry_snap,
+                # initial_sl_snap, r1, opened_at) is FROZEN at creation so "+1R"
+                # is always measured from the ORIGINAL risk even after the stop
+                # is later moved (spec §4 — r1 must stay stable when the SL
+                # wanders). Only the volatile invalidation_price (a fresh proposal
+                # may update it) and updated_at are refreshed.
                 await conn.execute(
                     """
                     UPDATE position_management
-                    SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
-                        invalidation_price = ?, updated_at = ?
+                    SET invalidation_price = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (
-                        entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, existing["id"],
-                    ),
+                    (invalidation_price, now, existing["id"]),
                 )
                 await conn.commit()
                 return int(existing["id"])
