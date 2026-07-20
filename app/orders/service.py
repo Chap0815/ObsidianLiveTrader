@@ -378,9 +378,14 @@ class OrderService:
         self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
 
     async def _balances(self) -> tuple[float, float]:
-        """Return (equity, available). Fail-closed on API/mapping errors."""
+        """Return (equity, available). Fail-closed on API/mapping errors.
+
+        fresh=True: this equity feeds order SIZING/gating, so it must never come
+        from the 429 stale-serve cache (which could hand back optimistic-high
+        equity during a volatile rate-limit burst and let an oversized order pass
+        MAX_RISK_PCT). On a 429 here we fail closed instead."""
         try:
-            assets = await self.client.assets()
+            assets = await self.client.assets(fresh=True)
             equity, available = usdt_balances(assets)
         except ExchangeError as e:
             raise OrderError(f"equity unavailable: {e}") from e
@@ -399,7 +404,9 @@ class OrderService:
         the sizing endpoint all use identical aggregate semantics (R-01).
         """
         try:
-            positions = await self.client.positions(symbol)
+            # fresh=True: aggregate-exposure input to the risk gate — never the
+            # 429 stale-serve cache (stale positions could understate open risk).
+            positions = await self.client.positions(symbol, fresh=True)
         except ExchangeError as e:
             # Fail-closed: treating unknown exposure as 0 would understate MAX_RISK_PCT
             raise OrderError(

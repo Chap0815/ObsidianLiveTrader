@@ -335,8 +335,12 @@ class MexcClient:
         return parse_contract_meta(row)
 
     async def klines(
-        self, symbol: str, interval: str, limit_hint: int = 200
+        self, symbol: str, interval: str, limit_hint: int = 200, *, paced: bool = False
     ) -> list[Candle]:
+        # `paced` is accepted for interface parity with HyperliquidClient (the
+        # scanner passes it uniformly); MEXC has no HL-style read-rate budget, so
+        # it's a no-op here (its fan-out is bounded by the scanner's semaphore).
+        _ = paced
         mexc_interval = INTERVAL_MAP.get(interval, interval)
         params: dict[str, Any] = {"interval": mexc_interval}
         sec = _INTERVAL_SECONDS.get(interval) or _INTERVAL_SECONDS.get(mexc_interval)
@@ -402,14 +406,21 @@ class MexcClient:
 
     # ── private ─────────────────────────────────────────────────────────
 
-    async def assets(self) -> list[dict[str, Any]]:
+    async def assets(self, *, fresh: bool = False) -> list[dict[str, Any]]:
+        # `fresh` is accepted for interface parity with HyperliquidClient (money
+        # reads request it); MEXC issues a live request every call and has no
+        # stale-serve cache, so it's already effectively fresh — no-op.
+        _ = fresh
         data = await self._request(
             "GET", "/api/v1/private/account/assets", private=True
         )
         return list(data or [])
 
-    async def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+    async def positions(
+        self, symbol: str | None = None, *, fresh: bool = False
+    ) -> list[dict[str, Any]]:
         """GET /api/v1/private/position/open_positions"""
+        _ = fresh  # interface parity — MEXC has no stale-serve cache (see assets)
         params = {"symbol": symbol} if symbol else None
         data = await self._request(
             "GET",
@@ -419,7 +430,7 @@ class MexcClient:
         )
         return list(data or [])
 
-    async def account_snapshot(self) -> dict[str, Any]:
+    async def account_snapshot(self, *, fresh: bool = False) -> dict[str, Any]:
         """Fetch assets + open positions and map to API account shape.
 
         Each position gets its OWN contract_size (F-10) — resolved from
@@ -428,8 +439,8 @@ class MexcClient:
         fails or a symbol is missing from it, map_position safely defaults
         that position's contract_size to 1.0.
         """
-        assets_raw = await self.assets()
-        positions_raw = await self.positions()
+        assets_raw = await self.assets(fresh=fresh)
+        positions_raw = await self.positions(fresh=fresh)
         contract_sizes: dict[str, float] = {}
         if positions_raw:
             try:

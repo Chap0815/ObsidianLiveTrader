@@ -74,15 +74,65 @@ _USER_STATE_MAX_STALE_S = 8.0
 # instead of surfacing a 502. NEVER applied to the money path (place/modify/
 # cancel): a 429 there might follow a send that actually landed, so a silent
 # resend could double the order — those fail honestly.
-_RATE_LIMIT_RETRIES = 3
-_RATE_LIMIT_BACKOFF_S = 0.5  # 0.5s, 1.0s, 2.0s (exp) → ~3.5s worst-case
+_RATE_LIMIT_RETRIES = 2
+# 0.5s, 1.0s (exp) → ~1.5s worst-case. Kept short on purpose: a longer retry
+# chain on a monitor read fan-out under sustained 429 would push the trade-monitor
+# cycle past its interval and delay auto-BE/trailing.
+_RATE_LIMIT_BACKOFF_S = 0.5
+# Hard ceiling on a single token-bucket wait so a fat-fingered tiny hl_read_max_rps
+# (e.g. a per-minute/per-second mix-up) can never stall the read path for minutes.
+_MAX_ACQUIRE_WAIT_S = 5.0
 
 
 def _is_rate_limited(e: Exception) -> bool:
-    """True iff the SDK exception is a Hyperliquid 429 (rate limit)."""
+    """True iff the SDK exception is a Hyperliquid 429 (rate limit).
+
+    Primary signal is the SDK's ClientError.status_code (always set to 429 on a
+    real rate-limit); the text fallback matches the standard reason phrase rather
+    than the bare digits "429" (which could appear in a price/id and cause a
+    spurious retry on an unrelated error)."""
     if getattr(e, "status_code", None) == 429:
         return True
-    return "429" in str(e)
+    return "too many requests" in str(e).lower()
+
+
+class _AsyncTokenBucket:
+    """Async token bucket that paces HL READ calls under the per-IP rate limit.
+
+    Refills at ``rate`` tokens/sec up to ``capacity``. ``acquire()`` returns
+    immediately while tokens remain (a short burst passes free) and otherwise
+    sleeps just long enough for one token to accrue — turning a scanner klines
+    flood (up to ~universe_size×3 calls) into a paced stream instead of a 429
+    burst. The lock is intentionally held across the sleep so waiters form an
+    ordered, evenly-spaced queue at the target rate.
+
+    NEVER used for the money path (place/modify/cancel): an order must not wait
+    behind a scanner fan-out. See HyperliquidClient._to_thread.
+    """
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self._rate = max(1e-6, float(rate))
+        self._capacity = max(1.0, float(capacity))
+        self._tokens = self._capacity
+        self._last: float | None = None
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if self._last is None:
+                self._last = now
+            self._tokens = min(
+                self._capacity, self._tokens + (now - self._last) * self._rate
+            )
+            self._last = now
+            if self._tokens < 1.0:
+                wait = min(_MAX_ACQUIRE_WAIT_S, (1.0 - self._tokens) / self._rate)
+                await asyncio.sleep(wait)
+                self._tokens = 0.0
+                self._last = time.monotonic()
+            else:
+                self._tokens -= 1.0
 
 
 def round_hl_price(px: float, sz_decimals: int) -> float:
@@ -223,6 +273,20 @@ class HyperliquidClient:
         # Feeds oi_change_pct_1h / _4h in market_extras(). In-memory only —
         # resets on restart (advisory context, not persisted state).
         self._oi_history: dict[str, list[tuple[float, float]]] = {}
+        # Shared read-rate budget (proaktiv gegen 429). Read-path _to_thread calls
+        # pass through this bucket; money-path calls bypass it. rps<=0 disables it.
+        # Settings read defensively so client construction never fails on config.
+        try:
+            from app.config import get_settings
+
+            _s = get_settings()
+            _rps = float(getattr(_s, "hl_read_max_rps", 10.0))
+            _burst = float(getattr(_s, "hl_read_burst", 20.0))
+        except Exception:
+            _rps, _burst = 10.0, 20.0
+        self._read_limiter: _AsyncTokenBucket | None = (
+            _AsyncTokenBucket(_rps, _burst) if _rps > 0 else None
+        )
 
     def _meta_ctxs_sync(self, ttl: float = 2.0):
         """meta_and_asset_ctxs() with a short TTL cache (runs inside a thread)."""
@@ -362,7 +426,9 @@ class HyperliquidClient:
         self._executor_trade.shutdown(wait=False, cancel_futures=True)
         self._executor_data.shutdown(wait=False, cancel_futures=True)
 
-    async def _to_thread(self, fn, *args, money_path: bool = False, **kwargs):
+    async def _to_thread(
+        self, fn, *args, money_path: bool = False, paced: bool = False, **kwargs
+    ):
         """Run SDK call on a dedicated, size-bounded executor.
 
         Q-01: money-path calls (place/cancel/close/modify) route to the RESERVED
@@ -380,15 +446,21 @@ class HyperliquidClient:
         call = functools.partial(fn, *args, **kwargs) if (args or kwargs) else fn
         attempts = 0
         while True:
+            # Pace ONLY reads that opt in (the scanner klines fan-out) through the
+            # shared token bucket, and do it INSIDE the retry loop so retries also
+            # re-pace — otherwise a 429 storm's retries would bypass the limiter and
+            # multiply the upstream request rate exactly when it must not. Interactive
+            # and monitor reads pass paced=False: they're low-volume and rely on the
+            # 429-retry + stale cache, and must never queue behind a scan (priority
+            # inversion). The money path is NEVER paced or retried — an order must
+            # not wait behind a scan, nor be auto-resent (double-order risk).
+            if paced and not money_path and self._read_limiter is not None:
+                await self._read_limiter.acquire()
             try:
                 return await loop.run_in_executor(executor, call)
             except HyperliquidError:
                 raise
             except Exception as e:
-                # Transient 429 → short exponential backoff + retry, but ONLY on a
-                # read/data path. A money-path call (place/modify/cancel) must
-                # NEVER be auto-resent on 429: the first send may already have
-                # landed and a retry could double it. Money path fails honestly.
                 if (
                     not money_path
                     and attempts < _RATE_LIMIT_RETRIES
@@ -619,7 +691,7 @@ class HyperliquidClient:
         return await self._to_thread(_x)
 
     async def klines(
-        self, symbol: str, interval: str, limit_hint: int = 200
+        self, symbol: str, interval: str, limit_hint: int = 200, *, paced: bool = False
     ) -> list[Candle]:
         def _k():
             coin = to_hl_coin(symbol)
@@ -669,7 +741,7 @@ class HyperliquidClient:
                 out = out[-limit_hint:]
             return out
 
-        return await self._to_thread(_k)
+        return await self._to_thread(_k, paced=paced)
 
     @staticmethod
     def _validate_user_state(state: Any) -> dict[str, Any]:
@@ -694,7 +766,12 @@ class HyperliquidClient:
         return state
 
     def _user_state_cached(
-        self, info: Any, addr: str, ttl: float = _USER_STATE_TTL_S
+        self,
+        info: Any,
+        addr: str,
+        ttl: float = _USER_STATE_TTL_S,
+        *,
+        allow_stale: bool = True,
     ) -> dict[str, Any]:
         """info.user_state(addr) behind a short TTL cache with 429/error ride-out.
 
@@ -703,21 +780,32 @@ class HyperliquidClient:
         cache. On a fetch/validate EXCEPTION (esp. the 429 ClientError) fall back
         to a bounded-stale cached state (age <= _USER_STATE_MAX_STALE_S) so a
         transient rate-limit burst degrades to a slightly stale read for the
-        display/monitor/risk-gate paths instead of 502-ing; if no usable cache
-        exists it re-raises, so a genuine "no data" still fails honestly.
+        display/monitor paths instead of 502-ing; if no usable cache exists it
+        re-raises, so a genuine "no data" still fails honestly.
+
+        allow_stale=False (money-DECISION reads: entry sizing/gate equity &
+        aggregate-position exposure) DISABLES the stale ride-out: a 429 there
+        fails closed rather than sizing an order against up-to-8s-stale, likely
+        optimistic-high equity. The 2s TTL still applies (a <=2s-old value is
+        fresh enough and its origin is a real fetch, not an error fallback).
 
         NOTE: this is deliberately NOT used by the F-08 close-path TOCTOU re-read,
         which must stay a fresh live read to catch an externally flipped position.
         """
-        now = time.time()
         cache = self._user_state_cache
-        if cache is not None and cache[2] == addr and (now - cache[0]) < ttl:
+        if cache is not None and cache[2] == addr and (time.time() - cache[0]) < ttl:
             return self._validate_user_state(cache[1])
         try:
             state = self._validate_user_state(info.user_state(addr))
         except Exception as e:
+            # Measure staleness AFTER the (possibly slow / up-to-http_timeout_s
+            # blocking) fetch, so the 8s bound reflects the ACTUAL age of what
+            # we'd serve — a timed-out fetch must not serve ~18s-old money data
+            # while logging it as "aged 7.9s".
+            now = time.time()
             if (
-                cache is not None
+                allow_stale
+                and cache is not None
                 and cache[2] == addr
                 and (now - cache[0]) <= _USER_STATE_MAX_STALE_S
             ):
@@ -732,11 +820,11 @@ class HyperliquidClient:
                     self._user_state_stale_warned = True
                 return self._validate_user_state(cache[1])
             raise
-        self._user_state_cache = (now, state, addr)
+        self._user_state_cache = (time.time(), state, addr)
         self._user_state_stale_warned = False
         return state
 
-    async def assets(self) -> list[dict[str, Any]]:
+    async def assets(self, *, fresh: bool = False) -> list[dict[str, Any]]:
         def _a():
             if not self.account_address and not self.private_key:
                 return []
@@ -748,7 +836,7 @@ class HyperliquidClient:
 
                 addr = Account.from_key(self.private_key).address
                 self.account_address = addr
-            state = self._user_state_cached(info, addr)
+            state = self._user_state_cached(info, addr, allow_stale=not fresh)
             margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
             equity = float(margin.get("accountValue") or 0)
             withdrawable = float(state.get("withdrawable") or 0)
@@ -774,7 +862,9 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"user_state failed: {e}") from e
 
-    async def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+    async def positions(
+        self, symbol: str | None = None, *, fresh: bool = False
+    ) -> list[dict[str, Any]]:
         def _p():
             if not self.account_address and not self.private_key:
                 return []
@@ -784,7 +874,7 @@ class HyperliquidClient:
                 from eth_account import Account
 
                 addr = Account.from_key(self.private_key).address
-            state = self._user_state_cached(info, addr)
+            state = self._user_state_cached(info, addr, allow_stale=not fresh)
             rows = []
             coin_f = to_hl_coin(symbol) if symbol else None
             for ap in state.get("assetPositions") or []:
@@ -880,11 +970,11 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"user_fills failed: {e}") from e
 
-    async def account_snapshot(self) -> dict[str, Any]:
+    async def account_snapshot(self, *, fresh: bool = False) -> dict[str, Any]:
         from app.mexc.client import map_account_snapshot
 
-        assets = await self.assets()
-        positions = await self.positions()
+        assets = await self.assets(fresh=fresh)
+        positions = await self.positions(fresh=fresh)
         return map_account_snapshot(assets, positions)
 
     async def set_leverage(

@@ -308,10 +308,14 @@ async def build_scan_contexts(
                 # 6) stays close to the old 4, still net faster than sequential.
                 # Fail-safe preserved: a failed ltf/htf raises -> handled below;
                 # _fetch_daily_candles never raises (returns [] -> "unknown").
+                # paced=True: this whole-universe klines fan-out (up to
+                # universe_size×3 calls) is THE burst that trips Hyperliquid 429.
+                # Route it through the client's read-rate token bucket so it stays
+                # under the per-IP limit; interactive/monitor reads stay unpaced.
                 ltf_candles, htf_candles, daily_candles = await asyncio.gather(
-                    client.klines(sym, tf, limit_hint=kline_limit),
-                    client.klines(sym, htf, limit_hint=kline_limit),
-                    _fetch_daily_candles(client, sym, daily, kline_limit),
+                    client.klines(sym, tf, limit_hint=kline_limit, paced=True),
+                    client.klines(sym, htf, limit_hint=kline_limit, paced=True),
+                    _fetch_daily_candles(client, sym, daily, kline_limit, paced=True),
                 )
             except Exception as e:  # exchange hiccup on one coin must not kill the scan
                 errors.append(f"{sym}: {e}")
@@ -334,7 +338,7 @@ async def build_scan_contexts(
         # RAW rate is intentionally omitted here -- the prompt only ever reads
         # fundingExtreme/fundingAnnualized (see SCANNER_SYSTEM_PROMPT point 4),
         # so shipping the raw number too was pure token ballast repeated across
-        # up to scanner_max_coins (20) coins per scan.
+        # every coin in the scan universe (up to scanner_universe_size).
         if isinstance(rate, (int, float)):
             ctx["funding_extreme"] = _funding_extreme(rate)
             ctx["funding_annualized"] = _funding_annualized(rate, None)
@@ -797,12 +801,21 @@ async def scan_with_llm(
     if mode == "prefilter" and len(contexts) > settings.scanner_llm_chunk_max:
         mid = (len(contexts) + 1) // 2
         chunks = [contexts[:mid], contexts[mid:]]
+        # Run the two screener chunks CONCURRENTLY — they are independent LLM
+        # calls, so a sequential await would double the scan's LLM-latency budget
+        # and (stacked on the paced klines phase) could push a slow scan past the
+        # frontend's request-abort window.
+        chunk_calls = await asyncio.gather(
+            *(
+                _call_scanner_llm(
+                    SCANNER_SYSTEM_PROMPT, _scan_user_prompt(chunk), settings
+                )
+                for chunk in chunks
+            )
+        )
         merged: list[ScanResult] = []
         model_used = "none"
-        for chunk in chunks:
-            text, model_used = await _call_scanner_llm(
-                SCANNER_SYSTEM_PROMPT, _scan_user_prompt(chunk), settings
-            )
+        for chunk, (text, model_used) in zip(chunks, chunk_calls):
             merged.extend(_parse_scan_or_raise(text, _allowed(chunk), model_used))
         return _merge_scan_results(merged), model_used
 

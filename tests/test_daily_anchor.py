@@ -24,7 +24,7 @@ class _CountingClient:
             min_vol=0.001, max_vol=1e6, max_leverage=50, api_allowed=True,
         )
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         self.kline_calls[interval] = self.kline_calls.get(interval, 0) + 1
         return [
             Candle(time=(1_700_000_000 + i * 900) * 1000,
@@ -85,7 +85,7 @@ class _DailyRaisingClient(_CountingClient):
     used to verify the fail-safe: a daily fetch error must not blow up
     build_market_snapshot, it must just yield daily=None."""
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         if interval == "1D":
             self.kline_calls[interval] = self.kline_calls.get(interval, 0) + 1
             raise RuntimeError("daily fetch boom")
@@ -109,7 +109,7 @@ class _DepthClient:
     def __init__(self):
         self.daily_limits: list[int] = []
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         self.daily_limits.append(limit_hint)
         return [
             Candle(

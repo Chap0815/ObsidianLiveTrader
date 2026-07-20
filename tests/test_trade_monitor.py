@@ -35,7 +35,7 @@ class FakeClient:
             # Presence is all that matters (the real write goes via the spy).
             self.place_stop_order = lambda *a, **k: None
 
-    async def account_snapshot(self):
+    async def account_snapshot(self, *, fresh=False):
         return {"positions": self._positions}
 
     async def ticker(self, symbol):

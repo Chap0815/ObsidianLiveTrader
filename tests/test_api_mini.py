@@ -26,7 +26,7 @@ def _candles(closes):
 def _mock_client(by_symbol):
     mock = MagicMock()
 
-    async def klines(symbol, interval, limit_hint=200):
+    async def klines(symbol, interval, limit_hint=200, *, paced=False):
         return by_symbol[symbol]
 
     mock.klines = AsyncMock(side_effect=klines)
@@ -87,7 +87,7 @@ def test_mini_per_symbol_error_isolated():
     def _mk():
         mock = MagicMock()
 
-        async def klines(symbol, interval, limit_hint=200):
+        async def klines(symbol, interval, limit_hint=200, *, paced=False):
             if symbol == "ETH_USDT":
                 raise RuntimeError("boom")
             return _candles([1.0, 1.1])
@@ -130,7 +130,7 @@ def test_mini_cache_preserves_errors():
     def _mk():
         mock = MagicMock()
 
-        async def klines(symbol, interval, limit_hint=200):
+        async def klines(symbol, interval, limit_hint=200, *, paced=False):
             if symbol == "ETH_USDT":
                 raise RuntimeError("boom")
             return _candles([1.0, 1.1])

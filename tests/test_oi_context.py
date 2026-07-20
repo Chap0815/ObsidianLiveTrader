@@ -35,7 +35,7 @@ class _FakeMarketClient:
             min_vol=0.001, max_vol=1e6, max_leverage=50, api_allowed=True,
         )
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         return self._candles()
 
 

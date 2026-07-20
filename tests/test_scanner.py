@@ -36,7 +36,7 @@ def test_parse_scan_results_empty():
 @pytest.mark.asyncio
 async def test_build_scan_contexts_survives_single_coin_failure():
     class FakeClient:
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             if symbol == "BROKEN":
                 raise RuntimeError("exchange down for this coin")
             base = 100.0 if symbol == "BTC" else 10.0
@@ -157,7 +157,7 @@ async def test_scanner_context_omits_raw_funding_rate():
     clear_daily_cache()
 
     class FakeClient:
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             base = 100.0
             return [
                 Candle(
@@ -183,7 +183,7 @@ async def test_build_scan_contexts_adds_funding_extreme_and_daily_regime():
     clear_daily_cache()
 
     class FakeClient:
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             base = 100.0
             return [
                 Candle(
@@ -234,7 +234,7 @@ async def test_build_scan_contexts_threads_oi_read_when_present():
     clear_daily_cache()
 
     class FakeClient:
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             # rising closes so the ~1h price direction reads 'up'
             return [
                 Candle(
@@ -272,7 +272,7 @@ async def test_build_scan_contexts_fetches_timeframes_concurrently():
             self.inflight = 0
             self.max_inflight = 0
 
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             try:
@@ -307,7 +307,7 @@ async def test_build_scan_contexts_isolates_error_with_gather():
     clear_daily_cache()
 
     class FakeClient:
-        async def klines(self, symbol, interval, limit_hint=120):
+        async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             if symbol == "BROKEN":
                 raise RuntimeError("exchange down for this coin")
             return [

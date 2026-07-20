@@ -2525,7 +2525,11 @@ async def sizing_suggest(
     existing_risk_warnings: list[str] = []
     if exchange_ready(s):
         try:
-            snap = await client.account_snapshot()
+            # fresh=True: this snapshot sizes an order (suggest_vol + aggregate
+            # risk), so it must bypass the 429 stale-serve cache — a 429 here
+            # yields equity=0 → "equity unavailable for sizing" (fail-closed)
+            # rather than sizing against stale, likely optimistic-high equity.
+            snap = await client.account_snapshot(fresh=True)
             equity = float(snap.get("equity_usdt") or 0)
             available = float(snap.get("available_usdt") or 0)
         except ExchangeError:

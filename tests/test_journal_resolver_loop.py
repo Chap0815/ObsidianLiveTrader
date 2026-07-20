@@ -25,13 +25,13 @@ class FakeClient:
         self.candles_by_symbol = candles_by_symbol
         self.calls = []
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         self.calls.append((symbol, interval, limit_hint))
         return self.candles_by_symbol[symbol]
 
 
 class RaisingClient:
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         raise RuntimeError("exchange down")
 
 

@@ -166,7 +166,13 @@ def clear_daily_cache() -> None:
 
 
 async def _fetch_daily_candles(
-    client: Any, symbol: str, daily: str, limit_hint: int, *, ttl: float = _DAILY_TTL_S
+    client: Any,
+    symbol: str,
+    daily: str,
+    limit_hint: int,
+    *,
+    ttl: float = _DAILY_TTL_S,
+    paced: bool = False,
 ) -> list[Candle]:
     """Daily anchor fetch. ADVISORY: must NEVER break the snapshot — a failed
     1D fetch returns [] (daily_slice=None, prompt falls back to htf). Errors
@@ -182,7 +188,7 @@ async def _fetch_daily_candles(
     if hit is not None and (now - hit[0]) < ttl and hit[2] >= limit_hint:
         return hit[1]
     try:
-        candles = await client.klines(symbol, daily, limit_hint=limit_hint)
+        candles = await client.klines(symbol, daily, limit_hint=limit_hint, paced=paced)
     except Exception:
         return []  # do not cache errors
     _daily_cache[key] = (now, candles, limit_hint)

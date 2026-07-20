@@ -261,6 +261,116 @@ async def test_to_thread_does_not_retry_non_429(monkeypatch):
     assert calls["n"] == 1
 
 
+# ── read-rate budget (token bucket paces scanner flood; money path bypasses) ──
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_bursts_then_paces(monkeypatch):
+    """The first `capacity` acquires pass free (burst); the next one must sleep
+    ~1/rate — this is what turns the 75-coin klines flood into a paced stream."""
+    import app.hyperliquid.client as mod
+
+    slept: list[float] = []
+
+    async def _fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", _fake_sleep)
+    b = mod._AsyncTokenBucket(rate=5.0, capacity=3.0)
+    for _ in range(3):
+        await b.acquire()
+    assert slept == []  # burst of 3 passes without pacing
+    await b.acquire()
+    assert len(slept) == 1 and slept[0] > 0  # 4th call paced
+
+
+@pytest.mark.asyncio
+async def test_only_paced_reads_consume_a_token():
+    """Pacing is OPT-IN (only the scanner klines fan-out passes paced=True). An
+    unpaced interactive read must NOT queue on the bucket (no priority inversion),
+    and the money path is never paced even if paced=True is passed."""
+    c = _client(MagicMock())
+    calls = {"n": 0}
+
+    class _SpyBucket:
+        async def acquire(self):
+            calls["n"] += 1
+
+    c._read_limiter = _SpyBucket()
+    assert await c._to_thread(lambda: "ok", paced=True) == "ok"  # paced read → token
+    assert await c._to_thread(lambda: "ok") == "ok"  # unpaced read → no token
+    assert (
+        await c._to_thread(lambda: "ok", money_path=True, paced=True) == "ok"
+    )  # money path → never paced
+    assert calls["n"] == 1  # only the paced read consumed a token
+
+
+@pytest.mark.asyncio
+async def test_paced_read_repaces_each_retry(monkeypatch):
+    """Finding 1: a paced read that 429s must RE-acquire a token for every retry,
+    so a 429 storm's retries stay under the rate limit instead of bypassing it."""
+    import app.hyperliquid.client as mod
+
+    monkeypatch.setattr(mod, "_RATE_LIMIT_BACKOFF_S", 0.0)
+    c = _client(MagicMock())
+    tokens = {"n": 0}
+
+    class _SpyBucket:
+        async def acquire(self):
+            tokens["n"] += 1
+
+    c._read_limiter = _SpyBucket()
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _Boom(429)
+        return "ok"
+
+    assert await c._to_thread(fn, paced=True) == "ok"
+    assert calls["n"] == 3  # 2 retries then success
+    assert tokens["n"] == 3  # one token acquired PER attempt (re-paced)
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_clamps_pathological_sleep(monkeypatch):
+    """A fat-fingered tiny rps must never produce a multi-minute lock-held sleep:
+    each acquire wait is clamped to _MAX_ACQUIRE_WAIT_S."""
+    import app.hyperliquid.client as mod
+
+    slept: list[float] = []
+
+    async def _fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", _fake_sleep)
+    b = mod._AsyncTokenBucket(rate=1e-6, capacity=1.0)  # absurdly slow
+    await b.acquire()  # first token free (capacity 1)
+    await b.acquire()  # must pace — but clamped, not ~11 days
+    assert slept and slept[-1] <= mod._MAX_ACQUIRE_WAIT_S
+
+
+@pytest.mark.asyncio
+async def test_assets_fresh_fails_closed_on_429_despite_warm_cache(monkeypatch):
+    """Money-decision reads (assets(fresh=True), feeding order sizing/gate) must
+    NOT accept the 8s stale-serve: a 429 with a warm cache still raises, so sizing
+    fails closed rather than sizing against stale, optimistic-high equity."""
+    import app.hyperliquid.client as mod
+
+    monkeypatch.setattr(mod, "_RATE_LIMIT_BACKOFF_S", 0.0)
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    await c.assets()  # warm the cache
+    ts, state, addr = c._user_state_cache
+    c._user_state_cache = (time.time() - 3.0, state, addr)  # aged past TTL, within 8s
+    info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
+    # Contrast: a non-fresh read would serve the stale cache; fresh must fail closed.
+    with pytest.raises(HyperliquidError):
+        await c.assets(fresh=True)
+
+
 # ── H-2: totalNtlPos is notional exposure, not unrealized PnL ─────────────────
 
 

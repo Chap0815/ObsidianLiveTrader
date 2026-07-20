@@ -92,7 +92,7 @@ class _BtcClient:
     def __init__(self):
         self.calls = {}
 
-    async def klines(self, symbol, interval, limit_hint=200):
+    async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
         self.calls[interval] = self.calls.get(interval, 0) + 1
         # rising closes -> ema20>ema50>ema200, price above all -> bullish
         return [
@@ -129,7 +129,7 @@ async def test_fetch_btc_regime_degrades_on_empty():
     clear_daily_cache()  # ensure the empty client isn't served stale candles
 
     class _Empty:
-        async def klines(self, symbol, interval, limit_hint=200):
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
             return []
 
     assert await fetch_btc_regime(_Empty()) is None

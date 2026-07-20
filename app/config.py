@@ -151,17 +151,27 @@ class Settings(BaseSettings):
     # Default prefilter; classic bleibt als Fallback byte-genau erhalten.
     scanner_mode: str = "prefilter"
     # Kandidaten aus market_overview im prefilter-Mode (Universum vor Klines).
-    scanner_universe_size: int = 50
+    scanner_universe_size: int = 75
     # Top-N je Ranking-Dimension (|price-change|, |OI-Δ|, Volatilität) für die Union.
-    scanner_rank_top_n: int = 20
+    scanner_rank_top_n: int = 35
     # 24h-Turnover-Liquiditätsfloor (USD): unter diesem Wert fliegt ein Coin
     # aus dem Universum, egal wie stark er sich bewegt (Wash-/Illiquid-Schutz).
     scanner_turnover_floor_usd: float = 5_000_000.0
     # Deterministischer Prefilter reicht nur so viele Coins ans (teure) LLM weiter.
-    scanner_prefilter_top_k: int = 8
+    scanner_prefilter_top_k: int = 15
     # >so viele LLM-Kandidaten -> in 2 Chunks splitten und mergen (S2-02). Nur im
     # prefilter-Mode aktiv; classic bleibt IMMER ein einziger Call (byte-genau).
     scanner_llm_chunk_max: int = 12
+
+    # ── Hyperliquid Read-Rate-Budget (proaktiv gegen 429) ────────────────────
+    # Der Scanner-Fan-out (bis ~universe_size×3 Klines-Calls je Scan) plus die
+    # Frontend-/Monitor-Polls teilen sich EINEN Token-Bucket: Read-Calls werden
+    # auf hl_read_max_rps/s gedrosselt (Kurzburst bis hl_read_burst), damit die
+    # per-IP-Rate von Hyperliquid nicht in 429 → /api/market 502 läuft.
+    # Der Money-Pfad (Order/Modify/Cancel) ist NIE gedrosselt. 0 = Drossel aus.
+    # Höher = schnellere Scans, aber näher an Hyperliquids Limit (~20/s).
+    hl_read_max_rps: float = 10.0
+    hl_read_burst: float = 20.0
     # Konservativ | Ausgewogen(balanced) | Frei(free). Presets fill only fields
     # NOT explicitly set in .env — see RISK_PROFILES above. These field defaults
     # MIRROR the default "balanced" preset so a config read never lies about the
