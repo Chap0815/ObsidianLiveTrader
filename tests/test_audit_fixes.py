@@ -1361,6 +1361,46 @@ async def test_pre_hold_failure_prevents_auto_close():
     assert out["flatten"] and out["flatten"].get("action") == "skipped_pre_hold_unknown"
 
 
+@pytest.mark.asyncio
+async def test_post_place_hold_failure_fails_closed_not_flat():
+    """Defect A: a FAILED post-place positions() query at the auto-flatten site
+    must NEVER be read as 'flat'. Previously that site used a helper that dropped
+    the reliability flag → hold_now=0.0 → routed to cancel-resting and warned
+    'no fill / cancelled resting', leaving a FILLED, unprotected position open.
+
+    With a reliable pre_hold and NO reported fill, an unreliable post-place hold
+    read must fail closed symmetric with the pre_hold branch: close NOTHING,
+    cancel NOTHING, do NOT claim 'no fill', and warn to manually check."""
+    client = _happy_client({"orderId": 1})  # no fill field, no SL evidence
+    client.positions = AsyncMock(
+        side_effect=[
+            [],  # preview existing risk
+            [],  # confirm existing risk
+            [],  # pre_hold — RELIABLE (flat before), pre_hold_ok=True
+            _filled_pos(1.0),  # post-place SL verify (no SL → unverified)
+            MexcError("positions endpoint flaky"),  # flatten hold_now — UNRELIABLE
+        ]
+    )
+    client.open_stop_orders = AsyncMock(return_value=[])  # SL genuinely missing
+    svc = OrderService(
+        client,
+        _settings(auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+    out = await svc.confirm(prev["token"])
+    assert out["sl_verified"] is False
+    # Fail-closed: no close, no cancel, and NOT reported as 'no fill'.
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+    assert out["flatten"]
+    assert out["flatten"].get("action") == "skipped_post_hold_unknown"
+    assert any(
+        "manuell" in w.lower() and "AUTO_FLATTEN" in w for w in out["warnings"]
+    )
+
+
 # ── F-03: manual close must verify the close response semantically ────────────
 
 

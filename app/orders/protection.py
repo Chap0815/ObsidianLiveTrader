@@ -80,8 +80,18 @@ def classify_protection(
     triggerPrice/price + an orderType label; an unlabeled trigger is classified
     by side + entry, or counts as neither (unknown) — never a fabricated SL.
     Read-only — never places/cancels anything.
+
+    C1: when MULTIPLE resting orders classify as SL — a documented real state
+    (``modify_stop_loss`` can leave two stops on
+    ``modify_sl_ok_old_cancel_failed`` / ``modify_sl_unverified_old_kept``) — the
+    MOST-protective one is reported, never last-wins. Under-reporting the current
+    SL would let the auto-trail monitor compute a trail between a loose old stop
+    and the good one and then cancel BOTH → live protection drops. Most
+    protective: long → the HIGHEST sl, short → the LOWEST sl. When the side is
+    unknown the last-seen candidate is kept (prior behaviour). TP keeps last-wins
+    (not safety-critical).
     """
-    sl: float | None = None
+    sl_candidates: list[float] = []
     tp: float | None = None
     for row in stops or []:
         try:
@@ -89,7 +99,7 @@ def classify_protection(
         except (TypeError, ValueError):
             sl_field = None
         if sl_field and sl_field > 0:
-            sl = sl_field
+            sl_candidates.append(sl_field)
             continue
         try:
             tp_field = float(row.get("takeProfitPrice"))
@@ -111,13 +121,33 @@ def classify_protection(
         if kind == "tp":
             tp = trg
         elif kind == "sl":
-            sl = trg
+            sl_candidates.append(trg)
         else:
             # Unlabeled trigger: never assume SL. Classify by side + entry;
             # if that's not resolvable, it's unknown protection (neither).
             geo = classify_unlabeled_trigger(trg, side, entry)
             if geo == "sl":
-                sl = trg
+                sl_candidates.append(trg)
             elif geo == "tp":
                 tp = trg
-    return sl, tp
+    return most_protective_sl(sl_candidates, side), tp
+
+
+def most_protective_sl(
+    candidates: list[float], side: str | None
+) -> float | None:
+    """Pick the MOST-protective stop among candidates (C1).
+
+    long → HIGHEST sl (closest to entry above the loss side), short → LOWEST sl.
+    When the side is unknown the direction can't be decided, so the last-seen
+    candidate is returned (preserves the pre-C1 last-wins behaviour for that
+    ambiguous case). Empty → None.
+    """
+    if not candidates:
+        return None
+    side_n = (side or "").strip().lower()
+    if side_n == "long":
+        return max(candidates)
+    if side_n == "short":
+        return min(candidates)
+    return candidates[-1]

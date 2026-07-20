@@ -16,7 +16,7 @@ from app.hyperliquid.errors import HyperliquidError
 from app.mexc.client import MexcClient, map_position, usdt_balances
 from app.mexc.errors import MexcError
 from app.models import ContractMeta, OrderTicket
-from app.orders.protection import classify_order_label
+from app.orders.protection import classify_order_label, classify_protection
 from app.orders.tokens import PreviewStore, TokenError
 from app.risk.gates import GateResult, validate_order
 from app.risk.sizing import round_down_to_unit, round_trigger_to_unit
@@ -805,11 +805,6 @@ class OrderService:
             return max(hv, 0.0), ot, True
         return 0.0, 1, True
 
-    async def _same_side_hold_vol(self, symbol: str, side: str) -> tuple[float, int]:
-        """Return (hold_vol, open_type 1|2) for same-side position; (0, 1) if none."""
-        hv, ot, _ = await self._same_side_hold_vol_ok(symbol, side)
-        return hv, ot
-
     async def confirm(self, token: str) -> dict[str, Any]:
         """Consume token, re-check arming + gates, set leverage, place order."""
         async with self._trade_lock:
@@ -1345,8 +1340,8 @@ class OrderService:
             and self.settings.auto_flatten_if_sl_unverified
         ):
             try:
-                hold_now, pos_open_type = await self._same_side_hold_vol(
-                    symbol, ticket.side
+                hold_now, pos_open_type, hold_now_ok = (
+                    await self._same_side_hold_vol_ok(symbol, ticket.side)
                 )
                 # Determine OUR fill. Prefer the exchange's reported fill from
                 # the order response — that is bot-safe: it counts only this
@@ -1375,6 +1370,28 @@ class OrderService:
                         "AUTO_FLATTEN übersprungen: Vor-Handels-Menge unbekannt "
                         "(positions-Abfrage fehlgeschlagen) und keine Fill-Menge "
                         "in der Order-Antwort — es wird NICHTS geschlossen. "
+                        "Position und SL JETZT manuell auf der Börse prüfen."
+                    )
+                elif not hold_now_ok:
+                    # Defect A / FAIL-CLOSED: the POST-place hold read is
+                    # UNRELIABLE (positions() query failed) and there is no
+                    # reported fill. A dropped reliability flag would surface
+                    # hold_now=0.0 → look "flat" → route to cancel-resting and
+                    # falsely warn "no fill / cancelled resting", leaving a
+                    # FILLED, unprotected position OPEN. Never treat an unreadable
+                    # hold as flat: close NOTHING, cancel NOTHING, warn to check.
+                    new_fill = None
+                    flatten_result = {
+                        "action": "skipped_post_hold_unknown",
+                        "error": "post-place hold unreadable and no reported fill",
+                        "pre_hold_checked": True,
+                        "post_hold_checked": False,
+                    }
+                    warnings.append(
+                        "AUTO_FLATTEN übersprungen: Nach-Handels-Menge nicht "
+                        "lesbar (positions-Abfrage fehlgeschlagen) und keine "
+                        "Fill-Menge in der Order-Antwort — es wird NICHTS "
+                        "geschlossen und NICHTS als 'kein Fill' storniert. "
                         "Position und SL JETZT manuell auf der Börse prüfen."
                     )
                 else:
@@ -1932,16 +1949,25 @@ class OrderService:
 
     # ── Projekt H / Task 1: modify_stop_loss (money-critical) ────────────────
 
-    async def _existing_sl_orders(self, symbol: str, side: str) -> list[Any]:
-        """OIDs of open SL-ish trigger orders for this symbol (TP orders kept).
+    async def _existing_sl_orders(
+        self, symbol: str, side: str
+    ) -> tuple[list[Any], float | None]:
+        """OIDs of open SL-ish trigger orders + the MOST-protective resting SL.
 
-        Fail-open on lookup error: return [] so modify still places a fresh stop
-        (the old one, if any, simply stays — never unprotected).
+        Returns ``(oids, most_protective_sl)``. ``most_protective_sl`` is derived
+        from the SAME fetched stop list via the shared ``classify_protection``
+        SSOT (C1: long → highest, short → lowest), so the modify guard cannot
+        drift from the extractor/verifier. ``None`` when no SL rests or the
+        lookup failed.
+
+        Fail-open on lookup error: return ([], None) so modify still places a
+        fresh stop (the old one, if any, simply stays — never unprotected).
         """
         try:
             stops = await self.client.open_stop_orders(symbol)
         except ExchangeError:
-            return []
+            return [], None
+        most_protective, _tp = classify_protection(stops or [], side=side)
         is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
         out: list[Any] = []
         for s in stops or []:
@@ -1963,7 +1989,7 @@ class OrderService:
                 oid = s["raw"].get("oid")
             if oid is not None:
                 out.append(oid)
-        return out
+        return out, most_protective
 
     async def _verify_sl_oid(
         self, symbol: str, new_oid: Any, expected_sl: float
@@ -2109,7 +2135,31 @@ class OrderService:
         if side == "short" and not (rounded_sl > mark):
             raise OrderError(f"rounded short SL {rounded_sl} not above mark {mark}")
 
-        old_oids = await self._existing_sl_orders(symbol, side)
+        old_oids, existing_sl = await self._existing_sl_orders(symbol, side)
+
+        # ── C1b defense-in-depth: NEVER LOOSEN existing protection ──
+        # Even if a caller passes a bad new_sl, refuse a move that would make the
+        # position LESS protected than the most-protective stop already resting
+        # (long: new below existing; short: new above). Raised BEFORE placing or
+        # cancelling anything, so the old, tighter stop stays live (never
+        # unprotected). The legitimate TIGHTEN path is unaffected.
+        if existing_sl is not None and existing_sl > 0:
+            loosens = (side == "long" and rounded_sl < existing_sl) or (
+                side == "short" and rounded_sl > existing_sl
+            )
+            if loosens:
+                await self._audit_modify(
+                    symbol, side, rounded_sl,
+                    {"existing_sl": existing_sl, "requested_sl": rounded_sl},
+                    "modify_sl_refused_loosen",
+                    "would loosen existing protection",
+                )
+                raise OrderError(
+                    f"modify-SL REFUSED — new SL {rounded_sl} would LOOSEN the "
+                    f"existing most-protective stop {existing_sl} ({side}). "
+                    "Old stop left in place (still protected); pass a more "
+                    "protective SL to tighten."
+                )
 
         # ── FAIL-SAFE STEP 1: place the NEW stop BEFORE removing the old one ──
         try:

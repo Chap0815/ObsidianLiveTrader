@@ -642,6 +642,53 @@ async def test_modify_sl_positions_lookup_failure_is_distinct_from_no_position(s
 
 
 @pytest.mark.asyncio
+async def test_modify_sl_refuses_loosening_new_sl_long(store):
+    """C1b defense-in-depth: a caller passing a LOOSER new_sl than the existing
+    most-protective resting stop must be REFUSED (never-unprotected): the old,
+    tighter stop is left in place, nothing is placed or cancelled."""
+    c = _modify_client()  # existing resting stop @ 98_000, mark 100_000, long
+    svc = OrderService(c, _modify_settings(), store)
+    with pytest.raises(OrderError) as ei:
+        # 97_000 < existing 98_000 → would LOOSEN protection (still below mark).
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=97_000.0)
+    msg = str(ei.value).lower()
+    assert "loosen" in msg or "lockern" in msg or "protective" in msg
+    c.place_stop_order.assert_not_called()  # old stop untouched
+    c.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_refuses_loosening_new_sl_short(store):
+    """C1b (short): for a short, a HIGHER new_sl than the existing stop loosens."""
+    c = _modify_client()
+    c.positions = AsyncMock(
+        return_value=[{"symbol": "BTC_USDT", "side": "short",
+                       "hold_vol": 0.01, "open_type": 1}]
+    )
+    old = {"orderId": 111, "symbol": "BTC_USDT", "orderType": "Stop",
+           "triggerPrice": 102_000.0}
+    c.open_stop_orders = AsyncMock(side_effect=[[old], [old], [old]])
+    svc = OrderService(c, _modify_settings(), store)
+    with pytest.raises(OrderError) as ei:
+        # 103_000 > existing 102_000 → would LOOSEN a short (still above mark).
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="short", new_sl=103_000.0)
+    msg = str(ei.value).lower()
+    assert "loosen" in msg or "lockern" in msg or "protective" in msg
+    c.place_stop_order.assert_not_called()
+    c.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_tighten_still_allowed_over_existing(store):
+    """C1b must NOT block the legitimate TIGHTEN path (new_sl more protective)."""
+    c = _modify_client()  # existing 98_000, new 99_000 long → tighter
+    svc = OrderService(c, _modify_settings(), store)
+    out = await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
+    assert out["ok"] is True
+    c.place_stop_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_modify_sl_disarmed_blocked(store):
     c = _modify_client()
     svc = OrderService(c, _modify_settings(trading_enabled=False), store)

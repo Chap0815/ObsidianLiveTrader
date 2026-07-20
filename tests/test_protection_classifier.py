@@ -88,6 +88,51 @@ async def test_reevaluate_and_verify_agree():
     assert checked is True
 
 
+def test_classify_multiple_sl_long_picks_most_protective_highest():
+    """C1: with MULTIPLE resting SL orders, classify_protection must report the
+    MOST-protective one, never last-wins.
+
+    modify_stop_loss can legitimately leave TWO stops resting
+    (modify_sl_ok_old_cancel_failed / modify_sl_unverified_old_kept). For a
+    LONG the higher stop is the tighter/real protection. If the exchange returns
+    the LOOSE old stop LAST, last-wins would under-report current_sl → the
+    auto-trail monitor could compute a trail between the two and then cancel
+    BOTH → live protection drops (118 → 105). The classifier must pick 118.
+    """
+    stops = [
+        {"orderType": "Stop", "triggerPrice": 118.0},  # tight/real
+        {"orderType": "Stop", "triggerPrice": 105.0},  # loose old — LAST
+    ]
+    sl, tp = classify_protection(stops, side="long", entry=120.0)
+    assert sl == 118.0
+    assert tp is None
+
+
+def test_classify_multiple_sl_short_picks_most_protective_lowest():
+    """C1 (short): for a SHORT the LOWER stop is the tighter/real protection.
+
+    Loose old stop (130) returned LAST would win under last-wins → under-report.
+    Must pick the lowest (112).
+    """
+    stops = [
+        {"orderType": "Stop", "triggerPrice": 112.0},  # tight/real
+        {"orderType": "Stop", "triggerPrice": 130.0},  # loose old — LAST
+    ]
+    sl, tp = classify_protection(stops, side="short", entry=100.0)
+    assert sl == 112.0
+    assert tp is None
+
+
+def test_classify_multiple_sl_explicit_field_most_protective():
+    """C1: the most-protective rule also holds for explicit stopLossPrice fields."""
+    stops = [
+        {"stopLossPrice": 118.0},
+        {"stopLossPrice": 105.0},  # loose — LAST
+    ]
+    sl, _tp = classify_protection(stops, side="long", entry=120.0)
+    assert sl == 118.0
+
+
 @pytest.mark.asyncio
 async def test_mexc_tpsl_combined_order_is_sl_not_tp():
     """Regression-Pin fuer DIE Divergenz, die Task 19 motiviert hat (Q-05):
