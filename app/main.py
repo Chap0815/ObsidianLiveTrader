@@ -2233,6 +2233,14 @@ async def positions_arm(
                 f"allowed: {sorted(_ARM_ALLOWED_RULES)}"
             ),
         )
+    # Require REAL booleans — a truthy string like "false" must NEVER arm a
+    # money-path auto-action (it drives svc.modify_stop_loss in the monitor).
+    # bool(v) would treat "false" as True, so reject non-bool values outright.
+    for _k, _v in rules.items():
+        if not isinstance(_v, bool):
+            raise HTTPException(
+                status_code=400, detail=f"Rule '{_k}' must be a boolean (got {type(_v).__name__})"
+            )
 
     db = getattr(request.app.state, "db", None)
     if db is None:

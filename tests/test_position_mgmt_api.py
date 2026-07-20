@@ -210,3 +210,37 @@ def test_endpoints_require_token_when_set(tmp_path, monkeypatch):
         assert ok.status_code == 200, ok.text
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
     get_settings.cache_clear()
+
+
+def test_arm_wrong_side_rejected(tmp_path, monkeypatch):
+    """Arming a side that isn't the live side must 404 (never arm a phantom)."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_wrongside.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    with TestClient(app) as tc:
+        client = _mock_client([_pos(side="short")])  # only a SHORT is open
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 404, r.text
+    get_settings.cache_clear()
+
+
+def test_arm_non_bool_rule_value_rejected(tmp_path, monkeypatch):
+    """A truthy string like "false" must NOT arm — non-bool rule values → 400."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_nonbool.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": "false"}},
+        )
+        assert r.status_code == 400, r.text
+    get_settings.cache_clear()
