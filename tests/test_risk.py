@@ -376,3 +376,38 @@ def test_manual_trigger_blocked_in_gate_when_disabled():
     )
     assert g.ok is False
     assert any("ALLOW_MANUAL_TRIGGER" in e for e in g.errors)
+
+
+# ── Money-path request models: non-finite must be rejected (gt=0 lets +Inf pass) ──
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_modify_sl_request_rejects_nonfinite(bad):
+    """ModifySLRequest.new_sl (gt=0) lets +Infinity through (inf > 0). A non-finite
+    stop must never reach place_stop_order — a short WITHOUT an existing SL can't
+    be clamped by the mark-geometry guard."""
+    from app.models import ModifySLRequest
+
+    with pytest.raises(ValidationError):
+        ModifySLRequest(symbol="BTC_USDT", side="long", new_sl=bad)
+
+
+def test_modify_sl_request_accepts_finite():
+    from app.models import ModifySLRequest
+
+    assert ModifySLRequest(symbol="BTC_USDT", side="long", new_sl=100.0).new_sl == 100.0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_close_position_request_rejects_nonfinite_vol(bad):
+    from app.models import ClosePositionRequest
+
+    with pytest.raises(ValidationError):
+        ClosePositionRequest(symbol="BTC_USDT", side="long", vol=bad)
+
+
+def test_close_position_request_accepts_finite_and_none():
+    from app.models import ClosePositionRequest
+
+    assert ClosePositionRequest(symbol="BTC_USDT", side="long", vol=None).vol is None
+    assert ClosePositionRequest(symbol="BTC_USDT", side="long", vol=0.5).vol == 0.5

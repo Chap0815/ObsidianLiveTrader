@@ -355,6 +355,15 @@ class ClosePositionRequest(BaseModel):
         None, gt=0, le=1, description="Share of current hold to close (0<f<=1)"
     )
 
+    @field_validator("vol", "fraction")
+    @classmethod
+    def _reject_nonfinite(cls, v: float | None) -> float | None:
+        # gt=0 rejects NaN/-Inf; +Infinity still passes for `vol` (no upper bound).
+        # A non-finite close size must never reach the money path.
+        if v is not None and not math.isfinite(v):
+            raise ValueError("must be a finite number (NaN/Infinity rejected)")
+        return v
+
 
 class CancelRequest(BaseModel):
     order_id: str | int | None = None
@@ -371,6 +380,16 @@ class ModifySLRequest(BaseModel):
     symbol: str
     side: OrderSide
     new_sl: float = Field(..., gt=0, description="New stop-loss price")
+
+    @field_validator("new_sl")
+    @classmethod
+    def _reject_nonfinite(cls, v: float) -> float:
+        # gt=0 already rejects NaN and -Inf, but +Infinity passes (inf > 0). A
+        # non-finite stop price must never reach place_stop_order (money path):
+        # for a short WITHOUT an existing SL the mark-geometry guard can't clamp it.
+        if not math.isfinite(v):
+            raise ValueError("new_sl must be a finite number (NaN/Infinity rejected)")
+        return v
 
 
 class ArmRequest(BaseModel):
