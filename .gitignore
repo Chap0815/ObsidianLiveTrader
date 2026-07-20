@@ -24,3 +24,14 @@ data/
 
 # Development-internal (superpowers SDD artifacts)
 .superpowers/
+
+# Ruff cache
+.ruff_cache/
+
+# Development-internal docs (raw audit dumps, session handoffs, scratch prompts)
+# — kept on disk for reference, but not part of the tracked project docs.
+docs/superpowers/reviews/
+docs/superpowers/HANDOFF-*.md
+docs/NACHT_AUDIT_LOG.md
+docs/NACHT_AUDIT_PROMPT.md
+docs/OPTIMIERUNG_PLAN.md
