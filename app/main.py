@@ -2249,6 +2249,15 @@ async def positions_arm(
     if client is None:
         raise HTTPException(status_code=503, detail="Exchange client not initialized")
 
+    # Auto-BE is HL-only (same constraint as modify_stop_loss). Reject arming it
+    # on a non-HL exchange at the source — otherwise the monitor could never
+    # execute it and would just keep emitting an "unavailable" alert. Disarming
+    # (auto_be=False) stays allowed on any exchange.
+    if rules.get("auto_be") and not hasattr(client, "place_stop_order"):
+        raise HTTPException(
+            status_code=400, detail="Auto-BE ist nur auf Hyperliquid verfuegbar."
+        )
+
     # Position must be LIVE — can't arm what isn't open (spec §4 identity).
     try:
         snap = await client.account_snapshot()

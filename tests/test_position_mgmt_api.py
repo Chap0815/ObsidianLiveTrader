@@ -244,3 +244,22 @@ def test_arm_non_bool_rule_value_rejected(tmp_path, monkeypatch):
         )
         assert r.status_code == 400, r.text
     get_settings.cache_clear()
+
+
+def test_arm_auto_be_rejected_on_non_hl(tmp_path, monkeypatch):
+    """Auto-BE is HL-only — arming it on a non-HL client must 400 at the source
+    (prevents the monitor from emitting a repeating 'unavailable' alert)."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_nonhl.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        del client.place_stop_order  # non-HL: no HL stop-order method
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 400, r.text
+    get_settings.cache_clear()

@@ -256,12 +256,17 @@ async def _process_position(
             # non-HL client is surfaced as an informational feed entry, never a
             # direct order write.
             if not hasattr(client, "place_stop_order"):
-                alert_state["auto_be_unavailable"] = {
-                    "active": True,
-                    "message": "Auto-BE ist nur auf Hyperliquid verfuegbar.",
-                    "ts": now_ms,
-                }
-                state_dirty = True
+                # Debounced like the other alerts: set the ts ONCE, don't rewrite
+                # it every cycle (that would re-toast the client every poll). The
+                # arm endpoint also rejects arming auto_be on non-HL, so this is
+                # only reachable for a stale armed record under a non-HL config.
+                if not alert_state.get("auto_be_unavailable"):
+                    alert_state["auto_be_unavailable"] = {
+                        "active": True,
+                        "message": "Auto-BE ist nur auf Hyperliquid verfuegbar.",
+                        "ts": now_ms,
+                    }
+                    state_dirty = True
                 continue
             attempts = _be_attempts(app)
             akey = (symbol, side)

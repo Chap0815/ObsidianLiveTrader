@@ -220,3 +220,25 @@ async def test_transient_absence_does_not_disarm_before_grace(monkeypatch, db_pa
     # Reaching the grace threshold closes it.
     await monitor._run_one_cycle(app, NOW_MS)
     assert await db.get_open_position_mgmt("BTC_USDT", "long") is None
+
+
+@pytest.mark.asyncio
+async def test_non_hl_unavailable_alert_is_debounced(monkeypatch, db_path):
+    """A non-HL armed position surfaces 'auto_be_unavailable' ONCE; the ts must
+    NOT be rewritten every cycle (that would re-toast the client each poll)."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=102.5, is_hl=False)  # no place_stop_order
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+    row1 = await db.get_open_position_mgmt("BTC_USDT", "long")
+    ts1 = row1["last_alert_state"]["auto_be_unavailable"]["ts"]
+    assert ts1 == NOW_MS
+
+    # Second cycle at a LATER time — the alert must stay at the original ts.
+    await monitor._run_one_cycle(app, NOW_MS + 60_000)
+    row2 = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row2["last_alert_state"]["auto_be_unavailable"]["ts"] == ts1
