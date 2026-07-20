@@ -382,7 +382,7 @@ class MexcClient:
             volume24=_opt_float(row.get("volume24")),
             amount24=_opt_float(row.get("amount24")),
             funding_rate=_opt_float(row.get("fundingRate")),
-            timestamp=int(row["timestamp"]) if row.get("timestamp") is not None else None,
+            timestamp=_opt_int(row.get("timestamp")),
         )
 
     async def funding_rate(self, symbol: str) -> FundingRate:
@@ -395,13 +395,9 @@ class MexcClient:
             funding_rate=float(row.get("fundingRate") or 0),
             max_funding_rate=_opt_float(row.get("maxFundingRate")),
             min_funding_rate=_opt_float(row.get("minFundingRate")),
-            collect_cycle=int(row["collectCycle"])
-            if row.get("collectCycle") is not None
-            else None,
-            next_settle_time=int(row["nextSettleTime"])
-            if row.get("nextSettleTime") is not None
-            else None,
-            timestamp=int(row["timestamp"]) if row.get("timestamp") is not None else None,
+            collect_cycle=_opt_int(row.get("collectCycle")),
+            next_settle_time=_opt_int(row.get("nextSettleTime")),
+            timestamp=_opt_int(row.get("timestamp")),
         )
 
     # ── private ─────────────────────────────────────────────────────────
@@ -820,9 +816,29 @@ def _mexc_state_is_dead(row: Any) -> bool:
 
 
 def _opt_float(v: Any) -> float | None:
-    if v is None:
+    """float(v) or None — mirrors Hyperliquid's `_opt_f`: MEXC blanks optional
+    numeric fields as "" (not just null/omitted), e.g. fairPrice/liquidatePrice/
+    im/marginRatio/funding fields. A bare `float(v)` raises ValueError on ""
+    (or on garbage), which is not a MexcError and escapes the ExchangeError
+    handlers upstream — degrade to None instead of crashing the poll cycle."""
+    if v is None or v == "":
         return None
-    return float(v)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(v: Any) -> int | None:
+    """int(v) or None — same "" / garbage guard as `_opt_float`, for the raw
+    int(...) timestamp/cycle fields (timestamp, collectCycle, nextSettleTime)
+    that previously only checked `is not None`."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # C3-01: MEXC deal `side` codes (same codes place_order takes) -> the same

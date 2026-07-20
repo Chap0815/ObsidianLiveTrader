@@ -9,7 +9,7 @@ import re
 import httpx
 import pytest
 
-from app.mexc.client import MexcClient, _fmt_price
+from app.mexc.client import MexcClient, _fmt_price, _opt_float, _opt_int, map_position
 from app.mexc.errors import MexcError
 
 # Scientific notation looks like "2e-05" / "1.2E+10" — a digit directly
@@ -358,3 +358,131 @@ async def test_mexc_user_fills_skips_unparseable_rows():
     out = await c.user_fills(symbol="BTC_USDT")
     assert len(out) == 1
     assert out[0]["time"] == 1_700_000_000_000
+
+
+# --- Defect D: _opt_float/_opt_int must guard "" like Hyperliquid's _opt_f,
+# not just None — MEXC blanks optional numeric fields as "" (e.g. fairPrice,
+# liquidatePrice, collectCycle), and float("")/int("") raise ValueError, which
+# is not a MexcError so it escapes the ExchangeError handlers and crashes the
+# whole poll cycle instead of degrading that one field to None. ---
+
+
+def test_opt_float_empty_string_returns_none():
+    assert _opt_float("") is None
+
+
+def test_opt_float_garbage_string_returns_none():
+    assert _opt_float("abc") is None
+
+
+def test_opt_float_valid_numeric_string_still_parses():
+    assert _opt_float("1.5") == 1.5
+
+
+def test_opt_float_none_returns_none():
+    assert _opt_float(None) is None
+
+
+def test_opt_int_empty_string_returns_none():
+    assert _opt_int("") is None
+
+
+def test_opt_int_garbage_string_returns_none():
+    assert _opt_int("abc") is None
+
+
+def test_opt_int_valid_numeric_string_still_parses():
+    assert _opt_int("42") == 42
+
+
+def test_opt_int_none_returns_none():
+    assert _opt_int(None) is None
+
+
+@pytest.mark.asyncio
+async def test_ticker_empty_string_optional_fields_degrade_to_none():
+    """fairPrice:"" (real MEXC blank-field pattern) must not crash ticker() —
+    it must map to fair_price=None instead of raising ValueError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "symbol": "BTC_USDT",
+                    "lastPrice": 65000.0,
+                    "bid1": "",
+                    "ask1": "",
+                    "fairPrice": "",
+                    "indexPrice": "",
+                    "volume24": "",
+                    "amount24": "",
+                    "fundingRate": "",
+                    "timestamp": "",
+                },
+            },
+        )
+
+    c = _client_with_handler(handler)
+    t = await c.ticker("BTC_USDT")
+    assert t.last_price == 65000.0
+    assert t.bid1 is None
+    assert t.ask1 is None
+    assert t.fair_price is None
+    assert t.index_price is None
+    assert t.volume24 is None
+    assert t.amount24 is None
+    assert t.funding_rate is None
+    assert t.timestamp is None
+
+
+@pytest.mark.asyncio
+async def test_funding_rate_empty_string_optional_fields_degrade_to_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "symbol": "BTC_USDT",
+                    "fundingRate": 0.0001,
+                    "maxFundingRate": "",
+                    "minFundingRate": "",
+                    "collectCycle": "",
+                    "nextSettleTime": "",
+                    "timestamp": "",
+                },
+            },
+        )
+
+    c = _client_with_handler(handler)
+    fr = await c.funding_rate("BTC_USDT")
+    assert fr.funding_rate == 0.0001
+    assert fr.max_funding_rate is None
+    assert fr.min_funding_rate is None
+    assert fr.collect_cycle is None
+    assert fr.next_settle_time is None
+    assert fr.timestamp is None
+
+
+def test_map_position_empty_string_optional_fields_degrade_to_none():
+    row = {
+        "positionId": 1,
+        "symbol": "BTC_USDT",
+        "positionType": 1,
+        "holdVol": 1.0,
+        "holdAvgPrice": 65000.0,
+        "leverage": 10,
+        "openType": 1,
+        "unRealizedPnl": 0.0,
+        "realised": 0.0,
+        "liquidatePrice": "",
+        "im": "",
+        "marginRatio": "",
+        "state": 1,
+    }
+    out = map_position(row)
+    assert out["liquidate_price"] is None
+    assert out["im"] is None
+    assert out["margin_ratio"] is None
