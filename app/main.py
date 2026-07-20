@@ -2293,7 +2293,22 @@ async def positions_arm(
     # order — it only writes the mgmt record.
     await ensure_baseline(db, client, symbol, side, entry, now_ms)
     await db.set_armed_rules(symbol, side, rules)
+    # Re-arming clears any sticky auto-BE halt (F2) so the "neu scharfschalten"
+    # recovery the halt alert advertises actually works: drop the in-memory
+    # attempt counter and the stale auto_be_error entry from the feed.
+    _attempts = getattr(request.app.state, "tm_be_attempts", None)
+    if isinstance(_attempts, dict):
+        _attempts.pop((symbol, side), None)
     record = await db.get_open_position_mgmt(symbol, side)
+    if (
+        record
+        and isinstance(record.get("last_alert_state"), dict)
+        and "auto_be_error" in record["last_alert_state"]
+    ):
+        cleared = dict(record["last_alert_state"])
+        cleared.pop("auto_be_error", None)
+        await db.set_alert_state(symbol, side, cleared)
+        record["last_alert_state"] = cleared
     return record or {}
 
 
@@ -2340,6 +2355,11 @@ async def positions_killswitch(
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
     disarmed = await db.disarm_all()
+    # Also clear the in-memory auto-BE halt counters so a fresh arm after a
+    # kill-switch starts clean (F2).
+    _attempts = getattr(request.app.state, "tm_be_attempts", None)
+    if isinstance(_attempts, dict):
+        _attempts.clear()
     return {"disarmed": disarmed}
 
 

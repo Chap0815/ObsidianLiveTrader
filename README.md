@@ -164,6 +164,25 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `JOURNAL_RESOLVE_INTERVAL_S` | `60` | Poll-Intervall (s), um offene Journal-Einträge gegen den Markt aufzulösen |
 | `JOURNAL_WINDOW_HOURS` | `24` | Betrachtungsfenster (h) für die Journal-Auswertung |
 | `JOURNAL_MIN_SAMPLE` | `20` | Mindestanzahl Samples, bevor Journal-Statistiken angezeigt werden |
+| `TM_ENABLED` | `true` | Trade-Management-Monitor (Auto-BE + Alarme). Auto-Aktionen NUR bei pro Position scharfgeschalteter Regel; ohne Arming nur Alarme |
+| `TM_MONITOR_INTERVAL_S` | `20` | Monitor-Poll-Intervall (s); Bereich `[5, 300]` |
+| `TM_BE_TRIGGER_R` | `1.0` | Auto-BE feuert ab diesem unrealisierten R-Vielfachen; `[0.1, 10]` |
+| `TM_BE_FEE_RT` | `0.0006` | Round-Trip-Fee-Puffer für die Break-Even-Berechnung; `[0, 0.01]` |
+| `TM_TIME_STOP_HOURS` | `4.0` | Time-Stop-Alarm, wenn die Position so lange läuft; `[0.25, 168]` |
+| `TM_TIME_STOP_MIN_R` | `0.5` | Time-Stop-Alarm nur, wenn die Position unter diesem R steht; `[-5, 10]` |
+
+**Trade-Management-Layer (v1):** ein server-seitiger Monitor läuft mit dem Prozess
+und überwacht offene Positionen. Standard = nur **Alarme** (Thesis-Invalidierung,
+Time-Stop). Pro Position kann im Dashboard **Auto-BE** scharfgeschaltet werden —
+dann zieht die App den Stop-Loss bei `+TM_BE_TRIGGER_R` R selbst auf Break-Even.
+Auto-BE ist **Hyperliquid-only**, feuert **einmal** pro Position, bewegt den Stop
+**nur in Schutzrichtung** (nie lockern) und läuft über den bestehenden
+`modify-sl`-Pfad (never-unprotected, `trade_lock`, Audit). Endpunkte (alle
+`require_local_token`): `POST /api/positions/arm` `{symbol, side, rules:{auto_be:bool}}`,
+`GET /api/positions/alerts` (Polling-Feed für UI), `POST /api/positions/killswitch`
+(entschärft sofort ALLE Positionen). Bekannte Grenzen (Spec §10): App-Neustart
+mitten im Trade nimmt den aktuellen SL als Baseline; ein Close→Reopen bei nahezu
+identischem Entry innerhalb der 2-Zyklen-Absenz-Grace kann die alte Baseline erben.
 
 ### Wechsel auf Mainnet
 

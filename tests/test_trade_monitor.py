@@ -242,3 +242,25 @@ async def test_non_hl_unavailable_alert_is_debounced(monkeypatch, db_path):
     await monitor._run_one_cycle(app, NOW_MS + 60_000)
     row2 = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row2["last_alert_state"]["auto_be_unavailable"]["ts"] == ts1
+
+
+@pytest.mark.asyncio
+async def test_sl_read_failure_never_moves_the_stop(monkeypatch, db_path):
+    """F1: if the current-SL read RAISES (not 'no stop', a lookup hiccup), the
+    monitor must NOT move the stop — moving on an unknown stop could loosen a
+    well-trailed stop down to break-even. The frozen baseline keeps r1>0 so
+    evaluate_rules would emit a move; the read-failure guard must drop it."""
+    from unittest.mock import AsyncMock as _AM
+
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)  # r1=2 baseline, armed
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=102.5, is_hl=True)  # +1.25R, would move
+    client.open_stop_orders = _AM(side_effect=RuntimeError("hiccup"))  # read FAILS
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    svc.modify_stop_loss.assert_not_awaited()  # never move on a failed SL read
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 0  # not latched

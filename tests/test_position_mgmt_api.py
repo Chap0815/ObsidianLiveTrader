@@ -263,3 +263,37 @@ def test_arm_auto_be_rejected_on_non_hl(tmp_path, monkeypatch):
         )
         assert r.status_code == 400, r.text
     get_settings.cache_clear()
+
+
+def test_rearm_clears_auto_be_halt(tmp_path, monkeypatch):
+    """F2: re-arming must clear the sticky auto-BE halt (in-memory attempt
+    counter + stale auto_be_error) so the 'neu scharfschalten' recovery works."""
+    import asyncio
+
+    db_file = str(tmp_path / "rearm.db")
+    monkeypatch.setenv("DATABASE_PATH", db_file)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    # Seed an OPEN record carrying a stale halted auto_be_error.
+    asyncio.get_event_loop_policy().new_event_loop()
+    asyncio.run(
+        _seed_open(
+            db_file,
+            "BTC_USDT",
+            armed=False,
+            alert_state={"auto_be_error": {"active": True, "halted": True, "ts": 1}},
+        )
+    )
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        tc.app.state.tm_be_attempts = {("BTC_USDT", "long"): 3}  # halted
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 200, r.text
+        assert "auto_be_error" not in r.json().get("last_alert_state", {})
+        assert ("BTC_USDT", "long") not in tc.app.state.tm_be_attempts
+    get_settings.cache_clear()

@@ -130,18 +130,24 @@ async def _best_effort_invalidation(db: Any, symbol: str) -> float | None:
     return None
 
 
-async def _current_sl(client: Any, symbol: str, side: str, entry: float) -> float | None:
-    """Current protective stop for one position via open trigger orders.
+async def _current_sl(
+    client: Any, symbol: str, side: str, entry: float
+) -> tuple[float | None, bool]:
+    """Current protective stop + a read-OK flag.
 
-    Fail-safe: a lookup failure yields None (treated as "no known SL" — with
-    r1=0 that means no auto-BE, never a fabricated stop).
+    Returns ``(sl, True)`` on a successful read (``sl`` may be None = genuinely
+    no stop), or ``(None, False)`` when the lookup RAISED. Callers MUST NOT treat
+    a failed read as "no stop": with `_is_more_protective(current_sl=None)`
+    returning True, a transient `open_stop_orders` hiccup would otherwise let the
+    monitor move a well-trailed stop DOWN to break-even (F1). On a failed read
+    the monitor skips the move entirely; the baseline just gets r1=0 (no auto-BE).
     """
     try:
         stops = await client.open_stop_orders(symbol)
         sl, _tp = classify_protection(stops, side=side, entry=entry)
-        return sl
+        return sl, True
     except Exception:
-        return None
+        return None, False
 
 
 async def ensure_baseline(
@@ -159,7 +165,7 @@ async def ensure_baseline(
     to a fresh baseline when the entry deviated beyond tolerance. NEVER places an
     order or moves a stop — it only writes the mgmt DB record.
     """
-    current_sl = await _current_sl(client, symbol, side, entry)
+    current_sl, _sl_ok = await _current_sl(client, symbol, side, entry)
     # r1 is fixed at baseline time. With no known SL it can't be computed → 0.0,
     # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
     # gate) — safe until a real stop exists.
@@ -204,7 +210,7 @@ async def _process_position(
     if entry <= 0:
         return
 
-    current_sl = await _current_sl(client, symbol, side, entry)
+    current_sl, sl_ok = await _current_sl(client, symbol, side, entry)
 
     # Mark price — required to evaluate any rule geometry. No mark → skip (the
     # next cycle retries); never guess.
@@ -245,6 +251,12 @@ async def _process_position(
         now_ms=now_ms,
         settings=settings,
     )
+
+    # F1: if the current-SL read FAILED (not "no stop", but a lookup error),
+    # never move the stop this cycle — moving on an unknown stop could loosen a
+    # well-trailed stop down to break-even. Advisory alarms still fire.
+    if not sl_ok:
+        actions = [a for a in actions if not isinstance(a, MoveSlToBe)]
 
     # Working copy of the debounce/feed state; persisted once at the end.
     alert_state = dict(baseline.last_alert_state)
