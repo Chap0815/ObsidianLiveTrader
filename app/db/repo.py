@@ -815,52 +815,42 @@ class Database:
                 await conn.commit()
                 return int(existing["id"])
 
-            try:
-                cur = await conn.execute(
-                    """
-                    INSERT INTO position_management
-                      (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                       invalidation_price, armed_rules, be_done, last_alert_state,
-                       status, created_at, updated_at, high_water)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?, ?)
-                    """,
-                    (
-                        symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, now, entry_snap,
-                    ),
-                )
-                await conn.commit()
-                return int(cur.lastrowid or 0)
-            except aiosqlite.IntegrityError:
-                # Race: another writer (arm endpoint vs monitor loop, same
-                # process) inserted the OPEN row between our SELECT and INSERT and
-                # tripped the partial-unique index. Their baseline wins; refresh
-                # the volatile fields in place instead of raising.
-                await conn.rollback()
-                cur = await conn.execute(
-                    """
-                    SELECT id FROM position_management
-                    WHERE symbol = ? AND side = ? AND status = 'OPEN'
-                    """,
-                    (symbol, side),
-                )
-                row = await cur.fetchone()
-                if row is None:
-                    raise
-                await conn.execute(
-                    """
-                    UPDATE position_management
-                    SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
-                        invalidation_price = ?, updated_at = ?, high_water = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, entry_snap, row["id"],
-                    ),
-                )
-                await conn.commit()
-                return int(row["id"])
+            # Atomic UPSERT (single statement) on the partial-unique index
+            # (symbol, side) WHERE status='OPEN'. This replaces the former
+            # INSERT-then-catch-IntegrityError-then-conn.rollback() recovery: on the
+            # SHARED connection (Q-03) that connection-wide rollback could discard a
+            # concurrent coroutine's (resolver / monitor / HTTP) still-uncommitted
+            # write, silently losing it. One ON CONFLICT DO UPDATE has NO rollback,
+            # NO savepoint and NO multi-statement window that interleaving or a
+            # foreign commit could corrupt. On the (symbol, side) race the DO UPDATE
+            # refreshes the winner's baseline + volatile fields in place — the same
+            # outcome the old catch-path produced. Needs SQLite >= 3.35 (partial
+            # ON CONFLICT target >= 3.24, RETURNING >= 3.35); shipped build is 3.49.
+            cur = await conn.execute(
+                """
+                INSERT INTO position_management
+                  (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                   invalidation_price, armed_rules, be_done, last_alert_state,
+                   status, created_at, updated_at, high_water)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?, ?)
+                ON CONFLICT(symbol, side) WHERE status = 'OPEN' DO UPDATE SET
+                  entry_snap = excluded.entry_snap,
+                  initial_sl_snap = excluded.initial_sl_snap,
+                  r1 = excluded.r1,
+                  opened_at = excluded.opened_at,
+                  invalidation_price = excluded.invalidation_price,
+                  updated_at = excluded.updated_at,
+                  high_water = excluded.high_water
+                RETURNING id
+                """,
+                (
+                    symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
+                    invalidation_price, now, now, entry_snap,
+                ),
+            )
+            row = await cur.fetchone()
+            await conn.commit()
+            return int(row["id"]) if row else 0
 
     async def get_open_position_mgmt(
         self, symbol: str, side: str

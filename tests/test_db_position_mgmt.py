@@ -216,3 +216,56 @@ async def test_disarm_all_empties_armed_rules_and_returns_count(db_path):
     for sym, side in (("BTC_USDT", "long"), ("ETH_USDT", "short")):
         row = await db.get_open_position_mgmt(sym, side)
         assert row["armed_rules"] == {}
+
+
+# ── 2026-07-20: shared-connection atomic-upsert fix (concurrent-write safety) ──
+
+
+@pytest.mark.asyncio
+async def test_partial_index_on_conflict_upsert_supported(tmp_path):
+    """Pin the SQLite features the position_mgmt upsert now relies on: a partial-
+    index ON CONFLICT target (>=3.24) + RETURNING (>=3.35). If a runtime ever ships
+    an older sqlite, THIS fails loudly instead of the method raising in production.
+    Also proves DO UPDATE refreshes in place (no duplicate, no IntegrityError)."""
+    import aiosqlite
+
+    conn = await aiosqlite.connect(str(tmp_path / "u.db"))
+    try:
+        await conn.execute("CREATE TABLE pm(id INTEGER PRIMARY KEY, sym TEXT, st TEXT, v INTEGER)")
+        await conn.execute("CREATE UNIQUE INDEX u ON pm(sym) WHERE st='OPEN'")
+        await conn.execute("INSERT INTO pm(sym, st, v) VALUES ('BTC','OPEN',1)")
+        await conn.commit()
+        cur = await conn.execute(
+            "INSERT INTO pm(sym, st, v) VALUES ('BTC','OPEN',2) "
+            "ON CONFLICT(sym) WHERE st='OPEN' DO UPDATE SET v=excluded.v RETURNING id, v"
+        )
+        row = await cur.fetchone()
+        await conn.commit()
+        cur2 = await conn.execute("SELECT COUNT(*), MAX(v) FROM pm")
+        cnt, maxv = await cur2.fetchone()
+    finally:
+        await conn.close()
+    assert row is not None and row[1] == 2  # RETURNING gave the updated row
+    assert cnt == 1 and maxv == 2  # updated IN PLACE — no duplicate, no raise
+
+
+@pytest.mark.asyncio
+async def test_concurrent_upsert_same_position_converges_to_one_row(db_path):
+    """End-to-end invariant: two connections issuing upserts for the same
+    (symbol, side) OPEN position must converge to exactly ONE row / id — no
+    duplicate, no crash — whether they serialize (second sees the row) or race
+    the partial-unique index (ON CONFLICT DO UPDATE). Which internal path each
+    call takes is timing-dependent and NOT asserted here (that's the honest
+    scope); the atomic upsert makes the outcome identical either way."""
+    import asyncio
+
+    db1 = Database(db_path)
+    await db1.init()
+    db2 = Database(db_path)
+    ids = await asyncio.gather(
+        db1.upsert_position_mgmt(**_base_kwargs()),
+        db2.upsert_position_mgmt(**_base_kwargs()),
+    )
+    rows = await db1.list_open_position_mgmt()
+    assert len(rows) == 1  # exactly one OPEN row, no duplicate
+    assert ids[0] == ids[1] == rows[0]["id"]  # both returned the one winning id
