@@ -2777,6 +2777,12 @@ async def _mexc_poll_fallback(websocket: WebSocket, client, symbol: str) -> None
             )
             for t in pending:
                 t.cancel()
+            # Await the cancelled task(s) so cancellation SETTLES before we return
+            # and the socket closes — mirrors hl_proxy's teardown (hl_proxy.py:256).
+            # Without this the pending task is destroyed still-pending ("Task was
+            # destroyed but it is pending" / "exception was never retrieved").
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             for t in done:
                 exc = t.exception()
                 if exc and not isinstance(
