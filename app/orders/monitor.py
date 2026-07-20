@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Any
 
+from app.analysis.indicators import compute_atr
 from app.config import get_settings
 from app.orders.protection import classify_protection
 from app.orders.trade_manager import Alert, MgmtBaseline, MoveSlToBe, evaluate_rules
@@ -227,6 +229,11 @@ async def _process_position(
     # read above for the protection-direction check — the baseline only freezes
     # the ORIGINAL initial_sl/r1.
     await ensure_baseline(db, client, symbol, side, entry, now_ms)
+    # Monotonic Chandelier high-water — its OWN UPDATE (never the freeze path),
+    # advanced every cycle BEFORE rule evaluation so the trail always trails the
+    # best price seen (long: running high; short: running low). Cheap; harmless
+    # for non-trail positions (the value is only READ when auto_trail is armed).
+    await db.update_high_water(symbol, side, mark)
     mgmt_row = await db.get_open_position_mgmt(symbol, side)
     if mgmt_row is None:
         return
@@ -240,7 +247,16 @@ async def _process_position(
         armed_rules=mgmt_row.get("armed_rules") or {},
         be_done=bool(mgmt_row.get("be_done")),
         last_alert_state=mgmt_row.get("last_alert_state") or {},
+        high_water=mgmt_row.get("high_water"),
     )
+
+    # ATR is fetched ONLY for auto_trail-armed positions (klines cost, spec §3).
+    # Fail-safe: any fetch/compute error → atr=None → evaluate_rules emits no
+    # trail move this cycle (never trail on an unknown ATR).
+    armed = baseline.armed_rules if isinstance(baseline.armed_rules, dict) else {}
+    atr = None
+    if armed.get("auto_trail"):
+        atr = await _atr_for(app, client, settings, symbol, now_ms)
 
     actions = evaluate_rules(
         side=side,
@@ -250,6 +266,7 @@ async def _process_position(
         mgmt=baseline,
         now_ms=now_ms,
         settings=settings,
+        atr=atr,
     )
 
     # F1: if the current-SL read FAILED (not "no stop", but a lookup error),
@@ -262,24 +279,57 @@ async def _process_position(
     alert_state = dict(baseline.last_alert_state)
     state_dirty = False
 
+    # Advisory alarms always all fire (they never touch an order).
     for action in actions:
-        if isinstance(action, MoveSlToBe):
-            # HL-only gate — identical predicate to modify_stop_loss (§3.6). A
-            # non-HL client is surfaced as an informational feed entry, never a
-            # direct order write.
-            if not hasattr(client, "place_stop_order"):
-                # Debounced like the other alerts: set the ts ONCE, don't rewrite
-                # it every cycle (that would re-toast the client every poll). The
-                # arm endpoint also rejects arming auto_be on non-HL, so this is
-                # only reachable for a stale armed record under a non-HL config.
-                if not alert_state.get("auto_be_unavailable"):
-                    alert_state["auto_be_unavailable"] = {
-                        "active": True,
-                        "message": "Auto-BE ist nur auf Hyperliquid verfuegbar.",
-                        "ts": now_ms,
-                    }
-                    state_dirty = True
-                continue
+        if isinstance(action, Alert):
+            alert_state[action.kind] = {
+                "active": True,
+                "message": action.message,
+                "ts": now_ms,
+            }
+            state_dirty = True
+
+    # ── Single most-protective stop move (Nice-2) ────────────────────────────
+    # evaluate_rules can return BOTH an Auto-BE and an Auto-Trail MoveSlToBe in
+    # ONE cycle. Applying them sequentially via modify_stop_loss could NET-LOOSEN
+    # the live stop (e.g. BE→118 applied, then Trail→115 applied → 118 drops to
+    # 115). RULE: among all MoveSlToBe actions this cycle, execute ONLY the most
+    # protective one (long: highest new_sl; short: lowest new_sl); ignore the
+    # rest. Each candidate already passed evaluate_rules' _is_more_protective /
+    # right-side guards, so the winner is strictly a tightening move.
+    #
+    # be_done latch: a BE move being ELIGIBLE this cycle (any emitted MoveSlToBe
+    # with an "auto-BE" reason) means the resulting stop — the MOST protective of
+    # BE and Trail — is at least as protective as break-even. So on a successful
+    # move we latch be_done whenever BE was eligible, whether the executed move
+    # was the BE one or a (higher) trail. Trailing itself has NO latch: a pure
+    # trail move never sets be_done and keeps firing as the high-water advances.
+    moves = [a for a in actions if isinstance(a, MoveSlToBe)]
+    if moves:
+        if side == "long":
+            chosen = max(moves, key=lambda m: m.new_sl)
+        else:
+            chosen = min(moves, key=lambda m: m.new_sl)
+        be_eligible = any(str(m.reason).startswith("auto-BE") for m in moves)
+        is_be_move = str(chosen.reason).startswith("auto-BE")
+
+        # HL-only gate — identical predicate to modify_stop_loss (§3.6). A non-HL
+        # client is surfaced as an informational feed entry, never a direct write.
+        if not hasattr(client, "place_stop_order"):
+            # Debounced: set the ts ONCE (don't re-toast every poll). The arm
+            # endpoint rejects arming auto_be/auto_trail on non-HL, so this is
+            # only reachable for a stale armed record under a non-HL config.
+            if not alert_state.get("auto_be_unavailable"):
+                alert_state["auto_be_unavailable"] = {
+                    "active": True,
+                    "message": (
+                        "Auto-Management (BE/Trail) ist nur auf Hyperliquid "
+                        "verfuegbar."
+                    ),
+                    "ts": now_ms,
+                }
+                state_dirty = True
+        else:
             attempts = _be_attempts(app)
             akey = (symbol, side)
             if attempts.get(akey, 0) >= _BE_MAX_ATTEMPTS:
@@ -291,55 +341,64 @@ async def _process_position(
                         "active": True,
                         "halted": True,
                         "message": (
-                            f"Auto-BE nach {_BE_MAX_ATTEMPTS} Fehlversuchen "
-                            "gestoppt — bitte pruefen / neu scharfschalten."
+                            f"Auto-Management nach {_BE_MAX_ATTEMPTS} "
+                            "Fehlversuchen gestoppt — bitte pruefen / neu "
+                            "scharfschalten."
                         ),
                         "ts": now_ms,
                     }
                     state_dirty = True
-                continue
-            try:
-                await service.modify_stop_loss(
-                    symbol=symbol, side=side, new_sl=action.new_sl
-                )
-            except Exception as e:  # noqa: BLE001 — must not abort the cycle
-                n = attempts.get(akey, 0) + 1
-                attempts[akey] = n
-                log.warning(
-                    "auto-BE modify_stop_loss failed for %s %s (%d/%d): %s",
-                    symbol,
-                    side,
-                    n,
-                    _BE_MAX_ATTEMPTS,
-                    e,
-                )
-                alert_state["auto_be_error"] = {
-                    "active": True,
-                    "halted": n >= _BE_MAX_ATTEMPTS,
-                    "message": f"Auto-BE fehlgeschlagen ({n}/{_BE_MAX_ATTEMPTS}): {e}",
-                    "ts": now_ms,
-                }
-                state_dirty = True
-                # Do NOT mark be_done — leave it armed to retry until the cap.
-                continue
-            # Success: single-shot disarm + visible auto-action feed entry.
-            attempts.pop(akey, None)
-            await db.mark_be_done(symbol, side)
-            alert_state["auto_be"] = {
-                "active": True,
-                "reason": action.reason,
-                "new_sl": action.new_sl,
-                "message": f"App hat SL auf BE gezogen ({action.reason}).",
-                "ts": now_ms,
-            }
-            state_dirty = True
-        elif isinstance(action, Alert):
-            alert_state[action.kind] = {
-                "active": True,
-                "message": action.message,
-                "ts": now_ms,
-            }
-            state_dirty = True
+            else:
+                try:
+                    await service.modify_stop_loss(
+                        symbol=symbol, side=side, new_sl=chosen.new_sl
+                    )
+                except Exception as e:  # noqa: BLE001 — must not abort the cycle
+                    n = attempts.get(akey, 0) + 1
+                    attempts[akey] = n
+                    log.warning(
+                        "auto-mgmt modify_stop_loss failed for %s %s (%d/%d): %s",
+                        symbol,
+                        side,
+                        n,
+                        _BE_MAX_ATTEMPTS,
+                        e,
+                    )
+                    alert_state["auto_be_error"] = {
+                        "active": True,
+                        "halted": n >= _BE_MAX_ATTEMPTS,
+                        "message": (
+                            f"Auto-Management fehlgeschlagen "
+                            f"({n}/{_BE_MAX_ATTEMPTS}): {e}"
+                        ),
+                        "ts": now_ms,
+                    }
+                    state_dirty = True
+                    # Do NOT latch be_done — leave it armed to retry until the cap.
+                else:
+                    # Success: clear the retry cap (both BE and repeated trailing
+                    # reset it) + a visible auto-action feed entry.
+                    attempts.pop(akey, None)
+                    if be_eligible:
+                        # Resulting stop is >= break-even → latch the one-shot BE.
+                        await db.mark_be_done(symbol, side)
+                    if is_be_move:
+                        alert_state["auto_be"] = {
+                            "active": True,
+                            "reason": chosen.reason,
+                            "new_sl": chosen.new_sl,
+                            "message": f"App hat SL auf BE gezogen ({chosen.reason}).",
+                            "ts": now_ms,
+                        }
+                    else:
+                        alert_state["auto_trail"] = {
+                            "active": True,
+                            "reason": chosen.reason,
+                            "new_sl": chosen.new_sl,
+                            "message": "App hat SL nachgezogen (Trail).",
+                            "ts": now_ms,
+                        }
+                    state_dirty = True
 
     if state_dirty:
         await db.set_alert_state(symbol, side, alert_state)
@@ -369,6 +428,50 @@ def _absence_counts(app: Any) -> dict:
         d = {}
         app.state.tm_absence = d
     return d
+
+
+def _atr_cache(app: Any) -> dict:
+    d = getattr(app.state, "tm_atr_cache", None)
+    if not isinstance(d, dict):
+        d = {}
+        app.state.tm_atr_cache = d
+    return d
+
+
+async def _atr_for(
+    app: Any, client: Any, settings: Any, symbol: str, now_ms: int
+) -> float | None:
+    """Latest Wilder-ATR for ``symbol`` on the trail TF — fail-safe + cached.
+
+    Called ONLY for positions that have ``auto_trail`` armed (klines cost).
+    Any error (klines fetch, decode, too-few candles) yields ``None`` so the
+    caller NEVER trails on an unknown/bad ATR (spec §3/§4). A short in-memory
+    cache keyed by (symbol, tf) with a ~one-cycle TTL means two armed positions
+    on the same symbol/tf — and re-entry into the same cycle — never double-fetch.
+    """
+    tf = settings.tm_trail_atr_tf
+    period = settings.tm_trail_atr_period
+    cache = _atr_cache(app)
+    key = (symbol, tf)
+    try:
+        ttl_ms = max(1, int(settings.tm_monitor_interval_s)) * 1000
+    except Exception:
+        ttl_ms = 20_000
+    hit = cache.get(key)
+    if isinstance(hit, dict) and (now_ms - int(hit.get("ts", 0))) < ttl_ms:
+        return hit.get("atr")
+
+    atr: float | None = None
+    try:
+        candles = await client.klines(symbol, tf, limit_hint=max(period * 3, 60))
+        series = compute_atr(candles, period=period)
+        atr = next((v for v in reversed(series) if v is not None), None)
+        if atr is not None and not (math.isfinite(atr) and atr > 0):
+            atr = None  # never act on a non-finite / non-positive ATR
+    except Exception:
+        atr = None  # fail-safe: no ATR → no trail move this cycle
+    cache[key] = {"atr": atr, "ts": now_ms}
+    return atr
 
 
 async def _run_one_cycle(app: Any, now_ms: int) -> None:

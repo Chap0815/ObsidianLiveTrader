@@ -107,11 +107,11 @@ def test_arm_unknown_rule_name_rejected(tmp_path, monkeypatch):
             json={
                 "symbol": "BTC_USDT",
                 "side": "long",
-                "rules": {"auto_trail": True},
+                "rules": {"auto_moon": True},
             },
         )
         assert r.status_code == 400, r.text
-        assert "auto_trail" in r.text
+        assert "auto_moon" in r.text
     get_settings.cache_clear()
 
 
@@ -260,6 +260,25 @@ def test_arm_auto_be_rejected_on_non_hl(tmp_path, monkeypatch):
         r = tc.post(
             "/api/positions/arm",
             json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 400, r.text
+    get_settings.cache_clear()
+
+
+def test_arm_auto_trail_rejected_on_non_hl(tmp_path, monkeypatch):
+    """Auto-Trail is HL-only (drives modify_stop_loss) — arming it on a non-HL
+    client must 400 at the source, exactly like auto_be (V4 whitelist + reject)."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_trail_nonhl.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        del client.place_stop_order  # non-HL: no HL stop-order method
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_trail": True}},
         )
         assert r.status_code == 400, r.text
     get_settings.cache_clear()

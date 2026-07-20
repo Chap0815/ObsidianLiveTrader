@@ -2195,11 +2195,11 @@ async def orders_modify_sl(
         raise HTTPException(status_code=502, detail=str(e)) from e
 
 
-# v1 whitelist of autonomous management rule NAMES (spec §1.3). Only auto_be is
-# an autonomous action; any other key on an arm request is a CLIENT BUG, never
-# silently ignored (would hide a typo that leaves the user thinking they armed
-# something they didn't).
-_ARM_ALLOWED_RULES = {"auto_be"}
+# Whitelist of autonomous management rule NAMES (spec §1.3). auto_be (v1) and
+# auto_trail (v2) are the autonomous actions; any other key on an arm request is
+# a CLIENT BUG, never silently ignored (would hide a typo that leaves the user
+# thinking they armed something they didn't).
+_ARM_ALLOWED_RULES = {"auto_be", "auto_trail"}
 
 
 @app.post("/api/positions/arm")
@@ -2249,13 +2249,16 @@ async def positions_arm(
     if client is None:
         raise HTTPException(status_code=503, detail="Exchange client not initialized")
 
-    # Auto-BE is HL-only (same constraint as modify_stop_loss). Reject arming it
-    # on a non-HL exchange at the source — otherwise the monitor could never
-    # execute it and would just keep emitting an "unavailable" alert. Disarming
-    # (auto_be=False) stays allowed on any exchange.
-    if rules.get("auto_be") and not hasattr(client, "place_stop_order"):
+    # Auto-BE and Auto-Trail are HL-only (both drive modify_stop_loss). Reject
+    # arming either on a non-HL exchange at the source — otherwise the monitor
+    # could never execute it and would just keep emitting an "unavailable" alert.
+    # Disarming (auto_be/auto_trail=False) stays allowed on any exchange.
+    if (rules.get("auto_be") or rules.get("auto_trail")) and not hasattr(
+        client, "place_stop_order"
+    ):
         raise HTTPException(
-            status_code=400, detail="Auto-BE ist nur auf Hyperliquid verfuegbar."
+            status_code=400,
+            detail="Auto-Management (BE/Trail) ist nur auf Hyperliquid verfuegbar.",
         )
 
     # Position must be LIVE — can't arm what isn't open (spec §4 identity).

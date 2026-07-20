@@ -71,7 +71,7 @@ def db_path(tmp_path):
     return str(tmp_path / "monitor.db")
 
 
-async def _seed_open(db, *, armed):
+async def _seed_open(db, *, armed, rules=None):
     await db.upsert_position_mgmt(
         "BTC_USDT",
         "long",
@@ -82,7 +82,22 @@ async def _seed_open(db, *, armed):
         invalidation_price=None,
     )
     if armed:
-        await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True})
+        await db.set_armed_rules(
+            "BTC_USDT", "long", rules if rules is not None else {"auto_be": True}
+        )
+
+
+def _flat_candles(n=30, close=100.0, tr=1.0):
+    """Candles with a CONSTANT true range ``tr`` → Wilder ATR == ``tr``.
+
+    (All closes equal ``close`` so each bar's TR = max(high-low, |high-pc|,
+    |low-pc|) = high-low = tr.) compute_atr only reads .high/.low/.close.
+    """
+    half = tr / 2.0
+    return [
+        SimpleNamespace(high=close + half, low=close - half, close=close)
+        for _ in range(n)
+    ]
 
 
 @pytest.mark.asyncio
@@ -264,3 +279,125 @@ async def test_sl_read_failure_never_moves_the_stop(monkeypatch, db_path):
     svc.modify_stop_loss.assert_not_awaited()  # never move on a failed SL read
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 0  # not latched
+
+
+# ── TML v2 (Task V4): Auto-Trailing wired into the monitor ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_armed_trail_moves_sl_and_refires_no_latch(monkeypatch, db_path):
+    """armed auto_trail HL, +>activation_r, HW set, ATR ok → modify_stop_loss with
+    the Chandelier trail SL. Trailing has NO be_done latch: a rising high-water
+    fires a fresh (tighter) trail move every cycle."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    # entry 100, r1=2. atr=1, mult=2 → offset 2. mark 110 → hw 110 → trail 108.
+    client = FakeClient([_pos()], mark=110.0, is_hl=True)
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    assert svc.modify_stop_loss.await_count == 1
+    assert svc.modify_stop_loss.await_args.kwargs["new_sl"] == pytest.approx(108.0)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 0  # trailing never latches be_done
+    assert "auto_trail" in row["last_alert_state"]
+    assert row["high_water"] == pytest.approx(110.0)
+
+    # Second cycle, higher mark → hw 112 → trail 110: a fresh, tighter move.
+    client._mark = 112.0
+    await monitor._run_one_cycle(app, NOW_MS + 20_000)
+    assert svc.modify_stop_loss.await_count == 2
+    assert svc.modify_stop_loss.await_args.kwargs["new_sl"] == pytest.approx(110.0)
+
+
+@pytest.mark.asyncio
+async def test_atr_fetch_error_no_trail_move(monkeypatch, db_path):
+    """Fail-safe: a klines/ATR fetch error → atr None → evaluate_rules emits no
+    trail move → modify_stop_loss never called (never trail on an unknown ATR)."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=110.0, is_hl=True)
+    client.klines = AsyncMock(side_effect=RuntimeError("klines down"))
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    client.klines.assert_awaited()  # it tried (armed trail)…
+    svc.modify_stop_loss.assert_not_awaited()  # …but no ATR → no move
+
+
+@pytest.mark.asyncio
+async def test_non_trail_position_does_not_fetch_klines(monkeypatch, db_path):
+    """Cost guard: a position WITHOUT auto_trail must never trigger a klines
+    fetch — the ATR path is entered only for auto_trail-armed positions."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_be": True})  # BE only, no trail
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=102.5, is_hl=True)  # +1.25R → auto-BE fires
+    client.klines = AsyncMock(return_value=_flat_candles())
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    client.klines.assert_not_awaited()  # NO klines for a non-trail position
+    svc.modify_stop_loss.assert_awaited_once()  # auto-BE still ran
+
+
+@pytest.mark.asyncio
+async def test_high_water_updated_each_cycle_monotonic(monkeypatch, db_path):
+    """High-water advances every cycle before rule evaluation, monotonically
+    (long: never decreases)."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=False)
+    _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=105.0, is_hl=True)
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+    assert (await db.get_open_position_mgmt("BTC_USDT", "long"))[
+        "high_water"
+    ] == pytest.approx(105.0)
+
+    client._mark = 110.0
+    await monitor._run_one_cycle(app, NOW_MS + 20_000)
+    assert (await db.get_open_position_mgmt("BTC_USDT", "long"))[
+        "high_water"
+    ] == pytest.approx(110.0)
+
+    client._mark = 108.0  # pullback: high-water must NOT decrease
+    await monitor._run_one_cycle(app, NOW_MS + 40_000)
+    assert (await db.get_open_position_mgmt("BTC_USDT", "long"))[
+        "high_water"
+    ] == pytest.approx(110.0)
+
+
+@pytest.mark.asyncio
+async def test_multi_move_applies_only_most_protective(monkeypatch, db_path):
+    """Nice-2: when BOTH Auto-BE and Auto-Trail emit a move in one cycle, only the
+    MOST protective (long: highest new_sl) is applied via a SINGLE modify_stop_loss
+    — never both sequentially (which could net-loosen the live stop). be_done is
+    latched because a BE move was eligible."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_be": True, "auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    # mark 110: BE ≈ 100.06, trail = hw(110) - 2*atr(1) = 108. Trail is tighter.
+    client = FakeClient([_pos()], mark=110.0, is_hl=True)
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()  # exactly ONE move this cycle
+    assert svc.modify_stop_loss.await_args.kwargs["new_sl"] == pytest.approx(108.0)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 1  # BE was eligible → latched even though trail won
+    assert "auto_trail" in row["last_alert_state"]
