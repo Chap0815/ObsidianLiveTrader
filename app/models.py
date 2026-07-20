@@ -308,3 +308,17 @@ class ModifySLRequest(BaseModel):
     side: OrderSide
     new_sl: float = Field(..., gt=0, description="New stop-loss price")
 
+
+class ArmRequest(BaseModel):
+    """Arm autonomous management rules for ONE live position (spec §3.1/§4).
+
+    This ENABLES autonomous stop moves, but the endpoint itself never moves a
+    stop or places an order — it only writes the mgmt DB record; the server-side
+    monitor is the sole actor. `side` is validated to long/short by OrderSide;
+    the endpoint additionally whitelists the rule NAMES (v1: only `auto_be`).
+    """
+
+    symbol: str
+    side: OrderSide
+    rules: dict[str, Any] = Field(default_factory=dict)
+

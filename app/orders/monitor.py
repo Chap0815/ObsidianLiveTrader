@@ -144,6 +144,43 @@ async def _current_sl(client: Any, symbol: str, side: str, entry: float) -> floa
         return None
 
 
+async def ensure_baseline(
+    db: Any, client: Any, symbol: str, side: str, entry: float, now_ms: int
+) -> None:
+    """Create (first sighting / arm time) or refresh the durable baseline for
+    ONE open position — the SINGLE baseline path shared by the monitor cycle and
+    the ``POST /api/positions/arm`` endpoint (spec §4).
+
+    Reads the current protective stop, computes ``r1 = |entry - initial_sl|``
+    (0.0 when no SL is known → evaluate_rules treats it as "no R signal"), the
+    best-effort opened_at and thesis-invalidation, then upserts. The repo FREEZES
+    entry_snap/initial_sl_snap/r1 on a non-deviated re-sighting (so "+1R" stays
+    measured from the ORIGINAL risk even after the stop later moves) and resets
+    to a fresh baseline when the entry deviated beyond tolerance. NEVER places an
+    order or moves a stop — it only writes the mgmt DB record.
+    """
+    current_sl = await _current_sl(client, symbol, side, entry)
+    # r1 is fixed at baseline time. With no known SL it can't be computed → 0.0,
+    # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
+    # gate) — safe until a real stop exists.
+    r1 = abs(entry - current_sl) if current_sl is not None else 0.0
+    opened_at = await _best_effort_opened_at(client, db, symbol, side, now_ms)
+    invalidation = await _best_effort_invalidation(db, symbol)
+
+    # Durable baseline. First sighting inserts; a later sighting refreshes in
+    # place (arming/be_done/alert-state preserved), unless entry deviated beyond
+    # tolerance → treated as a NEW position by the repo (reset). §4/§5.
+    await db.upsert_position_mgmt(
+        symbol,
+        side,
+        entry_snap=entry,
+        initial_sl_snap=current_sl if current_sl is not None else entry,
+        r1=r1,
+        opened_at=opened_at,
+        invalidation_price=invalidation,
+    )
+
+
 async def _process_position(
     app: Any,
     db: Any,
@@ -179,25 +216,11 @@ async def _process_position(
     if mark is None or mark <= 0:
         return
 
-    # r1 is fixed at baseline time. With no known SL it can't be computed → 0.0,
-    # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
-    # gate) — safe until a real stop exists.
-    r1 = abs(entry - current_sl) if current_sl is not None else 0.0
-    opened_at = await _best_effort_opened_at(client, db, symbol, side, now_ms)
-    invalidation = await _best_effort_invalidation(db, symbol)
-
-    # Durable baseline. First sighting inserts; a later sighting refreshes in
-    # place (arming/be_done/alert-state preserved), unless entry deviated beyond
-    # tolerance → treated as a NEW position by the repo (reset). §4/§5.
-    await db.upsert_position_mgmt(
-        symbol,
-        side,
-        entry_snap=entry,
-        initial_sl_snap=current_sl if current_sl is not None else entry,
-        r1=r1,
-        opened_at=opened_at,
-        invalidation_price=invalidation,
-    )
+    # Durable baseline via the SHARED helper (identical freeze/reset semantics
+    # to the arm endpoint). evaluate_rules below still uses the LIVE current_sl
+    # read above for the protection-direction check — the baseline only freezes
+    # the ORIGINAL initial_sl/r1.
+    await ensure_baseline(db, client, symbol, side, entry, now_ms)
     mgmt_row = await db.get_open_position_mgmt(symbol, side)
     if mgmt_row is None:
         return

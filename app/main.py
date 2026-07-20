@@ -45,6 +45,7 @@ from app.mexc.client import empty_account
 from app.mexc.errors import MexcError
 from app.models import (
     AnalyzeRequest,
+    ArmRequest,
     CancelRequest,
     ClosePositionRequest,
     ConfirmRequest,
@@ -2192,6 +2193,137 @@ async def orders_modify_sl(
         ) from e
     except ExchangeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+# v1 whitelist of autonomous management rule NAMES (spec §1.3). Only auto_be is
+# an autonomous action; any other key on an arm request is a CLIENT BUG, never
+# silently ignored (would hide a typo that leaves the user thinking they armed
+# something they didn't).
+_ARM_ALLOWED_RULES = {"auto_be"}
+
+
+@app.post("/api/positions/arm")
+async def positions_arm(
+    request: Request,
+    body: ArmRequest,
+    _: None = Depends(require_local_token),
+):
+    """Arm autonomous management rules for ONE LIVE position (spec §3.1/§4).
+
+    This is the control that ENABLES autonomous stop-loss moves — but it NEVER
+    moves a stop or places an order itself. It only (a) FREEZES the durable
+    baseline at arm time via the SHARED ``ensure_baseline`` path (so "+1R" is
+    measured from the risk at arm time) and (b) writes ``armed_rules``. All money
+    action stays exclusively in the monitor loop, which reads armed_rules from
+    the DB each cycle.
+    """
+    from app.orders.monitor import ensure_baseline
+
+    symbol = normalize_symbol(body.symbol)
+    side = body.side
+    rules = body.rules or {}
+
+    # Reject unknown rule names up front (400) — do NOT silently drop them.
+    unknown = set(rules) - _ARM_ALLOWED_RULES
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown rule name(s): {sorted(unknown)}; "
+                f"allowed: {sorted(_ARM_ALLOWED_RULES)}"
+            ),
+        )
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    client = _exchange_client(request)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Exchange client not initialized")
+
+    # Position must be LIVE — can't arm what isn't open (spec §4 identity).
+    try:
+        snap = await client.account_snapshot()
+    except ExchangeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    positions = (snap.get("positions") if isinstance(snap, dict) else None) or []
+    pos = next(
+        (
+            p
+            for p in positions
+            if isinstance(p, dict)
+            and p.get("symbol") == symbol
+            and p.get("side") == side
+        ),
+        None,
+    )
+    if pos is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No live {side} position for {symbol} to arm",
+        )
+    try:
+        entry = float(pos.get("entry_price"))
+    except (TypeError, ValueError):
+        entry = 0.0
+    if entry <= 0:
+        raise HTTPException(
+            status_code=400, detail="Position has no usable entry price"
+        )
+
+    now_ms = int(_time.time() * 1000)
+    # Freeze the baseline THEN write the arming. ensure_baseline never places an
+    # order — it only writes the mgmt record.
+    await ensure_baseline(db, client, symbol, side, entry, now_ms)
+    await db.set_armed_rules(symbol, side, rules)
+    record = await db.get_open_position_mgmt(symbol, side)
+    return record or {}
+
+
+@app.get("/api/positions/alerts")
+async def positions_alerts(
+    request: Request,
+    _: None = Depends(require_local_token),
+):
+    """Polled alert + auto-action feed (spec §6). No server→client push exists;
+    the client polls this on its account/overview interval and renders
+    toasts/banners + 1-click actions. Aggregates each OPEN mgmt row's
+    last_alert_state (alarms + the "App hat SL auf BE gezogen" auto-action feed)
+    plus its armed_rules / be_done so the UI can reflect arming state."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return {"alerts": []}
+    try:
+        rows = await db.list_open_position_mgmt()
+    except Exception:
+        log.warning("positions/alerts: list_open_position_mgmt failed", exc_info=True)
+        return {"alerts": []}
+    out = [
+        {
+            "symbol": r.get("symbol"),
+            "side": r.get("side"),
+            "armed_rules": r.get("armed_rules") or {},
+            "be_done": bool(r.get("be_done")),
+            "alerts": r.get("last_alert_state") or {},
+        }
+        for r in rows
+    ]
+    return {"alerts": out}
+
+
+@app.post("/api/positions/killswitch")
+async def positions_killswitch(
+    request: Request,
+    _: None = Depends(require_local_token),
+):
+    """Kill-switch (spec §3.5): disarm ALL open positions immediately. Empties
+    armed_rules on every OPEN mgmt row; the monitor re-reads armed_rules each
+    cycle, so every auto-action stops next cycle. Never touches a stop/order."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    disarmed = await db.disarm_all()
+    return {"disarmed": disarmed}
 
 
 @app.get("/api/orders/open")
