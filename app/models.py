@@ -195,6 +195,27 @@ class TradeProposal(BaseModel):
     # sizing or decision path.
     pre_mortem: str | None = None
 
+    @field_validator(
+        "entry_price", "tp1", "tp2", "tp3", "stop_loss", "rrr", "invalidation_price"
+    )
+    @classmethod
+    def _reject_nonfinite(cls, v: float | None) -> float | None:
+        """Reject NaN/±Inf on the geometry fields parsed from UNTRUSTED LLM output.
+
+        stdlib json.loads accepts the ``NaN``/``Infinity`` tokens and pydantic
+        floats default to ``allow_inf_nan=True``, so without this a NaN entry/SL/
+        TP would SILENTLY bypass the advisory safety nets: `_geometry_inverted`'s
+        auto-STAY_OUT downgrade and `_price_plausibility_flags` both compare
+        against the value, and every NaN comparison is False → no downgrade →
+        garbage levels surface as a tradeable setup, and NaN pollutes the journal
+        / recalibration stats. Rejecting here becomes a clean LlmError via
+        `_parse_content_to_proposal` (mirrors `OrderTicket._reject_nonfinite`).
+        ``None`` stays allowed so legitimate STAY_OUT/absent optionals are kept.
+        """
+        if v is not None and not math.isfinite(v):
+            raise ValueError("must be a finite number (NaN/Infinity rejected)")
+        return v
+
 
 class AnalyzeRequest(BaseModel):
     symbol: str = "BTC_USDT"
@@ -230,6 +251,16 @@ class ReevaluateProposal(BaseModel):
     # for PARTIAL_CLOSE; null otherwise.
     partial_close_pct: float | None = Field(None, ge=0, le=100)
     risk_notes: str = ""
+
+    @field_validator("new_sl", "new_tp", "partial_close_pct")
+    @classmethod
+    def _reject_nonfinite(cls, v: float | None) -> float | None:
+        """Reject NaN/±Inf on the numeric fields parsed from untrusted LLM output
+        (same rationale as TradeProposal._reject_nonfinite / OrderTicket): a NaN
+        new_sl/new_tp must not surface as an actionable reevaluation."""
+        if v is not None and not math.isfinite(v):
+            raise ValueError("must be a finite number (NaN/Infinity rejected)")
+        return v
 
 
 class ReevaluateRequest(BaseModel):

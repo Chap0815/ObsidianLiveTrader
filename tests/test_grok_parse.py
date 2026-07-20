@@ -221,3 +221,68 @@ def test_build_llm_context_htf_before_ltf():
     ctx = build_llm_context(market, {}, Settings(include_account_in_llm=False))
     keys = list(ctx.keys())
     assert keys.index("htf") < keys.index("ltf")
+
+
+# ── NaN/Inf on untrusted LLM geometry must be rejected (advisory-net bypass) ──
+
+
+@pytest.mark.parametrize("field", ["entry_price", "tp1", "tp2", "tp3", "stop_loss", "rrr", "invalidation_price"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_trade_proposal_rejects_nonfinite_geometry(field, bad):
+    """A NaN/Inf geometry leg from the model would SILENTLY bypass the STAY_OUT
+    downgrade nets (every NaN comparison is False). The model must reject it so
+    it surfaces as a clean LlmError, never a fake-tradeable proposal."""
+    data = dict(VALID_BUY)
+    data[field] = bad
+    with pytest.raises(ValidationError):
+        TradeProposal.model_validate(data)
+
+
+def test_parse_proposal_rejects_nan_token_from_json():
+    """stdlib json.loads accepts the bare NaN token — parse_proposal must still
+    reject it via the model validator (not carry a NaN proposal downstream)."""
+    raw = json.dumps(VALID_BUY).replace("64100.0", "NaN")  # stop_loss -> NaN
+    assert "NaN" in raw
+    with pytest.raises(ValidationError):
+        parse_proposal(raw)
+
+
+def test_trade_proposal_accepts_finite_and_none():
+    """No false positives: the valid finite BUY still parses, a very-large finite
+    level passes, and a STAY_OUT with all-None geometry is untouched."""
+    assert TradeProposal.model_validate(VALID_BUY).action == "BUY"
+    big = dict(VALID_BUY, entry_price=1e12, tp1=1.1e12, stop_loss=0.9e12)
+    assert TradeProposal.model_validate(big).entry_price == 1e12  # large finite OK
+    p = TradeProposal.model_validate(VALID_STAY_OUT)
+    assert p.entry_price is None and p.stop_loss is None
+
+
+def test_parse_content_to_proposal_maps_nan_to_llmerror():
+    """The production contract: a NaN leg must degrade to a clean LlmError (HTTP
+    502), NEVER a 500 or a fake-tradeable proposal."""
+    from app.llm.client import LlmError, _parse_content_to_proposal
+
+    raw = json.dumps(VALID_BUY).replace("64100.0", "NaN")  # stop_loss -> NaN
+    with pytest.raises(LlmError):
+        _parse_content_to_proposal(raw, provider="grok")
+
+
+@pytest.mark.parametrize("field", ["new_sl", "new_tp", "partial_close_pct"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_reevaluate_proposal_rejects_nonfinite(field, bad):
+    from app.models import ReevaluateProposal
+
+    base = {"action": "HOLD", "new_sl": None, "new_tp": None}
+    base[field] = bad
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(base)
+
+
+def test_parse_reevaluation_rejects_nan_token():
+    """Symmetry with the proposal side: the bare NaN token in a reevaluation
+    response is rejected at parse, not carried downstream."""
+    from app.llm.client import parse_reevaluation
+
+    raw = '{"action": "MOVE_SL_BE", "new_sl": NaN, "reason": "x"}'
+    with pytest.raises(ValidationError):
+        parse_reevaluation(raw)
