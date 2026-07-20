@@ -167,6 +167,16 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_journal_setup "
                 "ON journal_entries(setup_type)"
             )
+            # TML v2 (Task V3): additive high_water column for pre-existing DBs.
+            # Same idempotent pattern as above -- CREATE TABLE IF NOT EXISTS never
+            # adds a column to an already-created table. Literal is hardcoded
+            # (never request-derived) -> f-string/execute is safe.
+            cur = await conn.execute("PRAGMA table_info(position_management)")
+            pm_cols = {row[1] for row in await cur.fetchall()}
+            if "high_water" not in pm_cols:
+                await conn.execute(
+                    "ALTER TABLE position_management ADD COLUMN high_water REAL"
+                )
             await conn.commit()
 
     async def insert_proposal(
@@ -727,6 +737,13 @@ class Database:
         default is alarm-only, never silently inherit an old arming/1R).
         Otherwise the existing row is updated in place (arming/be_done/alert
         state preserved) and its id is returned unchanged.
+
+        `high_water` (TML v2, Task V3): initialized to `entry_snap` on a fresh
+        baseline (INSERT or entry-deviation reset) -- a conservative starting
+        point (never claims a more favorable high/low than the entry itself)
+        that also avoids NULL-handling downstream. It is NEVER written on the
+        non-deviated FROZEN refresh path above -- it only advances via the
+        dedicated `update_high_water()` UPDATE, monotonically.
         """
         now = _now_ms()
         async with self._acquire() as conn:
@@ -770,12 +787,13 @@ class Database:
                     UPDATE position_management
                     SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
                         invalidation_price = ?, armed_rules = '{}', be_done = 0,
-                        last_alert_state = '{}', status = 'OPEN', updated_at = ?
+                        last_alert_state = '{}', status = 'OPEN', updated_at = ?,
+                        high_water = ?
                     WHERE id = ?
                     """,
                     (
                         entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, existing["id"],
+                        invalidation_price, now, entry_snap, existing["id"],
                     ),
                 )
                 await conn.commit()
@@ -787,12 +805,12 @@ class Database:
                     INSERT INTO position_management
                       (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
                        invalidation_price, armed_rules, be_done, last_alert_state,
-                       status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?)
+                       status, created_at, updated_at, high_water)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?, ?)
                     """,
                     (
                         symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, now,
+                        invalidation_price, now, now, entry_snap,
                     ),
                 )
                 await conn.commit()
@@ -817,12 +835,12 @@ class Database:
                     """
                     UPDATE position_management
                     SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
-                        invalidation_price = ?, updated_at = ?
+                        invalidation_price = ?, updated_at = ?, high_water = ?
                     WHERE id = ?
                     """,
                     (
                         entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, row["id"],
+                        invalidation_price, now, entry_snap, row["id"],
                     ),
                 )
                 await conn.commit()
@@ -878,6 +896,34 @@ class Database:
                 WHERE symbol = ? AND side = ? AND status = 'OPEN'
                 """,
                 (_now_ms(), symbol, side),
+            )
+            await conn.commit()
+
+    async def update_high_water(self, symbol: str, side: str, mark: float) -> None:
+        """Monotonic Chandelier high-water update (TML v2, Task V3).
+
+        Its OWN UPDATE -- deliberately NOT part of upsert_position_mgmt's
+        FROZEN non-deviated path -- so it moves every monitor cycle regardless
+        of whether the entry/SL baseline itself is frozen.
+
+        long:  high_water = MAX(COALESCE(high_water, mark), mark)  -- never decreases.
+        short: high_water = MIN(COALESCE(high_water, mark), mark)  -- never increases
+               (it tracks a running LOW for shorts, reusing the same column).
+
+        SQLite's MAX(x, y) / MIN(x, y) with two+ arguments is the multi-arg
+        SCALAR function (row-wise), not the single-arg aggregate -- exactly
+        what's needed here. Only the OPEN record for (symbol, side) is
+        touched; if none exists this is a no-op (no row created).
+        """
+        fn = "MAX" if side == "long" else "MIN"
+        async with self._acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE position_management
+                SET high_water = {fn}(COALESCE(high_water, ?), ?), updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (mark, mark, _now_ms(), symbol, side),
             )
             await conn.commit()
 

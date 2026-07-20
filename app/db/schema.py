@@ -105,7 +105,13 @@ CREATE TABLE IF NOT EXISTS position_management (
   last_alert_state   TEXT    NOT NULL DEFAULT '{}',  -- JSON: debounce state per alert kind
   status             TEXT    NOT NULL DEFAULT 'OPEN', -- OPEN | CLOSED
   created_at         INTEGER NOT NULL,
-  updated_at         INTEGER NOT NULL
+  updated_at         INTEGER NOT NULL,
+  high_water         REAL                            -- TML v2 (Task V3): monotonic
+                                                       -- Chandelier high-water (long:
+                                                       -- running max mark; short: running
+                                                       -- min mark). Moves ONLY via
+                                                       -- update_high_water(), never via
+                                                       -- the upsert FROZEN path.
 );
 
 -- Partial unique index: at most ONE OPEN row per (symbol, side). CLOSED rows
