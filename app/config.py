@@ -157,6 +157,12 @@ class Settings(BaseSettings):
     # 24h-Turnover-Liquiditätsfloor (USD): unter diesem Wert fliegt ein Coin
     # aus dem Universum, egal wie stark er sich bewegt (Wash-/Illiquid-Schutz).
     scanner_turnover_floor_usd: float = 5_000_000.0
+    # Stufe-1-Vorfilter (billig, OHNE Klines): im prefilter-Mode bekommen nur so
+    # viele rang-sortierte Universum-Coins ueberhaupt Klines gefetcht, BEVOR der
+    # klines-basierte Stufe-2-Prefilter laeuft. Kappt den 429-treibenden Klines-
+    # Sturm (~universe_size×3 Calls). >= scanner_universe_size deaktiviert die
+    # Kuerzung; nie unter scanner_prefilter_top_k (Stufe-2 braucht Auswahl).
+    scanner_prefilter_stage1_k: int = 40
     # Deterministischer Prefilter reicht nur so viele Coins ans (teure) LLM weiter.
     scanner_prefilter_top_k: int = 15
     # >so viele LLM-Kandidaten -> in 2 Chunks splitten und mergen (S2-02). Nur im
@@ -317,7 +323,10 @@ class Settings(BaseSettings):
         return "classic"
 
     @field_validator(
-        "scanner_universe_size", "scanner_rank_top_n", "scanner_prefilter_top_k"
+        "scanner_universe_size",
+        "scanner_rank_top_n",
+        "scanner_prefilter_top_k",
+        "scanner_prefilter_stage1_k",
     )
     @classmethod
     def scanner_positive_int_ok(cls, v: int, info) -> int:
@@ -326,6 +335,27 @@ class Settings(BaseSettings):
                 f"{info.field_name.upper()} must be an integer in [1, 500] (got {v!r})"
             )
         return int(v)
+
+    @field_validator("hl_read_max_rps")
+    @classmethod
+    def hl_read_max_rps_ok(cls, v: float) -> float:
+        # inf would pass a bare `v < 0` check and silently disable the limiter
+        # (max(1e-6, inf) == inf → never throttle); require a finite value.
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(
+                "HL_READ_MAX_RPS must be a finite number >= 0 "
+                f"(0 disables the read-rate limiter) (got {v!r})"
+            )
+        return v
+
+    @field_validator("hl_read_burst")
+    @classmethod
+    def hl_read_burst_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 1:
+            raise ValueError(
+                f"HL_READ_BURST must be a finite number >= 1 (got {v!r})"
+            )
+        return v
 
     @field_validator("scanner_llm_chunk_max")
     @classmethod

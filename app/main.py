@@ -2803,6 +2803,7 @@ async def market_scan(
         build_scan_contexts,
         prefilter_contexts,
         scan_with_llm,
+        select_prefilter_stage1,
         select_scan_universe,
     )
 
@@ -2830,6 +2831,11 @@ async def market_scan(
         raise HTTPException(status_code=502, detail="no market overview data")
 
     universe = select_scan_universe(overview, s)
+    universe_size = len(universe)  # honest pre-slice count for the response
+    # Stage-1 cut BEFORE the klines fan-out — fetch klines for only the strongest
+    # rank-ordered candidates instead of the whole universe (the 429 burster).
+    universe = select_prefilter_stage1(universe, s)
+    stage1_size = len(universe)
     contexts, fetch_errors = await build_scan_contexts(client, universe, tf, htf)
     if not contexts:
         raise HTTPException(
@@ -2850,7 +2856,8 @@ async def market_scan(
         "scanned": [c["symbol"] for c in contexts],
         "model_used": model_used,
         "scanner_mode": mode,
-        "universe_size": len(universe),
+        "universe_size": universe_size,
+        "stage1_size": stage1_size,
         "tf": tf,
         "htf": htf,
         "errors": fetch_errors,

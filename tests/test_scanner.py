@@ -406,6 +406,10 @@ def test_scan_response_has_scanned_at(monkeypatch):
     assert "scanned_at" in data
     assert isinstance(data["scanned_at"], (int, float))
     assert before <= data["scanned_at"] <= after
+    # Two-stage prefilter observability: honest pre-slice universe_size and a
+    # distinct post-slice stage1_size (never larger than the universe).
+    assert "universe_size" in data and "stage1_size" in data
+    assert data["stage1_size"] <= data["universe_size"]
 
 
 def test_parse_scan_results_salvages_truncated_json():
@@ -616,3 +620,90 @@ async def test_classic_mode_unchanged(monkeypatch):
     contexts = [{"symbol": f"C{i}"} for i in range(20)]  # 20 > 12 but classic
     await scanner_mod.scan_with_llm(contexts, s)
     assert calls["n"] == 1  # single batched call, never chunked in classic
+
+
+# ── 2026-07-20: two-stage prefilter (stage-1 batch cut) + interleaved universe ──
+
+
+def test_stage1_slices_to_k_preserving_order():
+    from app.config import Settings
+    from app.llm.scanner import select_prefilter_stage1
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_prefilter_stage1_k=5,
+        scanner_prefilter_top_k=3,
+        scanner_universe_size=20,
+    )
+    uni = [{"symbol": f"C{i}"} for i in range(20)]
+    out = select_prefilter_stage1(uni, s)
+    assert [c["symbol"] for c in out] == [f"C{i}" for i in range(5)]  # top-5, order kept
+
+
+def test_stage1_never_cuts_below_prefilter_top_k():
+    """A stage1_k below prefilter_top_k must be floored UP to top_k, else stage-2
+    would be vestigial (nothing to select)."""
+    from app.config import Settings
+    from app.llm.scanner import select_prefilter_stage1
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_prefilter_stage1_k=2,
+        scanner_prefilter_top_k=6,
+        scanner_universe_size=20,
+    )
+    uni = [{"symbol": f"C{i}"} for i in range(20)]
+    assert len(select_prefilter_stage1(uni, s)) == 6  # floored to top_k, not 2
+
+
+def test_stage1_noop_when_k_ge_universe():
+    from app.config import Settings
+    from app.llm.scanner import select_prefilter_stage1
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_prefilter_stage1_k=50,
+        scanner_prefilter_top_k=15,
+        scanner_universe_size=10,
+    )
+    uni = [{"symbol": f"C{i}"} for i in range(10)]
+    assert select_prefilter_stage1(uni, s) == uni  # reversible: k >= len → unchanged
+
+
+def test_stage1_passthrough_in_classic():
+    from app.config import Settings
+    from app.llm.scanner import select_prefilter_stage1
+
+    s = Settings(
+        scanner_mode="classic",
+        scanner_prefilter_stage1_k=3,
+        scanner_prefilter_top_k=3,
+    )
+    uni = [{"symbol": f"C{i}"} for i in range(10)]
+    assert select_prefilter_stage1(uni, s) == uni  # classic never cuts
+
+
+def test_universe_interleaves_signal_dimensions():
+    """Signal dims are interleaved (not momentum-block-then-funding-block) so a
+    stage-1 front-slice keeps dimension diversity: the funding leader must appear
+    before the third momentum coin, not after ALL momentum."""
+    from app.config import Settings
+    from app.llm.scanner import select_scan_universe
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_rank_top_n=3,
+        scanner_universe_size=10,
+        scanner_turnover_floor_usd=0.0,
+    )
+    overview = []
+    for i in range(3):  # high |price_change|, zero funding
+        overview.append(
+            {"symbol": f"M{i}", "price_change_pct": 50 - i, "funding": 0.0, "volume24": 1e9}
+        )
+    for i in range(3):  # zero price_change, high |funding|
+        overview.append(
+            {"symbol": f"F{i}", "price_change_pct": 0.0, "funding": 0.5 - i * 0.01, "volume24": 1e9}
+        )
+    uni = [c["symbol"] for c in select_scan_universe(overview, s)]
+    assert uni.index("F0") < uni.index("M2")  # funding leader beats momentum #3

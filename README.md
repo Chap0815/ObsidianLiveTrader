@@ -163,11 +163,14 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `SCANNER_MODEL` | `claude-sonnet-5` | Günstiges/schnelles Modell für den Coin-Screen (Detail-Analyse bleibt `LLM_PROVIDER`) |
 | `SCANNER_MAX_COINS` | `20` | Top-Volumen-Coins, die gescreent werden |
 | `SCANNER_MODE` | `prefilter` | `classic` (alt: Top-N-nach-Turnover in einem LLM-Call) \| `prefilter` (Multi-Ranking-Universum + deterministischer Rules-Prefilter, Chunk-Split/Merge bei vielen Kandidaten) |
-| `SCANNER_UNIVERSE_SIZE` | `50` | Kandidaten aus `market_overview` im `prefilter`-Mode (Universum vor Klines); `[1, 500]` |
-| `SCANNER_RANK_TOP_N` | `20` | Top-N je Ranking-Dimension (\|Preisänderung\|, \|OI-Δ\|, Volatilität) für die Union; `[1, 500]` |
+| `SCANNER_UNIVERSE_SIZE` | `75` | Kandidaten aus `market_overview` im `prefilter`-Mode (Universum vor Klines); `[1, 500]` |
+| `SCANNER_RANK_TOP_N` | `35` | Top-N je Ranking-Dimension (\|Preisänderung\|, \|OI-Δ\|, \|Funding\|) für die interleavte Union; `[1, 500]` |
 | `SCANNER_TURNOVER_FLOOR_USD` | `5000000.0` | 24h-Turnover-Liquiditätsfloor (USD); darunter fliegt ein Coin aus dem Universum, egal wie stark er sich bewegt (Wash-/Illiquid-Schutz) |
-| `SCANNER_PREFILTER_TOP_K` | `8` | So viele Coins reicht der deterministische Prefilter maximal ans (teure) LLM weiter; `[1, 500]` |
+| `SCANNER_PREFILTER_STAGE1_K` | `40` | **Stufe-1 (billig, ohne Klines):** nur so viele rang-sortierte Universum-Coins bekommen überhaupt Klines gefetcht, bevor der klines-basierte Stufe-2-Prefilter läuft. Kappt den 429-treibenden Klines-Sturm (`≈ universe_size × 3` Calls). `≥ SCANNER_UNIVERSE_SIZE` deaktiviert die Kürzung; wird nie unter `SCANNER_PREFILTER_TOP_K` geschnitten; `[1, 500]` |
+| `SCANNER_PREFILTER_TOP_K` | `15` | **Stufe-2 (Klines):** so viele Coins reicht der deterministische Prefilter maximal ans (teure) LLM weiter; `[1, 500]` |
 | `SCANNER_LLM_CHUNK_MAX` | `12` | Über so vielen LLM-Kandidaten wird in 2 Chunks gesplittet und gemerged (nur `prefilter`-Mode; `classic` bleibt immer ein Call); `[2, 100]` |
+| `HL_READ_MAX_RPS` | `10.0` | Hyperliquid Read-Rate-Budget: gedrosselte Read-Calls (v.a. der Scanner-Klines-Fan-out) pro Sekunde, damit die per-IP-Rate nicht in 429 → `/api/market` 502 läuft. Der Money-Pfad (Order/Modify/Cancel) ist **nie** gedrosselt. `0` = aus; höher = schnellere Scans, näher an HLs Limit (~20/s); endlich `≥ 0` |
+| `HL_READ_BURST` | `20.0` | Kurzburst-Kapazität des Read-Rate-Budgets (Token-Bucket); endlich `≥ 1` |
 
 ### Risiko-Profil & Gates
 

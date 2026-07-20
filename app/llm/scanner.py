@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import time
+from itertools import zip_longest
 from typing import Any
 
 import httpx
@@ -430,13 +431,25 @@ def select_scan_universe(
 
     union: list[dict[str, Any]] = []
     seen: set[str] = set()
-    # Momentum/flow first, then a turnover top-up tail to fill remaining slots.
-    for r in [*by_momentum, *by_oi, *by_funding, *by_turnover]:
+
+    def _add(r: dict[str, Any]) -> None:
         sym = str(r.get("symbol") or "")
-        if not sym or sym in seen:
-            continue
-        seen.add(sym)
-        union.append(r)
+        if sym and sym not in seen:
+            seen.add(sym)
+            union.append(r)
+
+    # INTERLEAVE the signal dimensions round-robin (rank-1 of each, then rank-2,
+    # …) so a stage-1 front-slice (select_prefilter_stage1) keeps dimension
+    # diversity instead of collapsing to a pure 24h-momentum prefix — that prefix
+    # is anti-correlated with _prefilter_score's stretch/exhaustion penalties and
+    # would drop the coil/range-fade setups stage-2 exists to find. Turnover is
+    # only the top-up TAIL (deprioritized blue-chip liquidity), appended last.
+    for tier in zip_longest(by_momentum, by_oi, by_funding):
+        for r in tier:
+            if r is not None:
+                _add(r)
+    for r in by_turnover:
+        _add(r)
     result = union[: max(1, settings.scanner_universe_size)]
     # Observability (T24): which dimensions actually contributed. On batch
     # payloads OI-Δ/1h/4h are typically absent -> by_oi empty -> the universe is
@@ -447,6 +460,31 @@ def select_scan_universe(
         len(pool), len(by_momentum), len(by_oi), len(by_funding), len(result),
     )
     return result
+
+
+def select_prefilter_stage1(
+    universe: list[dict[str, Any]], settings: Settings
+) -> list[dict[str, Any]]:
+    """Stage-1 (cheap, no klines) cut of the rank-ordered universe.
+
+    select_scan_universe interleaves the signal dimensions strongest-first, so
+    taking the top stage1_k here means build_scan_contexts fetches klines for
+    only those candidates instead of the whole universe — the big 429-inducing
+    burst. The klines-based stage-2 (prefilter_contexts) then picks the final
+    top-K from what survives.
+
+    NEVER cuts below scanner_prefilter_top_k, so stage-2 never gets fewer
+    candidates than it keeps (the intelligent klines filter must not degrade to a
+    no-op; at the floor edge it becomes a pass-through, never a shrink).
+    Pass-through in classic mode or when the effective k >= len(universe), so the
+    change is fully reversible via config."""
+    if (settings.scanner_mode or "classic") == "classic":
+        return universe
+    k = max(
+        int(settings.scanner_prefilter_stage1_k),
+        int(settings.scanner_prefilter_top_k),
+    )
+    return universe[:k] if k < len(universe) else universe
 
 
 # ── Task 24 (S2-08): deterministic rules-prefilter ──────────────────────────
