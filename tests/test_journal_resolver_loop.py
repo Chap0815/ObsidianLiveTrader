@@ -127,6 +127,51 @@ async def test_single_pass_sizes_fetch_to_reach_t0(db_path):
 
 
 @pytest.mark.asyncio
+async def test_far_stale_pending_row_forced_terminal_not_stuck_forever(db_path):
+    """Defect E regression: once a row's age exceeds the horizon a
+    now-anchored, _MAX_LIMIT_HINT-capped kline fetch can ever reach back to
+    (1000 bars * 900s for 15m = ~250h), the row must NOT stay PENDING
+    forever -- it must be forced to a terminal, non-WIN/LOSS status so it
+    stops rotting the P2 calibration sample and stops being re-fetched every
+    cycle indefinitely."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    now = T0 + timedelta(hours=260)  # past the ~250h horizon for 15m/1000 bars
+    # Simulates a real now-anchored fetch: candles are recent, nowhere near t0,
+    # and never touch tp1/sl -- exactly what keeps the row PENDING forever
+    # today.
+    client = FakeClient({
+        "BTC_USDT": [_candle(255 * 60, 100.5, 99.5), _candle(259 * 60, 100.5, 99.5)]
+    })
+    await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+    rows = await db.recent_journal()
+    assert rows[0]["status"] != "PENDING"
+    assert rows[0]["status"] not in ("WIN", "LOSS")
+
+    stats = await db.journal_stats()
+    assert stats["wins"] == 0
+    assert stats["losses"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_row_within_horizon_still_untouched(db_path):
+    """A row older than window_s but still within the _MAX_LIMIT_HINT horizon
+    must be left exactly as before (PENDING, retried next cycle) -- the new
+    hard ceiling must not fire early."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    now = T0 + timedelta(hours=200)  # within ~250h horizon for 15m
+    client = FakeClient({
+        "BTC_USDT": [_candle(190 * 60, 100.5, 99.5), _candle(195 * 60, 100.5, 99.5)]
+    })
+    await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
 async def test_pending_stays_when_window_open(db_path):
     db = Database(db_path)
     await db.init()

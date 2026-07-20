@@ -303,6 +303,21 @@ def _limit_hint_for(tf: str, window_s: float) -> int:
     return max(10, min(_MAX_LIMIT_HINT, n))
 
 
+def _stale_horizon_s(tf: str) -> float | None:
+    """Defect E: the oldest t0 a now-anchored, _MAX_LIMIT_HINT-capped kline
+    fetch can EVER reach back to, in seconds. `client.klines()` always
+    fetches the most recent N bars from `now` (never anchored to a row's t0),
+    so once a PENDING row's age exceeds `_MAX_LIMIT_HINT * tf_s`, the earliest
+    candle any future fetch returns can never cover t0 again -- `covers_t0`
+    in resolve_entry is permanently False and the row would stay PENDING
+    forever. Returns None for an unknown/degenerate tf (no seconds mapping,
+    so no horizon can be computed -- existing behavior is left untouched)."""
+    tf_s = _TF_SECONDS.get(tf)
+    if not tf_s or tf_s <= 0:
+        return None
+    return float(_MAX_LIMIT_HINT * tf_s)
+
+
 async def resolve_pending_once(
     db: Any,
     client: Any,
@@ -363,6 +378,7 @@ async def resolve_pending_once(
                     pass
             continue
 
+        stale_horizon_s = _stale_horizon_s(tf)
         for row in grp:
             try:
                 outcome = resolve_entry(
@@ -376,6 +392,27 @@ async def resolve_pending_once(
                     window_s=eff_window_s,
                     order_type=row.get("order_type"),
                 )
+                # Defect E fix (b): a row this far stale can NEVER regain
+                # coverage back to t0 from a now-anchored, capped fetch -- the
+                # pure resolve_entry would (correctly, per its own contract)
+                # leave it PENDING forever. Force it to a terminal, non-WIN/
+                # LOSS status (reusing EXPIRED -- existing stats queries
+                # already filter on status IN ('WIN','LOSS') and a dedicated
+                # `expired` count, so this is excluded from win-rate/sum_r and
+                # surfaced honestly, not fabricated as a win or loss) so it
+                # exits the pending bucket and stops being re-fetched forever.
+                if (
+                    outcome.status == PENDING
+                    and stale_horizon_s is not None
+                ):
+                    try:
+                        elapsed_row = (
+                            now - _created_dt(row["created_at"])
+                        ).total_seconds()
+                    except Exception:
+                        elapsed_row = 0.0
+                    if elapsed_row > stale_horizon_s:
+                        outcome = Outcome(status=EXPIRED)
                 if outcome.status != PENDING:
                     await db.update_journal_outcome(
                         row["id"],
