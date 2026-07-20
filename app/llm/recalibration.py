@@ -107,13 +107,12 @@ def recalibrate(
         return _raw(emitted_confidence)
 
     wr_pct = round(win_rate_lo * 100)
-    seg = f"deine {emitted}-Setups"
-    ctx = "/".join(p for p in (setup_type or "", regime or "") if p)
-    if ctx:
-        seg += f" ({ctx})"
+    # The win-rate/n come from the tier-wide by_confidence group (all setups &
+    # regimes), NOT the setup_type/regime intersection — so DON'T scope the note
+    # to those (would misattribute a tier-wide number to a narrow context).
     note = (
         f"KI: {emitted} · kalibriert: {calibrated} — "
-        f"{seg}: {wr_pct} % WR (Wilson-LB, n={n})"
+        f"deine {emitted}-Setups insgesamt: {wr_pct} % WR (Wilson-LB, n={n})"
     )
     return {
         "calibrated_confidence": calibrated,
