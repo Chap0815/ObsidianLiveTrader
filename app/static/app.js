@@ -2157,6 +2157,36 @@
     );
   }
 
+  /** TML v2 (Task V5): ⚡ Auto-Trail arming toggle for ONE position — mirrors
+   *  _armToggleHtml exactly (same HL-only gate, same server-truth discipline,
+   *  same delegated data-action pipeline), just for the second autonomous rule
+   *  (auto_trail: Chandelier ATR trailing-stop, spec §…, TML v2). `armed`
+   *  reads state.positionMgmt[key].armed_rules.auto_trail — NEVER an
+   *  optimistic guess — and `busy` shares the SAME per-(symbol,side) lock as
+   *  Auto-BE (state.armBusy), so the two toggles on one card can never race
+   *  each other's read-current/merge/POST cycle (see armAutoBe/armAutoTrail). */
+  function _armTrailToggleHtml(symbol, sideVal) {
+    if (!isHlExchange()) {
+      return (
+        '<button type="button" class="cp-arm-btn cp-arm-disabled" disabled ' +
+        'title="Auto-Trail (automatisches SL-Nachziehen per ATR) ist nur auf Hyperliquid verfügbar">' +
+        "⚡ Trail</button>"
+      );
+    }
+    const key = _mgmtKey(symbol, sideVal);
+    const mgmt = state.positionMgmt[key];
+    const armed = !!(mgmt && mgmt.armed_rules && mgmt.armed_rules.auto_trail);
+    const busy = !!state.armBusy[key];
+    return (
+      '<button type="button" class="cp-arm-btn cp-arm-trail-btn' + (armed ? " cp-arm-trail-active" : "") + '"' +
+      ' data-action="arm-trail" data-armed="' + (armed ? "1" : "0") + '"' +
+      (busy ? " disabled" : "") +
+      ' title="Auto-Trail: zieht den Stop-Loss per ATR-Chandelier nach, sobald die Position die Aktivierungs-R erreicht hat. Der SERVER führt die Aktion aus — dieser Schalter aktiviert/deaktiviert sie nur.">' +
+      "⚡ Trail: " + (armed ? "An" : "Aus") +
+      "</button>"
+    );
+  }
+
   function _posDataAttrs(p, sideVal, posCs) {
     return (
       ' data-sym="' + escapeHtml(String(p.symbol || "")) + '"' +
@@ -2464,6 +2494,22 @@
         }
         return;
       }
+      if (a === "arm-trail") {
+        // TML v2 (Task V5): toggle the HL-only Auto-Trail autonomous rule —
+        // mirrors "arm-be" exactly, including reading the CURRENT server-truth
+        // state off the button itself (data-armed) rather than guessing.
+        e.stopPropagation();
+        if (actionEl.disabled) return;
+        const box = actionEl.closest(".cp-actions");
+        if (box) {
+          armAutoTrail(
+            box.getAttribute("data-sym"),
+            box.getAttribute("data-side"),
+            actionEl.getAttribute("data-armed") !== "1"
+          );
+        }
+        return;
+      }
       if (a === "sl-edit") {
         // N3-09: reveal/hide the inline SL-price editor. Pure UI toggle, no
         // network — the actual move is gated behind data-action="sl-set".
@@ -2662,6 +2708,9 @@
     // HTML and the fingerprint (same discipline as slHtml/reevalHtml above)
     // so the button can never drift from what the fp hashed.
     const armHtml = _armToggleHtml(p.symbol, sideVal);
+    // TML v2 (Task V5): ⚡ Auto-Trail arming toggle — same "compute once, reuse
+    // for HTML + fp" discipline as armHtml right above.
+    const armTrailHtml = _armTrailToggleHtml(p.symbol, sideVal);
     // N3-09: the actions row always carries the inline SL-editor (✎ SL) so a
     // stop can be dragged to ANY price from the card; the BE button rides
     // along only when a break-even price is computable. data-be is included
@@ -2677,6 +2726,7 @@
       beBtn +
       '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Stop-Loss auf einen beliebigen Preis nachziehen">✎ SL</button>' +
       armHtml +
+      armTrailHtml +
       '<span class="cp-sl-edit hidden">' +
       '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL-Preis" aria-label="Neuer Stop-Loss-Preis" />' +
       '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Setzen</button>' +
@@ -2688,7 +2738,8 @@
     // protection change or a fresh KI verdict DOES rebuild the card. armHtml
     // (Task 7) folds in the Auto-BE arming state — a poll-driven change to
     // armed_rules.auto_be therefore rebuilds the card in place; an unchanged
-    // poll never does (no flicker, buttons stay clickable).
+    // poll never does (no flicker, buttons stay clickable). armTrailHtml
+    // (TML v2, Task V5) does the same for armed_rules.auto_trail.
     const fp = _hashStr(
       [
         String(p.symbol || ""), sideVal, String(p.leverage),
@@ -2697,7 +2748,7 @@
         fmt(p.liquidate_price, 6),
         String(posCs), notional != null ? fmt(notional, 0) : "-",
         bePrice != null ? String(bePrice) : "-",
-        slHtml, reevalHtml, armHtml, isActive ? "A" : "-",
+        slHtml, reevalHtml, armHtml, armTrailHtml, isActive ? "A" : "-",
       ].join("")
     );
     const html =
@@ -5351,20 +5402,41 @@
     }
   }
 
+  /** TML v2 (Task V5): read the CURRENT server-truth armed_rules for one
+   *  position (from the last alerts poll) and return a FULL rules object with
+   *  `patch` applied on top — always real booleans for BOTH known rule names.
+   *  CRITICAL: POST /api/positions/arm's `set_armed_rules` REPLACES the whole
+   *  armed_rules dict server-side (it does not merge), so every arm request
+   *  from the UI must carry the complete desired state, not just the rule the
+   *  user just clicked — otherwise toggling Trail would silently wipe an
+   *  already-armed Auto-BE (and vice-versa). */
+  function _mergedArmedRules(key, patch) {
+    const mgmt = state.positionMgmt[key];
+    const current = (mgmt && mgmt.armed_rules) || {};
+    return Object.assign(
+      { auto_be: !!current.auto_be, auto_trail: !!current.auto_trail },
+      patch
+    );
+  }
+
   /** Task 7: toggle the HL-only Auto-BE autonomous rule for ONE open
-   *  position. Sends a REAL boolean — the server 400s on anything else (a
-   *  truthy string like "false" must never arm a money path). Double-submit
-   *  guarded per (symbol,side); re-renders immediately with the button
-   *  disabled while in flight, then re-fetches the alerts poll right away
-   *  (rather than waiting up to 30s) so the toggle reflects the ACTUAL
-   *  server-side result, never an optimistic guess. */
+   *  position. Sends the FULL merged rules object (see _mergedArmedRules) with
+   *  a REAL boolean for auto_be — the server 400s on anything else (a truthy
+   *  string like "false" must never arm a money path). Double-submit guarded
+   *  per (symbol,side) — the SAME lock as armAutoTrail, since both toggles
+   *  read+merge+POST the same server record and must never race each other.
+   *  Re-renders immediately with the button disabled while in flight, then
+   *  re-fetches the alerts poll right away (rather than waiting up to 30s) so
+   *  the toggle reflects the ACTUAL server-side result, never an optimistic
+   *  guess. */
   async function armAutoBe(symbol, side, nextArmed) {
     const key = _mgmtKey(symbol, side);
     if (state.armBusy[key]) return;
     state.armBusy[key] = true;
     try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
     try {
-      const res = await armPosition(symbol, side, { auto_be: !!nextArmed });
+      const rules = _mergedArmedRules(key, { auto_be: !!nextArmed });
+      const res = await armPosition(symbol, side, rules);
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
         showToast(
@@ -5384,6 +5456,40 @@
       state.armBusy[key] = false;
       // Refresh from the server immediately — the toggle must show what the
       // backend actually persisted, not what we just requested.
+      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
+      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    }
+  }
+
+  /** TML v2 (Task V5): toggle the HL-only Auto-Trail autonomous rule for ONE
+   *  open position — mirrors armAutoBe exactly (same merge-not-clobber via
+   *  _mergedArmedRules, same shared armBusy lock, same immediate re-poll for
+   *  server-truth, same real-boolean discipline). */
+  async function armAutoTrail(symbol, side, nextArmed) {
+    const key = _mgmtKey(symbol, side);
+    if (state.armBusy[key]) return;
+    state.armBusy[key] = true;
+    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    try {
+      const rules = _mergedArmedRules(key, { auto_trail: !!nextArmed });
+      const res = await armPosition(symbol, side, rules);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        showToast(
+          "Scharfschalten fehlgeschlagen: " + detailToText(data.detail || data),
+          "err"
+        );
+        return;
+      }
+      showToast(
+        (nextArmed ? "Auto-Trail scharf: " : "Auto-Trail entschärft: ") +
+          String(symbol || "") + " (" + String(side || "") + ")",
+        "ok"
+      );
+    } catch (err) {
+      showToast("Scharfschalten fehlgeschlagen: " + (err && err.message), "err");
+    } finally {
+      state.armBusy[key] = false;
       try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
       try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
     }
@@ -5424,13 +5530,14 @@
 
   /** Task 7: turn ONE first-seen alert/auto-action into a toast + a feed
    *  entry. `kind` is one of "thesis"/"time_stop" (advisory alarms, warn),
-   *  "auto_be" (the server just moved the stop — ok), "auto_be_error" /
+   *  "auto_be" (the server just moved the stop — ok), "auto_trail" (TML v2:
+   *  the server just trailed the stop via ATR — ok), "auto_be_error" /
    *  "auto_be_unavailable" (subtle warning). The 1-click follow-up action
    *  (moving the SL, closing) is the EXISTING "SL → Break-Even"/close button
    *  already on the card — this never duplicates a money path. */
   function _surfaceMgmtAlert(symbol, side, kind, a) {
     const msg = String((a && a.message) || kind);
-    const toastKind = kind === "auto_be" ? "ok" : "warn";
+    const toastKind = kind === "auto_be" || kind === "auto_trail" ? "ok" : "warn";
     showToast(String(symbol || "") + " (" + String(side || "") + "): " + msg, toastKind);
     _pushMgmtFeed({
       symbol: symbol,

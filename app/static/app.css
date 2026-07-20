@@ -1700,6 +1700,23 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   cursor: not-allowed;
 }
 
+/* TML v2 (Task V5) — ⚡ Auto-Trail arming toggle. Same geometry/base rules as
+   .cp-arm-btn above (shared class); the ACTIVE state uses --accent (the
+   indigo-violet signature color) instead of --warn so the two autonomous
+   toggles read as distinct-but-consistent siblings on one card — never
+   green/red (--long/--short), which stay exclusive to P&L per file header. */
+.cp-arm-trail-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.cp-arm-trail-active:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(155, 135, 245, 0.2);
+}
+
 .positions-body,
 .orders-body {
   font-family: var(--mono);
