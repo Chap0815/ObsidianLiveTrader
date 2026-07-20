@@ -1,6 +1,7 @@
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Candle(BaseModel):
@@ -281,6 +282,32 @@ class OrderTicket(BaseModel):
             "settings.max_risk_pct and falls back to that cap if omitted/invalid."
         ),
     )
+
+    @field_validator(
+        "vol",
+        "leverage",
+        "price",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "tp2",
+        "tp1_share",
+        "risk_pct",
+    )
+    @classmethod
+    def _reject_nonfinite(cls, v: float | int | None) -> float | int | None:
+        """Reject NaN/±Inf on every numeric field that feeds risk/geometry.
+
+        Defect B (CRITICAL): stdlib json.loads accepts the ``NaN`` token, and a
+        NaN stop_loss fails the risk gate OPEN (``NaN <= 0`` is False → treated
+        as a valid stop; every downstream ``>``/``<`` comparison is False → no
+        error). Rejecting non-finite values here makes the HTTP path 422 before
+        such a ticket can ever reach the gate. ``None`` stays allowed so
+        legitimate absent optionals are untouched.
+        """
+        if v is not None and not math.isfinite(v):
+            raise ValueError("must be a finite number (NaN/Infinity rejected)")
+        return v
 
 
 class ConfirmRequest(BaseModel):

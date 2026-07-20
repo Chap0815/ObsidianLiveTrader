@@ -1,6 +1,9 @@
 """Unit tests for sizing helpers and risk gates (no network)."""
 
+import math
+
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.models import ContractMeta, OrderTicket
@@ -306,6 +309,57 @@ def test_gate_uses_conservative_trigger_rounding():
     )
     assert g.ok is True, g.errors
     assert g.rounded_stop == pytest.approx(99_000.0)
+
+
+# ── Defect B (CRITICAL): NaN/Inf stop_loss must NOT fail the gate open ──
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_order_ticket_rejects_nonfinite_stop_loss(bad):
+    """Root cause: OrderTicket must reject a non-finite stop_loss at
+    construction (pydantic), so the HTTP path 422s instead of carrying a NaN
+    stop into the risk gate where every `>`/`<` comparison silently passes."""
+    with pytest.raises(ValidationError):
+        _ticket(stop_loss=bad)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["stop_loss", "take_profit", "tp2", "entry", "price", "vol", "leverage"],
+)
+def test_order_ticket_rejects_nonfinite_numeric_fields(field):
+    """Every numeric price/level/size field that feeds risk or geometry must
+    reject NaN/Inf. (leverage is int → Inf/NaN rejected by float bound too.)"""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            _ticket(**{field: bad})
+
+
+def test_order_ticket_keeps_optional_none():
+    """The new validator must not reject legitimate absent optionals."""
+    t = _ticket(stop_loss=None, take_profit=None, tp2=None, entry=None)
+    assert t.stop_loss is None
+    assert t.take_profit is None
+
+
+def test_gate_fails_closed_on_nan_stop_loss_hl_contract():
+    """Defense-in-depth: even if a non-HTTP caller bypasses pydantic and hands
+    the gate a NaN stop on an HL-style contract (price_unit=0 → side-aware
+    rounding skipped) with a huge notional, the gate must return ok=False —
+    NOT ok=True with empty errors (fail-open). Reproduces the CRITICAL defect."""
+    # Bypass the OrderTicket validator to simulate a non-HTTP caller.
+    t = _ticket(order_type="market", price=None, vol=50_000, take_profit=200_000)
+    object.__setattr__(t, "stop_loss", float("nan"))
+    g = validate_order(
+        t,
+        _contract(price_unit=0.0),  # Hyperliquid-style: no tick rounding
+        equity=10_000,
+        settings=_settings(allow_unprotected_entry=False),
+        last_price=100_000,
+    )
+    assert g.ok is False
+    assert g.errors  # must not be an empty error list
+    assert math.isfinite(g.risk_pct)  # no NaN leaks into the reported risk
 
 
 def test_manual_trigger_blocked_in_gate_when_disabled():

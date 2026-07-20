@@ -250,6 +250,15 @@ def validate_order(
         sl_f: float | None = None
     else:
         sl_f = float(sl)
+        # Defect B (CRITICAL) defense-in-depth: a NaN/Inf stop_loss fails EVERY
+        # comparison below silently (NaN <= 0, NaN >= entry are all False), and
+        # on an HL-style contract (price_unit==0) the side-aware rounding that
+        # would otherwise raise on NaN is SKIPPED — so a non-HTTP caller that
+        # bypasses the OrderTicket pydantic validator could carry an unusable
+        # stop with unbounded risk straight through the gate (ok=True, no
+        # errors). Reject it here too so the gate fails CLOSED regardless.
+        if not math.isfinite(sl_f):
+            errors.append("Stop-Loss ist keine gültige Zahl (NaN/Infinity)")
         if entry_for_risk is not None and side in ("long", "short"):
             if side == "long" and sl_f >= entry_for_risk:
                 errors.append("long stop_loss must be below entry")
@@ -295,7 +304,9 @@ def validate_order(
     risk_p = 0.0
     if (
         sl_f is not None
+        and math.isfinite(sl_f)
         and entry_for_risk is not None
+        and math.isfinite(entry_for_risk)
         and rounded_vol > 0
         and contract.contract_size > 0
     ):
@@ -341,8 +352,10 @@ def validate_order(
     rrr: float | None = None
     if (
         sl_f is not None
+        and math.isfinite(sl_f)
         and rounded_tp is not None
         and entry_for_risk is not None
+        and math.isfinite(entry_for_risk)
         and side in ("long", "short")
     ):
         try:
