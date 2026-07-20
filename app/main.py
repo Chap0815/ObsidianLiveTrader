@@ -25,6 +25,7 @@ from app.analysis.context import (
     build_market_snapshot,
     fetch_btc_regime,
     is_btc_symbol,
+    regime_tag,
     snapshot_to_api_dict,
 )
 from app.config import Settings, get_settings
@@ -1692,6 +1693,16 @@ async def analyze(
         last_px = market_api.get("last_price")
         ltf_last = ((market_api.get("ltf") or {}).get("indicators") or {}).get("last") or {}
         atr = ltf_last.get("atr14")
+        # Block 2/TP2 Task P1: ATR% (LTF) for the regime-tag vol bucket. Reuses
+        # the atr/last_px already fetched for annotations above -- no extra
+        # fetch. Fail-safe: any bad input just leaves atr_pct None, which
+        # regime_tag() maps to "unknown" (never a crash, never a gate change).
+        atr_pct: float | None = None
+        try:
+            if atr and last_px:
+                atr_pct = float(atr) / float(last_px) * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            atr_pct = None
         try:
             if proposal.entry_price and last_px:
                 annotations["entry_vs_last_pct"] = round(
@@ -1770,6 +1781,11 @@ async def analyze(
                         setup_type=_journal_setup_type(proposal),
                         context_hash=context_hash,
                         prompt_version=prompt_version,
+                        # Block 2/TP2 Task P1: advisory-only regime tag, computed
+                        # from signals already fetched for the prompt (market_regime,
+                        # atr_pct) -- no extra LLM call, no extra fetch. Never
+                        # influences action/direction/gates/sizing above.
+                        regime=regime_tag(market_regime, atr_pct),
                     )
                 except Exception:
                     # Journal is advisory — never break analyze on a write error.

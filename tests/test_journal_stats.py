@@ -165,6 +165,58 @@ async def test_stats_groups_have_ci_and_ambiguous(db_path):
     assert blk["clean_win_rate"] == 0.5
 
 
+# ── Block 2/TP2 Task P1: regime column persists + by_regime breakdown ───
+
+@pytest.mark.asyncio
+async def test_regime_column_persists(db_path):
+    db = Database(db_path)
+    await db.init()
+    jid = await db.insert_journal_entry(
+        **_base_kwargs(regime="btcUp/volNormal", context_hash="reg-a")
+    )
+    assert jid >= 1
+    async with aiosqlite.connect(db_path) as conn:
+        cur = await conn.execute(
+            "SELECT regime FROM journal_entries WHERE id = ?", (jid,)
+        )
+        row = await cur.fetchone()
+    assert row == ("btcUp/volNormal",)
+
+    # a row with no regime (older caller / fail-safe path) stays NULL, not "".
+    jid2 = await db.insert_journal_entry(**_base_kwargs(context_hash="reg-b"))
+    async with aiosqlite.connect(db_path) as conn:
+        cur = await conn.execute(
+            "SELECT regime FROM journal_entries WHERE id = ?", (jid2,)
+        )
+        row2 = await cur.fetchone()
+    assert row2 == (None,)
+
+
+@pytest.mark.asyncio
+async def test_by_regime_breakdown(db_path):
+    db = Database(db_path)
+    await db.init()
+    w = await db.insert_journal_entry(
+        **_base_kwargs(regime="btcUp/volNormal", context_hash="a")
+    )
+    l = await db.insert_journal_entry(
+        **_base_kwargs(
+            regime="btcDown/volHigh", action="SELL", direction="short", context_hash="b"
+        )
+    )
+    # a row with NULL regime must not crash the group / appear as a key
+    await db.insert_journal_entry(**_base_kwargs(regime=None, context_hash="c"))
+    await db.update_journal_outcome(w, status="WIN", realized_r=2.0)
+    await db.update_journal_outcome(l, status="LOSS", realized_r=-1.0)
+
+    raw = await db.journal_stats()
+    r = build_stats_response(raw, min_sample=20)
+    by_regime = r["by_regime"]
+    assert by_regime["btcUp/volNormal"]["wins"] == 1
+    assert by_regime["btcDown/volHigh"]["losses"] == 1
+    assert None not in by_regime and "None" not in by_regime
+
+
 # ── by_setup breakdown ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio

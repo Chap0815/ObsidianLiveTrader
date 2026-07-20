@@ -103,11 +103,14 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
     by_action = _groups(raw.get("by_action", {}), min_sample)
     by_provider = _groups(raw.get("by_provider", {}), min_sample)
     by_setup = _groups(raw.get("by_setup", {}), min_sample)
+    # Block 2/TP2 Task P1: segment by the persisted regime tag (btc-trend x
+    # vol bucket), mirroring by_setup exactly.
+    by_regime = _groups(raw.get("by_regime", {}), min_sample)
 
     # Caveats: name any non-empty group below the sample threshold, plus the
     # standing shadow-fill disclaimer so the rates are never misread as PnL.
     low_named: list[str] = []
-    for grp in (by_confidence, by_action, by_provider, by_setup):
+    for grp in (by_confidence, by_action, by_provider, by_setup, by_regime):
         for name, block in grp.items():
             if 0 < block["sample"] < min_sample:
                 low_named.append(name)
@@ -158,6 +161,7 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
         "by_action": by_action,
         "by_provider": by_provider,
         "by_setup": by_setup,
+        "by_regime": by_regime,
         "caveats": caveats,
     }
 

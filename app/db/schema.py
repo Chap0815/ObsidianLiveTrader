@@ -71,7 +71,13 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   -- migration in Database.init() (CREATE TABLE IF NOT EXISTS never adds columns).
   setup_type    TEXT,                      -- chart_pattern[/time_horizon] attribution key
   context_hash  TEXT,                      -- stable hash of analysis context (dedupe key)
-  prompt_version TEXT                      -- hash of build_system_prompt() (regime attribution)
+  prompt_version TEXT,                     -- hash of build_system_prompt() (regime attribution)
+  -- Block 2/TP2 Task P1: compact regime tag (btc trend bucket x vol bucket),
+  -- e.g. "btcUp/volNormal", or "unknown" when a signal was missing. Added here
+  -- for fresh DBs; on EXISTING DBs it is backfilled by the idempotent ALTER
+  -- migration in Database.init() (CREATE TABLE IF NOT EXISTS never adds
+  -- columns). Advisory-only label, never used in a gate/sizing/decision.
+  regime        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_journal_created ON journal_entries(created_at DESC);

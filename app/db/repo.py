@@ -153,7 +153,9 @@ class Database:
             # (real journal data present) these must be ADDed explicitly or every
             # INSERT would break with "no such column". Bestandszeilen = NULL.
             # Literals are hardcoded (never request-derived) -> f-string is safe.
-            for _col in ("setup_type", "context_hash", "prompt_version"):
+            # Block 2/TP2 Task P1: regime is additive too -- same idempotent
+            # pattern (fail-safe fallback value is "unknown", NULL on old rows).
+            for _col in ("setup_type", "context_hash", "prompt_version", "regime"):
                 if _col not in cols:
                     await conn.execute(
                         f"ALTER TABLE journal_entries ADD COLUMN {_col} TEXT"
@@ -166,6 +168,11 @@ class Database:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_journal_setup "
                 "ON journal_entries(setup_type)"
+            )
+            # Same reasoning for regime's by_regime GROUP BY (Task P1).
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journal_regime "
+                "ON journal_entries(regime)"
             )
             # TML v2 (Task V3): additive high_water column for pre-existing DBs.
             # Same idempotent pattern as above -- CREATE TABLE IF NOT EXISTS never
@@ -376,6 +383,7 @@ class Database:
         setup_type: str | None = None,
         context_hash: str | None = None,
         prompt_version: str | None = None,
+        regime: str | None = None,
         dedupe_window_min: int = 30,
     ) -> int:
         now = created_at or _utc_now_iso()
@@ -415,7 +423,7 @@ class Database:
                             entry_price = ?, stop_loss = ?, tp1 = ?, rrr = ?,
                             provider = ?, model = ?, scanner_summary = ?,
                             last_price_t0 = ?, status = ?, proposal_id = ?,
-                            setup_type = ?, prompt_version = ?
+                            setup_type = ?, prompt_version = ?, regime = ?
                         WHERE id = ?
                         """,
                         (
@@ -423,7 +431,7 @@ class Database:
                             setup_confidence, entry_price, stop_loss, tp1, rrr,
                             provider, model, scanner_summary, last_price_t0,
                             status, proposal_id, setup_type, prompt_version,
-                            existing_id,
+                            regime, existing_id,
                         ),
                     )
                     await conn.commit()
@@ -435,8 +443,9 @@ class Database:
                   (created_at, symbol, tf, htf, action, direction,
                    setup_confidence, entry_price, stop_loss, tp1, rrr,
                    provider, model, scanner_summary, last_price_t0,
-                   status, proposal_id, setup_type, context_hash, prompt_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   status, proposal_id, setup_type, context_hash, prompt_version,
+                   regime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -459,6 +468,7 @@ class Database:
                     setup_type,
                     context_hash,
                     prompt_version,
+                    regime,
                 ),
             )
             await conn.commit()
@@ -678,6 +688,12 @@ class Database:
                 # (chart_pattern[/time_horizon]). NULL setup_type rows are
                 # excluded by the _groups WHERE clause (pre-migration rows).
                 "by_setup": await _groups("setup_type"),
+                # Block 2/TP2 Task P1: win rate keyed by the persisted regime
+                # tag (btc-trend x vol bucket). Only NULL rows (pre-migration,
+                # never analyzed with this feature) are excluded by _groups'
+                # WHERE clause; "unknown" is a real string value and stays IN
+                # the group like any other segment.
+                "by_regime": await _groups("regime"),
             }
 
     async def clear_journal(self) -> int:

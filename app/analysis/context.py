@@ -255,6 +255,56 @@ def _stack_and_stretch(candles: list[Candle]) -> tuple[str, float | None]:
     return stack, stretch
 
 
+# Block 2/TP2 Task P1: regime-tag buckets. Trend bucket maps fetch_btc_regime's
+# btc_daily_stack (itself "bullish"/"bearish"/"mixed"/"unknown" from
+# _ema_stack_label) onto the plan's up/down/chop vocabulary. Vol bucket splits
+# ATR% (ATR14 / last_price * 100, LTF) into low/normal/high. Thresholds are a
+# deliberate, documented choice (not derived from data) sized for typical LTF
+# (15m-1H) crypto perp ATR% — scanner.py's own "tradeable" floor is 0.3%, well
+# inside the low bucket here. Advisory-only labels; never used in any gate.
+_REGIME_TREND_MAP = {"bullish": "up", "bearish": "down", "mixed": "chop"}
+_VOL_BUCKET_LOW_PCT = 1.0   # atr_pct below this -> "low"
+_VOL_BUCKET_HIGH_PCT = 3.0  # atr_pct at/above this -> "high"; between -> "normal"
+
+
+def regime_tag(btc_regime: dict[str, Any] | None, atr_pct: float | None) -> str:
+    """Compact per-trade regime tag: '<btcTrend>/<vol>', e.g. "btcUp/volNormal".
+
+    PURE + deterministic + fail-safe: ANY missing/invalid input collapses the
+    WHOLE tag to "unknown" (never a partial tag, never a crash) so it never
+    blocks or alters an analyze, and journal_stats' by_regime GROUP BY always
+    sees a clean, small vocabulary of keys.
+
+    Trend bucket: btc_regime["btc_daily_stack"] (bullish/bearish/mixed/unknown)
+    -> up/down/chop; any other/missing value -> unknown.
+    Vol bucket: atr_pct < 1.0 -> low; 1.0 <= atr_pct < 3.0 -> normal;
+    atr_pct >= 3.0 -> high. A non-numeric/negative/NaN atr_pct -> unknown.
+
+    Advisory only (Block 2/TP2 §3.B): purely a persisted label for later
+    journal segmentation; it never feeds a gate, sizing, or the LLM decision.
+    """
+    if not isinstance(btc_regime, dict):
+        return "unknown"
+    trend = _REGIME_TREND_MAP.get(btc_regime.get("btc_daily_stack"))
+    if trend is None:
+        return "unknown"
+    if atr_pct is None or isinstance(atr_pct, bool):
+        return "unknown"
+    try:
+        pct = float(atr_pct)
+    except (TypeError, ValueError):
+        return "unknown"
+    if pct != pct or pct < 0:  # NaN / negative guard
+        return "unknown"
+    if pct < _VOL_BUCKET_LOW_PCT:
+        vol = "low"
+    elif pct < _VOL_BUCKET_HIGH_PCT:
+        vol = "normal"
+    else:
+        vol = "high"
+    return f"btc{trend.capitalize()}/vol{vol.capitalize()}"
+
+
 async def fetch_btc_regime(
     client: Any,
     *,
