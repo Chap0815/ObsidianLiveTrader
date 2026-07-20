@@ -174,3 +174,49 @@ async def test_non_hl_position_never_auto_bes(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 0
     assert "auto_be_unavailable" in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_modify_failure_is_bounded(monkeypatch, db_path):
+    """I-1: a persistently failing auto-BE must stop hammering after
+    _BE_MAX_ATTEMPTS and go into a sticky halted state, not retry forever."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    svc = SimpleNamespace(modify_stop_loss=AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(monitor, "_make_order_service", lambda app, client, settings: svc)
+    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
+
+    # Run more cycles than the cap; every cycle the position is still live/armed/+1R.
+    for _ in range(monitor._BE_MAX_ATTEMPTS + 3):
+        await monitor._run_one_cycle(app, NOW_MS)
+
+    # Exactly _BE_MAX_ATTEMPTS real modify attempts, then it stops calling.
+    assert svc.modify_stop_loss.await_count == monitor._BE_MAX_ATTEMPTS
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 0  # never succeeded → stays un-done
+    assert row["last_alert_state"]["auto_be_error"]["halted"] is True
+
+
+@pytest.mark.asyncio
+async def test_transient_absence_does_not_disarm_before_grace(monkeypatch, db_path):
+    """I-2: a single empty/partial snapshot must NOT close the mgmt record and
+    wipe arming; only _CLOSE_GRACE_CYCLES consecutive absences close it."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=102.5, is_hl=True)
+    app = _make_app(db, client)
+
+    # Empty snapshot cycles (transient) — reuse the same app so absence counts persist.
+    client._positions = []
+    for i in range(monitor._CLOSE_GRACE_CYCLES - 1):  # one short of the grace
+        await monitor._run_one_cycle(app, NOW_MS)
+        row = await db.get_open_position_mgmt("BTC_USDT", "long")
+        assert row is not None, "record closed too early on a transient glitch"
+        assert row["armed_rules"] == {"auto_be": True}  # arming preserved
+
+    # Reaching the grace threshold closes it.
+    await monitor._run_one_cycle(app, NOW_MS)
+    assert await db.get_open_position_mgmt("BTC_USDT", "long") is None

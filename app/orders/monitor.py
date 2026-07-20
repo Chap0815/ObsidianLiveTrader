@@ -240,26 +240,50 @@ async def _process_position(
                 }
                 state_dirty = True
                 continue
+            attempts = _be_attempts(app)
+            akey = (symbol, side)
+            if attempts.get(akey, 0) >= _BE_MAX_ATTEMPTS:
+                # Already failed _BE_MAX_ATTEMPTS times — stop hammering the
+                # exchange every cycle (I-1). Sticky halt until the position
+                # vanishes / process restarts / user re-arms.
+                if not alert_state.get("auto_be_error", {}).get("halted"):
+                    alert_state["auto_be_error"] = {
+                        "active": True,
+                        "halted": True,
+                        "message": (
+                            f"Auto-BE nach {_BE_MAX_ATTEMPTS} Fehlversuchen "
+                            "gestoppt — bitte pruefen / neu scharfschalten."
+                        ),
+                        "ts": now_ms,
+                    }
+                    state_dirty = True
+                continue
             try:
                 await service.modify_stop_loss(
                     symbol=symbol, side=side, new_sl=action.new_sl
                 )
             except Exception as e:  # noqa: BLE001 — must not abort the cycle
+                n = attempts.get(akey, 0) + 1
+                attempts[akey] = n
                 log.warning(
-                    "auto-BE modify_stop_loss failed for %s %s: %s",
+                    "auto-BE modify_stop_loss failed for %s %s (%d/%d): %s",
                     symbol,
                     side,
+                    n,
+                    _BE_MAX_ATTEMPTS,
                     e,
                 )
                 alert_state["auto_be_error"] = {
                     "active": True,
-                    "message": f"Auto-BE fehlgeschlagen: {e}",
+                    "halted": n >= _BE_MAX_ATTEMPTS,
+                    "message": f"Auto-BE fehlgeschlagen ({n}/{_BE_MAX_ATTEMPTS}): {e}",
                     "ts": now_ms,
                 }
                 state_dirty = True
-                # Do NOT mark be_done — leave it armed to retry next cycle.
+                # Do NOT mark be_done — leave it armed to retry until the cap.
                 continue
             # Success: single-shot disarm + visible auto-action feed entry.
+            attempts.pop(akey, None)
             await db.mark_be_done(symbol, side)
             alert_state["auto_be"] = {
                 "active": True,
@@ -279,6 +303,32 @@ async def _process_position(
 
     if state_dirty:
         await db.set_alert_state(symbol, side, alert_state)
+
+
+# Auto-BE stops re-attempting after this many consecutive modify failures per
+# (symbol, side) — bounds the "hammer the exchange every cycle" case (I-1). The
+# counter is in-memory: a process restart or the position vanishing clears it.
+_BE_MAX_ATTEMPTS = 3
+# A mgmt record is only closed after this many CONSECUTIVE cycles where its
+# (symbol, side) is absent from the live snapshot — so a transient empty/partial
+# account_snapshot cannot silently wipe a user's arming (I-2).
+_CLOSE_GRACE_CYCLES = 2
+
+
+def _be_attempts(app: Any) -> dict:
+    d = getattr(app.state, "tm_be_attempts", None)
+    if not isinstance(d, dict):
+        d = {}
+        app.state.tm_be_attempts = d
+    return d
+
+
+def _absence_counts(app: Any) -> dict:
+    d = getattr(app.state, "tm_absence", None)
+    if not isinstance(d, dict):
+        d = {}
+        app.state.tm_absence = d
+    return d
 
 
 async def _run_one_cycle(app: Any, now_ms: int) -> None:
@@ -321,12 +371,23 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
             continue
 
     # Positions no longer live → close their mgmt record (frees the OPEN slot so
-    # a later re-open starts a fresh baseline).
+    # a later re-open starts a fresh baseline). Only after _CLOSE_GRACE_CYCLES
+    # CONSECUTIVE absences (I-2): a transient empty/partial snapshot must not
+    # silently wipe a user's arming — a single glitchy cycle is forgiven.
+    absence = _absence_counts(app)
+    attempts = _be_attempts(app)
     try:
         for row in await db.list_open_position_mgmt():
             key = (row.get("symbol"), row.get("side"))
-            if key not in live_keys:
+            if key in live_keys:
+                absence.pop(key, None)
+                continue
+            n = absence.get(key, 0) + 1
+            absence[key] = n
+            if n >= _CLOSE_GRACE_CYCLES:
                 await db.close_position_mgmt(row.get("symbol"), row.get("side"))
+                absence.pop(key, None)
+                attempts.pop(key, None)  # a vanished position clears its BE-retry cap
     except Exception:
         log.warning("trade monitor: close-vanished sweep failed", exc_info=True)
 
