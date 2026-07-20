@@ -8,6 +8,7 @@ response must surface as an error (→ UNKNOWN downstream), never as a confident
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -128,6 +129,68 @@ async def test_assets_and_positions_ok_on_complete_state():
     rows = await c.assets()
     assert rows[0]["equity"] == 1000.0
     assert await c.positions() == []
+
+
+# ── user_state short-TTL cache + 429 resilience (over-poll → 429 → 502 fix) ───
+
+
+@pytest.mark.asyncio
+async def test_assets_and_positions_share_one_user_state_within_ttl():
+    """assets()+positions() within the short TTL must collapse to a SINGLE
+    upstream user_state fetch. This dedups account_snapshot's 2 reads and rapid
+    concurrent endpoint polls that were driving Hyperliquid 429 → /api/market 502."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    await c.assets()
+    await c.positions()
+    assert info.user_state.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_assets_positions_serve_stale_cache_on_429():
+    """A warm cache older than the TTL but within the stale bound must be served
+    when the refetch 429s — a transient rate-limit burst degrades to a slightly
+    stale read instead of 502-ing the market view / starving the trade monitor."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    await c.assets()  # warm the cache (call_count == 1)
+    # Age the cache past the TTL but within the stale bound, then 429 the refetch.
+    ts, state, addr = c._user_state_cache
+    c._user_state_cache = (time.time() - 5.0, state, addr)
+    info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
+    rows = await c.assets()
+    assert rows[0]["equity"] == 1000.0  # stale equity served, no raise
+    assert await c.positions() == []  # stale positions served, no raise
+
+
+@pytest.mark.asyncio
+async def test_assets_positions_raise_on_error_without_warm_cache():
+    """No usable cache + upstream error → still fail honestly (never fabricate a
+    flat account). Only a genuinely warm cache may absorb a 429."""
+    info = MagicMock()
+    info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
+    c = _client(info)
+    with pytest.raises(HyperliquidError):
+        await c.assets()
+    with pytest.raises(HyperliquidError):
+        await c.positions()
+
+
+@pytest.mark.asyncio
+async def test_assets_raises_when_cache_too_stale_on_error():
+    """Beyond the bounded stale window the cache is no longer trustworthy: a 429
+    with a too-old cache must raise, not serve arbitrarily old equity/positions."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_COMPLETE_STATE)
+    c = _client(info)
+    await c.assets()
+    ts, state, addr = c._user_state_cache
+    c._user_state_cache = (time.time() - 30.0, state, addr)  # past MAX_STALE
+    info.user_state = MagicMock(side_effect=RuntimeError("429"))
+    with pytest.raises(HyperliquidError):
+        await c.assets()
 
 
 # ── H-2: totalNtlPos is notional exposure, not unrealized PnL ─────────────────

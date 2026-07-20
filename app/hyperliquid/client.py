@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -51,6 +52,21 @@ HL_MIN_NOTIONAL_USD = 10.0
 # Was cached forever, so tick/leverage-rule updates and newly-listed coins never
 # refreshed within a session (audit exchange M-1). 1h keeps upstream load low.
 _META_TTL_S = 3600.0
+
+log = logging.getLogger("app.hyperliquid.client")
+
+# Short-TTL cache for user_state (clearinghouseState). assets() and positions()
+# each hit info.user_state independently, so every account_snapshot cost 2 calls;
+# combined with frontend polls (/api/account, /api/orders/open, /api/market,
+# /api/fills) and the trade-monitor loop this drove Hyperliquid 429s → /api/market
+# 502 + "trade monitor: account_snapshot failed". A 2s TTL collapses the 2 reads
+# per snapshot into 1 and dedups rapid concurrent polls.
+_USER_STATE_TTL_S = 2.0
+# On a fetch error (esp. a 429 ClientError) serve the last good state for up to
+# this age instead of raising — rides out a transient 429 burst for the
+# read/display/monitor paths. Equity/positions don't meaningfully move in 8s;
+# beyond it we fail honestly rather than trust arbitrarily stale money data.
+_USER_STATE_MAX_STALE_S = 8.0
 
 
 def round_hl_price(px: float, sz_decimals: int) -> float:
@@ -180,6 +196,13 @@ class HyperliquidClient:
         # funding). ticker() and funding_rate() both need it — without this each
         # /api/market call hit the upstream 2× on top of every poll.
         self._ctx_cache: tuple[float, Any] | None = None
+        # Short-TTL cache for user_state, keyed by (ts, validated_state, addr) so a
+        # changed account_address never serves another account's state. See
+        # _user_state_cached() and the _USER_STATE_* constants above.
+        self._user_state_cache: tuple[float, dict[str, Any], str] | None = None
+        # One-shot flag so a sustained 429 burst logs the stale-serve warning once,
+        # not on every degraded poll; reset on the next successful fetch.
+        self._user_state_stale_warned: bool = False
         # OI history per coin: list of (unix_ts, open_interest), pruned to ~4.5h.
         # Feeds oi_change_pct_1h / _4h in market_extras(). In-memory only —
         # resets on restart (advisory context, not persisted state).
@@ -640,6 +663,49 @@ class HyperliquidClient:
             )
         return state
 
+    def _user_state_cached(
+        self, info: Any, addr: str, ttl: float = _USER_STATE_TTL_S
+    ) -> dict[str, Any]:
+        """info.user_state(addr) behind a short TTL cache with 429/error ride-out.
+
+        Runs INSIDE the _to_thread worker (sync). Fresh (< ttl) → return the
+        cached, _validate_user_state-validated state. Otherwise fetch + validate +
+        cache. On a fetch/validate EXCEPTION (esp. the 429 ClientError) fall back
+        to a bounded-stale cached state (age <= _USER_STATE_MAX_STALE_S) so a
+        transient rate-limit burst degrades to a slightly stale read for the
+        display/monitor/risk-gate paths instead of 502-ing; if no usable cache
+        exists it re-raises, so a genuine "no data" still fails honestly.
+
+        NOTE: this is deliberately NOT used by the F-08 close-path TOCTOU re-read,
+        which must stay a fresh live read to catch an externally flipped position.
+        """
+        now = time.time()
+        cache = self._user_state_cache
+        if cache is not None and cache[2] == addr and (now - cache[0]) < ttl:
+            return self._validate_user_state(cache[1])
+        try:
+            state = self._validate_user_state(info.user_state(addr))
+        except Exception as e:
+            if (
+                cache is not None
+                and cache[2] == addr
+                and (now - cache[0]) <= _USER_STATE_MAX_STALE_S
+            ):
+                if not self._user_state_stale_warned:
+                    log.warning(
+                        "user_state fetch failed (%s); serving cached state "
+                        "aged %.1fs (<= %.1fs bound) to ride out the burst",
+                        e,
+                        now - cache[0],
+                        _USER_STATE_MAX_STALE_S,
+                    )
+                    self._user_state_stale_warned = True
+                return self._validate_user_state(cache[1])
+            raise
+        self._user_state_cache = (now, state, addr)
+        self._user_state_stale_warned = False
+        return state
+
     async def assets(self) -> list[dict[str, Any]]:
         def _a():
             if not self.account_address and not self.private_key:
@@ -652,7 +718,7 @@ class HyperliquidClient:
 
                 addr = Account.from_key(self.private_key).address
                 self.account_address = addr
-            state = self._validate_user_state(info.user_state(addr))
+            state = self._user_state_cached(info, addr)
             margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
             equity = float(margin.get("accountValue") or 0)
             withdrawable = float(state.get("withdrawable") or 0)
@@ -688,7 +754,7 @@ class HyperliquidClient:
                 from eth_account import Account
 
                 addr = Account.from_key(self.private_key).address
-            state = self._validate_user_state(info.user_state(addr))
+            state = self._user_state_cached(info, addr)
             rows = []
             coin_f = to_hl_coin(symbol) if symbol else None
             for ap in state.get("assetPositions") or []:
