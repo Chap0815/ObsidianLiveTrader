@@ -2660,6 +2660,54 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .an-mgmt b { color: var(--text); font-weight: 600; }
 
+/* Block 2/TP2 Task P2 (UI): Confidence-Recalibration overlay -- server-side
+   downgrade of the KI's own setup_confidence display + sizing suggestion,
+   from the account's own realized Wilson-LB hit-rate. NEVER a block/veto and
+   NEVER changes the raw KI output shown elsewhere in the panel. Warn-toned
+   like .an-premortem when a downgrade actually fired (a "be more careful"
+   signal); a quiet .an-calibration-subtle line when it didn't (e.g. not
+   enough samples yet) so an untouched result doesn't compete with the
+   confidence tile above. */
+.an-calibration {
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.an-calibration-changed {
+  color: var(--muted);
+  padding: var(--space-2h) var(--space-3);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border-radius: var(--radius);
+  border-left: 2px solid var(--warn);
+}
+
+.an-calibration-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--warn);
+  margin-bottom: 4px;
+}
+
+.an-calibration-note {
+  color: var(--muted);
+}
+
+.an-calibration-subtle {
+  color: var(--faint);
+  font-size: var(--fs-xs);
+}
+
+/* Calibrated sizing SUGGESTION line inside .an-mgmt (next to the raw "Größe
+   (KI)" line, which stays visible above it) -- warn-toned to mark it as a
+   "shrink the recommendation" hint the trader can ignore. */
+.an-sizing-calibrated,
+.an-sizing-calibrated b {
+  color: var(--warn);
+}
+
 .an-foot {
   font-size: var(--fs-base);
   color: var(--faint);

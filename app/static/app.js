@@ -5779,6 +5779,37 @@
               p.rrr != null && p.rrr >= minRrr() ? "solide" : "knapp", "tile-rrr");
     }
     html += "</div>";
+
+    // Block 2/TP2 Task P2 (UI): active Confidence-Recalibration overlay. The
+    // raw KI-emitted `setup_confidence` stays visible untouched in the tile
+    // above (transparency — never hidden); this renders the SERVER-computed
+    // calibrated tier + note, purely display/advisory (never blocks, never
+    // upgrades, never touches action/sizing sent anywhere). The fields are
+    // response-level siblings of `proposal` — threaded into renderProposal
+    // the exact same way data.provider/data.model/data.provider_fallback
+    // already are (an-subhead above): read straight off `data`, no request
+    // change.
+    const calConf = String(data.confidence_calibrated || "").toLowerCase();
+    const calNote = data.calibration_note ? String(data.calibration_note).trim() : "";
+    const confLabel = (t) =>
+      t === "high" ? "Hoch" : t === "medium" ? "Mittel" : t === "low" ? "Niedrig" : (t || "—");
+    if (calConf && sconf && calConf !== sconf) {
+      // A downgrade actually fired -- surface it clearly (warn-toned "be more
+      // careful" hint), badge + the full transparency note below it.
+      html +=
+        '<div class="an-calibration an-calibration-changed">' +
+        '<span class="an-calibration-badge">KI: ' + escapeHtml(confLabel(sconf)) +
+        " · kalibriert: " + escapeHtml(confLabel(calConf)) + "</span>" +
+        (calNote ? '<div class="an-calibration-note">' + escapeHtml(calNote) + "</div>" : "") +
+        "</div>";
+    } else if (calNote) {
+      // No tier change, but a transparency note exists (e.g. "zu wenig
+      // Daten (n=…)") -- low-key, must not compete with the unchanged
+      // confidence tile above.
+      html +=
+        '<div class="an-calibration an-calibration-subtle">Kalibrierung: ' +
+        escapeHtml(calNote) + "</div>";
+    }
     if (!stayOut && p.trigger_entry_zone) {
       html += '<div class="an-zone"><b>Einstiegszone:</b> ' +
         escapeHtml(p.trigger_entry_zone) + "</div>";
@@ -5808,13 +5839,28 @@
     // by the LLM but never surfaced anywhere in the panel.
     const sizingNote = !stayOut ? String(p.position_sizing_note || "").trim() : "";
 
+    // Block 2/TP2 Task P2 (UI): calibrated sizing SUGGESTION (response-level
+    // `data.size_factor` / `data.position_sizing_note_calibrated`) — only
+    // rendered when a downgrade actually shrank it (size_factor < 1). The raw
+    // KI sizing note above stays visible; this is an extra line the trader
+    // can ignore. Display-only: nothing sent to the server ever reads this.
+    const sizeFactor = Number(data.size_factor);
+    const sizingNoteCalibrated =
+      !stayOut && Number.isFinite(sizeFactor) && sizeFactor < 1 && data.position_sizing_note_calibrated
+        ? String(data.position_sizing_note_calibrated).trim()
+        : "";
+
     // Management (structured invalidation price first, then any free-text)
     const invPx = Number(p.invalidation_price);
     const hasInvPx = Number.isFinite(invPx) && invPx > 0;
-    if (sizingNote || mgmt.move_sl_to_be || mgmt.early_invalidation || hasInvPx) {
+    if (sizingNote || sizingNoteCalibrated || mgmt.move_sl_to_be || mgmt.early_invalidation || hasInvPx) {
       html +=
         '<div class="an-mgmt">' +
         (sizingNote ? '<div><b>Größe (KI):</b> ' + escapeHtml(sizingNote) + "</div>" : "") +
+        (sizingNoteCalibrated
+          ? '<div class="an-sizing-calibrated"><b>Größe (kalibriert, Vorschlag):</b> ' +
+            escapeHtml(sizingNoteCalibrated) + "</div>"
+          : "") +
         (mgmt.move_sl_to_be ? '<div><b>SL→BE:</b> ' + escapeHtml(mgmt.move_sl_to_be) + "</div>" : "") +
         (hasInvPx
           ? '<div><b>Invalidierung:</b> ' + fmtN(invPx) +
