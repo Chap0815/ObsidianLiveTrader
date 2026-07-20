@@ -209,11 +209,21 @@
         >
           🧹 Journal leeren
         </button>
+        <button
+          type="button"
+          id="btn-killswitch"
+          class="btn btn-ghost btn-killswitch data-act hidden"
+          data-for="positions"
+          title="Entschärft SOFORT alle scharfgeschalteten Auto-Regeln (z. B. Auto-BE) für JEDE offene Position. Der Server bewegt danach keinen Stop mehr automatisch — bereits gesetzte Stops bleiben unverändert."
+        >
+          ⏻ Alle Auto-Regeln entschärfen
+        </button>
       </div>
     </div>
     <div class="data-panes">
       <div class="data-pane active" role="tabpanel" aria-label="Positionen" data-pane="positions">
         <div id="positions-summary" class="positions-summary hidden"></div>
+        <div id="mgmt-feed" class="mgmt-feed hidden"></div>
         <div id="positions-body" class="positions-body muted">—</div>
       </div>
       <div class="data-pane hidden" role="tabpanel" aria-label="Offene Orders" data-pane="orders">

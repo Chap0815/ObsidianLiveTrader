@@ -172,6 +172,15 @@ var state = {
   _ttlTimer: null, // preview TTL countdown setInterval handle
   _wsReconnect: null, // WS reconnect setTimeout handle
   _zonesRafPending: false, // zones redraw rAF coalescing flag
+  // Task 7 (Trade-Management-Layer, frontend): server-truth arming/alert
+  // state, mirrored from GET /api/positions/alerts on the existing account
+  // poll cadence — the ⚡ Auto-BE toggle NEVER guesses optimistically, it only
+  // ever reflects what this poll last reported.
+  positionMgmt: {}, // "SYMBOL|side" -> {armed_rules, be_done, alerts} (last poll row)
+  armBusy: {}, // "SYMBOL|side" -> true while POST /api/positions/arm is in flight (double-click guard)
+  killswitchBusy: false, // POST /api/positions/killswitch in flight guard
+  _seenAlertTs: {}, // "SYMBOL|side|kind" -> ts already surfaced (client-side de-dup so a poll never re-toasts the SAME alert)
+  _mgmtFeed: [], // recent auto-action/alert feed entries (newest first), capped — the visible "App hat SL auf BE gezogen" trail
 };
 // A3-04: freeze the SET of top-level keys. Nested objects (slAlarm[sym],
 // reevalBusy[sym], _markOffset[sym], _lineSpecs.*, tradeMarkers[sym], …)

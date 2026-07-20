@@ -108,3 +108,31 @@ function apiFetchAbortable(resource, url, opts) {
   }
   return apiFetch(url, merged);
 }
+
+/* ── Trade-Management-Layer endpoints (Task 7) ───────────────────────────
+ * Thin apiFetch() wrappers — no state, no JSON parsing, no toasts. Callers
+ * (app.js) await the Response themselves, exactly like every other apiFetch
+ * call site. Kept here, not in app.js, for the same STATE-FREE reason as the
+ * rest of this file (see header). */
+
+/** Arm/disarm one autonomous rule for ONE open position. `rules` MUST carry
+ * REAL booleans (e.g. {auto_be: true}) — the server 400s on any non-bool
+ * rule value (a truthy string like "false" must never arm a money path). */
+function armPosition(symbol, side, rules) {
+  return apiFetch("/api/positions/arm", {
+    method: "POST",
+    body: JSON.stringify({ symbol: symbol, side: side, rules: rules || {} }),
+  });
+}
+
+/** Polled alert + auto-action feed (spec §6) — armed_rules/be_done/alerts
+ * per OPEN position. No server→client push exists; the caller polls this. */
+function fetchPositionAlerts() {
+  return apiFetch("/api/positions/alerts");
+}
+
+/** Global kill-switch: disarms ALL autonomous rules on EVERY open position
+ * immediately (spec §3.5). Never touches a stop/order itself. */
+function killswitchPositions() {
+  return apiFetch("/api/positions/killswitch", { method: "POST" });
+}

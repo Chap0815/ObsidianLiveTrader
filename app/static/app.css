@@ -522,6 +522,14 @@ select:focus {
   background: color-mix(in srgb, var(--short) 10%, transparent);
 }
 
+/* Task 7 — global kill-switch: a SAFETY action (disarms autonomous rules),
+   not a destructive one, so it reads --warn on hover rather than --short. */
+.btn-killswitch:hover:not(:disabled) {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
 /* ── Health + equity ────────────────────────────────────── */
 .health {
   display: flex;
@@ -1649,6 +1657,49 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   color: var(--short);
 }
 
+/* Task 7 — ⚡ Auto-BE arming toggle. Same button geometry as the sibling
+   cp-*-btn actions (cp-be-btn/cp-sl-edit-btn) for a level actions row; color
+   is the ONLY thing that signals state, per the D3-01 "color = meaning" rule
+   — --warn while armed (an autonomous money action is now live), plain
+   --muted/--border while off. Never green/red (--long/--short) — those stay
+   exclusive to P&L per file header. */
+.cp-arm-btn {
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: var(--space-2);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.cp-arm-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.cp-arm-active {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: rgba(229, 169, 60, 0.1);
+}
+
+.cp-arm-active:hover:not(:disabled) {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: rgba(229, 169, 60, 0.16);
+}
+
+.cp-arm-disabled,
+.cp-arm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .positions-body,
 .orders-body {
   font-family: var(--mono);
@@ -1671,6 +1722,40 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   font-family: var(--mono);
 }
 .pos-sum-val { font-weight: 600; }
+
+/* Task 7 — auto-action / alert feed (the visible "App hat SL auf BE
+   gezogen" trail): a small, capped, newest-first list above the position
+   cards. Hidden entirely with no entries (T34-style — no empty chrome). */
+.mgmt-feed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1h) var(--space-2h);
+  margin-bottom: var(--space-1h);
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.mgmt-feed-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1h);
+  border-left: 2px solid var(--border);
+  padding-left: var(--space-1h);
+}
+
+.mgmt-feed-ok { border-left-color: var(--long); }
+.mgmt-feed-warn { border-left-color: var(--warn); }
+
+.mgmt-feed-sym {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.mgmt-feed-msg { color: var(--muted); }
 
 .positions-body.muted,
 .orders-body.muted {

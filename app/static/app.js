@@ -2115,6 +2115,48 @@
     );
   }
 
+  /** Task 7: canonical key for state.positionMgmt / state.armBusy —
+   *  "SYMBOL|side", uppercase symbol (matches state.overviewData's key
+   *  convention) so a poll row and a position card always agree regardless
+   *  of casing differences between the account snapshot and the mgmt DB row. */
+  function _mgmtKey(symbol, side) {
+    return String(symbol || "").toUpperCase() + "|" + String(side || "").toLowerCase();
+  }
+
+  /** Task 7: ⚡ Auto-BE arming toggle for ONE position — HL-only (auto-BE is
+   *  an autonomous stop-move the server only ever executes on Hyperliquid,
+   *  mirroring modify_stop_loss's own HL gate). On any other exchange the
+   *  button stays visible but disabled with an explanatory title, instead of
+   *  disappearing (so the actions row keeps a stable shape).
+   *
+   *  Reflects SERVER TRUTH ONLY: `armed` comes from state.positionMgmt, which
+   *  is populated exclusively by the GET /api/positions/alerts poll — this
+   *  function never guesses the post-click state optimistically, so the
+   *  toggle can't show "armed" if the POST actually failed or was rejected.
+   *  Clicking dispatches through the existing delegated data-action pipeline
+   *  (onPositionsBodyClick), not an inline onclick. */
+  function _armToggleHtml(symbol, sideVal) {
+    if (!isHlExchange()) {
+      return (
+        '<button type="button" class="cp-arm-btn cp-arm-disabled" disabled ' +
+        'title="Auto-BE (automatisches SL auf Break-Even ab +1R) ist nur auf Hyperliquid verfügbar">' +
+        "⚡ Auto-BE</button>"
+      );
+    }
+    const key = _mgmtKey(symbol, sideVal);
+    const mgmt = state.positionMgmt[key];
+    const armed = !!(mgmt && mgmt.armed_rules && mgmt.armed_rules.auto_be);
+    const busy = !!state.armBusy[key];
+    return (
+      '<button type="button" class="cp-arm-btn' + (armed ? " cp-arm-active" : "") + '"' +
+      ' data-action="arm-be" data-armed="' + (armed ? "1" : "0") + '"' +
+      (busy ? " disabled" : "") +
+      ' title="Auto-BE: zieht den Stop-Loss automatisch auf Break-Even, sobald die Position +1R im Gewinn steht. Der SERVER führt die Aktion aus — dieser Schalter aktiviert/deaktiviert sie nur.">' +
+      "⚡ Auto-BE: " + (armed ? "An" : "Aus") +
+      "</button>"
+    );
+  }
+
   function _posDataAttrs(p, sideVal, posCs) {
     return (
       ' data-sym="' + escapeHtml(String(p.symbol || "")) + '"' +
@@ -2405,6 +2447,23 @@
         }
         return;
       }
+      if (a === "arm-be") {
+        // Task 7: toggle the HL-only Auto-BE autonomous rule. Reads the
+        // CURRENT server-truth state off the button itself (data-armed, set
+        // from state.positionMgmt by _armToggleHtml) and requests the
+        // opposite — never a locally-guessed boolean.
+        e.stopPropagation();
+        if (actionEl.disabled) return;
+        const box = actionEl.closest(".cp-actions");
+        if (box) {
+          armAutoBe(
+            box.getAttribute("data-sym"),
+            box.getAttribute("data-side"),
+            actionEl.getAttribute("data-armed") !== "1"
+          );
+        }
+        return;
+      }
       if (a === "sl-edit") {
         // N3-09: reveal/hide the inline SL-price editor. Pure UI toggle, no
         // network — the actual move is gated behind data-action="sl-set".
@@ -2599,6 +2658,10 @@
     // banner / reeval block can't drift between what's shown and what's hashed.
     const slHtml = slStatusBanner(p);
     const reevalHtml = reevalResultHtml(p.symbol);
+    // Task 7: ⚡ Auto-BE arming toggle — computed once, reused for BOTH the
+    // HTML and the fingerprint (same discipline as slHtml/reevalHtml above)
+    // so the button can never drift from what the fp hashed.
+    const armHtml = _armToggleHtml(p.symbol, sideVal);
     // N3-09: the actions row always carries the inline SL-editor (✎ SL) so a
     // stop can be dragged to ANY price from the card; the BE button rides
     // along only when a break-even price is computable. data-be is included
@@ -2613,6 +2676,7 @@
       '<span class="cp-actions-label">Stop</span>' +
       beBtn +
       '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Stop-Loss auf einen beliebigen Preis nachziehen">✎ SL</button>' +
+      armHtml +
       '<span class="cp-sl-edit hidden">' +
       '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL-Preis" aria-label="Neuer Stop-Loss-Preis" />' +
       '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Setzen</button>' +
@@ -2621,7 +2685,10 @@
       "</div>";
     // Structural fingerprint: everything the user needs EXCEPT the live pnl/roe
     // text (patched in place). SL status + reeval block are included so a
-    // protection change or a fresh KI verdict DOES rebuild the card.
+    // protection change or a fresh KI verdict DOES rebuild the card. armHtml
+    // (Task 7) folds in the Auto-BE arming state — a poll-driven change to
+    // armed_rules.auto_be therefore rebuilds the card in place; an unchanged
+    // poll never does (no flicker, buttons stay clickable).
     const fp = _hashStr(
       [
         String(p.symbol || ""), sideVal, String(p.leverage),
@@ -2630,7 +2697,7 @@
         fmt(p.liquidate_price, 6),
         String(posCs), notional != null ? fmt(notional, 0) : "-",
         bePrice != null ? String(bePrice) : "-",
-        slHtml, reevalHtml, isActive ? "A" : "-",
+        slHtml, reevalHtml, armHtml, isActive ? "A" : "-",
       ].join("")
     );
     const html =
@@ -5284,6 +5351,173 @@
     }
   }
 
+  /** Task 7: toggle the HL-only Auto-BE autonomous rule for ONE open
+   *  position. Sends a REAL boolean — the server 400s on anything else (a
+   *  truthy string like "false" must never arm a money path). Double-submit
+   *  guarded per (symbol,side); re-renders immediately with the button
+   *  disabled while in flight, then re-fetches the alerts poll right away
+   *  (rather than waiting up to 30s) so the toggle reflects the ACTUAL
+   *  server-side result, never an optimistic guess. */
+  async function armAutoBe(symbol, side, nextArmed) {
+    const key = _mgmtKey(symbol, side);
+    if (state.armBusy[key]) return;
+    state.armBusy[key] = true;
+    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    try {
+      const res = await armPosition(symbol, side, { auto_be: !!nextArmed });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        showToast(
+          "Scharfschalten fehlgeschlagen: " + detailToText(data.detail || data),
+          "err"
+        );
+        return;
+      }
+      showToast(
+        (nextArmed ? "Auto-BE scharf: " : "Auto-BE entschärft: ") +
+          String(symbol || "") + " (" + String(side || "") + ")",
+        "ok"
+      );
+    } catch (err) {
+      showToast("Scharfschalten fehlgeschlagen: " + (err && err.message), "err");
+    } finally {
+      state.armBusy[key] = false;
+      // Refresh from the server immediately — the toggle must show what the
+      // backend actually persisted, not what we just requested.
+      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
+      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    }
+  }
+
+  /** Task 7: append one NEW auto-action/alert to the small visible feed
+   *  (newest first, capped) and re-render it. Never mutates an order/stop
+   *  itself — purely a display of what the SERVER already did or flagged. */
+  function _pushMgmtFeed(entry) {
+    state._mgmtFeed.unshift(entry);
+    if (state._mgmtFeed.length > 8) state._mgmtFeed.length = 8;
+    _renderMgmtFeed();
+  }
+
+  function _renderMgmtFeed() {
+    const el = $("mgmt-feed");
+    if (!el) return;
+    if (!state._mgmtFeed.length) {
+      el.classList.add("hidden");
+      el.innerHTML = "";
+      return;
+    }
+    el.classList.remove("hidden");
+    el.innerHTML = state._mgmtFeed
+      .map(function (f) {
+        const cls = f.toastKind === "ok" ? "mgmt-feed-ok" : "mgmt-feed-warn";
+        return (
+          '<div class="mgmt-feed-item ' + cls + '">' +
+          '<span class="mgmt-feed-sym">' +
+          escapeHtml(String(f.symbol || "")) + " (" + escapeHtml(String(f.side || "")) + ")" +
+          "</span>" +
+          '<span class="mgmt-feed-msg">' + escapeHtml(String(f.message || "")) + "</span>" +
+          "</div>"
+        );
+      })
+      .join("");
+  }
+
+  /** Task 7: turn ONE first-seen alert/auto-action into a toast + a feed
+   *  entry. `kind` is one of "thesis"/"time_stop" (advisory alarms, warn),
+   *  "auto_be" (the server just moved the stop — ok), "auto_be_error" /
+   *  "auto_be_unavailable" (subtle warning). The 1-click follow-up action
+   *  (moving the SL, closing) is the EXISTING "SL → Break-Even"/close button
+   *  already on the card — this never duplicates a money path. */
+  function _surfaceMgmtAlert(symbol, side, kind, a) {
+    const msg = String((a && a.message) || kind);
+    const toastKind = kind === "auto_be" ? "ok" : "warn";
+    showToast(String(symbol || "") + " (" + String(side || "") + "): " + msg, toastKind);
+    _pushMgmtFeed({
+      symbol: symbol,
+      side: side,
+      kind: kind,
+      message: msg,
+      toastKind: toastKind,
+    });
+  }
+
+  /** Task 7: poll GET /api/positions/alerts — called on the SAME cadence as
+   *  the existing account poll (T39 hidden-guard applied by the caller, same
+   *  as loadAccount). Populates state.positionMgmt (server truth for the ⚡
+   *  Auto-BE toggle, spec §8) and surfaces any NEW alert/auto-action as a
+   *  toast + feed entry.
+   *
+   *  De-dup: each alert kind carries a server-set `ts` (spec §6) that only
+   *  changes when the backend raises a genuinely NEW occurrence — the
+   *  debounce lives server-side (last_alert_state). state._seenAlertTs
+   *  remembers the ts already shown per (symbol,side,kind) so a poll that
+   *  returns the SAME still-active alert never re-toasts it; only a changed
+   *  ts (a fresh occurrence) surfaces again. */
+  async function refreshPositionAlerts() {
+    let data;
+    try {
+      const res = await fetchPositionAlerts();
+      if (!res.ok) return;
+      data = await res.json();
+    } catch (_) {
+      return; // best-effort — the next scheduled poll retries
+    }
+    const rows = (data && data.alerts) || [];
+    const nextMgmt = {};
+    rows.forEach(function (r) {
+      const key = _mgmtKey(r.symbol, r.side);
+      nextMgmt[key] = r;
+      const alerts = r.alerts || {};
+      Object.keys(alerts).forEach(function (kind) {
+        const a = alerts[kind];
+        if (!a || !a.active) return;
+        const ts = a.ts;
+        const seenKey = key + "|" + kind;
+        if (ts == null || state._seenAlertTs[seenKey] === ts) return; // already shown THIS occurrence
+        state._seenAlertTs[seenKey] = ts;
+        _surfaceMgmtAlert(r.symbol, r.side, kind, a);
+      });
+    });
+    state.positionMgmt = nextMgmt;
+    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+  }
+
+  /** Task 7 kill-switch (spec §3.5): disarms ALL autonomous rules on EVERY
+   *  open position immediately, via POST /api/positions/killswitch. Never
+   *  touches a stop/order itself — purely clears armed_rules server-side;
+   *  the monitor loop stops acting on it next cycle. Confirms first (global,
+   *  irreversible-until-rearmed action), then refreshes the alerts poll so
+   *  every card's toggle clears right away. */
+  async function killswitchAllPositions() {
+    if (state.killswitchBusy) return;
+    if (
+      !window.confirm(
+        "Alle Auto-Regeln (z. B. Auto-BE) für ALLE offenen Positionen sofort entschärfen?"
+      )
+    ) {
+      return;
+    }
+    state.killswitchBusy = true;
+    try {
+      const res = await killswitchPositions();
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        showToast(
+          "Kill-Switch fehlgeschlagen: " + detailToText(data.detail || data),
+          "err"
+        );
+        return;
+      }
+      showToast("Entschärft: " + fmt(data.disarmed, 0) + " Position(en).", "ok");
+    } catch (err) {
+      showToast("Kill-Switch fehlgeschlagen: " + (err && err.message), "err");
+    } finally {
+      state.killswitchBusy = false;
+      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
+      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    }
+  }
+
   function setApplyEnabled(enabled) {
     const btn = $("btn-apply-proposal");
     if (!btn) return;
@@ -7812,6 +8046,11 @@
       jrnClearBtn.addEventListener("click", () => clearJournal());
     }
 
+    const killswitchBtn = $("btn-killswitch");
+    if (killswitchBtn) {
+      killswitchBtn.addEventListener("click", () => killswitchAllPositions());
+    }
+
     const sugBtn = $("btn-suggest-vol");
     if (sugBtn) {
       sugBtn.addEventListener("click", () => suggestVol());
@@ -8567,6 +8806,7 @@
     loadHistory();
     loadSymbols();
     loadLlm();
+    try { refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
     // O6: skip the 30s account/fills/orders polls while the tab is hidden
     // (no point fetching into a page nobody is looking at); refresh immediately
     // when it becomes visible again so the data is never stale on return.
@@ -8576,11 +8816,16 @@
     setInterval(_whenVisible(loadAccount), 30000);
     setInterval(_whenVisible(loadFills), 30000); // same cadence as the account poll
     setInterval(_whenVisible(loadOpenOrders), 30000);
+    // Task 7: /api/positions/alerts on the SAME cadence + hidden-guard as the
+    // account poll above — arming toggles + alert/auto-action feed never
+    // poll into a background tab.
+    setInterval(_whenVisible(refreshPositionAlerts), 30000);
     document.addEventListener("visibilitychange", function () {
       if (document.hidden) return;
       loadAccount();
       loadOpenOrders();
       loadFills();
+      try { refreshPositionAlerts(); } catch (_) {}
       // E3-05: the chart poll and overview timer were skipped while hidden.
       // They self-schedule via setInterval so they re-arm on their own, but the
       // next fire can be up to a full interval away — kick an immediate silent
