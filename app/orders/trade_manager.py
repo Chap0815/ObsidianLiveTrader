@@ -45,6 +45,10 @@ class MgmtBaseline:
     be_done: bool = False
     last_alert_state: dict = field(default_factory=dict)
     high_water: float | None = None
+    # F4: the high-water captured at a MANUAL SL modify. While set, the trail is
+    # held (a deliberate loosening isn't immediately overridden) until the
+    # high-water surpasses it (long: strictly above; short: strictly below).
+    user_override_hw: float | None = None
 
 
 @dataclass
@@ -124,12 +128,23 @@ def evaluate_rules(
     high_water = mgmt.high_water
     hw_ok = isinstance(high_water, (int, float)) and math.isfinite(high_water)
     atr_ok = isinstance(atr, (int, float)) and math.isfinite(atr) and atr > 0
+    # F4: a manual SL move parks the then-current high-water here. The trail stays
+    # silent until the high-water advances PAST that level, so the user's chosen
+    # (looser) stop is respected instead of being restored every cycle. A tighten
+    # is unaffected: its own _is_more_protective guard already blocks the trail
+    # until a new high, exactly as the override does.
+    uo = mgmt.user_override_hw
+    uo_active = isinstance(uo, (int, float)) and math.isfinite(uo)
     if (
         armed.get("auto_trail")
         and unreal_r is not None
         and unreal_r >= settings.tm_trail_activation_r
         and atr_ok
         and hw_ok
+        and (
+            not uo_active
+            or (high_water > uo if side == "long" else high_water < uo)
+        )
     ):
         offset = settings.tm_trail_atr_mult * atr
         trail = high_water - offset if side == "long" else high_water + offset
@@ -138,7 +153,21 @@ def evaluate_rules(
         # so the trail can never be placed past price where it would trigger
         # instantly or be rejected.
         trail_on_right_side = trail < mark if side == "long" else trail > mark
-        if trail_on_right_side and _is_more_protective(side, trail, current_sl):
+        # F3: minimum step — the trail must beat the live SL by at least
+        # (tm_trail_min_step_atr * ATR) before we spend a modify round-trip. With
+        # no current SL any protective trail qualifies; min_step=0 collapses to
+        # the old any-improvement behavior (the _is_more_protective guard below
+        # still forbids equal/loosening moves).
+        min_step = settings.tm_trail_min_step_atr * atr
+        if side == "long":
+            beats_min_step = current_sl is None or (trail - current_sl) >= min_step
+        else:
+            beats_min_step = current_sl is None or (current_sl - trail) >= min_step
+        if (
+            trail_on_right_side
+            and beats_min_step
+            and _is_more_protective(side, trail, current_sl)
+        ):
             actions.append(MoveSlToBe(trail, "auto-trail"))
 
     # ── Thesis-invalidation alarm (advisory, R-independent) ──────────────────

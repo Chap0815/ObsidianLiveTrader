@@ -272,6 +272,11 @@ class Settings(BaseSettings):
     tm_trail_activation_r: float = 1.0
     tm_trail_atr_period: int = 14
     tm_trail_atr_tf: str = "15m"
+    # F3: minimum trail step as a fraction of ATR — the trail only emits a new
+    # modify_stop_loss when it beats the live SL by at least this*ATR, so a slow
+    # trend no longer triggers a full exchange round-trip every cycle. 0 = old
+    # any-improvement behavior. Same defensive posture (finite, >= 0).
+    tm_trail_min_step_atr: float = 0.25
 
     # Block 2/TP2 Task P2: minimum resolved sample a confidence group needs
     # before the server-side Confidence-Recalibration may downgrade its DISPLAY
@@ -624,6 +629,16 @@ class Settings(BaseSettings):
         if not math.isfinite(v) or not (0 <= v <= 10):
             raise ValueError(
                 f"TM_TRAIL_ACTIVATION_R must be a finite number in [0, 10] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("tm_trail_min_step_atr")
+    @classmethod
+    def tm_trail_min_step_atr_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 10):
+            raise ValueError(
+                f"TM_TRAIL_MIN_STEP_ATR must be a finite number in [0, 10] "
                 f"(got {v!r})"
             )
         return v

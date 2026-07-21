@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -189,6 +190,20 @@ class Database:
             if "high_water" not in pm_cols:
                 await conn.execute(
                     "ALTER TABLE position_management ADD COLUMN high_water REAL"
+                )
+            # F2/F4: additive columns for pre-existing DBs — same idempotent
+            # pattern. open_sig = STABLE reopen-signature (INTEGER: HL Flat->Open
+            # fill time / MEXC positionId); its change on a same-entry re-sighting
+            # forces a reopen reset. user_override_hw = high-water parked at a
+            # manual SL move. Both NULL on legacy rows, which the read paths treat
+            # as "unset" (no reset, no override).
+            if "open_sig" not in pm_cols:
+                await conn.execute(
+                    "ALTER TABLE position_management ADD COLUMN open_sig INTEGER"
+                )
+            if "user_override_hw" not in pm_cols:
+                await conn.execute(
+                    "ALTER TABLE position_management ADD COLUMN user_override_hw REAL"
                 )
             await conn.commit()
 
@@ -752,6 +767,7 @@ class Database:
         r1: float,
         opened_at: int | None,
         invalidation_price: float | None,
+        open_sig: int | None = None,
     ) -> int:
         """Insert the OPEN record for (symbol, side) or refresh the existing one.
 
@@ -775,7 +791,7 @@ class Database:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
-                SELECT id, entry_snap FROM position_management
+                SELECT id, entry_snap, open_sig FROM position_management
                 WHERE symbol = ? AND side = ? AND status = 'OPEN'
                 """,
                 (symbol, side),
@@ -785,19 +801,51 @@ class Database:
             if existing is not None and not _entry_deviated(
                 float(existing["entry_snap"]), entry_snap
             ):
+                # F2: a close+reopen of the SAME (symbol, side) at ~the same entry
+                # slips past _entry_deviated. When BOTH the stored and the fresh
+                # STABLE reopen-signature (HL Flat->Open fill time / MEXC
+                # positionId) are known and DIFFER, it is a genuine reopen →
+                # hard-reset the volatile state (be_done latch, stale high-water,
+                # user override) so the fresh position re-arms cleanly. The frozen
+                # risk baseline (entry_snap/initial_sl/r1/opened_at) and the user's
+                # armed_rules are preserved (same-entry reopen keeps the same risk
+                # geometry + arming intent — mirrors reset_position_mgmt_baseline).
+                # NULL on either side (unavailable signature, or a legacy/first
+                # sighting) is inconclusive → never resets (best-effort, no misfire).
+                sig_changed = (
+                    open_sig is not None
+                    and existing["open_sig"] is not None
+                    and int(existing["open_sig"]) != int(open_sig)
+                )
+                if sig_changed:
+                    await conn.execute(
+                        """
+                        UPDATE position_management
+                        SET be_done = 0, high_water = entry_snap,
+                            user_override_hw = NULL, open_sig = ?,
+                            invalidation_price = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (open_sig, invalidation_price, now, existing["id"]),
+                    )
+                    await conn.commit()
+                    return int(existing["id"])
                 # Non-deviated re-sighting: the BASELINE (entry_snap,
                 # initial_sl_snap, r1, opened_at) is FROZEN at creation so "+1R"
                 # is always measured from the ORIGINAL risk even after the stop
                 # is later moved (spec §4 — r1 must stay stable when the SL
                 # wanders). Only the volatile invalidation_price (a fresh proposal
-                # may update it) and updated_at are refreshed.
+                # may update it) and updated_at are refreshed. open_sig is LEARNED
+                # once via COALESCE when it was NULL (legacy row / first known
+                # signature) so a future change can be detected — never overwritten.
                 await conn.execute(
                     """
                     UPDATE position_management
-                    SET invalidation_price = ?, updated_at = ?
+                    SET invalidation_price = ?, updated_at = ?,
+                        open_sig = COALESCE(open_sig, ?)
                     WHERE id = ?
                     """,
-                    (invalidation_price, now, existing["id"]),
+                    (invalidation_price, now, open_sig, existing["id"]),
                 )
                 await conn.commit()
                 return int(existing["id"])
@@ -813,12 +861,13 @@ class Database:
                     SET entry_snap = ?, initial_sl_snap = ?, r1 = ?, opened_at = ?,
                         invalidation_price = ?, armed_rules = '{}', be_done = 0,
                         last_alert_state = '{}', status = 'OPEN', updated_at = ?,
-                        high_water = ?
+                        high_water = ?, open_sig = ?, user_override_hw = NULL
                     WHERE id = ?
                     """,
                     (
                         entry_snap, initial_sl_snap, r1, opened_at,
-                        invalidation_price, now, entry_snap, existing["id"],
+                        invalidation_price, now, entry_snap, open_sig,
+                        existing["id"],
                     ),
                 )
                 await conn.commit()
@@ -840,8 +889,8 @@ class Database:
                 INSERT INTO position_management
                   (symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
                    invalidation_price, armed_rules, be_done, last_alert_state,
-                   status, created_at, updated_at, high_water)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?, ?)
+                   status, created_at, updated_at, high_water, open_sig)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 0, '{}', 'OPEN', ?, ?, ?, ?)
                 ON CONFLICT(symbol, side) WHERE status = 'OPEN' DO UPDATE SET
                   entry_snap = excluded.entry_snap,
                   initial_sl_snap = excluded.initial_sl_snap,
@@ -849,12 +898,13 @@ class Database:
                   opened_at = excluded.opened_at,
                   invalidation_price = excluded.invalidation_price,
                   updated_at = excluded.updated_at,
-                  high_water = excluded.high_water
+                  high_water = excluded.high_water,
+                  open_sig = excluded.open_sig
                 RETURNING id
                 """,
                 (
                     symbol, side, entry_snap, initial_sl_snap, r1, opened_at,
-                    invalidation_price, now, now, entry_snap,
+                    invalidation_price, now, now, entry_snap, open_sig,
                 ),
             )
             row = await cur.fetchone()
@@ -942,6 +992,53 @@ class Database:
             )
             await conn.commit()
 
+    async def heal_r1(self, symbol: str, side: str, current_sl: float) -> None:
+        """F1: back-fill a frozen r1 that was pinned to 0 because the position
+        was first seen WITHOUT a bracket SL.
+
+        Once a real protective stop exists, r1 = |entry_snap - current_sl| can
+        finally be measured. This ONLY heals 0/NULL → value (never overwrites an
+        already-real r1, so the freeze from the first genuine sighting stays
+        intact) and only when current_sl is a positive price that actually
+        differs from entry (a stop AT entry is a true 0R and stays unhealed).
+        Idempotent no-op if no OPEN record exists or r1 is already set.
+        """
+        try:
+            sl = float(current_sl)
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(sl) and sl > 0):
+            return
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET r1 = ABS(entry_snap - ?), updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                  AND (r1 IS NULL OR r1 = 0) AND entry_snap <> ?
+                """,
+                (sl, _now_ms(), symbol, side, sl),
+            )
+            await conn.commit()
+
+    async def set_user_override_hw(self, symbol: str, side: str) -> None:
+        """F4: park the CURRENT high_water as the user-override level after a
+        MANUAL SL move, so the trail holds until the high-water surpasses it.
+
+        Copies high_water → user_override_hw on the OPEN record for (symbol,
+        side). Idempotent no-op if no OPEN record exists.
+        """
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE position_management
+                SET user_override_hw = high_water, updated_at = ?
+                WHERE symbol = ? AND side = ? AND status = 'OPEN'
+                """,
+                (_now_ms(), symbol, side),
+            )
+            await conn.commit()
+
     async def reset_position_mgmt_baseline(self, symbol: str, side: str) -> None:
         """Re-arm/reopen fresh baseline: zero ``be_done`` and re-seed
         ``high_water`` to ``entry_snap`` on the OPEN record for (symbol, side).
@@ -961,7 +1058,8 @@ class Database:
             await conn.execute(
                 """
                 UPDATE position_management
-                SET be_done = 0, high_water = entry_snap, updated_at = ?
+                SET be_done = 0, high_water = entry_snap,
+                    user_override_hw = NULL, updated_at = ?
                 WHERE symbol = ? AND side = ? AND status = 'OPEN'
                 """,
                 (_now_ms(), symbol, side),

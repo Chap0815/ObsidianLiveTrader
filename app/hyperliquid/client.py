@@ -975,6 +975,12 @@ class HyperliquidClient:
                             "side": "buy" if str(f.get("side")) == "B" else "sell",
                             "time": int(f.get("time") or 0),
                             "dir": str(f.get("dir") or ""),
+                            # F2: signed position size BEFORE this fill. ==0 marks
+                            # a Flat->Open (trade-epoch) fill; used to derive a
+                            # STABLE reopen signature. Kept as a float when present.
+                            "start_position": float(f["startPosition"])
+                            if f.get("startPosition") not in (None, "")
+                            else None,
                             "closed_pnl": float(f["closedPnl"])
                             if f.get("closedPnl") not in (None, "")
                             else None,

@@ -118,12 +118,22 @@ CREATE TABLE IF NOT EXISTS position_management (
   status             TEXT    NOT NULL DEFAULT 'OPEN', -- OPEN | CLOSED
   created_at         INTEGER NOT NULL,
   updated_at         INTEGER NOT NULL,
-  high_water         REAL                            -- TML v2 (Task V3): monotonic
+  high_water         REAL,                           -- TML v2 (Task V3): monotonic
                                                        -- Chandelier high-water (long:
                                                        -- running max mark; short: running
                                                        -- min mark). Moves ONLY via
                                                        -- update_high_water(), never via
                                                        -- the upsert FROZEN path.
+  open_sig           INTEGER,                        -- F2: STABLE reopen-signature
+                                                       -- (HL: newest Flat->Open fill time;
+                                                       -- MEXC: snapshot positionId). A
+                                                       -- change on a same-entry re-sighting
+                                                       -- means a close+reopen → hard
+                                                       -- baseline reset. NULL = inconclusive
+                                                       -- → never resets.
+  user_override_hw   REAL                            -- F4: high-water parked at a manual
+                                                       -- SL move; the trail is held until
+                                                       -- high_water surpasses it.
 );
 
 -- Partial unique index: at most ONE OPEN row per (symbol, side). CLOSED rows

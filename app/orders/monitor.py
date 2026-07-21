@@ -94,20 +94,102 @@ async def _best_effort_opened_at(
     except Exception:
         pass
     # 2) Journal approximation (MEXC has no user_fills; also HL fallback).
+    # F5: recent_journal is newest-first, so returning the FIRST match picked the
+    # YOUNGEST row — every fresh proposal then "rejuvenated" opened_at and the
+    # time-stop could never reach its threshold. Take the OLDEST matching row in
+    # the recent window instead (best-effort: the window is capped, so this is the
+    # oldest KNOWN sighting of the active trade, not necessarily its true open).
     try:
         if db is not None:
             rows = await db.recent_journal()
+            oldest: int | None = None
             for r in rows or []:
                 if r.get("symbol") == symbol and str(
                     r.get("direction") or ""
                 ).lower() == side:
                     ms = _iso_to_ms(r.get("created_at"))
-                    if ms:
-                        return ms
+                    if ms and (oldest is None or ms < oldest):
+                        oldest = ms
+            if oldest is not None:
+                return oldest
     except Exception:
         pass
     # 3) Last resort: now (time-stop simply won't fire yet — fail-safe).
     return now_ms
+
+
+def _position_id_signature(pos: Any) -> int | None:
+    """MEXC (and any client exposing a STABLE exchange position id): the
+    ``positionId`` carried in the positions snapshot.
+
+    A close+reopen gets a NEW positionId; add-ons keep it — so it is a stable
+    trade-identity anchor, unlike anything derived from a rolling fill window.
+    None when absent or non-integer → INCONCLUSIVE (never resets). NOTE: HL's
+    snapshot ``position_id`` is just the coin (not a per-trade id), so this is
+    used ONLY on the non-HL path; HL uses ``_hl_epoch_signature`` instead.
+    """
+    if not isinstance(pos, dict):
+        return None
+    pid = pos.get("position_id")
+    if pid in (None, ""):
+        return None
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _hl_epoch_signature(client: Any, symbol: str, side: str) -> int | None:
+    """HL trade-epoch anchor: the time of the NEWEST Flat→Open fill
+    (``start_position`` == 0) for this side.
+
+    Why not ``min()``/``max()`` over the whole fill window: that is UNSTABLE.
+    The earliest fill can roll out of the rolling userFills window mid-trade
+    (spurious signature jump → false reset), and a lingering original fill can
+    keep the signature unchanged across a real reopen (false negative). The
+    Flat→Open fill is the true epoch: a reopen mints a NEW one (newer time) →
+    the signature changes → reset fires; add-ons/partial fills carry a non-zero
+    ``start_position`` and never move the anchor. If NO epoch fill is currently
+    in the window, return None = INCONCLUSIVE — deliberately never spring a
+    reset just because the anchor scrolled out of view. Never raises.
+    """
+    want = "long" if side == "long" else "short"
+    try:
+        fills = await client.user_fills(symbol)
+    except Exception:
+        return None
+    epochs: list[int] = []
+    for f in fills or []:
+        d = str(f.get("dir") or "").lower()
+        if "open" not in d or want not in d:
+            continue
+        sp = f.get("start_position")
+        try:
+            spf = float(sp)
+        except (TypeError, ValueError):
+            continue  # unknown start_position → can't confirm a flat→open epoch
+        t = int(f.get("time") or 0)
+        if abs(spf) < 1e-12 and t > 0:  # position was FLAT before this fill
+            epochs.append(t)
+    return max(epochs) if epochs else None
+
+
+async def _open_signature(
+    client: Any, pos: Any, symbol: str, side: str
+) -> int | None:
+    """A STABLE exchange reopen-signature, or None (INCONCLUSIVE).
+
+    F2: detects a close+reopen of the same (symbol, side) at ~the same entry
+    that the entry-deviation check can't catch. HL (identified by the
+    ``place_stop_order`` gate the monitor uses everywhere) derives a trade-epoch
+    from the newest Flat→Open fill; every other client (MEXC included — it DOES
+    have ``user_fills``, but a per-trade ``positionId`` in the snapshot is the
+    stabler anchor) uses that positionId. None on either side of a comparison is
+    treated as inconclusive by the repo (never a reset). Never raises.
+    """
+    if hasattr(client, "place_stop_order"):
+        return await _hl_epoch_signature(client, symbol, side)
+    return _position_id_signature(pos)
 
 
 async def _best_effort_invalidation(db: Any, symbol: str) -> float | None:
@@ -153,7 +235,14 @@ async def _current_sl(
 
 
 async def ensure_baseline(
-    db: Any, client: Any, symbol: str, side: str, entry: float, now_ms: int
+    db: Any,
+    client: Any,
+    symbol: str,
+    side: str,
+    entry: float,
+    now_ms: int,
+    *,
+    pos: Any = None,
 ) -> None:
     """Create (first sighting / arm time) or refresh the durable baseline for
     ONE open position — the SINGLE baseline path shared by the monitor cycle and
@@ -174,10 +263,14 @@ async def ensure_baseline(
     r1 = abs(entry - current_sl) if current_sl is not None else 0.0
     opened_at = await _best_effort_opened_at(client, db, symbol, side, now_ms)
     invalidation = await _best_effort_invalidation(db, symbol)
+    # F2: stable exchange reopen-signature (HL trade-epoch fill / MEXC positionId;
+    # None = inconclusive → no reset).
+    open_sig = await _open_signature(client, pos, symbol, side)
 
     # Durable baseline. First sighting inserts; a later sighting refreshes in
     # place (arming/be_done/alert-state preserved), unless entry deviated beyond
-    # tolerance → treated as a NEW position by the repo (reset). §4/§5.
+    # tolerance → treated as a NEW position by the repo (reset). A changed
+    # open_sig on a same-entry re-sighting also forces a reopen reset (F2). §4/§5.
     await db.upsert_position_mgmt(
         symbol,
         side,
@@ -186,7 +279,14 @@ async def ensure_baseline(
         r1=r1,
         opened_at=opened_at,
         invalidation_price=invalidation,
+        open_sig=open_sig,
     )
+    # F1: heal a frozen r1==0 (position first seen without a bracket SL) now that
+    # a real protective stop exists. Never overwrites an already-real r1, so the
+    # baseline freeze is preserved; unblocks the auto-BE / trail / time-stop R
+    # gates that r_available=(r1>0) would otherwise silently keep shut.
+    if current_sl is not None:
+        await db.heal_r1(symbol, side, current_sl)
 
 
 async def _process_position(
@@ -228,7 +328,7 @@ async def _process_position(
     # to the arm endpoint). evaluate_rules below still uses the LIVE current_sl
     # read above for the protection-direction check — the baseline only freezes
     # the ORIGINAL initial_sl/r1.
-    await ensure_baseline(db, client, symbol, side, entry, now_ms)
+    await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
     # Monotonic Chandelier high-water — its OWN UPDATE (never the freeze path),
     # advanced every cycle BEFORE rule evaluation so the trail always trails the
     # best price seen (long: running high; short: running low). Cheap; harmless
@@ -248,6 +348,7 @@ async def _process_position(
         be_done=bool(mgmt_row.get("be_done")),
         last_alert_state=mgmt_row.get("last_alert_state") or {},
         high_water=mgmt_row.get("high_water"),
+        user_override_hw=mgmt_row.get("user_override_hw"),
     )
 
     # ATR is fetched ONLY for auto_trail-armed positions (klines cost, spec §3).

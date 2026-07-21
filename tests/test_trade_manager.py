@@ -29,6 +29,7 @@ def _settings(**over):
         tm_time_stop_min_r=0.5,
         tm_trail_activation_r=1.0,
         tm_trail_atr_mult=2.0,
+        tm_trail_min_step_atr=0.25,
     )
     base.update(over)
     return SimpleNamespace(**base)

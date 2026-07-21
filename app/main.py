@@ -2373,7 +2373,7 @@ async def orders_modify_sl(
     svc = _order_service(request)
     symbol = normalize_symbol(body.symbol)
     try:
-        return await svc.modify_stop_loss(
+        result = await svc.modify_stop_loss(
             symbol=symbol, side=body.side, new_sl=body.new_sl
         )
     except OrderError as e:
@@ -2382,6 +2382,20 @@ async def orders_modify_sl(
         ) from e
     except ExchangeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+    # F4: this is the USER-initiated SL path (the monitor drives the service
+    # directly, never this endpoint). On a CONFIRMED move (verified=True — mirror
+    # the monitor's C2 discipline: an unverified move left the old stop in place)
+    # park the current high-water as the user-override level, so an intentional
+    # LOOSENING of the stop isn't restored by the trail every cycle. Best-effort:
+    # a missing DB / no OPEN mgmt record is a silent no-op (never blocks the move).
+    try:
+        db = getattr(request.app.state, "db", None)
+        if db is not None and isinstance(result, dict) and result.get("verified") is True:
+            await db.set_user_override_hw(symbol, body.side)
+    except Exception:
+        log.warning("modify-sl: set_user_override_hw failed", exc_info=True)
+    return result
 
 
 # Whitelist of autonomous management rule NAMES (spec §1.3). auto_be (v1) and
@@ -2483,7 +2497,7 @@ async def positions_arm(
     now_ms = int(_time.time() * 1000)
     # Freeze the baseline THEN write the arming. ensure_baseline never places an
     # order — it only writes the mgmt record.
-    await ensure_baseline(db, client, symbol, side, entry, now_ms)
+    await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
     await db.set_armed_rules(symbol, side, rules)
     # Re-arming clears any sticky auto-BE halt (F2) so the "neu scharfschalten"
     # recovery the halt alert advertises actually works: drop the in-memory
