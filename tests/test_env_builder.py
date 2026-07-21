@@ -1,7 +1,10 @@
 """Shared .env builder: normalize, build_minimal/full, atomic whitelist patch."""
 
+import os
+
 import pytest
 
+import app.env_builder as env_builder
 from app.config import Settings
 from app.env_builder import (
     DEFAULT_MODELS,
@@ -249,3 +252,44 @@ def test_patch_env_rejects_control_char_value(tmp_path):
 def test_default_models_have_all_providers():
     for prov in ("claude", "xai", "openai", "ollama"):
         assert DEFAULT_MODELS[prov]
+
+
+# ── Finding 3: os.replace retry on a transient Windows file lock ───────────
+def test_patch_env_retries_transient_permission_error_then_succeeds(tmp_path, monkeypatch):
+    p = tmp_path / ".env"
+    p.write_text("XAI_API_KEY=\n", encoding="utf-8")
+    real_replace = os.replace
+    calls: list[int] = []
+
+    def flaky_replace(src, dst):
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("WinError 5: Zugriff verweigert")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(env_builder.os, "replace", flaky_replace)
+    monkeypatch.setattr(env_builder.time, "sleep", lambda s: None)  # no real delay in tests
+
+    patch_env_vars(p, {"XAI_API_KEY": "xai-new"}, allowed=set(SETTINGS_LLM_WRITABLE))
+
+    assert len(calls) == 3
+    assert "XAI_API_KEY=xai-new" in p.read_text(encoding="utf-8")
+
+
+def test_patch_env_gives_up_after_persistent_permission_error(tmp_path, monkeypatch):
+    p = tmp_path / ".env"
+    p.write_text("XAI_API_KEY=\n", encoding="utf-8")
+
+    def always_fail(src, dst):
+        raise PermissionError("WinError 5: Zugriff verweigert")
+
+    monkeypatch.setattr(env_builder.os, "replace", always_fail)
+    monkeypatch.setattr(env_builder.time, "sleep", lambda s: None)
+
+    with pytest.raises(PermissionError):
+        patch_env_vars(p, {"XAI_API_KEY": "xai-new"}, allowed=set(SETTINGS_LLM_WRITABLE))
+
+    # fail-safe: the original .env must remain untouched, and the tmp file
+    # must not be left behind.
+    assert p.read_text(encoding="utf-8") == "XAI_API_KEY=\n"
+    assert list(tmp_path.glob(".env.*.tmp")) == []

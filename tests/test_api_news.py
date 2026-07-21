@@ -280,3 +280,76 @@ def test_news_total_failure_serves_stale_cache(monkeypatch):
     body = r.json()
     assert body.get("stale") is True
     assert body["items"] == first["items"]
+
+
+# --- Finding 1: cold-start all-feeds-failed must not hide news for 5 min ----
+def test_news_cold_start_all_fail_retries_soon_not_full_ttl(monkeypatch):
+    """A cold-start refresh (no prior cache) where every feed fails must not
+    cache the empty payload for the full NEWS_CACHE_TTL — only for the short
+    NEWS_NEGATIVE_CACHE_TTL — so a feed recovering seconds later is retried
+    promptly instead of the page staying empty for up to 5 min."""
+    feeds = [("A", "http://a")]
+    fake_now = [5000.0]
+    monkeypatch.setattr(main._time, "monotonic", lambda: fake_now[0])
+    with TestClient(app) as client:
+        client.app.state.news_cache = None
+        _patch(monkeypatch, feeds, {"http://a": httpx.ConnectError("down")})
+        first = client.get("/api/news").json()
+        assert first["items"] == []
+
+        # Well past NEWS_NEGATIVE_CACHE_TTL but far short of the full
+        # NEWS_CACHE_TTL — the old code would still serve the empty cache for
+        # up to 5 min; the fix must retry here.
+        fake_now[0] += main.NEWS_NEGATIVE_CACHE_TTL + 1
+        _patch(monkeypatch, feeds, {"http://a": RSS_XML})
+        second = client.get("/api/news").json()
+    assert second["items"], "expected a retry well before NEWS_CACHE_TTL elapses"
+
+
+# --- Finding 2: all-fail stale return must set a short negative-TTL too -----
+def test_news_all_fail_stale_reuses_negative_ttl_then_refreshes(monkeypatch):
+    """After an all-feeds-failed stale return, news_cache[0] must be updated
+    too (short negative TTL): repeat callers within that window hit the TTL
+    cache (no second upstream fetch batch each request), and once the window
+    elapses a real refresh happens again."""
+    fake_now = [2000.0]
+    monkeypatch.setattr(main._time, "monotonic", lambda: fake_now[0])
+    refresh_calls = 0
+    orig_refresh = main._refresh_news
+
+    async def counting_refresh(request):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return await orig_refresh(request)
+
+    monkeypatch.setattr(main, "_refresh_news", counting_refresh)
+
+    feeds = [("A", "http://a")]
+    with TestClient(app) as client:
+        # 1) prime a good cache
+        _patch(monkeypatch, feeds, {"http://a": RSS_XML})
+        client.app.state.news_cache = None
+        first = client.get("/api/news").json()
+        assert first["items"]
+        assert refresh_calls == 1
+
+        # 2) expire the TTL, all feeds now fail -> stale fallback
+        ts, payload = client.app.state.news_cache
+        client.app.state.news_cache = (ts - main.NEWS_CACHE_TTL - 1, payload)
+        _patch(monkeypatch, feeds, {"http://a": httpx.ConnectError("down")})
+        r = client.get("/api/news")
+        assert refresh_calls == 2
+        assert r.json().get("stale") is True
+
+        # 3) still inside the negative TTL -> cache hit, no second fetch batch
+        fake_now[0] += main.NEWS_NEGATIVE_CACHE_TTL - 1
+        r2 = client.get("/api/news")
+        assert refresh_calls == 2, "expected the negative-TTL cache to be hit"
+        assert r2.json().get("stale") is True
+
+        # 4) after the negative TTL elapses -> a real refresh happens again
+        fake_now[0] = 2021.0
+        _patch(monkeypatch, feeds, {"http://a": RSS_XML})
+        r3 = client.get("/api/news")
+    assert refresh_calls == 3
+    assert r3.json()["items"]

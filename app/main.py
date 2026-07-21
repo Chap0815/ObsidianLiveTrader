@@ -935,7 +935,7 @@ async def setup_save(request: Request, body: dict):
     # ".env.setup-tmp" — sonst koennte ein lokaler Prozess den Pfad vorher
     # anlegen/symlinken. Gleiches Verzeichnis wie ENV_PATH, damit der
     # abschliessende os.replace atomar bleibt.
-    from app.env_builder import restrict_env_permissions
+    from app.env_builder import replace_with_retry, restrict_env_permissions
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(ENV_PATH.parent), prefix=f"{ENV_PATH.name}.", suffix=".tmp"
@@ -953,9 +953,15 @@ async def setup_save(request: Request, body: dict):
         except Exception as e:
             tmp.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=f"Konfiguration ungültig: {e}") from e
-        os.replace(tmp, ENV_PATH)
+        replace_with_retry(tmp, ENV_PATH)
     except HTTPException:
         raise
+    except (PermissionError, OSError) as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=409,
+            detail=".env ist gerade durch ein anderes Programm gesperrt — bitte erneut versuchen.",
+        ) from e
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -1100,6 +1106,11 @@ async def settings_llm_key(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        except (PermissionError, OSError) as e:
+            raise HTTPException(
+                status_code=409,
+                detail=".env ist gerade durch ein anderes Programm gesperrt — bitte erneut versuchen.",
+            ) from e
         get_settings.cache_clear()
 
     return _settings_llm_status(request)
@@ -1357,6 +1368,9 @@ NEWS_FEEDS: list[tuple[str, str]] = [
     ("Decrypt", "https://decrypt.co/feed"),
 ]
 NEWS_CACHE_TTL = 300.0      # 5 min — news moves slowly; spare the upstreams
+NEWS_NEGATIVE_CACHE_TTL = 20.0  # all-feeds-failed payload: cache only briefly
+                                 # so a transient outage doesn't hide news for
+                                 # the full 5 min once feeds recover
 NEWS_FEED_TIMEOUT = 6.0     # per-feed hard timeout
 NEWS_MAX_ITEMS = 40
 NEWS_MAX_FEED_BYTES = 2 * 1024 * 1024  # 2 MB cap per feed response (F-14, DoS)
@@ -1491,13 +1505,26 @@ async def _refresh_news(request: Request) -> dict:
     items = items[:NEWS_MAX_ITEMS]
 
     payload = {"items": items, "errors": errors}
-    # Only overwrite the cache when we actually got items; otherwise keep
-    # serving the last good payload (stale) instead of an empty page.
-    if items or not cache:
+    if items:
         request.app.state.news_cache = (_time.monotonic(), payload)
         return payload
+
+    # All feeds failed this round. Never cache an empty/stale payload for the
+    # full TTL — that would hide a transient outage for up to 5 min even
+    # though the feeds may recover within seconds. Instead backdate the
+    # timestamp so it only counts as "fresh" for NEWS_NEGATIVE_CACHE_TTL:
+    # repeat callers within that short window still hit the cache (no fetch
+    # storm), but the next request after it gets a real refresh.
+    backdate = NEWS_CACHE_TTL - NEWS_NEGATIVE_CACHE_TTL
+    if not cache:
+        # Cold start: nothing good to fall back to — cache the empty payload
+        # itself, briefly.
+        request.app.state.news_cache = (_time.monotonic() - backdate, payload)
+        return payload
+
     stale = dict(cache[1])
     stale["stale"] = True
+    request.app.state.news_cache = (_time.monotonic() - backdate, stale)
     return stale
 
 

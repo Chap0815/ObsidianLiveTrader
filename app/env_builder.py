@@ -21,9 +21,33 @@ import re
 import secrets
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# B3-05: os.replace onto the live .env can transiently fail with
+# PermissionError (WinError 5) when OneDrive, an AV scanner or an editor
+# briefly holds an open handle on Windows. A handful of short retries clears
+# that without surfacing an opaque 500 to the user for what is normally a
+# sub-second lock.
+_REPLACE_RETRY_DELAYS = (0.1, 0.3)  # seconds; len(...) + 1 == total attempts
+
+
+def replace_with_retry(tmp: Path, dst: Path) -> None:
+    """os.replace with short retries on a transient Windows file lock.
+
+    Re-raises the last error once all attempts are exhausted; the caller
+    remains responsible for cleaning up ``tmp`` on failure.
+    """
+    for delay in (*_REPLACE_RETRY_DELAYS, None):
+        try:
+            os.replace(tmp, dst)
+            return
+        except OSError:
+            if delay is None:
+                raise
+            time.sleep(delay)
 
 # ── Whitelists ──────────────────────────────────────────────────────────────
 # Provider -> (api_key_var, model_var). Ollama has no key.
@@ -426,7 +450,7 @@ def patch_env_vars(
         # broad, inherited permissions of the directory while already holding
         # secrets.
         restrict_env_permissions(tmp)
-        os.replace(tmp, env_path)
+        replace_with_retry(tmp, env_path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise

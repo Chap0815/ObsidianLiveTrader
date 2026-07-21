@@ -93,3 +93,33 @@ def test_test_provider_rejects_unknown():
     with _client() as tc:
         r = tc.post("/api/settings/test-provider", json={"provider": "bogus"})
     assert r.status_code == 400
+
+
+# ── Finding 3: os.replace transient Windows lock -> 409, not opaque 500 ─────
+def test_llm_key_permission_error_maps_to_409(tmp_path, monkeypatch):
+    """A transient Windows file lock during the .env replace (OneDrive/AV/an
+    open editor briefly holding a handle) must not surface as an opaque
+    500 — the old .env stays intact (fail-safe) and the client gets a clear
+    409 to retry."""
+    import app.env_builder as env_builder
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "SETUP_COMPLETE=true\nXAI_API_KEY=\nXAI_MODEL=grok-4\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(main_mod, "ENV_PATH", env)
+
+    def always_fail(src, dst):
+        raise PermissionError("WinError 5: Zugriff verweigert")
+
+    monkeypatch.setattr(env_builder.os, "replace", always_fail)
+    monkeypatch.setattr(env_builder.time, "sleep", lambda s: None)  # no real delay in tests
+
+    with _client() as tc:
+        r = tc.post(
+            "/api/settings/llm-key",
+            json={"provider": "xai", "api_key": "xai-secret", "model": "grok-4"},
+        )
+    assert r.status_code == 409
+    assert "gesperrt" in r.json()["detail"]
+    assert "XAI_API_KEY=xai-secret" not in env.read_text(encoding="utf-8")

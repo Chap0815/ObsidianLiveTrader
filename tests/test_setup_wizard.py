@@ -71,3 +71,32 @@ def test_setup_locked_when_setup_complete():
         assert r.status_code == 303  # locked → back to dashboard
         r2 = c.post("/api/setup", json=_payload())
         assert r2.status_code == 403  # cannot overwrite existing config
+
+
+# ── Finding 3: os.replace transient Windows lock -> 409, not opaque 500 ─────
+def test_setup_save_permission_error_maps_to_409(tmp_path, monkeypatch):
+    """A transient Windows file lock on the final os.replace (OneDrive/AV/an
+    open editor briefly holding a handle) must not surface as an opaque
+    500 — the client gets a clear 409 to retry, and the tmp file (which
+    already carried the new secrets) is cleaned up, never left behind."""
+    from fastapi.testclient import TestClient
+
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env = tmp_path / ".env"  # does not exist -> _setup_needed() is True
+    monkeypatch.setattr(main, "ENV_PATH", env)
+
+    def always_fail(src, dst):
+        raise PermissionError("WinError 5: Zugriff verweigert")
+
+    monkeypatch.setattr(env_builder.os, "replace", always_fail)
+    monkeypatch.setattr(env_builder.time, "sleep", lambda s: None)  # no real delay in tests
+
+    with TestClient(main.app) as c:
+        r = c.post("/api/setup", json=_payload())
+
+    assert r.status_code == 409
+    assert "gesperrt" in r.json()["detail"]
+    assert not env.exists()  # fail-safe: never created
+    assert list(tmp_path.glob(".env.*.tmp")) == []  # tmp cleaned up
