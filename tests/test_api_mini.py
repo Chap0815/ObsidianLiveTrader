@@ -123,6 +123,24 @@ def test_mini_cache_ttl_skips_upstream_refetch():
     assert mock.klines.await_count == 1  # only the FIRST call hit the exchange
 
 
+def test_mini_cache_size_is_capped():
+    """The mini cache must not grow unbounded — once it exceeds the cap, the
+    oldest entry is dropped to bound memory growth (mirrors the analyze_cache
+    size cap in test_analyze_cache.py::test_analyze_cache_size_is_capped)."""
+    from app.main import MINI_CACHE_MAX_ENTRIES
+
+    mock = _mock_client({"BTC_USDT": _candles([100.0, 101.0])})
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        client.app.state.mini_cache = {}
+        for i in range(MINI_CACHE_MAX_ENTRIES + 5):
+            r = client.get("/api/mini", params={"symbols": "BTC_USDT", "limit": 2, "tf": f"tf{i}"})
+            assert r.status_code == 200, r.text
+
+        assert len(client.app.state.mini_cache) <= MINI_CACHE_MAX_ENTRIES
+
+
 def test_mini_cache_preserves_errors():
     """A cached payload must still carry per-symbol errors — a cache hit must
     not silently swallow a failure that was present on the cache-filling

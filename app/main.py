@@ -139,6 +139,11 @@ log = logging.getLogger("app.main")
 # read endpoint with no cache at all, so a browser tab + a second tab/poll
 # landing within a few seconds fired the exchange twice for identical data.
 MINI_CACHE_TTL_S = 18.0
+# Simple size cap (mirrors ANALYZE_CACHE_MAX_ENTRIES below) so a long-running
+# process (many symbol-tuple/tf/limit combinations from the overview grid)
+# can't grow this dict unbounded — the oldest entry (by insertion order) is
+# dropped once the cache exceeds this many entries.
+MINI_CACHE_MAX_ENTRIES = 64
 
 # /api/analyze in-memory result cache TTL (LLM-credit saver). Advisory only —
 # never consulted by the order/gate path (see analyze() below).
@@ -1259,6 +1264,12 @@ async def mini(
                 results.append(r)
         payload = {"results": results, "errors": errors}
         cache[cache_key] = (_time.monotonic(), payload)
+        # Simple size cap (O-ish growth bound): drop the oldest entry (by
+        # insertion order) once the cache exceeds the cap.
+        if len(cache) > MINI_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(cache))
+            if oldest_key != cache_key:
+                del cache[oldest_key]
         return payload
 
 
