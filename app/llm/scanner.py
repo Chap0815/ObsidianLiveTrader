@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from itertools import zip_longest
 from typing import Any
@@ -386,7 +387,19 @@ def _scan_user_prompt(contexts: list[dict[str, Any]]) -> str:
 
 
 def _num(v: Any) -> float | None:
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    """Coerce to a finite float, or None for absent/non-numeric/NaN/Inf data.
+
+    C (audit finding, LOW-MEDIUM): the old isinstance-only check let NaN/Inf
+    through as a "valid" numeric rank key. NaN compares False against
+    everything, so a single NaN key handed to _rank_top's sort() produces a
+    nondeterministic/undefined order instead of raising — treat non-finite the
+    same as missing data (None) so it's excluded from that ranking dimension
+    (still reachable via the turnover top-up tail, see select_scan_universe).
+    """
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) else None
 
 
 def _rank_top(

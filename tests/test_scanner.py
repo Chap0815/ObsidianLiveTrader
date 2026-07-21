@@ -536,6 +536,58 @@ def test_select_scan_universe_union_and_floor():
     assert syms.index("RUN") < syms.index("BIG")  # momentum ranks it above the cap
 
 
+def test_num_rejects_nan_and_inf():
+    """C (audit, LOW-MEDIUM): _num must treat NaN/Inf as absent data (None),
+    not as a numeric rank key — NaN compares False against everything, which
+    makes _rank_top's sort() nondeterministic/undefined when a NaN key is
+    present."""
+    import math
+
+    from app.llm.scanner import _num
+
+    assert _num(float("nan")) is None
+    assert _num(float("inf")) is None
+    assert _num(float("-inf")) is None
+    assert _num(5.0) == 5.0
+    assert _num(0) == 0
+    assert _num(True) is None  # bool must stay excluded (isinstance(bool, int))
+    assert _num("5.0") is None
+    v = _num(3.5)
+    assert v is not None and math.isfinite(v)
+
+
+def test_nan_momentum_does_not_corrupt_ranking_determinism():
+    """C: a coin with NaN price_change_pct must never corrupt the momentum
+    ranking's sort order. It must be deterministically excluded from the
+    momentum-ranked dimension (repeated calls give the identical result),
+    while remaining reachable through the turnover top-up tail."""
+    from app.config import Settings
+    from app.llm.scanner import select_scan_universe
+
+    s = Settings(
+        scanner_mode="prefilter",
+        scanner_turnover_floor_usd=0.0,
+        scanner_rank_top_n=2,
+        scanner_universe_size=10,
+    )
+    overview = [
+        {"symbol": "NANC", "volume24": 1e9, "price_change_pct": float("nan")},
+        {"symbol": "A", "volume24": 1e6, "price_change_pct": 10.0},
+        {"symbol": "B", "volume24": 1e6, "price_change_pct": 8.0},
+        {"symbol": "C", "volume24": 1e6, "price_change_pct": 6.0},
+    ]
+    results = [
+        tuple(r["symbol"] for r in select_scan_universe(overview, s))
+        for _ in range(20)
+    ]
+    assert len(set(results)) == 1  # deterministic across repeated calls
+    uni = results[0]
+    # top-2 momentum slots go to the two highest FINITE movers — the NaN coin
+    # never wins the momentum dimension despite its huge volume24
+    assert uni[:2] == ("A", "B")
+    assert "NANC" in uni  # still reachable via the turnover top-up tail
+
+
 def test_prefilter_reduces_deterministically():
     """S2-08: the deterministic prefilter reduces N contexts to top-K, is
     stable/repeatable, and keeps a clean-confluence coin over a weak one."""
