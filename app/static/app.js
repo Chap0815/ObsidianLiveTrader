@@ -7690,7 +7690,21 @@
       loadOpenOrders();
       loadHistory();
     } catch (err) {
-      showToast("Schließen fehlgeschlagen: " + (err && err.message), "err");
+      console.error("closePositionFrac", err);
+      // The server may have ALREADY executed the close — the response was
+      // merely lost (network/timeout), not a clean rejection (that's handled
+      // above via !res.ok, still an honest "fehlgeschlagen"). Never imply
+      // "nothing happened": warn to check the exchange, block a blind retry,
+      // and reconcile from the exchange.
+      showToast(
+        "⚠ Antwort verloren — Aktion evtl. ausgeführt. Position/Orders auf " +
+          "der Börse prüfen, NICHT blind wiederholen. (" +
+          (err && err.message ? err.message : err) + ")",
+        "err"
+      );
+      try { loadAccount(); } catch (_) {}
+      try { loadOpenOrders(); } catch (_) {}
+      try { loadHistory(); } catch (_) {}
     } finally {
       state.closeBusy = false;
     }
@@ -7744,10 +7758,20 @@
       loadAccount();
       loadOpenOrders();
     } catch (err) {
+      console.error("moveStopTo", err);
+      // The server may have ALREADY placed (and possibly cancel+replaced)
+      // the new stop — the response was merely lost (network/timeout), not
+      // a clean rejection (that's handled above via !res.ok, still an
+      // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
+      // check the exchange, block a blind retry, and reconcile.
       showToast(
-        "SL verschieben fehlgeschlagen: " + (err && err.message),
+        "⚠ Antwort verloren — SL-Aktion evtl. ausgeführt. Position/Orders " +
+          "auf der Börse prüfen, NICHT blind wiederholen. (" +
+          (err && err.message ? err.message : err) + ")",
         "err"
       );
+      try { loadAccount(); } catch (_) {}
+      try { loadOpenOrders(); } catch (_) {}
     } finally {
       state.slBusy = false;
     }
@@ -7962,10 +7986,20 @@
       loadAccount();
       loadOpenOrders();
     } catch (err) {
+      console.error("moveStopViaDrag", err);
+      // The server may have ALREADY placed (and possibly cancel+replaced)
+      // the new stop — the response was merely lost (network/timeout), not
+      // a clean rejection (that's handled above via !res.ok, still an
+      // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
+      // check the exchange, block a blind retry, and reconcile.
       showToast(
-        "SL verschieben fehlgeschlagen: " + (err && err.message),
+        "⚠ Antwort verloren — SL-Aktion evtl. ausgeführt. Position/Orders " +
+          "auf der Börse prüfen, NICHT blind wiederholen. (" +
+          (err && err.message ? err.message : err) + ")",
         "err"
       );
+      try { loadAccount(); } catch (_) {}
+      try { loadOpenOrders(); } catch (_) {}
     } finally {
       state.slBusy = false;
     }
@@ -8752,7 +8786,13 @@
       const needRrrAck = weakRrr;
       const ackState = { manual: !needManualAck, rrr: !needRrrAck };
       function recomputeConfirmDisabled() {
-        confirmBtn.disabled = !canConfirm || !ackState.manual || !ackState.rrr;
+        // F-B: the TTL-expiry timer (below) sets disabled=true AND clears
+        // state.previewToken directly — without also gating on the token
+        // here, a later ack-checkbox change would recompute from stale
+        // canConfirm/ackState and optically re-enable the button after the
+        // token already died.
+        confirmBtn.disabled =
+          !canConfirm || !ackState.manual || !ackState.rrr || !state.previewToken;
       }
       confirmBtn.disabled = !canConfirm || needManualAck || needRrrAck;
       confirmBtn.title = canConfirm
