@@ -371,6 +371,69 @@ async def test_assets_fresh_fails_closed_on_429_despite_warm_cache(monkeypatch):
         await c.assets(fresh=True)
 
 
+# ── Finding 1: fresh=True must BYPASS the 2s TTL short-circuit ────────────────
+# (the double-risk hole: confirm A under _trade_lock warms the cache with the
+# PRE-A account; confirm B <2s later, also fresh, must NOT be served that cache.)
+
+
+def _state_with_equity(value: str) -> dict:
+    """A complete user_state carrying a specific accountValue (money read)."""
+    return {
+        "marginSummary": {
+            "accountValue": value,
+            "totalMarginUsed": "50",
+            "totalNtlPos": "500",
+        },
+        "withdrawable": value,
+        "assetPositions": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_assets_fresh_bypasses_ttl_shortcircuit_and_fetches_live():
+    """A <=2s-old cache is 'fresh enough' for display, but a fresh=True money read
+    must ignore it and hit the exchange: a same-_trade_lock earlier confirm can
+    have warmed that cache with PRE-trade equity/positions. Non-fresh keeps using
+    the cache (dedup preserved)."""
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_state_with_equity("1000"))
+    c = _client(info)
+    await c.assets(fresh=True)  # warm cache; call_count == 1
+    assert info.user_state.call_count == 1
+    # Account changed upstream WITHIN the 2s TTL (e.g. an order just filled).
+    info.user_state = MagicMock(return_value=_state_with_equity("2000"))
+    # Non-fresh read within TTL: still served from cache (1000) — dedup intact.
+    assert (await c.assets())[0]["equity"] == 1000.0
+    assert info.user_state.call_count == 0
+    # fresh read within TTL: MUST refetch and see the live 2000, not stale 1000.
+    fresh_rows = await c.assets(fresh=True)
+    assert fresh_rows[0]["equity"] == 2000.0
+    assert info.user_state.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_positions_fresh_bypasses_ttl_shortcircuit_and_fetches_live():
+    """Same TTL-bypass invariant for the aggregate-exposure read: a fresh
+    positions() must reflect a position opened <2s ago, not the empty pre-trade
+    cache that would zero out the same-side risk gate."""
+    empty = _state_with_equity("1000")
+    with_pos = {
+        "marginSummary": {"accountValue": "1000", "totalMarginUsed": "50",
+                          "totalNtlPos": "500"},
+        "withdrawable": "1000",
+        "assetPositions": [
+            {"position": {"coin": "BTC", "szi": "0.5", "entryPx": "100"}}
+        ],
+    }
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=empty)
+    c = _client(info)
+    await c.positions("BTC", fresh=True)  # warm cache with the flat pre-trade state
+    info.user_state = MagicMock(return_value=with_pos)  # position opened <2s ago
+    live = await c.positions("BTC", fresh=True)
+    assert len(live) == 1  # sees the new position, not the stale empty cache
+
+
 # ── H-2: totalNtlPos is notional exposure, not unrealized PnL ─────────────────
 
 

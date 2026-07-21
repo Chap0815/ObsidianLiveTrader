@@ -771,29 +771,42 @@ class HyperliquidClient:
         addr: str,
         ttl: float = _USER_STATE_TTL_S,
         *,
-        allow_stale: bool = True,
+        fresh: bool = False,
     ) -> dict[str, Any]:
         """info.user_state(addr) behind a short TTL cache with 429/error ride-out.
 
-        Runs INSIDE the _to_thread worker (sync). Fresh (< ttl) → return the
-        cached, _validate_user_state-validated state. Otherwise fetch + validate +
-        cache. On a fetch/validate EXCEPTION (esp. the 429 ClientError) fall back
-        to a bounded-stale cached state (age <= _USER_STATE_MAX_STALE_S) so a
-        transient rate-limit burst degrades to a slightly stale read for the
-        display/monitor paths instead of 502-ing; if no usable cache exists it
-        re-raises, so a genuine "no data" still fails honestly.
+        Runs INSIDE the _to_thread worker (sync). Non-fresh + cache younger than
+        ttl → return the cached, _validate_user_state-validated state. Otherwise
+        fetch + validate + cache. On a fetch/validate EXCEPTION (esp. the 429
+        ClientError) fall back to a bounded-stale cached state (age <=
+        _USER_STATE_MAX_STALE_S) so a transient rate-limit burst degrades to a
+        slightly stale read for the display/monitor paths instead of 502-ing; if
+        no usable cache exists it re-raises, so a genuine "no data" still fails
+        honestly.
 
-        allow_stale=False (money-DECISION reads: entry sizing/gate equity &
-        aggregate-position exposure) DISABLES the stale ride-out: a 429 there
-        fails closed rather than sizing an order against up-to-8s-stale, likely
-        optimistic-high equity. The 2s TTL still applies (a <=2s-old value is
-        fresh enough and its origin is a real fetch, not an error fallback).
+        fresh=True (money-DECISION reads: entry sizing/gate equity, aggregate
+        exposure, live SL-modify size) forces a REAL live fetch and disables the
+        stale ride-out. Two properties matter for money-safety, and BOTH are
+        required:
+          1) it BYPASSES the 2s TTL short-circuit — a <=2s-old cache filled by an
+             EARLIER confirm under the same _trade_lock reflects the PRE-trade
+             account (positions/equity before that confirm's order), so serving
+             it here would let a second confirm size against risk=0 and double the
+             real exposure. fresh must therefore always hit the exchange.
+          2) it fails CLOSED on a 429 rather than sizing an order against
+             up-to-8s-stale, likely optimistic-high equity.
 
         NOTE: this is deliberately NOT used by the F-08 close-path TOCTOU re-read,
         which must stay a fresh live read to catch an externally flipped position.
         """
+        allow_stale = not fresh
         cache = self._user_state_cache
-        if cache is not None and cache[2] == addr and (time.time() - cache[0]) < ttl:
+        if (
+            not fresh
+            and cache is not None
+            and cache[2] == addr
+            and (time.time() - cache[0]) < ttl
+        ):
             return self._validate_user_state(cache[1])
         try:
             state = self._validate_user_state(info.user_state(addr))
@@ -824,6 +837,17 @@ class HyperliquidClient:
         self._user_state_stale_warned = False
         return state
 
+    def _invalidate_user_state_cache(self) -> None:
+        """Drop the cached user_state after a position-changing mutation.
+
+        Defense-in-depth for the fresh-read TTL fix: money-DECISION reads already
+        force a live fetch, but this makes even NON-fresh readers (monitor/display,
+        and any follow-up read within the 2s TTL) observe the POST-trade account
+        promptly instead of a place/close/stop/cancel-stale snapshot. Kept cheap:
+        a single atomic attribute clear, the next read simply refetches once.
+        """
+        self._user_state_cache = None
+
     async def assets(self, *, fresh: bool = False) -> list[dict[str, Any]]:
         def _a():
             if not self.account_address and not self.private_key:
@@ -836,7 +860,7 @@ class HyperliquidClient:
 
                 addr = Account.from_key(self.private_key).address
                 self.account_address = addr
-            state = self._user_state_cached(info, addr, allow_stale=not fresh)
+            state = self._user_state_cached(info, addr, fresh=fresh)
             margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
             equity = float(margin.get("accountValue") or 0)
             withdrawable = float(state.get("withdrawable") or 0)
@@ -874,7 +898,7 @@ class HyperliquidClient:
                 from eth_account import Account
 
                 addr = Account.from_key(self.private_key).address
-            state = self._user_state_cached(info, addr, allow_stale=not fresh)
+            state = self._user_state_cached(info, addr, fresh=fresh)
             rows = []
             coin_f = to_hl_coin(symbol) if symbol else None
             for ap in state.get("assetPositions") or []:
@@ -1211,11 +1235,15 @@ class HyperliquidClient:
             }
 
         try:
-            return await self._to_thread(_place, money_path=True)
+            result = await self._to_thread(_place, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
             raise HyperliquidError(f"place_order failed: {e}", raw=str(e)) from e
+        # Post-trade: the account now holds a new/changed position — evict the
+        # stale snapshot so non-fresh readers don't serve the pre-trade state.
+        self._invalidate_user_state_cache()
+        return result
 
     async def place_stop_order(
         self,
@@ -1286,11 +1314,13 @@ class HyperliquidClient:
             }
 
         try:
-            return await self._to_thread(_place, money_path=True)
+            result = await self._to_thread(_place, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
             raise HyperliquidError(f"place_stop_order failed: {e}", raw=str(e)) from e
+        self._invalidate_user_state_cache()
+        return result
 
     async def cancel_order(
         self, body: dict[str, Any] | list[Any]
@@ -1316,9 +1346,11 @@ class HyperliquidClient:
             return ex.cancel(coin, oid)
 
         try:
-            return await self._to_thread(_c, money_path=True)
+            result = await self._to_thread(_c, money_path=True)
         except Exception as e:
             raise HyperliquidError(f"cancel failed: {e}") from e
+        self._invalidate_user_state_cache()
+        return result
 
     async def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         def _o():
@@ -1492,11 +1524,13 @@ class HyperliquidClient:
             return result
 
         try:
-            return await self._to_thread(_cl, money_path=True)
+            result = await self._to_thread(_cl, money_path=True)
         except HyperliquidError:
             raise
         except Exception as e:
             raise HyperliquidError(f"close failed: {e}") from e
+        self._invalidate_user_state_cache()
+        return result
 
     async def order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
         """Find OUR order (open or filled) by externalOid, via its Cloid.

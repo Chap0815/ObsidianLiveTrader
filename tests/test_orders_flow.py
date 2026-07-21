@@ -910,7 +910,7 @@ async def test_mexc_close_clamps_vol_to_live_hold(client, store):
     # residual verify (2). The clamp must key off the fresh live 4, not stale 10.
     reads = iter([10.0, 4.0])
 
-    async def _positions(_symbol=None):
+    async def _positions(_symbol=None, **_kw):  # accepts the fresh= kwarg
         try:
             return _pos(next(reads))
         except StopIteration:
@@ -932,3 +932,55 @@ async def test_close_path_passes_external_oid(client, store):
     await svc.close_position(symbol="BTC_USDT", side="long", fraction=1.0)
     passed = client.close_position_market.await_args.kwargs.get("external_oid")
     assert passed  # truthy, non-None deterministic close oid
+
+
+# ── Finding 2: modify-SL sizes the new reduce-only stop to the LIVE hold ──────
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_sizes_new_stop_to_live_grown_position(store):
+    """Finding 2: an external same-side ADD grows the position between the client's
+    ~2s-cached positions read and the SL modify. The new reduce-only stop must be
+    sized to the FRESH live hold — otherwise it under-covers, and the old (larger)
+    stop is then cancelled, leaving the grown size net under-protected."""
+    c = _modify_client()
+
+    def _pos_by_fresh(_symbol=None, *, fresh=False):
+        # Cache says 0.01; the LIVE position has grown to 0.02 via an external add.
+        hv = 0.02 if fresh else 0.01
+        return [{"symbol": "BTC_USDT", "side": "long", "hold_vol": hv,
+                 "open_type": 1}]
+
+    c.positions = AsyncMock(side_effect=_pos_by_fresh)
+    svc = OrderService(c, _modify_settings(), store)
+    out = await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
+    assert out["ok"] is True
+    c.place_stop_order.assert_awaited_once()
+    # The new stop must cover the LIVE 0.02, not the stale 0.01.
+    assert c.place_stop_order.await_args.kwargs["vol"] == pytest.approx(0.02)
+
+
+# ── Finding 3: sub-min close after the X2-07 live-shrink re-clamp is rejected
+# CLEANLY, without shipping a sub-minimum order to the exchange. ──────────────
+
+
+@pytest.mark.asyncio
+async def test_mexc_close_rejects_sub_min_after_live_shrink(client, store):
+    """Finding 3: sizing passes the min_vol gate on the stale hold, but the O-09
+    live recheck shrinks the position so the re-clamped close falls BELOW the
+    exchange minimum. It must fail closed with the clear pre-shrink-style message
+    and never send a sub-minimum order the exchange would bounce confusingly."""
+    contract = ContractMeta(
+        symbol="BTC_USDT", contract_size=0.0001, price_unit=0.1,
+        vol_unit=0.001, min_vol=0.008, max_vol=1_000_000.0,
+        max_leverage=125, min_leverage=1, api_allowed=True,
+    )
+    client.contract_meta = AsyncMock(return_value=contract)
+    # Stale sizing hold 0.02 → 50% = 0.01 (>= min 0.008, passes pre-shrink gate).
+    # Live recheck hold 0.01 → 50% = 0.005 (< min 0.008 → must reject).
+    client.positions = AsyncMock(side_effect=[_pos(0.02), _pos(0.01)])
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    with pytest.raises(OrderError) as ei:
+        await svc.close_position(symbol="BTC_USDT", side="long", fraction=0.5)
+    assert "below the exchange minimum" in str(ei.value)
+    client.close_position_market.assert_not_called()

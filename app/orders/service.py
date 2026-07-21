@@ -784,7 +784,7 @@ class OrderService:
         return False
 
     async def _same_side_hold_vol_ok(
-        self, symbol: str, side: str
+        self, symbol: str, side: str, *, fresh: bool = False
     ) -> tuple[float, int, bool]:
         """Return (hold_vol, open_type 1|2, checked) for same-side position.
 
@@ -792,9 +792,14 @@ class OrderService:
         failure it is False so callers can fail-closed instead of trusting the
         silent 0.0 — a fake "no pre-existing size" would let auto-flatten treat
         an OLD position as a fresh fill and market-close it.
+
+        ``fresh`` forces a live positions read (bypassing the client's ~2s cache).
+        The SL-modify path needs it: a reduce-only stop sized to a <=2s-stale hold
+        under-covers a position that grew externally, and the modify then cancels
+        the old (larger) stop → net under-protection.
         """
         try:
-            positions = await self.client.positions(symbol)
+            positions = await self.client.positions(symbol, fresh=fresh)
         except ExchangeError:
             return 0.0, 1, False
         for raw in positions or []:
@@ -1702,11 +1707,17 @@ class OrderService:
             is_full = close_vol >= live_hold - 1e-12
             if not is_full and vol_unit > 0:
                 close_vol = round_down_to_unit(close_vol, vol_unit)
-            if close_vol <= 0:
+            # Mirror the pre-shrink min_vol gate: after re-clamping to the shrunk
+            # live hold a partial can drop below the exchange minimum. Reject it
+            # HERE (fail-closed, no exchange round-trip) with the same clear
+            # message as the pre-shrink path, instead of shipping a sub-minimum
+            # order that the exchange bounces with a confusing native error.
+            if close_vol <= 0 or (not is_full and min_vol > 0 and close_vol < min_vol):
                 raise OrderError(
                     f"close aborted: after re-checking the live {side} position on "
-                    f"{symbol} the closable amount rounded to zero — verify on the "
-                    "exchange"
+                    f"{symbol} the closable amount {close_vol} is below the exchange "
+                    f"minimum {min_vol} — choose a larger share or close the full "
+                    "position"
                 )
 
         # X2-06: deterministic close externalOid so the O-08 close-cloid recovery
@@ -2095,8 +2106,11 @@ class OrderService:
         # FAILURE — both surface as hold<=0 here, but only the former means
         # "no open position". Reporting a failed lookup as "no open position"
         # risks the user assuming they are flat when the true state is unknown.
+        # fresh=True: the new reduce-only stop is sized to `hold` below, so it
+        # must reflect the LIVE position — a <=2s-stale hold that missed an
+        # external same-side add would under-cover once the old stop is cancelled.
         hold, _open_type, hold_checked = await self._same_side_hold_vol_ok(
-            symbol, side
+            symbol, side, fresh=True
         )
         if hold <= 0:
             if not hold_checked:

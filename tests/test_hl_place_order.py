@@ -384,3 +384,58 @@ async def test_hl_place_order_scale_out_places_two_tp_triggers():
     assert len(trig_calls) == 2
     sizes = sorted(call.args[2] for call in trig_calls)
     assert sizes == pytest.approx([0.01, 0.01])
+
+
+# ── Finding 1 (defense-in-depth): position-changing mutations must EVICT the
+# user_state cache, so even a non-fresh reader sees the post-trade account and
+# never a place/close/stop/cancel-stale snapshot. ─────────────────────────────
+
+
+def _warm_cache(c) -> None:
+    c._user_state_cache = (time.time(), _COMPLETE_STATE_FOR_INVAL, "0x" + "a" * 40)
+
+
+_COMPLETE_STATE_FOR_INVAL = {
+    "marginSummary": {"accountValue": "1000", "totalMarginUsed": "50",
+                      "totalNtlPos": "500"},
+    "withdrawable": "950",
+    "assetPositions": [],
+}
+
+
+@pytest.mark.asyncio
+async def test_place_order_invalidates_user_state_cache():
+    c = _client()
+    _warm_cache(c)
+    await c.place_order({"symbol": "BTC", "side": 1, "type": "market", "vol": 0.01})
+    assert c._user_state_cache is None
+
+
+@pytest.mark.asyncio
+async def test_place_stop_order_invalidates_user_state_cache():
+    c = _client()
+    _warm_cache(c)
+    await c.place_stop_order(
+        "BTC", position_side="long", vol=0.01, trigger_px=99_000.0, tpsl="sl"
+    )
+    assert c._user_state_cache is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_invalidates_user_state_cache():
+    c = _client()
+    c._exchange.cancel = MagicMock(return_value=_OK)
+    _warm_cache(c)
+    await c.cancel_order({"orderId": 123, "symbol": "BTC"})
+    assert c._user_state_cache is None
+
+
+@pytest.mark.asyncio
+async def test_close_position_market_invalidates_user_state_cache():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)  # live LONG matches request
+    c._exchange.market_close = MagicMock(return_value=_OK)
+    _warm_cache(c)
+    await c.close_position_market("BTC", side="long", vol=0.5)
+    assert c._user_state_cache is None
