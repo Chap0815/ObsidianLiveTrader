@@ -31,6 +31,7 @@ from app.analysis.context import (
 from app.config import Settings, get_settings
 from app.db.repo import Database
 from app.exchange_factory import create_exchange_client, exchange_ready
+from app.hyperliquid.client import INTERVAL_MAP as HL_INTERVAL_MAP
 from app.hyperliquid.errors import HyperliquidError
 from app.llm.client import (
     LlmError,
@@ -43,6 +44,7 @@ from app.llm.client import (
 
 from app.llm.prompts import build_system_prompt
 from app.llm.recalibration import recalibrate
+from app.mexc.client import INTERVAL_MAP as MEXC_INTERVAL_MAP
 from app.mexc.client import empty_account
 from app.mexc.errors import MexcError
 from app.models import (
@@ -144,6 +146,23 @@ MINI_CACHE_TTL_S = 18.0
 # can't grow this dict unbounded — the oldest entry (by insertion order) is
 # dropped once the cache exceeds this many entries.
 MINI_CACHE_MAX_ENTRIES = 64
+
+# Audit finding A (LOW, Self-DoS hardening): the known interval keys accepted
+# by either exchange client's INTERVAL_MAP (app/hyperliquid/client.py,
+# app/mexc/client.py) — the shared, already-authoritative source of "valid
+# interval" for whichever exchange is active. /api/market/{symbol} used to
+# pass tf/htf straight through to INTERVAL_MAP.get(interval, interval), so an
+# unknown string went to the exchange verbatim instead of being rejected.
+VALID_MARKET_INTERVALS = frozenset(HL_INTERVAL_MAP) | frozenset(MEXC_INTERVAL_MAP)
+
+# /api/market in-memory cache TTL + size cap — same (timestamp, payload)
+# shape + singleflight lock as /api/mini above. This endpoint had NO cache at
+# all: every call fired live klines+ticker+funding at the exchange, so a
+# runaway poll loop (e.g. a stray browser tab) could burn through the user's
+# exchange rate limits. TTL kept short — live-trading UX must not suffer, and
+# the chart itself refreshes faster over the WS stream than this TTL anyway.
+MARKET_CACHE_TTL_S = 2.5
+MARKET_CACHE_MAX_ENTRIES = 64
 
 # /api/analyze in-memory result cache TTL (LLM-credit saver). Advisory only —
 # never consulted by the order/gate path (see analyze() below).
@@ -553,6 +572,10 @@ async def lifespan(app: FastAPI):
     # process start, same as the other in-memory caches on this state object.
     app.state.mini_cache = {}
     app.state.mini_lock = _asyncio.Lock()
+    # Audit finding A: /api/market cache + its singleflight lock — mirrors
+    # /api/mini above (fresh/empty on every process start).
+    app.state.market_cache = {}
+    app.state.market_lock = _asyncio.Lock()
     # L2X-01: PER-KEY singleflight for /api/analyze. A single global lock would
     # serialize DIFFERENT coins (two tabs → ~2x latency at Grok p50 ~15s). This
     # dict maps a cache_key -> [asyncio.Lock, refcount]: identical in-flight
@@ -1155,19 +1178,64 @@ async def market(
     tf: str = Query("15m", description="LTF interval"),
     htf: str = Query("1H", description="HTF interval"),
 ):
-    """Public market snapshot: klines, indicators, structure, funding, contract."""
+    """Public market snapshot: klines, indicators, structure, funding, contract.
+
+    Audit finding A (Self-DoS hardening): tf/htf are validated against
+    VALID_MARKET_INTERVALS (the known interval keys of both exchange
+    INTERVAL_MAPs) instead of passing through to the exchange client
+    unvalidated. Also cached for MARKET_CACHE_TTL_S with a singleflight lock
+    — same (timestamp, payload) shape as /api/mini above — so a runaway poll
+    loop can no longer fire a fresh klines+ticker+funding round-trip per call.
+    """
     symbol = normalize_symbol(symbol)
+    if tf not in VALID_MARKET_INTERVALS or htf not in VALID_MARKET_INTERVALS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid interval. Allowed: {sorted(VALID_MARKET_INTERVALS)}"
+            ),
+        )
     client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
     s = get_settings()
-    try:
-        snap = await build_market_snapshot(
-            symbol, tf, htf, client, limit_hint=s.kline_limit_hint
-        )
-    except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    return snapshot_to_api_dict(snap)
+
+    cache_key = (symbol, tf, htf)
+    cache = getattr(request.app.state, "market_cache", None)
+    if cache is None:
+        cache = {}
+        request.app.state.market_cache = cache
+    hit = cache.get(cache_key)
+    if hit and _time.monotonic() - hit[0] < MARKET_CACHE_TTL_S:
+        return hit[1]
+
+    lock = getattr(request.app.state, "market_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.market_lock = lock
+
+    async with lock:
+        # Re-check: another caller may have already refreshed this exact key
+        # while we were waiting for the lock (singleflight, mirrors /api/mini).
+        hit = cache.get(cache_key)
+        if hit and _time.monotonic() - hit[0] < MARKET_CACHE_TTL_S:
+            return hit[1]
+
+        try:
+            snap = await build_market_snapshot(
+                symbol, tf, htf, client, limit_hint=s.kline_limit_hint
+            )
+        except ExchangeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        payload = snapshot_to_api_dict(snap)
+        cache[cache_key] = (_time.monotonic(), payload)
+        # Simple size cap (mirrors /api/mini above): drop the oldest entry (by
+        # insertion order) once the cache exceeds the cap.
+        if len(cache) > MARKET_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(cache))
+            if oldest_key != cache_key:
+                del cache[oldest_key]
+        return payload
 
 
 @app.get("/api/mini")
@@ -1574,6 +1642,37 @@ def _journal_setup_type(proposal) -> str | None:
     return "/".join(parts) if parts else None
 
 
+def _journal_order_type(action: str | None, entry, last_price) -> str | None:
+    """Classify the shadow-fill order type for the journal row (Lern-Loop fix).
+
+    The TradeProposal has no explicit market/limit field — the app itself treats
+    a proposal-with-entry as a resting LIMIT by default (see app.js applyProposal).
+    So the order type is derived GEOMETRICALLY from where the entry sits relative
+    to the current price, using the app's own limit-order semantics (a buy limit
+    is immediately marketable when price is at/below it; a sell limit when price
+    is at/above it):
+
+      long : entry_price >= last_price -> 'market' (fills immediately at t0),
+             else 'limit' (a pullback buy below price -- needs a dip to fill).
+      short: entry_price <= last_price -> 'market', else 'limit'.
+
+    This is exactly the distinction the resolver needs: a market/breakout winner
+    that runs to TP without a pullback used to be dropped as NO_FILL under the
+    blanket LIMIT model, biasing win-rates against momentum setups. Genuine
+    pull-back limits keep the straddle requirement (an un-touched dip stays
+    NO_FILL, correctly). Returns None when there is no direction or no usable
+    price pair -> the resolver keeps its conservative LIMIT modeling.
+    """
+    direction = _journal_direction(action)
+    if direction is None:
+        return None
+    if not isinstance(entry, (int, float)) or not isinstance(last_price, (int, float)):
+        return None
+    if direction == "long":
+        return "market" if entry >= last_price else "limit"
+    return "market" if entry <= last_price else "limit"
+
+
 def _journal_status_for(action: str | None, entry, sl, tp1) -> str:
     """SKIPPED for STAY_OUT (never resolvable) or a non-STAY_OUT proposal that
     is missing entry/sl/tp1 (degenerate — cannot be shadow-resolved). Else
@@ -1832,6 +1931,14 @@ async def analyze(
                         setup_type=_journal_setup_type(proposal),
                         context_hash=context_hash,
                         prompt_version=prompt_version,
+                        # Lern-Loop fix: geometric market/limit classification so
+                        # the shadow resolver fills market entries at t0 instead
+                        # of dropping no-pullback momentum winners as NO_FILL.
+                        order_type=_journal_order_type(
+                            action,
+                            proposal.entry_price,
+                            market_api.get("last_price"),
+                        ),
                         # Block 2/TP2 Task P1: advisory-only regime tag, computed
                         # from signals already fetched for the prompt (market_regime,
                         # atr_pct) -- no extra LLM call, no extra fetch. Never

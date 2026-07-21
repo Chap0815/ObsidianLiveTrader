@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   model         TEXT,                      -- resolved model string
   scanner_summary TEXT,                    -- compact "bias/setup/score" string or NULL
   last_price_t0 REAL,                      -- market last_price when logged (context)
+  -- Lern-Loop fix: 'market'|'limit'|NULL. Drives the resolver's shadow-fill
+  -- model (market = fills at t0/index 0; limit = fills only when a candle
+  -- straddles entry_price). Added here for fresh DBs; on EXISTING DBs it is
+  -- backfilled by the idempotent ALTER in Database.init(). NULL (legacy rows /
+  -- omitted) keeps the conservative LIMIT modeling -- no retroactive bias.
+  order_type    TEXT,
   -- shadow-outcome resolver fields --
   status        TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING|WIN|LOSS|EXPIRED|SKIPPED|NO_FILL
   resolved_at   TEXT,                      -- UTC ISO when status left PENDING

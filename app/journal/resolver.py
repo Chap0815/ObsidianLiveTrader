@@ -390,14 +390,14 @@ async def resolve_pending_once(
                     candles=candles,
                     now=now,
                     window_s=eff_window_s,
-                    # order_type is ALWAYS None today: journal_entries has no
-                    # order_type column (and pending_journal_entries selects none),
-                    # so every shadow fill is LIMIT-modeled — it fills only when a
-                    # candle straddles entry_price. Deliberate simplification, made
-                    # explicit here: a momentum entry that runs away without a
-                    # pull-back reads as NO_FILL, which conservatively UNDER-states
-                    # that setup's win-rate in the calibration stats. Persist a real
-                    # order_type on the journal row to enable market-fill modeling.
+                    # Lern-Loop fix: order_type ('market'|'limit') is now
+                    # persisted on the journal row (derived geometrically at
+                    # analyze time, see _journal_order_type in app/main.py) and
+                    # surfaced by pending_journal_entries. A 'market' entry fills
+                    # at t0/index 0 (a no-pullback momentum winner resolves WIN
+                    # instead of being dropped as NO_FILL); a 'limit' entry still
+                    # fills only when a candle straddles entry_price. Legacy rows
+                    # (NULL order_type) keep the conservative LIMIT modeling.
                     order_type=row.get("order_type"),
                 )
                 # Defect E fix (b): a row this far stale can NEVER regain

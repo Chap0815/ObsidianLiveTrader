@@ -219,6 +219,94 @@ def parse_reevaluation(text: str) -> ReevaluateProposal:
     return ReevaluateProposal.model_validate(data)
 
 
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _cap_confidence(current: str, ceiling: str) -> str:
+    """Return the LOWER of `current` and `ceiling` on the low<medium<high scale
+    (a cap only ever lowers confidence, never raises it)."""
+    cur = current if current in _CONFIDENCE_RANK else "medium"
+    if _CONFIDENCE_RANK.get(ceiling, 2) < _CONFIDENCE_RANK[cur]:
+        return ceiling
+    return cur
+
+
+def annotate_reevaluation(
+    proposal: ReevaluateProposal, context: dict[str, Any] | None = None
+) -> ReevaluateProposal:
+    """Light plausibility net for a reevaluation's new_sl/new_tp (Finding 2).
+
+    parse_reevaluation only does Pydantic + confidence normalization — unlike
+    annotate_proposal on the analyze path, it has NO geometry/ATR sanity check.
+    So an absurd new_sl/new_tp (on the WRONG side of the current price for the
+    position's direction, or wildly far in ATR terms) is shown 1:1 with full
+    confidence. The apply path (ModifySLRequest + Money gates) re-validates, so
+    the only damage is a MISLEADING DISPLAY — hence, mirroring annotate_proposal's
+    WARN branch (not its hard STAY_OUT branch), we CAP confidence + attach a
+    warning to risk_notes and NEVER hard-reject the reevaluation.
+
+    Wrong-side geometry (clearly inverted) caps to 'low'; a merely far level
+    (> 8x LTF ATR from price) caps to 'medium'. No context / no position side /
+    no current price -> returned unchanged (fail-open, same posture as annotate).
+    """
+    if not isinstance(context, dict):
+        return proposal
+    position = context.get("position") if isinstance(context.get("position"), dict) else {}
+    side = str(position.get("side") or "").strip().lower()
+    if side not in ("long", "short"):
+        return proposal
+    last_price = position.get("current_price")
+    if not isinstance(last_price, (int, float)):
+        last_price = context.get("last_price")
+    if not isinstance(last_price, (int, float)) or last_price <= 0:
+        return proposal
+
+    # Reference ATR (optional, for the far-level WARN) from the LTF read block.
+    ltf = context.get("ltf") if isinstance(context.get("ltf"), dict) else {}
+    ltf_read = ltf.get("read") if isinstance(ltf.get("read"), dict) else {}
+    ltf_atr = ltf_read.get("atr14")
+    atr = float(ltf_atr) if isinstance(ltf_atr, (int, float)) and ltf_atr > 0 else None
+
+    wrong_side: list[str] = []
+    far: list[str] = []
+
+    def _check(label: str, level: float) -> None:
+        # Correct side per direction: for a LONG, the stop sits BELOW price and
+        # the target ABOVE; for a SHORT, inverted. new_sl and new_tp share the
+        # same side rule keyed by their type.
+        want_above = (label == "new_tp") == (side == "long")
+        is_above = level > last_price
+        if is_above != want_above:
+            wrong_side.append(
+                f"{label} {level:g} is on the wrong side of last_price "
+                f"{last_price:g} for a {side} position"
+            )
+        elif atr is not None and abs(level - last_price) > 8.0 * atr:
+            far.append(
+                f"{label} {level:g} is {abs(level - last_price) / atr:.1f}x LTF ATR "
+                f"from last_price {last_price:g}"
+            )
+
+    if isinstance(proposal.new_sl, (int, float)):
+        _check("new_sl", float(proposal.new_sl))
+    if isinstance(proposal.new_tp, (int, float)):
+        _check("new_tp", float(proposal.new_tp))
+
+    if not wrong_side and not far:
+        return proposal
+
+    ceiling = "low" if wrong_side else "medium"
+    reasons = "; ".join(wrong_side + far)
+    note = f"Warning: {reasons} — verify against current price before acting."
+    risk_notes = f"{proposal.risk_notes} | {note}" if proposal.risk_notes else note
+    return proposal.model_copy(
+        update={
+            "confidence": _cap_confidence(proposal.confidence, ceiling),
+            "risk_notes": risk_notes,
+        }
+    )
+
+
 def compute_simple_rrr(
     entry: float | None,
     stop: float | None,
@@ -1086,17 +1174,22 @@ def _parse_content_to_proposal(
     return annotate_proposal(proposal, context)
 
 
-def _parse_content_to_reevaluation(content: str, *, provider: str) -> ReevaluateProposal:
+def _parse_content_to_reevaluation(
+    content: str, *, provider: str, context: dict[str, Any] | None = None
+) -> ReevaluateProposal:
     if not content or not str(content).strip():
         raise LlmError(f"{provider} returned empty content")
     try:
-        return parse_reevaluation(str(content))
+        proposal = parse_reevaluation(str(content))
     except json.JSONDecodeError as e:
         raise LlmError(f"{provider} output is not valid JSON: {e}", raw=content) from e
     except ValidationError as e:
         raise LlmError(
             f"{provider} JSON failed schema validation: {e}", raw=content
         ) from e
+    # Finding 2: light geometry/ATR plausibility cap on new_sl/new_tp (advisory
+    # display only; the apply path re-validates via ModifySLRequest + Money gates).
+    return annotate_reevaluation(proposal, context)
 
 
 # L-09: transient-failure retry for the advisory provider POST. These calls
@@ -1677,7 +1770,7 @@ async def _call_claude_reevaluate(
     except (TypeError, AttributeError) as e:
         raise LlmError("Claude response missing content blocks", raw=payload) from e
 
-    return _parse_content_to_reevaluation(content, provider="Claude")
+    return _parse_content_to_reevaluation(content, provider="Claude", context=context)
 
 
 async def _call_xai_reevaluate(
@@ -1773,7 +1866,7 @@ async def _call_xai_reevaluate(
                 f"(finish_reason=length, max_tokens={sent_body['max_tokens']})"
             )
 
-    return _parse_content_to_reevaluation(str(content), provider="xAI")
+    return _parse_content_to_reevaluation(str(content), provider="xAI", context=context)
 
 
 async def _call_openai_compat_reevaluate(
@@ -1839,7 +1932,9 @@ async def _call_openai_compat_reevaluate(
         payload=payload,
     )
 
-    return _parse_content_to_reevaluation(str(content), provider=provider_label)
+    return _parse_content_to_reevaluation(
+        str(content), provider=provider_label, context=context
+    )
 
 
 async def _call_openai_reevaluate(

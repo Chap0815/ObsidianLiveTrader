@@ -278,6 +278,69 @@ def test_reevaluate_proposal_rejects_nonfinite(field, bad):
         ReevaluateProposal.model_validate(base)
 
 
+def _reeval(action="MOVE_SL_BE", **kw):
+    from app.models import ReevaluateProposal
+
+    base = dict(action=action, confidence="high", reason="x", new_sl=None, new_tp=None)
+    base.update(kw)
+    return ReevaluateProposal.model_validate(base)
+
+
+def _reeval_ctx(side="long", last_price=100.0, atr=1.0):
+    return {
+        "last_price": last_price,
+        "position": {"side": side, "current_price": last_price},
+        "ltf": {"read": {"atr14": atr}},
+    }
+
+
+def test_reevaluation_wrong_side_sl_caps_confidence_and_warns():
+    """Finding 2: a new_sl on the WRONG side of the current price for the
+    position direction (long, sl ABOVE price) must have its confidence capped
+    and a warning attached — never hard-rejected (the apply path re-validates)."""
+    from app.llm.client import annotate_reevaluation
+
+    p = _reeval(new_sl=105.0)  # long, price 100 -> stop above price is inverted
+    out = annotate_reevaluation(p, _reeval_ctx(side="long", last_price=100.0))
+    assert out.confidence == "low"
+    assert out.risk_notes  # a warning was attached
+    # NOT hard-rejected: the action and the (implausible) level are preserved.
+    assert out.action == "MOVE_SL_BE"
+    assert out.new_sl == 105.0
+
+
+def test_reevaluation_wrong_side_tp_short_caps_confidence():
+    from app.llm.client import annotate_reevaluation
+
+    # short position: a valid new_tp is BELOW price; 106 (above) is wrong-side.
+    p = _reeval(action="HOLD", new_tp=106.0)
+    out = annotate_reevaluation(p, _reeval_ctx(side="short", last_price=100.0))
+    assert out.confidence == "low"
+    assert out.risk_notes
+
+
+def test_reevaluation_valid_geometry_unchanged():
+    from app.llm.client import annotate_reevaluation
+
+    p = _reeval(new_sl=98.0, new_tp=104.0)  # long, both on the correct side
+    out = annotate_reevaluation(p, _reeval_ctx(side="long", last_price=100.0))
+    assert out.confidence == "high"
+    assert out.risk_notes == ""  # untouched
+
+
+def test_parse_content_reevaluation_applies_plausibility_cap():
+    """The cap is wired into the shared parse helper, so every provider path
+    (claude/xai/openai/ollama) gets the same net when context is supplied."""
+    from app.llm.client import _parse_content_to_reevaluation
+
+    raw = '{"action":"MOVE_SL_BE","confidence":"high","new_sl":105.0,"reason":"x"}'
+    out = _parse_content_to_reevaluation(
+        raw, provider="test", context=_reeval_ctx(side="long", last_price=100.0)
+    )
+    assert out.confidence == "low"
+    assert out.risk_notes
+
+
 def test_parse_reevaluation_rejects_nan_token():
     """Symmetry with the proposal side: the bare NaN token in a reevaluation
     response is rejected at parse, not carried downstream."""

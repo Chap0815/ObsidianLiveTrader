@@ -54,6 +54,48 @@ async def test_insert_and_readback_pending(db_path):
 
 
 @pytest.mark.asyncio
+async def test_order_type_migration_idempotent_on_legacy_db(db_path):
+    """order_type is an additive column (Lern-Loop fix). On a pre-existing DB
+    whose journal_entries table predates the column, init() must ALTER-add it
+    (PRAGMA table_info guard), be safe to run twice, and then round-trip
+    market/limit/NULL through the resolver's PENDING work queue."""
+    import aiosqlite
+
+    # Simulate a real pre-order_type DB: the full journal_entries schema MINUS
+    # order_type (the one additive column under test). init() must ALTER it in.
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            "CREATE TABLE journal_entries ("
+            " id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, symbol TEXT NOT NULL,"
+            " tf TEXT NOT NULL, htf TEXT NOT NULL, action TEXT NOT NULL, direction TEXT,"
+            " setup_confidence TEXT NOT NULL, entry_price REAL, stop_loss REAL, tp1 REAL,"
+            " rrr REAL, provider TEXT, model TEXT, scanner_summary TEXT, last_price_t0 REAL,"
+            " status TEXT NOT NULL DEFAULT 'PENDING', resolved_at TEXT, resolved_price REAL,"
+            " realized_r REAL, realized_r_net REAL, ambiguous INTEGER NOT NULL DEFAULT 0,"
+            " last_checked_at TEXT, proposal_id INTEGER, setup_type TEXT, context_hash TEXT,"
+            " prompt_version TEXT, regime TEXT)"
+        )
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init()  # must ALTER-add order_type + the other additive columns
+    await db.init()  # idempotent: a second run must not raise "duplicate column"
+
+    m = await db.insert_journal_entry(**_base_kwargs(order_type="market"))
+    lim = await db.insert_journal_entry(
+        **_base_kwargs(order_type="limit", symbol="ETH_USDT")
+    )
+    n = await db.insert_journal_entry(
+        **_base_kwargs(order_type=None, symbol="SOL_USDT")
+    )
+    pend = {r["id"]: r for r in await db.pending_journal_entries()}
+    assert pend[m]["order_type"] == "market"
+    assert pend[lim]["order_type"] == "limit"
+    # Legacy rows / omitted order_type stay NULL -> resolver keeps LIMIT modeling.
+    assert pend[n]["order_type"] is None
+
+
+@pytest.mark.asyncio
 async def test_stay_out_logged_skipped(db_path):
     db = Database(db_path)
     await db.init()

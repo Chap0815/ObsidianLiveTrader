@@ -217,6 +217,32 @@ async def test_raising_client_leaves_rows_pending(db_path):
 
 
 @pytest.mark.asyncio
+async def test_market_entry_fills_without_straddle_resolves_win(db_path):
+    """Lern-Loop-Bias fix: a MARKET breakout winner gaps ABOVE the entry (100)
+    and runs straight to tp1 (102) WITHOUT ever trading back down through the
+    entry. Modeled as a LIMIT this is NO_FILL (never straddled) and gets
+    dropped from the win-rate; persisted as order_type='market' it must fill at
+    t0 and resolve WIN. Exercises the full path: the order_type column must be
+    persisted by insert_journal_entry AND surfaced to the resolver by
+    pending_journal_entries."""
+    db = Database(db_path)
+    await db.init()
+    mkt_id = await _seed_long(db, symbol="BTC_USDT", order_type="market")
+    lim_id = await _seed_long(db, symbol="ETH_USDT", order_type="limit")
+    gap_up = [_candle(0, 105.0, 103.0), _candle(30, 106.0, 104.0)]
+    client = FakeClient({"BTC_USDT": list(gap_up), "ETH_USDT": list(gap_up)})
+    now = T0 + timedelta(hours=48)
+    await resolve_pending_once(db, client, window_s=WINDOW, now=now)
+
+    rows = {r["id"]: r for r in await db.recent_journal()}
+    # Market: filled at index 0, tp1 (102) inside the first candle -> WIN.
+    assert rows[mkt_id]["status"] == "WIN"
+    assert rows[mkt_id]["realized_r"] == pytest.approx(2.0)
+    # Limit: entry never straddled (price gapped above and never returned).
+    assert rows[lim_id]["status"] == "NO_FILL"
+
+
+@pytest.mark.asyncio
 async def test_loop_can_be_cancelled_cleanly(db_path):
     db = Database(db_path)
     await db.init()

@@ -155,7 +155,13 @@ class Database:
             # Literals are hardcoded (never request-derived) -> f-string is safe.
             # Block 2/TP2 Task P1: regime is additive too -- same idempotent
             # pattern (fail-safe fallback value is "unknown", NULL on old rows).
-            for _col in ("setup_type", "context_hash", "prompt_version", "regime"):
+            # Lern-Loop fix: `order_type` ('market'|'limit') so the shadow-fill
+            # resolver can model market entries as index-0 fills instead of
+            # treating every entry as a limit. Same idempotent TEXT-ALTER pattern;
+            # NULL on legacy rows keeps the old conservative LIMIT behaviour.
+            for _col in (
+                "setup_type", "context_hash", "prompt_version", "regime", "order_type"
+            ):
                 if _col not in cols:
                     await conn.execute(
                         f"ALTER TABLE journal_entries ADD COLUMN {_col} TEXT"
@@ -384,6 +390,7 @@ class Database:
         context_hash: str | None = None,
         prompt_version: str | None = None,
         regime: str | None = None,
+        order_type: str | None = None,
         dedupe_window_min: int = 30,
     ) -> int:
         now = created_at or _utc_now_iso()
@@ -423,7 +430,8 @@ class Database:
                             entry_price = ?, stop_loss = ?, tp1 = ?, rrr = ?,
                             provider = ?, model = ?, scanner_summary = ?,
                             last_price_t0 = ?, status = ?, proposal_id = ?,
-                            setup_type = ?, prompt_version = ?, regime = ?
+                            setup_type = ?, prompt_version = ?, regime = ?,
+                            order_type = ?
                         WHERE id = ?
                         """,
                         (
@@ -431,7 +439,7 @@ class Database:
                             setup_confidence, entry_price, stop_loss, tp1, rrr,
                             provider, model, scanner_summary, last_price_t0,
                             status, proposal_id, setup_type, prompt_version,
-                            regime, existing_id,
+                            regime, order_type, existing_id,
                         ),
                     )
                     await conn.commit()
@@ -444,8 +452,8 @@ class Database:
                    setup_confidence, entry_price, stop_loss, tp1, rrr,
                    provider, model, scanner_summary, last_price_t0,
                    status, proposal_id, setup_type, context_hash, prompt_version,
-                   regime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   regime, order_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -469,6 +477,7 @@ class Database:
                     context_hash,
                     prompt_version,
                     regime,
+                    order_type,
                 ),
             )
             await conn.commit()
@@ -481,7 +490,7 @@ class Database:
             cur = await conn.execute(
                 """
                 SELECT id, created_at, symbol, tf, htf, action, direction,
-                       entry_price, stop_loss, tp1, rrr, status
+                       entry_price, stop_loss, tp1, rrr, status, order_type
                 FROM journal_entries
                 WHERE status = 'PENDING'
                 ORDER BY id ASC
