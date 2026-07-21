@@ -122,6 +122,20 @@ def require_local_token(
     s = get_settings()
     expected = (s.local_api_token or "").strip()
     if not expected:
+        # Fail-closed (audit finding B): Settings.armed_requires_local_token
+        # already refuses to CONSTRUCT a TRADING_ENABLED=true config with an
+        # empty token, but this is the actual per-request auth gate — it must
+        # not rely on that single upstream layer. If trading is armed, an
+        # unauthenticated local API is never acceptable, so deny loudly here
+        # too instead of silently opening every private endpoint.
+        if s.trading_enabled:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Local auth token required: TRADING_ENABLED=true with no "
+                    "LOCAL_API_TOKEN configured. Set LOCAL_API_TOKEN in .env."
+                ),
+            )
         return
     if _token_matches(x_local_token, expected) or _token_matches(local_auth, expected):
         return

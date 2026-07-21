@@ -407,6 +407,42 @@ def test_patch_env_hardens_tmp_before_replace(tmp_path, monkeypatch):
     )
 
 
+def test_require_local_token_fails_closed_when_armed_without_token(monkeypatch):
+    """B (audit, LOW): TRADING_ENABLED=true + empty LOCAL_API_TOKEN must be
+    denied AT THE PER-REQUEST AUTH GATE too, not only prevented at Settings
+    construction (armed_requires_local_token). Defense in depth: the
+    real-world combo is already impossible to construct via env-based
+    Settings(), but require_local_token itself must not silently fail open if
+    that invariant is ever weakened elsewhere — armed + unauthenticated must
+    stay closed at every layer, loudly."""
+    import app.security as security
+
+    class _FakeSettings:
+        trading_enabled = True
+        local_api_token = ""
+
+    monkeypatch.setattr(security, "get_settings", lambda: _FakeSettings())
+    with pytest.raises(HTTPException) as exc:
+        security.require_local_token(x_local_token=None, local_auth=None)
+    assert exc.value.status_code in (401, 403)
+
+
+def test_require_local_token_still_open_when_disarmed_without_token(monkeypatch):
+    """Disarmed (TRADING_ENABLED=false) + no token configured is the intended
+    analysis-only UX (no real money at risk) and must keep working exactly as
+    before — the fail-closed fix must not regress the default dev/test
+    setup that every other test in this suite relies on."""
+    import app.security as security
+
+    class _FakeSettings:
+        trading_enabled = False
+        local_api_token = ""
+
+    monkeypatch.setattr(security, "get_settings", lambda: _FakeSettings())
+    # Must NOT raise
+    security.require_local_token(x_local_token=None, local_auth=None)
+
+
 def test_env_tmp_uses_mkstemp_not_fixed_name(tmp_path, monkeypatch):
     """B3-04: a fixed tmp filename (``.env.tmp``) lets a local process
     pre-create or symlink that path before the write lands. The tmp file
