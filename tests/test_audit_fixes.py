@@ -533,10 +533,11 @@ async def test_mexc_unconfirmable_fill_is_unknown_not_verified():
     verified. It resolves to UNKNOWN (loud manual-check warning), never a blind
     flatten — evidence, not optimism."""
     client = _mexc_client({"data": 1})
-    # preview-risk, confirm-risk, pre_hold (ok=empty), then the post-place fill
-    # query FAILS (unreliable), then the verify positions query.
+    # preview-risk, confirm-risk (also reused as pre_hold — Finding 2, no separate
+    # read), then the post-place fill query FAILS (unreliable), then the verify
+    # positions query.
     client.positions = AsyncMock(
-        side_effect=[[], [], [], MexcError("positions 503"), []]
+        side_effect=[[], [], MexcError("positions 503"), []]
     )
     svc = OrderService(
         client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
@@ -561,10 +562,11 @@ async def test_mexc_resting_limit_external_hold_bump_not_silently_verified():
     verify. State stays UNKNOWN (loud manual-check warning), never a silent
     verify of an unprotected resting order, and never a flatten."""
     client = _mexc_client({"data": 1})  # no reported fill → hold-delta fallback
-    # preview-risk, confirm-risk, pre_hold (=0), then the post-place fill query
-    # shows a same-side bump of 0.5 (external bot), then the verify positions.
+    # preview-risk, confirm-risk (reused as pre_hold=0 — Finding 2), then the
+    # post-place fill query shows a same-side bump of 0.5 (external bot), then
+    # the verify positions.
     client.positions = AsyncMock(
-        side_effect=[[], [], [], _filled_pos(0.5), _filled_pos(0.5)]
+        side_effect=[[], [], _filled_pos(0.5), _filled_pos(0.5)]
     )
     svc = OrderService(
         client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
@@ -593,10 +595,11 @@ async def test_mexc_resting_limit_external_bump_not_verified():
     UNPROTECTED. Result must be UNKNOWN (loud), never a silent verify, never a
     flatten."""
     client = _mexc_client({"data": 1})  # no reported fill
-    # Post-place hold shows a full-size same-side bump (external bot). Order-own
-    # lookup, however, proves OUR limit is still resting (dealVol 0, state open).
+    # preview-risk, confirm-risk (reused as pre_hold — Finding 2), then post-place
+    # hold shows a full-size same-side bump (external bot). Order-own lookup,
+    # however, proves OUR limit is still resting (dealVol 0, state open).
     client.positions = AsyncMock(
-        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0)]
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
     )
     client.order_by_external_oid = AsyncMock(
         return_value={"match": "open", "order": {"dealVol": 0.0, "state": 2}}
@@ -621,11 +624,12 @@ async def test_mexc_fast_market_fill_retries_hold_read():
     hold read shows 0 (looks resting), the retry shows the full fill → the entry
     is VERIFIED and NOT mislabelled 'LIMIT RUHT'."""
     client = _mexc_client({"data": 1})  # no reported fill → hold-delta (market)
-    # preview, confirm, pre_hold, fill-read #1 (empty→0), fill-read #2 (full),
-    # then the _verify_sl_attached positions reads (attempts=2). Filled from
-    # #2 onward so the retry proves the fill and verify sees the position.
+    # preview, confirm (reused as pre_hold — Finding 2), fill-read #1 (empty→0),
+    # fill-read #2 (full), then the _verify_sl_attached positions reads
+    # (attempts=2). Filled from #2 onward so the retry proves the fill and verify
+    # sees the position.
     client.positions = AsyncMock(
-        side_effect=[[], [], [], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
+        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
     )
     svc = OrderService(
         client,
@@ -1693,10 +1697,11 @@ async def test_mexc_recovery_uses_position_delta_signal():
     order index lags but the position already exists."""
     client = _happy_client({"orderId": 1})
     client.exchange_id = "mexc"
-    # pre_hold reads 0 (nothing yet); after the timeout the position shows the
-    # ordered size (rounded_vol≈1.0) → delta signal fires.
+    # pre_hold reads 0 (nothing yet; reused from the confirm-risk read — Finding
+    # 2); after the timeout the position shows the ordered size (rounded_vol≈1.0)
+    # → delta signal fires.
     client.positions = AsyncMock(
-        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
     )
 
     async def _place(_body):

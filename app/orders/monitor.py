@@ -38,6 +38,25 @@ from app.orders.trade_manager import Alert, MgmtBaseline, MoveSlToBe, evaluate_r
 
 log = logging.getLogger("app.orders.monitor")
 
+# Sentinel for "argument not supplied" so a caller can inject an already-read
+# value that is legitimately None (no stop) without it being mistaken for
+# "please read it yourself" (Finding 3).
+_UNSET: Any = object()
+
+
+async def _safe_user_fills(client: Any, symbol: str) -> list[dict[str, Any]] | None:
+    """ONE best-effort user_fills read, reused by BOTH the opened_at estimate and
+    the HL trade-epoch signature within a single position cycle (Finding 3:
+    previously each fetched its own copy). Returns None when the client exposes
+    no ``user_fills`` (MEXC) or the read RAISED — callers treat None exactly like
+    an empty/failed fill window (journal fallback / inconclusive signature)."""
+    if not hasattr(client, "user_fills"):
+        return None
+    try:
+        return await client.user_fills(symbol)
+    except Exception:
+        return None
+
 
 def _client(app: Any) -> Any | None:
     """Active exchange client — resolved exactly like requests/resolver do."""
@@ -71,26 +90,30 @@ def _iso_to_ms(value: Any) -> int | None:
 
 
 async def _best_effort_opened_at(
-    client: Any, db: Any, symbol: str, side: str, now_ms: int
+    client: Any, db: Any, symbol: str, side: str, now_ms: int, *, fills: Any = _UNSET
 ) -> int:
     """Position open time in ms — best-effort, only feeds the time-stop alarm.
 
     Priority: HL ``user_fills`` opening fill (earliest matching Open) → newest
     journal entry for (symbol, direction) → ``now_ms``. Never raises.
+
+    ``fills`` may be an already-fetched fill window (Finding 3: shared with the
+    epoch-signature read so the position is only queried once). ``_UNSET`` ⇒ read
+    it here; ``None``/`[]` ⇒ no usable fills, fall straight through to journal.
     """
     want = "long" if side == "long" else "short"
+    if fills is _UNSET:
+        fills = await _safe_user_fills(client, symbol)
     # 1) HL opening fill (exchange truth for the open time).
     try:
-        if hasattr(client, "user_fills"):
-            fills = await client.user_fills(symbol)
-            times = []
-            for f in fills or []:
-                d = str(f.get("dir") or "").lower()
-                t = int(f.get("time") or 0)
-                if "open" in d and want in d and t > 0:
-                    times.append(t)
-            if times:
-                return min(times)
+        times = []
+        for f in fills or []:
+            d = str(f.get("dir") or "").lower()
+            t = int(f.get("time") or 0)
+            if "open" in d and want in d and t > 0:
+                times.append(t)
+        if times:
+            return min(times)
     except Exception:
         pass
     # 2) Journal approximation (MEXC has no user_fills; also HL fallback).
@@ -139,7 +162,9 @@ def _position_id_signature(pos: Any) -> int | None:
         return None
 
 
-async def _hl_epoch_signature(client: Any, symbol: str, side: str) -> int | None:
+async def _hl_epoch_signature(
+    client: Any, symbol: str, side: str, *, fills: Any = _UNSET
+) -> int | None:
     """HL trade-epoch anchor: the time of the NEWEST Flat→Open fill
     (``start_position`` == 0) for this side.
 
@@ -154,10 +179,11 @@ async def _hl_epoch_signature(client: Any, symbol: str, side: str) -> int | None
     reset just because the anchor scrolled out of view. Never raises.
     """
     want = "long" if side == "long" else "short"
-    try:
-        fills = await client.user_fills(symbol)
-    except Exception:
-        return None
+    if fills is _UNSET:
+        try:
+            fills = await client.user_fills(symbol)
+        except Exception:
+            return None
     epochs: list[int] = []
     for f in fills or []:
         d = str(f.get("dir") or "").lower()
@@ -175,7 +201,7 @@ async def _hl_epoch_signature(client: Any, symbol: str, side: str) -> int | None
 
 
 async def _open_signature(
-    client: Any, pos: Any, symbol: str, side: str
+    client: Any, pos: Any, symbol: str, side: str, *, fills: Any = _UNSET
 ) -> int | None:
     """A STABLE exchange reopen-signature, or None (INCONCLUSIVE).
 
@@ -188,7 +214,7 @@ async def _open_signature(
     treated as inconclusive by the repo (never a reset). Never raises.
     """
     if hasattr(client, "place_stop_order"):
-        return await _hl_epoch_signature(client, symbol, side)
+        return await _hl_epoch_signature(client, symbol, side, fills=fills)
     return _position_id_signature(pos)
 
 
@@ -243,6 +269,8 @@ async def ensure_baseline(
     now_ms: int,
     *,
     pos: Any = None,
+    current_sl: Any = _UNSET,
+    fills: Any = _UNSET,
 ) -> None:
     """Create (first sighting / arm time) or refresh the durable baseline for
     ONE open position — the SINGLE baseline path shared by the monitor cycle and
@@ -255,17 +283,29 @@ async def ensure_baseline(
     measured from the ORIGINAL risk even after the stop later moves) and resets
     to a fresh baseline when the entry deviated beyond tolerance. NEVER places an
     order or moves a stop — it only writes the mgmt DB record.
+
+    Finding 3: ``current_sl`` and ``fills`` may be passed in by the monitor cycle,
+    which already read them for this position — avoiding a second
+    ``open_stop_orders`` read and a second ``user_fills`` read per cycle. Either
+    ``_UNSET`` ⇒ read it here (the arm endpoint path is unchanged). A supplied
+    ``current_sl`` of None is honoured as "no stop" (not re-read).
     """
-    current_sl, _sl_ok = await _current_sl(client, symbol, side, entry)
+    if current_sl is _UNSET:
+        current_sl, _sl_ok = await _current_sl(client, symbol, side, entry)
+    # ONE user_fills read shared by opened_at + the reopen signature below.
+    if fills is _UNSET:
+        fills = await _safe_user_fills(client, symbol)
     # r1 is fixed at baseline time. With no known SL it can't be computed → 0.0,
     # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
     # gate) — safe until a real stop exists.
     r1 = abs(entry - current_sl) if current_sl is not None else 0.0
-    opened_at = await _best_effort_opened_at(client, db, symbol, side, now_ms)
+    opened_at = await _best_effort_opened_at(
+        client, db, symbol, side, now_ms, fills=fills
+    )
     invalidation = await _best_effort_invalidation(db, symbol)
     # F2: stable exchange reopen-signature (HL trade-epoch fill / MEXC positionId;
     # None = inconclusive → no reset).
-    open_sig = await _open_signature(client, pos, symbol, side)
+    open_sig = await _open_signature(client, pos, symbol, side, fills=fills)
 
     # Durable baseline. First sighting inserts; a later sighting refreshes in
     # place (arming/be_done/alert-state preserved), unless entry deviated beyond
@@ -328,7 +368,11 @@ async def _process_position(
     # to the arm endpoint). evaluate_rules below still uses the LIVE current_sl
     # read above for the protection-direction check — the baseline only freezes
     # the ORIGINAL initial_sl/r1.
-    await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
+    # Finding 3: reuse the current_sl already read above (line ~"current_sl, sl_ok")
+    # so ensure_baseline does NOT issue a second open_stop_orders read this cycle.
+    await ensure_baseline(
+        db, client, symbol, side, entry, now_ms, pos=pos, current_sl=current_sl
+    )
     # Monotonic Chandelier high-water — its OWN UPDATE (never the freeze path),
     # advanced every cycle BEFORE rule evaluation so the trail always trails the
     # best price seen (long: running high; short: running low). Cheap; harmless

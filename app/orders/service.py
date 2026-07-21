@@ -6,6 +6,7 @@ No place without unused, unexpired preview token AND TRADING_ENABLED=true.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import uuid
 from datetime import datetime, timezone
@@ -377,41 +378,53 @@ class OrderService:
         # unit tests.
         self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
 
-    async def _balances(self) -> tuple[float, float]:
-        """Return (equity, available). Fail-closed on API/mapping errors.
+    async def _read_account_state(
+        self, symbol: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Fresh (assets, positions) for the money path in ONE combined read.
 
-        fresh=True: this equity feeds order SIZING/gating, so it must never come
-        from the 429 stale-serve cache (which could hand back optimistic-high
-        equity during a volatile rate-limit burst and let an oversized order pass
-        MAX_RISK_PCT). On a 429 here we fail closed instead."""
-        try:
-            assets = await self.client.assets(fresh=True)
-            equity, available = usdt_balances(assets)
-        except ExchangeError as e:
-            raise OrderError(f"equity unavailable: {e}") from e
+        Finding 2: the real HL/MEXC clients expose ``account_state`` which fetches
+        both from a SINGLE snapshot (HL: one clearinghouseState; MEXC: two
+        endpoints fired concurrently), replacing the old separate
+        ``assets(fresh=True)`` + ``positions(fresh=True)`` reads. ``fresh=True`` is
+        preserved end-to-end, so the 429 fail-closed / no-stale-serve guarantee is
+        identical.
+
+        A client that does not implement the combined method (e.g. a bare test
+        double) transparently falls back to the two sequential reads — detected on
+        the CLASS so an auto-attributing mock does not accidentally match.
+        """
+        combined = getattr(type(self.client), "account_state", None)
+        if inspect.iscoroutinefunction(combined):
+            assets, positions = await self.client.account_state(symbol, fresh=True)
+            return assets, positions
+        assets = await self.client.assets(fresh=True)
+        positions = await self.client.positions(symbol, fresh=True)
+        return assets, positions
+
+    def _map_balances(self, assets: list[dict[str, Any]]) -> tuple[float, float]:
+        """(equity, available) from an already-fetched assets blob. Fail-closed on
+        a zero/unknown equity — the FETCH error is handled by the caller so this
+        stays a pure, side-effect-free mapping shared by preview/confirm."""
+        equity, available = usdt_balances(assets)
         if equity is None or float(equity) <= 0:
             raise OrderError(
                 "equity unknown/zero — fail-closed (cannot enforce MAX_RISK_PCT)"
             )
         return float(equity), float(available)
 
-    async def _existing_risk(
-        self, symbol: str, side: str, contract_size: float
+    def _map_existing_risk(
+        self,
+        positions: list[dict[str, Any]],
+        symbol: str,
+        side: str,
+        contract_size: float,
     ) -> tuple[float, list[str]]:
-        """Same-side open risk + warnings. Positions API failure is fail-closed.
+        """Same-side open risk + warnings from already-fetched positions.
 
         `strict`/`pos_risk_cap_pct` flow from settings so Preview, Confirm and
         the sizing endpoint all use identical aggregate semantics (R-01).
         """
-        try:
-            # fresh=True: aggregate-exposure input to the risk gate — never the
-            # 429 stale-serve cache (stale positions could understate open risk).
-            positions = await self.client.positions(symbol, fresh=True)
-        except ExchangeError as e:
-            # Fail-closed: treating unknown exposure as 0 would understate MAX_RISK_PCT
-            raise OrderError(
-                f"positions unavailable — cannot enforce aggregate same-side risk: {e}"
-            ) from e
         try:
             return estimate_same_side_risk_usdt(
                 positions,
@@ -426,41 +439,81 @@ class OrderService:
         except ValueError as e:
             raise OrderError(str(e)) from e
 
+    async def _balances(self) -> tuple[float, float]:
+        """Return (equity, available). Fail-closed on API/mapping errors.
+
+        fresh=True: this equity feeds order SIZING/gating, so it must never come
+        from the 429 stale-serve cache (which could hand back optimistic-high
+        equity during a volatile rate-limit burst and let an oversized order pass
+        MAX_RISK_PCT). On a 429 here we fail closed instead."""
+        try:
+            assets = await self.client.assets(fresh=True)
+        except ExchangeError as e:
+            raise OrderError(f"equity unavailable: {e}") from e
+        return self._map_balances(assets)
+
+    async def _existing_risk(
+        self, symbol: str, side: str, contract_size: float
+    ) -> tuple[float, list[str]]:
+        """Same-side open risk + warnings. Positions API failure is fail-closed."""
+        try:
+            # fresh=True: aggregate-exposure input to the risk gate — never the
+            # 429 stale-serve cache (stale positions could understate open risk).
+            positions = await self.client.positions(symbol, fresh=True)
+        except ExchangeError as e:
+            # Fail-closed: treating unknown exposure as 0 would understate MAX_RISK_PCT
+            raise OrderError(
+                f"positions unavailable — cannot enforce aggregate same-side risk: {e}"
+            ) from e
+        return self._map_existing_risk(positions, symbol, side, contract_size)
+
     async def preview(self, ticket: OrderTicket) -> dict[str, Any]:
         """Run gates, optionally issue one-time token + persist preview hash."""
         symbol = ticket.symbol.upper().strip()
         ticket = ticket.model_copy(update={"symbol": symbol})
 
-        try:
-            contract = await self.client.contract_meta(symbol)
-        except ExchangeError as e:
-            raise OrderError(f"contract meta failed: {e}") from e
+        # Finding 1: contract_meta, ticker and the (combined, Finding 2) account
+        # read are independent — fetch them CONCURRENTLY instead of four serial
+        # roundtrips. Results are then unpacked in the SAME priority order the old
+        # sequential code raised in (contract → ticker → account), so the first
+        # surfaced error is byte-for-byte what a caller saw before. The risk
+        # COMPUTATION below stays sequential and unchanged.
+        contract_r, ticker_r, account_r = await asyncio.gather(
+            self.client.contract_meta(symbol),
+            self.client.ticker(symbol),
+            self._read_account_state(symbol),
+            return_exceptions=True,
+        )
+
+        if isinstance(contract_r, BaseException):
+            if isinstance(contract_r, ExchangeError):
+                raise OrderError(f"contract meta failed: {contract_r}") from contract_r
+            raise contract_r
+        contract = contract_r
 
         last_price: float | None = None
-        try:
-            ticker = await self.client.ticker(symbol)
-            last_price = float(ticker.last_price) if ticker.last_price else None
-        except ExchangeError as e:
-            raise OrderError(f"ticker failed: {e}") from e
+        if isinstance(ticker_r, BaseException):
+            if isinstance(ticker_r, ExchangeError):
+                raise OrderError(f"ticker failed: {ticker_r}") from ticker_r
+            raise ticker_r
+        last_price = float(ticker_r.last_price) if ticker_r.last_price else None
 
+        # Account read + its mappings share the fail-closed dict the old separate
+        # _balances / _existing_risk failures returned (Preview shows gate errors,
+        # never a 500). A fresh-read fetch failure maps to the same "equity
+        # unavailable" OrderError class the balances path raised.
         try:
-            equity, available = await self._balances()
-        except OrderError as e:
-            # Preview: still return gate errors instead of 500
-            return {
-                "ok": False,
-                "token": None,
-                "errors": list(e.errors),
-                "warnings": [],
-                "gate": {"ok": False, "errors": list(e.errors)},
-                "summary": {},
-            }
-
-        try:
-            existing, existing_warnings = await self._existing_risk(
-                symbol, ticket.side, contract.contract_size
+            if isinstance(account_r, BaseException):
+                if isinstance(account_r, ExchangeError):
+                    raise OrderError(f"equity unavailable: {account_r}") from account_r
+                raise account_r
+            assets, positions = account_r
+            equity, available = self._map_balances(assets)
+            existing, existing_warnings = self._map_existing_risk(
+                positions, symbol, ticket.side, contract.contract_size
             )
         except OrderError as e:
+            # Preview: still return gate errors instead of 500
             return {
                 "ok": False,
                 "token": None,
@@ -821,9 +874,20 @@ class OrderService:
         return 0.0, 1, True
 
     async def _mexc_pre_hold_and_position_id(
-        self, symbol: str, side: str
+        self,
+        symbol: str,
+        side: str,
+        *,
+        positions: list[dict[str, Any]] | None = None,
     ) -> tuple[tuple[float, int, bool], int | None]:
         """MEXC-only: one positions read → (pre_hold triple, same-side positionId).
+
+        ``positions`` lets the caller inject an ALREADY-FETCHED positions snapshot
+        (the confirm gate's combined account read) so no second positions request
+        is issued (Finding 2). When supplied it is a successful read → the triple
+        is ``checked=True``; only the self-fetch path can fail-close to
+        ``checked=False``. When omitted the original self-read behaviour is kept
+        for any other caller.
 
         F-1: MEXC change_leverage rejects a leverage set while a position is open
         unless positionId is supplied (see MexcClient.set_leverage docstring), so
@@ -841,10 +905,11 @@ class OrderService:
         id was unreadable, MEXC still rejects and the order fails closed rather
         than placing silently mis-levered).
         """
-        try:
-            positions = await self.client.positions(symbol)
-        except ExchangeError:
-            return (0.0, 1, False), None
+        if positions is None:
+            try:
+                positions = await self.client.positions(symbol)
+            except ExchangeError:
+                return (0.0, 1, False), None
         for raw in positions or []:
             p = map_position(raw) if "hold_vol" not in raw else raw
             if str(p.get("symbol") or "").upper() != symbol.upper():
@@ -898,22 +963,44 @@ class OrderService:
         if preview_last is not None:
             preview_last = float(preview_last)
 
-        try:
-            contract = await self.client.contract_meta(symbol)
-        except ExchangeError as e:
-            raise OrderError(f"contract meta failed: {e}") from e
+        # Finding 1+2: contract_meta, ticker and the combined account read
+        # (assets+positions from ONE snapshot) run CONCURRENTLY — 3 parallel
+        # roundtrips replace the old 4 serial reads (+ a redundant account fetch).
+        # Errors are unpacked in the original priority order (contract → ticker →
+        # account) so the same first failure surfaces, and all raise here (confirm
+        # never degrades to a dict). `positions` from this read is reused for the
+        # MEXC pre_hold / positionId lookup below, so no second positions fetch is
+        # issued (Finding 2, MEXC). The three reads are now a single snapshot,
+        # tightening — never loosening — the sizing/risk TOCTOU window.
+        contract_r, ticker_r, account_r = await asyncio.gather(
+            self.client.contract_meta(symbol),
+            self.client.ticker(symbol),
+            self._read_account_state(symbol),
+            return_exceptions=True,
+        )
+
+        if isinstance(contract_r, BaseException):
+            if isinstance(contract_r, ExchangeError):
+                raise OrderError(f"contract meta failed: {contract_r}") from contract_r
+            raise contract_r
+        contract = contract_r
 
         last_price: float | None = None
-        try:
-            ticker = await self.client.ticker(symbol)
-            if ticker.last_price:
-                last_price = float(ticker.last_price)
-        except ExchangeError as e:
-            raise OrderError(f"ticker failed on confirm: {e}") from e
+        if isinstance(ticker_r, BaseException):
+            if isinstance(ticker_r, ExchangeError):
+                raise OrderError(f"ticker failed on confirm: {ticker_r}") from ticker_r
+            raise ticker_r
+        if ticker_r.last_price:
+            last_price = float(ticker_r.last_price)
 
-        equity, available = await self._balances()
-        existing, existing_warnings = await self._existing_risk(
-            symbol, ticket.side, contract.contract_size
+        if isinstance(account_r, BaseException):
+            if isinstance(account_r, ExchangeError):
+                raise OrderError(f"equity unavailable: {account_r}") from account_r
+            raise account_r
+        assets, account_positions = account_r
+        equity, available = self._map_balances(assets)
+        existing, existing_warnings = self._map_existing_risk(
+            account_positions, symbol, ticket.side, contract.contract_size
         )
 
         gate = validate_order(
@@ -1023,15 +1110,22 @@ class OrderService:
         # that is a genuine, surfaced leverage conflict, not the old blanket
         # "positionId required" block on every add-on.
         #
-        # The positionId comes from the SAME positions read that backs pre_hold
-        # below (moved ahead of set_leverage on MEXC only), so this costs no
-        # extra API call. HL is byte-for-byte unchanged: position_id stays None
-        # (HL ignores it) and its pre_hold read keeps its original position.
+        # The positionId AND pre_hold come from the SAME positions snapshot the
+        # gate already read at the top of confirm (Finding 2, MEXC): it is passed
+        # straight into the helper, so NO second positions fetch runs here. This
+        # also makes pre_hold and the aggregate-risk gate share one consistent
+        # snapshot; the trade-off is that pre_hold is now read at gate time rather
+        # than immediately before set_leverage, but a failed-place is reconciled
+        # against a FRESH live hold below, so under-/over-flatten is still caught.
+        # HL is byte-for-byte unchanged: position_id stays None (HL ignores it)
+        # and its pre_hold read keeps its original (later) position.
         position_id: int | None = None
         pre_hold_precomputed: tuple[float, int, bool] | None = None
         if getattr(self.client, "exchange_id", "") == "mexc":
             pre_hold_precomputed, position_id = (
-                await self._mexc_pre_hold_and_position_id(symbol, ticket.side)
+                await self._mexc_pre_hold_and_position_id(
+                    symbol, ticket.side, positions=account_positions
+                )
             )
         try:
             await self.client.set_leverage(

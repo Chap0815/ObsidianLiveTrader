@@ -462,6 +462,31 @@ class MexcClient:
         )
         return list(data or [])
 
+    async def account_state(
+        self, symbol: str | None = None, *, fresh: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Combined (assets, positions) read for the money path (Finding 2).
+
+        MEXC exposes assets and positions as SEPARATE endpoints (no shared
+        snapshot like HL), so this fires the two live reads CONCURRENTLY rather
+        than sequentially and returns both. `symbol` scopes the positions read
+        exactly like positions(symbol). Errors propagate as MexcError (fail-
+        closed): the assets error is raised in preference to the positions one
+        (argument priority) so the failure ordering is deterministic and matches
+        the previous assets()-then-positions() sequence; either failure blocks
+        the order.
+        """
+        assets_raw, positions_raw = await asyncio.gather(
+            self.assets(fresh=fresh),
+            self.positions(symbol, fresh=fresh),
+            return_exceptions=True,
+        )
+        if isinstance(assets_raw, BaseException):
+            raise assets_raw
+        if isinstance(positions_raw, BaseException):
+            raise positions_raw
+        return list(assets_raw), list(positions_raw)
+
     async def account_snapshot(self, *, fresh: bool = False) -> dict[str, Any]:
         """Fetch assets + open positions and map to API account shape.
 

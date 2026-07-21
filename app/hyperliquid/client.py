@@ -848,38 +848,95 @@ class HyperliquidClient:
         """
         self._user_state_cache = None
 
+    def _resolve_addr(self) -> str | None:
+        """Account address, deriving + caching it from the private key if needed.
+
+        Shared by assets()/positions()/account_state() so all three resolve the
+        SAME address before hitting _user_state_cached.
+        """
+        addr = self.account_address
+        if not addr and self.private_key:
+            from eth_account import Account
+
+            addr = Account.from_key(self.private_key).address
+            self.account_address = addr
+        return addr
+
+    def _fetch_state_sync(self, *, fresh: bool) -> dict[str, Any] | None:
+        """One address-resolved _user_state_cached fetch (runs in the worker
+        thread). Returns None when no account is configured (→ caller yields an
+        empty result, exactly as before)."""
+        if not self.account_address and not self.private_key:
+            return None
+        info = self._get_info()
+        addr = self._resolve_addr()
+        return self._user_state_cached(info, addr, fresh=fresh)
+
+    @staticmethod
+    def _assets_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+        margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        equity = float(margin.get("accountValue") or 0)
+        withdrawable = float(state.get("withdrawable") or 0)
+        used = float(margin.get("totalMarginUsed") or 0)
+        # Prefer exchange-reported withdrawable; fall back to equity - IM
+        available = withdrawable if withdrawable > 0 else max(equity - used, 0.0)
+        return [
+            {
+                "currency": "USDT",  # normalized label; HL margin ccy is USDC
+                "equity": equity,
+                "availableBalance": available,
+                "cashBalance": withdrawable,
+                # H-2: totalNtlPos is total NOTIONAL position value, NOT
+                # unrealized PnL (that is per-position `unrealizedPnl`, read
+                # in positions()). Name it honestly so no future PnL/UI
+                # caller mistakes notional exposure for realized/unreal PnL.
+                "notional_position": float(margin.get("totalNtlPos") or 0),
+            }
+        ]
+
+    @staticmethod
+    def _positions_from_state(
+        state: dict[str, Any], symbol: str | None = None
+    ) -> list[dict[str, Any]]:
+        rows = []
+        coin_f = to_hl_coin(symbol) if symbol else None
+        for ap in state.get("assetPositions") or []:
+            pos = ap.get("position") or {}
+            coin = str(pos.get("coin") or "").upper()
+            if coin_f and coin != coin_f:
+                continue
+            szi = float(pos.get("szi") or 0)
+            if abs(szi) < 1e-12:
+                continue
+            side = "long" if szi > 0 else "short"
+            rows.append(
+                {
+                    "positionId": coin,
+                    "symbol": coin,
+                    "positionType": 1 if side == "long" else 2,
+                    "holdVol": abs(szi),
+                    "holdAvgPrice": float(pos.get("entryPx") or 0),
+                    "openAvgPrice": float(pos.get("entryPx") or 0),
+                    "leverage": (pos.get("leverage") or {}).get("value")
+                    if isinstance(pos.get("leverage"), dict)
+                    else pos.get("leverage"),
+                    "openType": 2
+                    if isinstance(pos.get("leverage"), dict)
+                    and pos.get("leverage", {}).get("type") == "cross"
+                    else 1,
+                    "unRealizedPnl": float(pos.get("unrealizedPnl") or 0),
+                    "liquidatePrice": float(pos.get("liquidationPx") or 0)
+                    if pos.get("liquidationPx") not in (None, "")
+                    else None,
+                    "im": float(pos.get("marginUsed") or 0),
+                }
+            )
+        return rows
+
     async def assets(self, *, fresh: bool = False) -> list[dict[str, Any]]:
         def _a():
-            if not self.account_address and not self.private_key:
-                return []
-            info = self._get_info()
-            # ensure address
-            addr = self.account_address
-            if not addr and self.private_key:
-                from eth_account import Account
-
-                addr = Account.from_key(self.private_key).address
-                self.account_address = addr
-            state = self._user_state_cached(info, addr, fresh=fresh)
-            margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
-            equity = float(margin.get("accountValue") or 0)
-            withdrawable = float(state.get("withdrawable") or 0)
-            used = float(margin.get("totalMarginUsed") or 0)
-            # Prefer exchange-reported withdrawable; fall back to equity - IM
-            available = withdrawable if withdrawable > 0 else max(equity - used, 0.0)
-            return [
-                {
-                    "currency": "USDT",  # normalized label; HL margin ccy is USDC
-                    "equity": equity,
-                    "availableBalance": available,
-                    "cashBalance": withdrawable,
-                    # H-2: totalNtlPos is total NOTIONAL position value, NOT
-                    # unrealized PnL (that is per-position `unrealizedPnl`, read
-                    # in positions()). Name it honestly so no future PnL/UI
-                    # caller mistakes notional exposure for realized/unreal PnL.
-                    "notional_position": float(margin.get("totalNtlPos") or 0),
-                }
-            ]
+            state = self._fetch_state_sync(fresh=fresh)
+            return [] if state is None else self._assets_from_state(state)
 
         try:
             return await self._to_thread(_a)
@@ -890,54 +947,45 @@ class HyperliquidClient:
         self, symbol: str | None = None, *, fresh: bool = False
     ) -> list[dict[str, Any]]:
         def _p():
-            if not self.account_address and not self.private_key:
-                return []
-            info = self._get_info()
-            addr = self.account_address
-            if not addr and self.private_key:
-                from eth_account import Account
-
-                addr = Account.from_key(self.private_key).address
-            state = self._user_state_cached(info, addr, fresh=fresh)
-            rows = []
-            coin_f = to_hl_coin(symbol) if symbol else None
-            for ap in state.get("assetPositions") or []:
-                pos = ap.get("position") or {}
-                coin = str(pos.get("coin") or "").upper()
-                if coin_f and coin != coin_f:
-                    continue
-                szi = float(pos.get("szi") or 0)
-                if abs(szi) < 1e-12:
-                    continue
-                side = "long" if szi > 0 else "short"
-                rows.append(
-                    {
-                        "positionId": coin,
-                        "symbol": coin,
-                        "positionType": 1 if side == "long" else 2,
-                        "holdVol": abs(szi),
-                        "holdAvgPrice": float(pos.get("entryPx") or 0),
-                        "openAvgPrice": float(pos.get("entryPx") or 0),
-                        "leverage": (pos.get("leverage") or {}).get("value")
-                        if isinstance(pos.get("leverage"), dict)
-                        else pos.get("leverage"),
-                        "openType": 2
-                        if isinstance(pos.get("leverage"), dict)
-                        and pos.get("leverage", {}).get("type") == "cross"
-                        else 1,
-                        "unRealizedPnl": float(pos.get("unrealizedPnl") or 0),
-                        "liquidatePrice": float(pos.get("liquidationPx") or 0)
-                        if pos.get("liquidationPx") not in (None, "")
-                        else None,
-                        "im": float(pos.get("marginUsed") or 0),
-                    }
-                )
-            return rows
+            state = self._fetch_state_sync(fresh=fresh)
+            return [] if state is None else self._positions_from_state(state, symbol)
 
         try:
             return await self._to_thread(_p)
         except Exception as e:
             raise HyperliquidError(f"positions failed: {e}") from e
+
+    async def account_state(
+        self, symbol: str | None = None, *, fresh: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """ONE clearinghouseState fetch → (assets, positions).
+
+        Finding 2 (latency): assets() and positions() each call
+        _user_state_cached, so a Preview/Confirm that needs both issued TWO
+        identical clearinghouseState fetches. Both are derived from the SAME
+        blob, so this combines them into a single fetch and hands back both.
+
+        Money-safety is unchanged: fresh=True still forces a real live fetch
+        with the same fail-closed 429 behaviour (no stale serve) as the
+        separate reads. TOCTOU can only improve — assets and positions now come
+        from ONE snapshot, so equity and open exposure are mutually consistent
+        instead of read ~a roundtrip apart. assets()/positions() are untouched
+        for every other caller.
+        """
+
+        def _as():
+            state = self._fetch_state_sync(fresh=fresh)
+            if state is None:
+                return [], []
+            return (
+                self._assets_from_state(state),
+                self._positions_from_state(state, symbol),
+            )
+
+        try:
+            return await self._to_thread(_as)
+        except Exception as e:
+            raise HyperliquidError(f"user_state failed: {e}") from e
 
     async def user_fills(
         self, symbol: str | None = None, limit: int = 100
