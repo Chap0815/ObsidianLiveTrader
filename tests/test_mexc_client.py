@@ -68,6 +68,126 @@ def test_fmt_price_rejects_non_finite():
         _fmt_price(float("nan"))
 
 
+# --- FINDING 3 (LOW/latent, silent SL loss): a positive price/SL smaller than
+# the quantization step ROUND_DOWNs to "0" on the wire while the service still
+# believes body_had_sl=True → a "protected" report with NO real stop. The
+# quantizer must HARD REJECT a positive value that collapses to 0, independent
+# of any (unavailable-here) contract priceScale. ---
+
+
+def test_fmt_price_rejects_subquantum_collapse():
+    # 5e-9 < 1e-8 (default 8dp step) → ROUND_DOWN would yield "0"; must reject.
+    with pytest.raises(MexcError):
+        _fmt_price(5e-9)
+
+
+def test_fmt_price_rejects_subquantum_collapse_with_explicit_scale():
+    # The reject must key off the ACTUAL quantized result, not the fixed 8dp
+    # fallback: a value fine at 8dp still collapses at a coarse contract scale.
+    with pytest.raises(MexcError):
+        _fmt_price(0.0009, scale=2)  # 2dp ROUND_DOWN → 0.00 → "0"
+
+
+def test_fmt_price_zero_is_still_allowed():
+    # A legitimate 0 (market-order price field) is NOT a collapse — never reject.
+    assert _fmt_price(0) == "0"
+    assert _fmt_price(0.0) == "0"
+
+
+@pytest.mark.asyncio
+async def test_place_order_hard_rejects_collapsing_sl():
+    """FINDING 3 end-to-end: a sub-quantum stopLossPrice must raise BEFORE the
+    body is signed/sent — never ship "0" as the SL while the caller thinks the
+    position is protected."""
+    capture: dict = {}
+    c = _mock_client(capture)
+    with pytest.raises(MexcError):
+        await c.place_order(
+            {
+                "symbol": "SHIB_USDT",
+                "vol": 1000,
+                "side": 1,
+                "type": 1,
+                "openType": 1,
+                "leverage": 10,
+                "price": 0.00002,
+                "stopLossPrice": 5e-9,
+            }
+        )
+    # Nothing reached the transport — the reject fires while formatting the body.
+    assert "content" not in capture
+
+
+# --- FINDING 2 (MEDIUM, error mistaken for success): MEXC can answer HTTP 200
+# with {"code": <nonzero>, "message": ...} and NO "success" field
+# (gateway/maintenance/rate-limit variants). _request only checked
+# `success is False`, so such an error was passed through as a successful
+# result — fatal on place_order. ---
+
+
+@pytest.mark.asyncio
+async def test_mexc_request_rejects_nonzero_code_without_success_field():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 2011, "message": "system busy"})
+
+    c = _client_with_handler(handler)
+    with pytest.raises(MexcError) as ei:
+        await c.place_order(
+            {
+                "symbol": "BTC_USDT",
+                "vol": 1,
+                "side": 1,
+                "type": 5,
+                "openType": 1,
+                "leverage": 5,
+            }
+        )
+    msg = str(ei.value).lower()
+    assert "2011" in msg or "busy" in msg
+
+
+@pytest.mark.asyncio
+async def test_mexc_request_allows_zero_code_and_missing_code():
+    """Control: code=0 and responses with NO code field are legitimate success
+    answers and must NOT be rejected by the new nonzero-code check."""
+
+    def handler_zero(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"orderId": 7}})
+
+    out = await _client_with_handler(handler_zero).place_order(
+        {"symbol": "BTC_USDT", "vol": 1, "side": 1, "type": 5,
+         "openType": 1, "leverage": 5}
+    )
+    assert out == {"orderId": 7}
+
+    def handler_nocode(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": {"orderId": 8}})
+
+    out2 = await _client_with_handler(handler_nocode).place_order(
+        {"symbol": "BTC_USDT", "vol": 1, "side": 1, "type": 5,
+         "openType": 1, "leverage": 5}
+    )
+    assert out2 == {"orderId": 8}
+
+
+@pytest.mark.asyncio
+async def test_mexc_request_success_true_wins_over_nonzero_code():
+    """The nonzero-code check is a FALLBACK for when `success` is absent. An
+    explicit success:true is authoritative — a legitimate answer that also
+    carries a non-zero code must NOT be blocked in the money path."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"success": True, "code": 2011, "data": {"orderId": 9}}
+        )
+
+    out = await _client_with_handler(handler).place_order(
+        {"symbol": "BTC_USDT", "vol": 1, "side": 1, "type": 5,
+         "openType": 1, "leverage": 5}
+    )
+    assert out == {"orderId": 9}
+
+
 @pytest.mark.asyncio
 async def test_mexc_price_roundtrip_normal_coin():
     """A normal BTC-sized price must not lose precision or gain noise digits."""

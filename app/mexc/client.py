@@ -111,11 +111,23 @@ def _fmt_price(v: Any, scale: int | None = None) -> str:
     if not math.isfinite(float(v)):
         raise MexcError(f"Nicht-endlicher Preiswert: {v!r}")
     d = Decimal(str(v))
+    was_positive = d > 0
     decimals = scale if scale is not None else _DEFAULT_PRICE_DECIMALS
     if decimals < 0:
         decimals = 0
     quant = Decimal(1).scaleb(-decimals)
     d = d.quantize(quant, rounding=ROUND_DOWN)
+    # F-3 safety leine: a positive price/SL smaller than the quantization step
+    # ROUND_DOWNs to 0 here. Shipping "0" for a stopLossPrice while the service
+    # still believes body_had_sl=True is a SILENT stop-loss loss ("protected"
+    # report, no real stop). Reject hard instead — independent of whether a
+    # contract priceScale was threaded in (a legitimate 0, e.g. a market-order
+    # price field, is never "positive" so it passes untouched).
+    if was_positive and d <= 0:
+        raise MexcError(
+            f"Preis {v!r} kollabiert bei Quantisierung (scale={decimals}) auf 0 "
+            "— harter Reject statt stillem SL-/Preis-Verlust auf der Wire"
+        )
     s = format(d, "f")
     if "." in s:
         s = s.rstrip("0").rstrip(".")
@@ -270,6 +282,26 @@ class MexcClient:
                 str(data.get("message") or data.get("code") or "MEXC error"),
                 raw=data,
             )
+        # F-2: MEXC can answer HTTP 200 with {"code": <nonzero>, "message": ...}
+        # and NO "success" field (gateway/maintenance/rate-limit variants). The
+        # success-only check above would pass such an error through as a result
+        # (fatal on place_order). Mirror _close_response_error's code guard, but
+        # ONLY as a FALLBACK when success is absent: an explicit success:true is
+        # authoritative (a legitimate answer that also carries a non-zero code
+        # must NOT be blocked in the money path), and success:false is already
+        # caught above. So gate on `success is None`. A missing code or the
+        # success codes (0/200) are legitimate answers and must not be rejected.
+        if isinstance(data, dict) and data.get("success") is None:
+            code = data.get("code")
+            if code not in (None, 0, "0", 200, "200"):
+                raise MexcError(
+                    str(
+                        data.get("message")
+                        or data.get("msg")
+                        or f"MEXC error code={code}"
+                    ),
+                    raw=data,
+                )
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return data

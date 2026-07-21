@@ -817,6 +817,51 @@ class OrderService:
             return max(hv, 0.0), ot, True
         return 0.0, 1, True
 
+    async def _mexc_pre_hold_and_position_id(
+        self, symbol: str, side: str
+    ) -> tuple[tuple[float, int, bool], int | None]:
+        """MEXC-only: one positions read → (pre_hold triple, same-side positionId).
+
+        F-1: MEXC change_leverage rejects a leverage set while a position is open
+        unless positionId is supplied (see MexcClient.set_leverage docstring), so
+        an add-on onto an open position needs the existing position's id. Rather
+        than adding a NEW positions call, this reuses the read that already backs
+        ``pre_hold`` (taken here, just moved ahead of set_leverage on MEXC), so
+        the fix costs no extra API request. The returned triple matches
+        ``_same_side_hold_vol_ok`` exactly ((hold_vol, open_type 1|2, checked)),
+        and the caller uses it verbatim as ``pre_hold``.
+
+        Fail-closed: a positions lookup failure returns ((0.0, 1, False), None) —
+        checked=False so the caller fails closed on hold just like the original
+        pre_hold path; a missing/garbage id returns None → set_leverage uses the
+        no-position form (correct when flat; if a position truly exists but its
+        id was unreadable, MEXC still rejects and the order fails closed rather
+        than placing silently mis-levered).
+        """
+        try:
+            positions = await self.client.positions(symbol)
+        except ExchangeError:
+            return (0.0, 1, False), None
+        for raw in positions or []:
+            p = map_position(raw) if "hold_vol" not in raw else raw
+            if str(p.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if str(p.get("side") or "").lower() != side.lower():
+                continue
+            hv = max(float(p.get("hold_vol") or 0), 0.0)
+            ot = 2 if p.get("open_type") in (2, "2", "cross") else 1
+            pid: int | None
+            raw_pid = p.get("position_id")
+            if raw_pid is None:
+                pid = None
+            else:
+                try:
+                    pid = int(raw_pid)
+                except (TypeError, ValueError):
+                    pid = None
+            return (hv, ot, True), pid
+        return (0.0, 1, True), None
+
     async def confirm(self, token: str) -> dict[str, Any]:
         """Consume token, re-check arming + gates, set leverage, place order."""
         async with self._trade_lock:
@@ -957,12 +1002,41 @@ class OrderService:
         # Set leverage — HARD fail (do not place with unknown leverage)
         open_type = int(ticket.open_type or 1)
         position_type = 1 if ticket.side == "long" else 2
+        # F-1: MEXC change_leverage REQUIRES positionId when a same-side position
+        # is already open — without it every add-on onto an open MEXC position is
+        # hard-blocked here ("set_leverage failed"). Resolve the existing
+        # positionId and forward it; with no open position we keep the prior
+        # symbol/openType/positionType form.
+        #
+        # Chosen over the alternative ("skip set_leverage on MEXC entirely,
+        # leverage already rides in the create body"): the create body's leverage
+        # DOES apply for both isolated/cross (openType is in the body too), so
+        # skipping would be safe for the FRESH-position case — but keeping the
+        # explicit set preserves the existing "never place with unverified
+        # leverage" hard-fail guarantee and, for an add-on, still lets MEXC
+        # confirm/adjust the position's leverage. It is also the smaller change.
+        # Trade-off: if the add-on requests a DIFFERENT leverage than the open
+        # position, MEXC may reject the change_leverage(positionId) call — but
+        # that is a genuine, surfaced leverage conflict, not the old blanket
+        # "positionId required" block on every add-on.
+        #
+        # The positionId comes from the SAME positions read that backs pre_hold
+        # below (moved ahead of set_leverage on MEXC only), so this costs no
+        # extra API call. HL is byte-for-byte unchanged: position_id stays None
+        # (HL ignores it) and its pre_hold read keeps its original position.
+        position_id: int | None = None
+        pre_hold_precomputed: tuple[float, int, bool] | None = None
+        if getattr(self.client, "exchange_id", "") == "mexc":
+            pre_hold_precomputed, position_id = (
+                await self._mexc_pre_hold_and_position_id(symbol, ticket.side)
+            )
         try:
             await self.client.set_leverage(
                 symbol,
                 int(ticket.leverage),
                 open_type,
                 position_type=position_type,
+                position_id=position_id,
             )
         except ExchangeError as e:
             raise OrderError(f"set_leverage failed — order blocked: {e}") from e
@@ -970,9 +1044,13 @@ class OrderService:
         # Hold before place — used so auto-flatten never closes pre-existing size.
         # pre_hold_ok records whether the query was RELIABLE; a failed lookup
         # must fail-closed (no differential-flatten) rather than assume 0.
-        pre_hold, _, pre_hold_ok = await self._same_side_hold_vol_ok(
-            symbol, ticket.side
-        )
+        # On MEXC this reuses the read taken above (no duplicate positions call).
+        if pre_hold_precomputed is not None:
+            pre_hold, _, pre_hold_ok = pre_hold_precomputed
+        else:
+            pre_hold, _, pre_hold_ok = await self._same_side_hold_vol_ok(
+                symbol, ticket.side
+            )
 
         recovered_from_timeout = False
         transport_err: str | None = None

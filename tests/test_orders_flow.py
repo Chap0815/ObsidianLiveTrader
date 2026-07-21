@@ -189,6 +189,72 @@ async def test_preview_then_confirm_places_once(client, store):
     client.set_leverage.assert_called()
 
 
+# ── FINDING 1: an add-on to an EXISTING same-side MEXC position must forward
+# the positionId to change_leverage (MEXC rejects a leverage set on an open
+# position without it → every add-on was hard-blocked). HL is unaffected. ─────
+
+
+@pytest.mark.asyncio
+async def test_mexc_addon_confirm_forwards_position_id_to_set_leverage(client, store):
+    from app.mexc.errors import MexcError
+
+    client.exchange_id = "mexc"
+    # An open same-side long position already exists (positionId 4242). A nearby
+    # liquidatePrice keeps the aggregate same-side risk negligible so the test
+    # stays focused on the leverage call, not the risk gate.
+    client.positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC_USDT",
+                "positionType": 1,
+                "openType": 1,
+                "holdVol": 1.0,
+                "holdAvgPrice": 100_000.0,
+                "leverage": 5,
+                "liquidatePrice": 99_900.0,
+                "positionId": 4242,
+            }
+        ]
+    )
+
+    # Fake MEXC change_leverage: with an OPEN position it REQUIRES positionId,
+    # else it rejects exactly like the live exchange.
+    async def _set_leverage(
+        symbol, leverage, open_type, position_type=None, position_id=None
+    ):
+        if position_id is None:
+            raise MexcError(
+                "change_leverage: positionId required while a position is open"
+            )
+        return {"success": True}
+
+    client.set_leverage = AsyncMock(side_effect=_set_leverage)
+
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    prev = await svc.preview(_good_ticket())
+    assert prev["ok"] is True
+    conf = await svc.confirm(prev["token"])
+    assert conf["ok"] is True
+    client.place_order.assert_called_once()
+    # The existing position's id must have been resolved and forwarded.
+    assert client.set_leverage.await_args.kwargs.get("position_id") == 4242
+
+
+@pytest.mark.asyncio
+async def test_hl_confirm_leaves_set_leverage_position_id_none(client, store):
+    """FINDING 1 guard: the positionId lookup is MEXC-only. A non-MEXC (HL)
+    client must still be called with position_id=None (path unchanged)."""
+    client.exchange_id = "hyperliquid"
+    client.positions = AsyncMock(
+        return_value=[]
+    )
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    prev = await svc.preview(_good_ticket())
+    conf = await svc.confirm(prev["token"])
+    assert conf["ok"] is True
+    assert client.set_leverage.await_args.kwargs.get("position_id") is None
+
+
 @pytest.mark.asyncio
 async def test_double_confirm_fails(client, store):
     svc = OrderService(client, _settings(trading_enabled=True), store)
