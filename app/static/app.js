@@ -556,12 +556,21 @@
     }
   }
 
-  function candlesToSeries(candles) {
+  /** tf bucket-aligns c.time via barOpenTimeSec — the SAME rule the
+   *  intra-candle build (applyLiveTrade/applyLiveCandle) and the live-bar
+   *  seed use. If the two paths bucketed differently, a backend candle whose
+   *  `time` isn't already exactly bucket-aligned would seed one bar and the
+   *  live tick would then open a second, adjacent bar for the same bucket —
+   *  a visible double candle (Finding 3). */
+  function candlesToSeries(candles, tf) {
     if (!Array.isArray(candles)) return [];
     const out = [];
     for (const c of candles) {
-      const time = toChartTime(c.time);
-      if (time == null) continue;
+      // barOpenTimeSec() defaults non-finite input to "now" (it has no
+      // null-return path) — guard explicitly so garbage/missing c.time is
+      // still skipped instead of silently landing as a bogus current-time bar.
+      if (!Number.isFinite(Number(c.time))) continue;
+      const time = barOpenTimeSec(c.time, tf);
       out.push({
         time,
         open: Number(c.open),
@@ -575,12 +584,15 @@
     return out;
   }
 
-  function volumeToSeries(candles) {
+  // Fed from the same `candles` array/same c.time as candlesToSeries — must
+  // bucket identically or the volume histogram bars drift out of alignment
+  // with their own candles (Finding 3).
+  function volumeToSeries(candles, tf) {
     if (!Array.isArray(candles)) return [];
     const out = [];
     for (const c of candles) {
-      const time = toChartTime(c.time);
-      if (time == null) continue;
+      if (!Number.isFinite(Number(c.time))) continue;
+      const time = barOpenTimeSec(c.time, tf);
       out.push({
         time,
         value: Number(c.vol) || 0,
@@ -594,15 +606,17 @@
     return out;
   }
 
-  function emaToSeries(candles, emaArr) {
+  // Same candles[i].time / same tf-bucket rule as candlesToSeries — an EMA
+  // point must land on the exact bar its candle sits on (Finding 3).
+  function emaToSeries(candles, emaArr, tf) {
     if (!Array.isArray(candles) || !Array.isArray(emaArr)) return [];
     const out = [];
     const n = Math.min(candles.length, emaArr.length);
     for (let i = 0; i < n; i++) {
       const v = emaArr[i];
       if (v == null || Number.isNaN(Number(v))) continue;
-      const time = toChartTime(candles[i].time);
-      if (time == null) continue;
+      if (!Number.isFinite(Number(candles[i].time))) continue;
+      const time = barOpenTimeSec(candles[i].time, tf);
       out.push({ time, value: Number(v) });
     }
     out.sort((a, b) => a.time - b.time);
@@ -1243,7 +1257,7 @@
     state.lastPx = Number(px);
     const priceEl = $("ctx-price");
     if (priceEl) {
-      priceEl.textContent = fmt(state.lastPx, 6);
+      priceEl.textContent = fmtPx(state.lastPx);
       // Tick direction coloring, like on the exchange tape
       if (prev != null && state.lastPx !== prev) {
         priceEl.style.color = state.lastPx > prev ? "var(--long)" : "var(--short)";
@@ -1684,17 +1698,18 @@
       }
     }
 
+    updateChartPriceFormat(); // Finding 1: precision must match THIS coin before it paints
     if (state.candleSeries) {
-      state.candleSeries.setData(candlesToSeries(candles));
+      state.candleSeries.setData(candlesToSeries(candles, tf));
     }
     if (state.ema20Series) {
-      state.ema20Series.setData(emaToSeries(candles, indicators.ema20));
+      state.ema20Series.setData(emaToSeries(candles, indicators.ema20, tf));
     }
     if (state.ema50Series) {
-      state.ema50Series.setData(emaToSeries(candles, indicators.ema50));
+      state.ema50Series.setData(emaToSeries(candles, indicators.ema50, tf));
     }
     if (state.volumeSeries) {
-      state.volumeSeries.setData(volumeToSeries(candles));
+      state.volumeSeries.setData(volumeToSeries(candles, tf));
     }
 
     if (state.chart) {
@@ -1754,7 +1769,14 @@
     // Seed live bar from last REST candle for seamless WS updates
     if (candles.length) {
       const last = candles[candles.length - 1];
-      const t = toChartTime(last.time);
+      // Finding 3: bucket-align via barOpenTimeSec (same rule as
+      // applyLiveTrade/applyLiveCandle) so a non-bucket-aligned REST time
+      // can't seed a liveBar on a different bar than the live tick path
+      // opens next, which would draw as a double candle. Guard against
+      // invalid last.time explicitly — barOpenTimeSec() has no null-return
+      // path (falls back to "now"), unlike toChartTime().
+      const rawLastTime = Number(last.time);
+      const t = Number.isFinite(rawLastTime) ? barOpenTimeSec(last.time, tf) : null;
       const prevLive = state.liveBar;
       if (
         silent && !keyChanged && prevLive &&
@@ -3922,6 +3944,34 @@
       state.market && state.market.contract && state.market.contract.priceUnit
     );
     return t > 0 ? t : 0.01;
+  }
+
+  /** Finding 1: keep the candle series' priceFormat in sync with the active
+   *  coin's tick size so sub-dollar coins don't collapse to "0.00" on the
+   *  price axis, crosshair, and every price-line axis label (Entry/SL/TP/Liq
+   *  via addChartLine — LWC derives those labels from the series'
+   *  priceFormat too, so fixing it here fixes them for free). Reads the raw
+   *  contract.priceUnit (NOT tickSize(), which hardcodes a 0.01 fallback)
+   *  so derivePriceFormat() can fall back to last-price magnitude when the
+   *  tick step genuinely isn't known yet. Called on every loadMarket
+   *  (explicit switch AND silent polls) but only ever calls applyOptions —
+   *  a real redraw — when the derived precision actually changed, so a
+   *  same-coin poll never spams a redraw per tick. */
+  function updateChartPriceFormat() {
+    if (!state.candleSeries) return;
+    const contract = state.market && state.market.contract;
+    const rawTick = contract && Number(contract.priceUnit);
+    const px = (state.market && state.market.last_price) || state.lastPx;
+    const pf = derivePriceFormat(rawTick, px);
+    if (state._chartPricePrecision === pf.precision) return;
+    state._chartPricePrecision = pf.precision;
+    try {
+      state.candleSeries.applyOptions({
+        priceFormat: { type: "price", precision: pf.precision, minMove: pf.minMove },
+      });
+    } catch (_) {
+      /* chart not ready — ignore, next loadMarket call retries */
+    }
   }
 
   /** Arrow-key/spinner step on the price inputs must scale with the coin's
@@ -7169,7 +7219,7 @@
       marks.map(function (m) { return Number.isFinite(m.price) ? m.price : "-"; }).join(","),
     ].join("|");
     const dataFp = [
-      Number.isFinite(last) ? fmt(last, 6) : "-",
+      Number.isFinite(last) ? fmtPx(last) : "-",
       chgTxt,
       pnl != null && Number.isFinite(pnl) ? fmt(pnl, 2) : "-",
       canvasFp,
@@ -7206,7 +7256,7 @@
     tile.innerHTML =
       (m.isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
       '<div class="mini-head"><span class="mini-sym">' + escapeHtml(m.key) + "</span>" +
-      '<span class="mini-price">' + (Number.isFinite(m.last) ? fmt(m.last, 6) : "—") + "</span></div>" +
+      '<span class="mini-price">' + (Number.isFinite(m.last) ? fmtPx(m.last) : "—") + "</span></div>" +
       '<div class="mini-badges">' + _miniPnlHtml(m.pnl) +
       '<span class="mini-chg ' + m.chgCls + '">' + m.chgTxt + "</span></div>" +
       // V3-02: a failed tile says so — never a silently frozen chart.
@@ -7239,7 +7289,7 @@
     if (tile.getAttribute("data-datafp") === m.dataFp) return;
     tile.setAttribute("data-datafp", m.dataFp);
     const priceEl = tile.querySelector(".mini-price");
-    if (priceEl) priceEl.textContent = Number.isFinite(m.last) ? fmt(m.last, 6) : "—";
+    if (priceEl) priceEl.textContent = Number.isFinite(m.last) ? fmtPx(m.last) : "—";
     const badges = tile.querySelector(".mini-badges");
     if (badges) {
       badges.innerHTML =

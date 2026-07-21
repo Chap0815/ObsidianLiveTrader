@@ -28,6 +28,58 @@ function fmt(n, digits) {
   });
 }
 
+/**
+ * Derive a Lightweight-Charts priceFormat {precision, minMove} for the
+ * candle series. LWC's own default (precision:2, minMove:0.01) collapses
+ * sub-dollar coins onto "0.00" on the price axis, crosshair, and every
+ * price-line axis label (Entry/SL/TP/Liq via addChartLine) — Finding 1.
+ * Prefers the exchange's own tick step (tickStep, e.g. MEXC's
+ * contract.priceUnit — the same source updatePriceFieldSteps()/tickSize()
+ * read in app.js) since that's authoritative; falls back to deriving from
+ * the order of magnitude of lastPrice when no tick step is known yet (e.g.
+ * before the contract meta has loaded). Pure — no state/DOM access, so it's
+ * directly unit-testable.
+ */
+function derivePriceFormat(tickStep, lastPrice) {
+  const tick = Number(tickStep);
+  if (Number.isFinite(tick) && tick > 0) {
+    const s = tick.toString();
+    let precision;
+    if (s.indexOf("e-") !== -1) {
+      precision = Number(s.split("e-")[1]);
+    } else {
+      const i = s.indexOf(".");
+      precision = i === -1 ? 0 : s.length - i - 1;
+    }
+    precision = Math.min(Math.max(precision, 0), 10);
+    return { precision: precision, minMove: Math.pow(10, -precision) };
+  }
+  const px = Math.abs(Number(lastPrice));
+  if (!Number.isFinite(px) || px <= 0) {
+    return { precision: 2, minMove: 0.01 }; // LWC default — unchanged behavior
+  }
+  let precision;
+  if (px >= 1) {
+    precision = px >= 100 ? 2 : 4;
+  } else {
+    precision = Math.min(10, Math.max(2, -Math.floor(Math.log10(px)) + 3));
+  }
+  return { precision: precision, minMove: Math.pow(10, -precision) };
+}
+
+/**
+ * Adaptive-precision price formatter for display strings (ctx-price,
+ * mini-tile prices, fingerprints). fmt(px, 6) rounds anything below 1e-6 to
+ * "0" — sub-µ-priced coins (Finding 2). Prices only: other numeric fields
+ * keep plain fmt(), whose 4-digit default other call sites rely on.
+ */
+function fmtPx(px) {
+  if (px == null || Number.isNaN(Number(px))) return fmt(px, 6);
+  const abs = Math.abs(Number(px));
+  const d = abs > 0 && abs < 1 ? Math.min(10, Math.max(6, -Math.floor(Math.log10(abs)) + 3)) : 6;
+  return fmt(px, d);
+}
+
 function fmtPct(rate) {
   if (rate == null || Number.isNaN(Number(rate))) return "—";
   // funding often as fraction (e.g. 0.0001) → show bps-ish percent
