@@ -532,7 +532,10 @@ class OrderService:
         token_hash = PreviewStore.hash_token(token)
 
         if self.db is not None:
-            expires = datetime.now(timezone.utc).timestamp() + ttl
+            # Mirror PreviewStore.create()'s clamp (app/orders/tokens.py) so the
+            # DB-preview row's expiry never diverges from the in-memory token's
+            # for ttl<=0 (both must agree on when a preview is actually gone).
+            expires = datetime.now(timezone.utc).timestamp() + max(1, int(ttl))
             await self.db.insert_preview(
                 token_hash=token_hash,
                 payload_json=payload,

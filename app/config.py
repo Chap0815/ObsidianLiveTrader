@@ -566,6 +566,35 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("close_verify_delay_s")
+    @classmethod
+    def close_verify_delay_s_ok(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0 <= v <= 60):
+            raise ValueError(
+                f"CLOSE_VERIFY_DELAY_S must be a finite number in [0, 60] "
+                f"(got {v!r})"
+            )
+        return v
+
+    @field_validator("kline_limit_hint")
+    @classmethod
+    def kline_limit_hint_ok(cls, v: int) -> int:
+        if not (10 <= int(v) <= 1500):
+            raise ValueError(
+                f"KLINE_LIMIT_HINT must be an integer in [10, 1500] (got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("preview_token_ttl_seconds")
+    @classmethod
+    def preview_token_ttl_seconds_ok(cls, v: int) -> int:
+        if not (1 <= int(v) <= 3600):
+            raise ValueError(
+                f"PREVIEW_TOKEN_TTL_SECONDS must be an integer in [1, 3600] "
+                f"(got {v!r})"
+            )
+        return int(v)
+
     @field_validator("tm_monitor_interval_s")
     @classmethod
     def tm_monitor_interval_s_ok(cls, v: int) -> int:

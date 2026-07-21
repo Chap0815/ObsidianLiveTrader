@@ -51,3 +51,83 @@ def test_inf_burst_rejected():
 def test_stage1_k_below_one_rejected():
     with pytest.raises(ValidationError):
         Settings(scanner_prefilter_stage1_k=0)
+
+
+# --- Finding 1: close_verify_delay_s (2026-07-21 hardening) ---------------
+
+
+def test_close_verify_delay_s_default_is_zero():
+    assert Settings().close_verify_delay_s == 0.0
+
+
+def test_close_verify_delay_s_inf_rejected():
+    # inf would pass max(0.0, float(x or 0.0)) unchanged and hang the
+    # close-verify asyncio.sleep() indefinitely (app/orders/service.py).
+    with pytest.raises(ValidationError):
+        Settings(close_verify_delay_s=math.inf)
+
+
+def test_close_verify_delay_s_above_range_rejected():
+    with pytest.raises(ValidationError):
+        Settings(close_verify_delay_s=61.0)
+
+
+def test_close_verify_delay_s_negative_rejected():
+    with pytest.raises(ValidationError):
+        Settings(close_verify_delay_s=-1.0)
+
+
+def test_close_verify_delay_s_in_range_allowed():
+    assert Settings(close_verify_delay_s=5.0).close_verify_delay_s == 5.0
+
+
+# --- Finding 2: kline_limit_hint (2026-07-21 hardening) --------------------
+
+
+def test_kline_limit_hint_default_is_500():
+    assert Settings().kline_limit_hint == 500
+
+
+def test_kline_limit_hint_below_min_rejected():
+    # 0/negative silently falls back to only 10 candles for ATR/HTF analysis
+    # (app/hyperliquid/client.py: max(int(limit_hint), 10)).
+    with pytest.raises(ValidationError):
+        Settings(kline_limit_hint=0)
+
+
+def test_kline_limit_hint_above_max_rejected():
+    # Unbounded above puts 429 pressure on the exchange API.
+    with pytest.raises(ValidationError):
+        Settings(kline_limit_hint=100_000)
+
+
+def test_kline_limit_hint_in_range_allowed():
+    assert Settings(kline_limit_hint=200).kline_limit_hint == 200
+
+
+# --- Finding 3: preview_token_ttl_seconds (2026-07-21 hardening) -----------
+
+
+def test_preview_token_ttl_seconds_default_is_60():
+    assert Settings().preview_token_ttl_seconds == 60
+
+
+def test_preview_token_ttl_seconds_zero_rejected():
+    # 0/negative diverges from tokens.py's max(1, int(ttl)) clamp, giving
+    # the in-memory token and the DB-preview row different expiries.
+    with pytest.raises(ValidationError):
+        Settings(preview_token_ttl_seconds=0)
+
+
+def test_preview_token_ttl_seconds_negative_rejected():
+    with pytest.raises(ValidationError):
+        Settings(preview_token_ttl_seconds=-5)
+
+
+def test_preview_token_ttl_seconds_above_max_rejected():
+    with pytest.raises(ValidationError):
+        Settings(preview_token_ttl_seconds=3601)
+
+
+def test_preview_token_ttl_seconds_in_range_allowed():
+    assert Settings(preview_token_ttl_seconds=120).preview_token_ttl_seconds == 120
