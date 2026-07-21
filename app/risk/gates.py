@@ -233,6 +233,15 @@ def validate_order(
                 f"price drift {drift_pct:.3f}% exceeds MAX_PRICE_DRIFT_PCT="
                 f"{max_drift} (preview {prev} → now {now}) — re-preview"
             )
+    elif for_confirm and (preview_last_price is None or float(preview_last_price) <= 0):
+        # The preview captured no usable baseline price (its ticker returned no
+        # price), so the confirm-vs-preview drift check can't run. Surface it as a
+        # warning instead of silently skipping — the one-time token's TTL bounds
+        # the exposure window, but the human should re-preview on a large move.
+        warnings.append(
+            "Drift nicht prüfbar: Preview ohne Marktpreis erstellt — bei starker "
+            "Preisabweichung neu previewen"
+        )
 
     # ── SL required unless unprotected allowed ─────────────────────────
     sl = ticket.stop_loss

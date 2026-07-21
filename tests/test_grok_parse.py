@@ -286,3 +286,19 @@ def test_parse_reevaluation_rejects_nan_token():
     raw = '{"action": "MOVE_SL_BE", "new_sl": NaN, "reason": "x"}'
     with pytest.raises(ValidationError):
         parse_reevaluation(raw)
+
+
+def test_key_levels_coerce_nonfinite_to_none():
+    """Display-only key_levels: a NaN/Inf from untrusted LLM output is coerced to
+    None (support/resistance) or filtered (pools) — no reject, no NaN into the DB."""
+    from app.models import ProposalKeyLevels
+
+    kl = ProposalKeyLevels.model_validate(
+        {
+            "immediate_support": float("nan"),
+            "immediate_resistance": float("inf"),
+            "major_liquidity_pools": [100.0, float("nan"), "psych 50k"],
+        }
+    )
+    assert kl.immediate_support is None and kl.immediate_resistance is None
+    assert kl.major_liquidity_pools == [100.0, "psych 50k"]  # NaN filtered, str kept

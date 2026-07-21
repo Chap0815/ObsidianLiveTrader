@@ -411,3 +411,19 @@ def test_close_position_request_accepts_finite_and_none():
 
     assert ClosePositionRequest(symbol="BTC_USDT", side="long", vol=None).vol is None
     assert ClosePositionRequest(symbol="BTC_USDT", side="long", vol=0.5).vol == 0.5
+
+
+def test_confirm_warns_when_preview_baseline_price_missing():
+    """Drift can't be checked when the preview captured no baseline price — the
+    gate must SURFACE that as a warning (not silently skip), and must not error."""
+    g = validate_order(
+        _ticket(),
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=100_000,
+        for_confirm=True,
+        preview_last_price=None,
+    )
+    assert any("Drift nicht prüfbar" in w for w in g.warnings)
+    assert not any("drift" in e.lower() for e in g.errors)

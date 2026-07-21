@@ -135,6 +135,21 @@ class ProposalKeyLevels(BaseModel):
     immediate_resistance: float | None = None
     major_liquidity_pools: list[float | str] = Field(default_factory=list)
 
+    @field_validator("immediate_support", "immediate_resistance")
+    @classmethod
+    def _coerce_nonfinite_to_none(cls, v: float | None) -> float | None:
+        # Display-only levels: coerce a NaN/Inf (from untrusted LLM output) to
+        # None rather than reject the whole analysis. Also keeps a non-standard
+        # NaN token out of the proposals DB (repo._dumps → json.dumps allow_nan).
+        if v is not None and not math.isfinite(v):
+            return None
+        return v
+
+    @field_validator("major_liquidity_pools")
+    @classmethod
+    def _drop_nonfinite_pools(cls, v: list) -> list:
+        return [x for x in v if not (isinstance(x, float) and not math.isfinite(x))]
+
 
 class ProposalManagement(BaseModel):
     move_sl_to_be: str = ""
