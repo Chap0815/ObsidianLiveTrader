@@ -119,6 +119,7 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `HOST` | `127.0.0.1` | Bind-Adresse; nur Loopback erlaubt (LAN-Bind wird abgelehnt) |
 | `PORT` | `8787` | Bind-Port |
 | `SETUP_COMPLETE` | `false` (Code-Default) | Markiert Ersteinrichtung als erledigt. `false` hält `/setup` offen (Fail-safe für einen frischen, noch secret-losen Start); die vollständige `/setup`-Speicherung setzt es auf `true` und sperrt den Assistenten danach. **`.env.example` liefert `true`** — eine reine Kopie der Vorlage gilt als bereits eingerichtet |
+| `TRUSTED_HOSTS_EXTRA` | leer | Kein Settings-Feld (roher Env-Var-Read in `main.py`); komma-separierte Zusatz-Hostnamen für die TrustedHost-Allowlist (Default: nur `127.0.0.1`/`localhost`/`::1`) — DNS-Rebinding-Schutz |
 
 ### Exchange (MEXC / Hyperliquid)
 
@@ -201,14 +202,14 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | **`LOCAL_API_TOKEN`** | leer | **Pflicht**, sobald `TRADING_ENABLED=true` — Auth-Token für die lokale API |
 | `REQUIRE_LOOPBACK_WHEN_ARMED` | `true` | `TRADING_ENABLED=true` erzwingt Loopback-`HOST` |
 | `DEFAULT_SYMBOL` | `BTC` | Start-Symbol (Hyperliquid-Coin; MEXC: `BTC_USDT`) |
-| `PREVIEW_TOKEN_TTL_SECONDS` | `60` | Einmal-Token für Confirm |
+| `PREVIEW_TOKEN_TTL_SECONDS` | `60` | Einmal-Token für Confirm; `[1, 3600]` |
 | `DATABASE_PATH` | `data/trader.db` | SQLite Audit (Proposals/Orders) |
-| `KLINE_LIMIT_HINT` | `500` | Bevorzugte Anzahl Kerzen je Marktabruf |
+| `KLINE_LIMIT_HINT` | `500` | Bevorzugte Anzahl Kerzen je Marktabruf; `[10, 1500]` |
 | `AUTO_FLATTEN_IF_SL_UNVERIFIED` | `true` | Position sofort schließen, wenn SL nach Placement nicht verifizierbar |
 | `SL_VERIFY_ATTEMPTS` | `3` | Anzahl Polling-Versuche, um den gesetzten SL zu bestätigen |
 | `SL_VERIFY_DELAY_S` | `0.7` | Wartezeit (s) zwischen SL-Verify-Versuchen; `[0, 60]` |
 | `CLOSE_VERIFY_ATTEMPTS` | `1` | Polling-Versuche beim Re-Read der Position nach einem Close (deckt verzögerte Fills ab) |
-| `CLOSE_VERIFY_DELAY_S` | `0.0` | Wartezeit (s) zwischen Close-Verify-Versuchen |
+| `CLOSE_VERIFY_DELAY_S` | `0.0` | Wartezeit (s) zwischen Close-Verify-Versuchen; `[0, 60]` |
 
 ### Journal (KI-Feedback-Loop)
 
@@ -228,6 +229,7 @@ Alle Defaults unten sind 1:1 aus der `Settings`-Klasse in [`app/config.py`](app/
 | `TM_TRAIL_ACTIVATION_R` | `1.0` | Auto-Trail aktiviert erst ab diesem unrealisierten R; `[0, 10]` |
 | `TM_TRAIL_ATR_PERIOD` | `14` | ATR-Periode (Wilder) für den Trail; `[2, 100]` |
 | `TM_TRAIL_ATR_TF` | `15m` | Timeframe der ATR-Kerzen für den Trail; eine von `5m, 15m, 1h, 4h` |
+| `TM_TRAIL_MIN_STEP_ATR` | `0.25` | Mindest-Trail-Schritt als ATR-Bruchteil: der Trail modifiziert den SL nur, wenn er ihn um mind. dieses Vielfache des ATR verbessert (spart Exchange-Roundtrips bei langsamem Trend); `0` = jede Verbesserung sofort; `[0, 10]` |
 | `TM_RECAL_MIN_SAMPLE` | `20` | Confidence-Rekalibrierung: Mindest-Samples je Tier, bevor die reale Trefferquote die *angezeigte* Confidence/Sizing-Empfehlung anpasst; `[1, 1000]` |
 
 **Trade-Management-Layer (v1):** ein server-seitiger Monitor läuft mit dem Prozess
@@ -264,6 +266,15 @@ bleibt sichtbar, und es wird **nie** ein Trade geblockt oder `action` geändert
 der echte Order-/Gate-Pfad ist unberührt). Jede Analyse nennt zudem ein
 **Pre-Mortem** (`pre_mortem`): den einen wahrscheinlichsten Grund, warum der Trade
 scheitert — vor dem Einstieg.
+
+**Fill-Rate & Order-Type-Persistenz (Lern-Loop-Härtung):** Jeder Journal-Eintrag
+persistiert jetzt den `order_type` (`market`/`limit`, beim Analyze-Write geometrisch
+aus dem Entry abgeleitet) — der Shadow-Eval-Resolver modelliert einen marktfähigen
+Entry nicht mehr fälschlich als LIMIT (das hätte Breakout-Gewinner ohne Rücklauf als
+`NO_FILL` verworfen und den Track-Record setup-selektiv nach unten verzerrt). Stats
+und Track-Record zeigen zusätzlich `fill_rate` (`resolved / (resolved + NO_FILL)`)
+je Gruppe — die Winrate selbst rechnet weiterhin nur aus `WIN`/`LOSS`, `fill_rate`
+macht den Survivorship-Bias sichtbar (wie oft ein Setup überhaupt erreichbar war).
 
 ### Wechsel auf Mainnet
 
@@ -384,7 +395,7 @@ Vor dem Scharfschalten (`TRADING_ENABLED=true`) den Place/Cancel-Pfad mit Trade-
 | Method | Path | Zweck |
 |--------|------|--------|
 | GET | `/api/health` | Readiness, keine Secrets |
-| GET | `/api/market/{symbol}` | OHLCV + Indikatoren + Struktur |
+| GET | `/api/market/{symbol}` | OHLCV + Indikatoren + Struktur (Interval-Allowlist auf `tf`/`htf`, 2.5s-Cache mit Singleflight) |
 | GET | `/api/account` | Equity / Positionen |
 | POST | `/api/analyze` | Grok-Proposal (+ SQLite) |
 | POST | `/api/orders/preview` | Gates + One-Time-Token |
