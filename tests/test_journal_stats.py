@@ -13,7 +13,7 @@ import aiosqlite
 import pytest
 
 from app.db.repo import Database
-from app.journal.stats import build_stats_response
+from app.journal.stats import build_stats_response, build_track_record
 
 
 @pytest.fixture
@@ -238,3 +238,59 @@ async def test_by_setup_breakdown(db_path):
     assert by_setup["breakout"]["wins"] == 1
     assert by_setup["range"]["losses"] == 1
     assert None not in by_setup and "None" not in by_setup
+
+
+# ── Lern-Loop-Härtung: per-group NO_FILL / fill_rate visibility ──────────
+
+@pytest.mark.asyncio
+async def test_fill_rate_exposes_no_fill_bias(db_path):
+    """A group with 2 WIN / 1 LOSS / 1 NO_FILL: fill_rate = 3/4 (resolved over
+    resolved+NO_FILL), while win_rate stays computed on the 3 RESOLVED rows only
+    (2/3) — the NO_FILL row must not dilute the win rate but must lower the fill.
+    """
+    db = Database(db_path)
+    await db.init()
+    w1 = await db.insert_journal_entry(**_base_kwargs(setup_type="breakout", context_hash="a"))
+    w2 = await db.insert_journal_entry(**_base_kwargs(setup_type="breakout", context_hash="b"))
+    l1 = await db.insert_journal_entry(
+        **_base_kwargs(setup_type="breakout", action="SELL", direction="short", context_hash="c")
+    )
+    nf = await db.insert_journal_entry(**_base_kwargs(setup_type="breakout", context_hash="d"))
+    await db.update_journal_outcome(w1, status="WIN", realized_r=2.0)
+    await db.update_journal_outcome(w2, status="WIN", realized_r=2.0)
+    await db.update_journal_outcome(l1, status="LOSS", realized_r=-1.0)
+    await db.update_journal_outcome(nf, status="NO_FILL")
+
+    raw = await db.journal_stats()
+    r = build_stats_response(raw, min_sample=20)
+    blk = r["by_setup"]["breakout"]
+    # win rate is on the 3 resolved rows only (NO_FILL excluded)
+    assert blk["wins"] == 2 and blk["losses"] == 1 and blk["sample"] == 3
+    assert blk["win_rate"] == round(2 / 3, 3)
+    # fill rate = resolved / (resolved + NO_FILL) = 3/4
+    assert blk["no_fill"] == 1
+    assert blk["fill_rate"] == 0.75
+    # overall mirrors the same 3 resolved + 1 NO_FILL
+    assert r["overall"]["fill_rate"] == 0.75
+    assert r["totals"]["no_fill"] == 1
+
+    # and it reaches the compact track_record with the `fill` field
+    tr = build_track_record(r, min_sample=1)
+    assert tr["by_setup"]["breakout"]["fill"] == 0.75
+    assert tr["overall"]["fill"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_group_win_rate_none_but_no_fill_visible(db_path):
+    """A setup that ONLY ever NO_FILLs shows fill_rate 0.0 and no win rate —
+    the bias is visible instead of the setup silently vanishing from stats."""
+    db = Database(db_path)
+    await db.init()
+    nf = await db.insert_journal_entry(**_base_kwargs(setup_type="unreachable", context_hash="z"))
+    await db.update_journal_outcome(nf, status="NO_FILL")
+
+    raw = await db.journal_stats()
+    r = build_stats_response(raw, min_sample=20)
+    blk = r["by_setup"]["unreachable"]
+    assert blk["sample"] == 0 and blk["win_rate"] is None
+    assert blk["no_fill"] == 1 and blk["fill_rate"] == 0.0

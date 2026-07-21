@@ -35,6 +35,16 @@ def _round(x: float | None, digits: int = 3) -> float | None:
     return None if x is None else round(x, digits)
 
 
+def _fill_rate(resolved: int, no_fill: int) -> float | None:
+    """Share of this group's shadow-tracked LIMIT setups that actually filled:
+    resolved / (resolved + NO_FILL). None when the group has neither. NO_FILL
+    rows are excluded from win rate (they never became trades), so without this
+    the fill bias — a setup that wins often but rarely gets reached — is hidden.
+    """
+    denom = resolved + no_fill
+    return _round(resolved / denom) if denom else None
+
+
 def _block(
     wins: int,
     losses: int,
@@ -44,6 +54,7 @@ def _block(
     ambiguous: int = 0,
     clean_wins: int = 0,
     clean_losses: int = 0,
+    no_fill: int = 0,
 ) -> dict[str, Any]:
     """One per-group stats block.
 
@@ -51,6 +62,9 @@ def _block(
     not just a point estimate. F2-10: `ambiguous` (intrabar tp1&sl ties, counted
     pessimistically as LOSS by the resolver) plus a `clean_win_rate` that drops
     those rows entirely — so the ambiguity is visible and correctable.
+    Lern-Loop-Härtung: `no_fill` + `fill_rate` expose the NO_FILL bias per group
+    (win rate is computed on the resolved rows ONLY; fill_rate says how often the
+    setup was actually reachable).
     """
     sample = wins + losses
     win_rate = _round(wins / sample) if sample else None
@@ -66,6 +80,8 @@ def _block(
         "avg_realized_rrr": avg_r,
         "ambiguous": ambiguous,
         "clean_win_rate": clean_win_rate,
+        "no_fill": no_fill,
+        "fill_rate": _fill_rate(sample, no_fill),
         "low_sample": sample < min_sample,
     }
 
@@ -81,6 +97,7 @@ def _groups(raw_groups: dict[str, Any], min_sample: int) -> dict[str, Any]:
             ambiguous=int(g.get("ambiguous", 0)),
             clean_wins=int(g.get("clean_wins", 0)),
             clean_losses=int(g.get("clean_losses", 0)),
+            no_fill=int(g.get("no_fill", 0)),
         )
     return out
 
@@ -155,6 +172,11 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             if net_sample
             else None,
             "net_sample": net_sample,
+            # Lern-Loop-Härtung: overall NO_FILL count + fill_rate (resolved /
+            # resolved+NO_FILL) so the win rate above is read WITH its selection
+            # bias, not as if every setup was reachable.
+            "no_fill": int(raw.get("no_fill", 0)),
+            "fill_rate": _fill_rate(sample, int(raw.get("no_fill", 0))),
             "low_sample": sample < min_sample,
         },
         "by_confidence": by_confidence,
@@ -185,9 +207,11 @@ def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, A
     (never recomputed).
 
     Shape (only the fields the model needs to CALIBRATE its own confidence):
-      overall: {n, net_expectancy_r, win_rate_lo}
-      by_confidence / by_setup: {name: {n, win_rate_lo, avg_r}} — only groups
+      overall: {n, net_expectancy_r, win_rate_lo, fill}
+      by_confidence / by_setup: {name: {n, win_rate_lo, avg_r, fill}} — only groups
         whose own n >= min_sample (small groups are dropped, never shown as edge).
+      `fill` = resolved / (resolved + NO_FILL): win_rate_lo is on filled rows only,
+        so a low fill flags an edge that is often unreachable (selection bias).
 
     Returns None when the overall resolved sample is below min_sample — the
     whole block is omitted rather than presenting noise as ground truth.
@@ -212,6 +236,11 @@ def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, A
                     "n": gn,
                     "win_rate_lo": _lower_bound(block),
                     "avg_r": block.get("avg_realized_rrr"),
+                    # `fill` = fraction of this group's LIMIT setups that filled;
+                    # the win_rate_lo above is on the filled rows ONLY, so a low
+                    # `fill` flags an edge that is often unreachable. Compact by
+                    # design (one extra number per group) — token-cheap.
+                    "fill": block.get("fill_rate"),
                 }
         return out
 
@@ -220,6 +249,7 @@ def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, A
             "n": n,
             "net_expectancy_r": overall.get("avg_realized_rrr_net"),
             "win_rate_lo": _lower_bound(overall),
+            "fill": overall.get("fill_rate"),
         },
         "by_confidence": _groups(stats.get("by_confidence")),
         "by_setup": _groups(stats.get("by_setup")),

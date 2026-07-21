@@ -655,10 +655,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Obsidian Live Trader", version="0.3.0", lifespan=lifespan)
 app.middleware("http")(loopback_or_token_middleware)
-# DNS-rebinding guard: only loopback host headers are served
+# DNS-rebinding guard: only loopback host headers are served. "testserver" (the
+# FastAPI/Starlette TestClient default Host) is a TEST artifact and must NEVER be
+# trusted in the prod default. The suite opts it in centrally via the env var
+# TRUSTED_HOSTS_EXTRA (comma-separated), set in tests/conftest.py — so prod stays
+# loopback-only while the TestClient host keeps working without touching per-test URLs.
+_ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1"]
+_ALLOWED_HOSTS += [
+    h.strip() for h in os.environ.get("TRUSTED_HOSTS_EXTRA", "").split(",") if h.strip()
+]
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost", "::1", "testserver"],
+    allowed_hosts=_ALLOWED_HOSTS,
 )
 
 # B-01: private JSON responses must never be cached (browser/proxy disk

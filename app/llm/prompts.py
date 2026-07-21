@@ -186,12 +186,15 @@ NEVER forces STAY_OUT on its own. When the block is absent, skip this check.
 # calibration input to setup_confidence, NEVER a veto/threshold/auto-size.
 _TRACK_RECORD_RULE = """TRACK RECORD (calibration hint): the payload may include a
 `track_record` block — YOUR OWN recent shadow-book results: overall
-{n, net_expectancy_r, win_rate_lo} plus by_confidence and by_setup, each group with
-its sample size n and win_rate_lo = the Wilson LOWER bound of that group's win rate.
-Use it ONLY to CALIBRATE the setup_confidence you would otherwise derive: weight your
-confidence by your own recent hit rate on THIS setup type and confidence tier. A weak
-win_rate_lo (or negative net_expectancy_r) on the tier/setup you are about to emit is a
-reason to be MORE conservative with setup_confidence; a strong one supports it.
+{n, net_expectancy_r, win_rate_lo, fill} plus by_confidence and by_setup, each group with
+its sample size n, win_rate_lo = the Wilson LOWER bound of that group's win rate, and
+fill = the fraction of that group's LIMIT setups that actually filled (the rest were
+NO_FILL and are EXCLUDED from win_rate_lo). A low `fill` means the edge is real but often
+unreachable — the win rate is survivorship-biased toward the setups that got hit, so weight
+it down accordingly. Use it ONLY to CALIBRATE the setup_confidence you would otherwise
+derive: weight your confidence by your own recent hit rate on THIS setup type and confidence
+tier. A weak win_rate_lo (or negative net_expectancy_r) on the tier/setup you are about to
+emit is a reason to be MORE conservative with setup_confidence; a strong one supports it.
 This is a SOFT hint only: it NEVER forces STAY_OUT, never relaxes or overrides a
 decision_policy hard veto, and never replaces the CONFIDENCE DERIVATION table — it nudges
 the label within what the evidence already allows. The numbers are a shadow book (fill at

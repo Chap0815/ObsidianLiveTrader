@@ -646,9 +646,14 @@ class Database:
                            SUM(CASE WHEN status='WIN'  AND ambiguous=0
                                     THEN 1 ELSE 0 END) AS clean_wins,
                            SUM(CASE WHEN status='LOSS' AND ambiguous=0
-                                    THEN 1 ELSE 0 END) AS clean_losses
+                                    THEN 1 ELSE 0 END) AS clean_losses,
+                           -- Lern-Loop-Härtung: per-group NO_FILL count so the
+                           -- endpoint/track-record can expose the fill bias
+                           -- (NO_FILL rows are excluded from win rate; without
+                           -- this their share per setup/tier is invisible).
+                           SUM(CASE WHEN status='NO_FILL' THEN 1 ELSE 0 END) AS no_fill
                     FROM journal_entries
-                    WHERE status IN ('WIN','LOSS') AND {column} IS NOT NULL
+                    WHERE status IN ('WIN','LOSS','NO_FILL') AND {column} IS NOT NULL
                     GROUP BY {column}
                     """
                 )
@@ -664,6 +669,7 @@ class Database:
                         "ambiguous": int(r["ambiguous"] or 0),
                         "clean_wins": int(r["clean_wins"] or 0),
                         "clean_losses": int(r["clean_losses"] or 0),
+                        "no_fill": int(r["no_fill"] or 0),
                     }
                 return out
 

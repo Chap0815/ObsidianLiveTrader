@@ -26,6 +26,12 @@ os.environ.setdefault("DATABASE_PATH", _TEST_DB)
 # Tests must not require X-Local-Token from a developer .env
 os.environ["LOCAL_API_TOKEN"] = ""
 
+# The FastAPI TestClient sends Host: testserver, which the prod TrustedHost
+# allowlist (loopback-only) rejects by design. Opt it in HERE — centrally, once
+# — instead of trusting "testserver" in the prod default or rewriting per-test
+# base URLs. Set before app import so the module-level middleware picks it up.
+os.environ.setdefault("TRUSTED_HOSTS_EXTRA", "testserver")
+
 # Prefer deterministic exchange defaults in unit tests unless overridden
 os.environ.setdefault("EXCHANGE", "mexc")
 os.environ.setdefault("HL_TESTNET", "true")
