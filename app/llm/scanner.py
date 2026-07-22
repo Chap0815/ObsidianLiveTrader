@@ -537,6 +537,65 @@ def _rough_rrr(
     return reward / (a * 1.5)
 
 
+def _directional_confluence(
+    bias: str,
+    *,
+    r: float | None,
+    m: float | None,
+    price: float | None,
+    struct: dict[str, Any],
+    atr: float | None,
+    fe: Any,
+    oi: Any,
+) -> float:
+    """Direction-DEPENDENT confluence nudges (momentum reward, RRR side,
+    funding/OI sign) for a single bias.
+
+    Split out of _prefilter_score so an AMBIGUOUS regime (a bull==bear tie, i.e.
+    mixed/unknown stacked across all TFs) can be scored at its BEST plausible
+    side via max(long, short) instead of a hard long default. A prefilter must be
+    INCLUSIVE: a direction-ambiguous coin — exactly the range-fade candidate
+    stage-2 exists for — should not silently lose its short-side momentum/RRR/
+    squeeze-funding credit and get dropped before the LLM ever sees it.
+
+    Direction-INDEPENDENT nudges (regime magnitude, exhaustion penalty, location/
+    stretch, ATR%) stay in _prefilter_score and are counted exactly once."""
+    s = 0.0
+    # Momentum tail (RSI/MACD) supporting THIS bias.
+    if r is not None and m is not None:
+        if bias == "long" and m > 0 and 45 <= r <= 70:
+            s += 1.5
+        elif bias == "short" and m < 0 and 30 <= r <= 55:
+            s += 1.5
+
+    # Rough RRR to nearest opposing structure in THIS direction (None = no room).
+    rrr = _rough_rrr(bias, price, struct, atr)
+    if rrr is not None:
+        if rrr >= 1.5:
+            s += 1.5
+        elif rrr < 1.0:
+            s -= 1.0
+
+    # Funding / OI confluence (tiebreakers). neutral is side-agnostic (added to
+    # both, so it survives the max unchanged).
+    if fe == "neutral":
+        s += 0.25
+    elif (bias == "long" and fe == "crowded_short") or (
+        bias == "short" and fe == "crowded_long"
+    ):
+        s += 0.75  # crowded AGAINST us = squeeze fuel our way
+    elif (bias == "long" and fe == "crowded_long") or (
+        bias == "short" and fe == "crowded_short"
+    ):
+        s -= 0.5  # crowded WITH us = squeeze risk against us
+    if isinstance(oi, str):
+        if (bias == "long" and oi.startswith("price_up_oi_up")) or (
+            bias == "short" and oi.startswith("price_down_oi_up")
+        ):
+            s += 0.75
+    return s
+
+
 def _prefilter_score(ctx: dict[str, Any]) -> float:
     """Deterministic 0-ish..N quality nudge sum (higher = better candidate)."""
     ltf = ctx.get("ltf") or {}
@@ -547,25 +606,20 @@ def _prefilter_score(ctx: dict[str, Any]) -> float:
     struct = ltf.get("structure") or {}
 
     score = 0.0
-    # 1) Regime alignment across ltf/htf/1D (either direction).
+    # 1) Regime alignment across ltf/htf/1D (either direction) — magnitude only.
     stacks = [read.get("ema_stack"), hread.get("ema_stack"), ctx.get("daily_stack")]
     bull = sum(1 for s in stacks if s == "bullish")
     bear = sum(1 for s in stacks if s == "bearish")
     score += max(bull, bear) * 1.5
-    bias = "long" if bull >= bear else "short"
 
-    # 2) Momentum tail (RSI/MACD) supporting the dominant bias; exhaustion penalty.
+    # 2) Exhaustion penalty (direction-independent). Kept gated on r AND m being
+    #    present to stay byte-identical to the previous single-pass block.
     rsi_t = tails.get("rsi14") or []
     macd_t = tails.get("macd_hist") or []
     r = _num(rsi_t[-1]) if rsi_t else None
     m = _num(macd_t[-1]) if macd_t else None
-    if r is not None and m is not None:
-        if bias == "long" and m > 0 and 45 <= r <= 70:
-            score += 1.5
-        elif bias == "short" and m < 0 and 30 <= r <= 55:
-            score += 1.5
-        if r >= 78 or r <= 22:  # over-extended momentum = poor fresh entry
-            score -= 1.0
+    if r is not None and m is not None and (r >= 78 or r <= 22):
+        score -= 1.0  # over-extended momentum = poor fresh entry
 
     # 3) Location / stretch: near value is fresh, far is a no-chase risk.
     stretch = _num(read.get("price_vs_ema20_pct"))
@@ -580,32 +634,24 @@ def _prefilter_score(ctx: dict[str, Any]) -> float:
     if atr is not None and price and price > 0 and (atr / price * 100.0) >= 0.3:
         score += 0.5
 
-    # 4) Rough RRR to nearest opposing structure.
-    rrr = _rough_rrr(bias, price, struct, atr)
-    if rrr is not None:
-        if rrr >= 1.5:
-            score += 1.5
-        elif rrr < 1.0:
-            score -= 1.0
-
-    # 5) Funding / OI confluence (tiebreakers).
-    fe = ctx.get("funding_extreme")
-    if fe == "neutral":
-        score += 0.25
-    elif (bias == "long" and fe == "crowded_short") or (
-        bias == "short" and fe == "crowded_long"
-    ):
-        score += 0.75  # crowded AGAINST us = squeeze fuel our way
-    elif (bias == "long" and fe == "crowded_long") or (
-        bias == "short" and fe == "crowded_short"
-    ):
-        score -= 0.5  # crowded WITH us = squeeze risk against us
-    oi = ctx.get("oi_read")
-    if isinstance(oi, str):
-        if (bias == "long" and oi.startswith("price_up_oi_up")) or (
-            bias == "short" and oi.startswith("price_down_oi_up")
-        ):
-            score += 0.75
+    # 4+5) Direction-DEPENDENT confluence (momentum reward, RRR side, funding/OI).
+    #   A clearly-tilted stack (bull != bear) commits to that side EXACTLY as
+    #   before — no short credit for a clearly bullish coin, so directional coins
+    #   are byte-unchanged. A genuine tie (bull == bear) is direction-ambiguous
+    #   and is scored at its best plausible side (max long/short); max() naturally
+    #   ignores a None RRR (no room in that direction). All nudges are multiples
+    #   of 0.25 (exact in float), so the split introduces no rounding drift.
+    kw = {
+        "r": r, "m": m, "price": price, "struct": struct, "atr": atr,
+        "fe": ctx.get("funding_extreme"), "oi": ctx.get("oi_read"),
+    }
+    if bull == bear:
+        score += max(
+            _directional_confluence("long", **kw),
+            _directional_confluence("short", **kw),
+        )
+    else:
+        score += _directional_confluence("long" if bull > bear else "short", **kw)
 
     return score
 

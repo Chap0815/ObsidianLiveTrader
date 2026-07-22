@@ -759,3 +759,79 @@ def test_universe_interleaves_signal_dimensions():
         )
     uni = [c["symbol"] for c in select_scan_universe(overview, s)]
     assert uni.index("F0") < uni.index("M2")  # funding leader beats momentum #3
+
+
+# ── 2026-07-22: ambiguous-regime bias no longer hard-defaults to long ──────────
+# _prefilter_score committed a bull==bear tie (mixed/unknown across all TFs) HARD
+# to "long", starving clean short range-fades of their momentum/RRR/funding
+# credit and dropping them before stage-2/the LLM. A tie is now scored at its
+# BEST plausible side (max long/short); a clearly-tilted stack is byte-unchanged.
+
+
+def test_prefilter_tie_scores_best_direction_short_fade():
+    """(a) All-mixed stack (bull==bear tie) at range_high with room DOWN: the
+    coin must earn its SHORT confluence (momentum + RRR + squeeze-funding), not
+    the hard-long default that returned ~4.25 points less."""
+    from app.llm.scanner import _prefilter_score
+
+    # tie regime (0 bull / 0 bear), price pinned at range_high, room below,
+    # bearish momentum, crowded_long funding (= squeeze fuel for a short).
+    ctx = _ctx(
+        "FADE", ema="mixed", htf_ema="mixed", daily="mixed",
+        rsi=45.0, macd=-0.3, stretch=1.0, atr=1.0, price=100.0,
+        support=90.0, resistance=100.0, funding="crowded_long",
+    )
+    # direction-independent base: regime 0 + stretch +1.0 + atr% +0.5 = 1.5
+    # long side  : momentum 0 + RRR None + funding -0.5              = -0.5  (old score = 1.0)
+    # short side : momentum +1.5 + RRR +1.5 + funding +0.75          = +3.75
+    score = _prefilter_score(ctx)
+    assert score == pytest.approx(5.25)          # 1.5 + max(-0.5, 3.75)
+    assert score == pytest.approx(1.0 + 4.25)    # +4.25 vs the old hard-long default
+    # deterministic: identical input -> identical score
+    assert _prefilter_score(ctx) == pytest.approx(score)
+
+
+def test_prefilter_clear_bull_score_byte_unchanged():
+    """(b) A clearly bullish stack (bull>bear, no tie) must score EXACTLY as
+    before — the tie fix grants no short credit to directional coins."""
+    from app.llm.scanner import _prefilter_score
+
+    ctx = _ctx("BULL", ema="bullish", htf_ema="bullish", daily="bullish",
+               rsi=58.0, macd=0.4, stretch=1.0, atr=1.0, price=100.0,
+               resistance=112.0, funding="neutral")
+    # regime 4.5 + momentum +1.5 + stretch +1.0 + atr% +0.5 + RRR +1.5 + neutral +0.25
+    assert _prefilter_score(ctx) == pytest.approx(9.25)
+
+
+def test_prefilter_clear_bear_score_byte_unchanged():
+    """(c) A clearly bearish stack (bear>bull, no tie) is unchanged — the short
+    side was always scored here, so the fix is a no-op for it."""
+    from app.llm.scanner import _prefilter_score
+
+    ctx = _ctx("BEAR", ema="bearish", htf_ema="bearish", daily="bearish",
+               rsi=45.0, macd=-0.3, stretch=1.0, atr=1.0, price=100.0,
+               support=90.0, resistance=110.0, funding="neutral")
+    # regime 4.5 + momentum +1.5 + stretch +1.0 + atr% +0.5 + RRR +1.5 + neutral +0.25
+    assert _prefilter_score(ctx) == pytest.approx(9.25)
+
+
+def test_prefilter_tie_max_ignores_none_rrr_side():
+    """(d) The max over directions must ignore a None RRR (no room in a given
+    direction) without crashing, and stay a stable tie-break in prefilter_contexts."""
+    from app.config import Settings
+    from app.llm.scanner import _prefilter_score, prefilter_contexts
+
+    # tie coin boxed at range_high AND range_low collapsed to price -> RRR None
+    # BOTH ways; score must still resolve (no room credit either side).
+    boxed = _ctx("BOX", ema="mixed", htf_ema="mixed", daily="mixed",
+                 rsi=50.0, macd=0.0, stretch=1.0, atr=1.0, price=100.0,
+                 support=100.0, resistance=100.0, funding="neutral")
+    s0 = _prefilter_score(boxed)
+    # base 1.5 (stretch+atr) + neutral 0.25 + no momentum + no RRR either side
+    assert s0 == pytest.approx(1.75)
+
+    s = Settings(scanner_mode="prefilter", scanner_prefilter_top_k=2)
+    a = _ctx("A", ema="mixed", htf_ema="mixed", daily="mixed", funding="neutral")
+    b = _ctx("B", ema="mixed", htf_ema="mixed", daily="mixed", funding="neutral")
+    kept, _ = prefilter_contexts([a, b], s)
+    assert [c["symbol"] for c in kept] == ["A", "B"]  # equal score -> original order
