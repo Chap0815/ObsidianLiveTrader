@@ -33,6 +33,20 @@ _TIER_FLOOR: dict[str, float] = {"high": 0.50, "medium": 0.40, "low": 0.0}
 # Advisory only — it scales a recommendation, never a gate/limit.
 _DOWNGRADE_SIZE_FACTOR = 0.5
 
+# Block 2/TP2 P2b — REGIME axis floor. The realized Wilson LOWER bound the
+# CURRENT live regime (btc-trend x vol bucket, e.g. "btcDown/volHigh") must
+# clear to be trusted. Below it (at n >= min_sample) the regime is treated as
+# "signal-weak" and the DISPLAY is downgraded one step — independent of the
+# confidence-group verdict. Deliberately < _TIER_FLOOR["high"] (0.45 vs 0.50):
+# the regime is a CONTEXT modifier, not a primary gate. Documented, tunable.
+_REGIME_FLOOR = 0.45
+
+# Hard floor for the advisory size multiplier so a combined downgrade can never
+# collapse a suggestion toward zero. Defensive: with the current fixed per-axis
+# factor (0.5) the min() never actually drops below this, but it bounds any
+# future per-axis factor tuning. size stays in [_SIZE_FLOOR, 1.0].
+_SIZE_FLOOR = 0.25
+
 
 def _raw(emitted: str, note: str | None = None) -> dict[str, Any]:
     return {"calibrated_confidence": emitted, "size_factor": 1.0, "note": note}
@@ -80,42 +94,66 @@ def recalibrate(
     if emitted not in _TIER_FLOOR:
         return _raw(emitted_confidence)
 
-    # We recalibrate the emitted tier against the realized win-rate of PAST calls
-    # the KI labelled at THAT SAME tier (by_confidence group). setup_type/regime
-    # are accepted per the design signature and folded into the note for
-    # transparency; the threshold logic keys off the confidence group only
-    # (single-dimension, robust — no fragile intersected groups required).
-    by_conf = (stats or {}).get("by_confidence") if isinstance(stats, dict) else None
-    block = by_conf.get(emitted) if isinstance(by_conf, dict) else None
-    win_rate_lo, n = _lb_and_n(block)
+    min_n = int(min_sample)
+    stats_d = stats if isinstance(stats, dict) else {}
 
-    # Not enough data (or group absent) -> NO change. Show raw + honest note.
-    if n < int(min_sample):
-        note = f"zu wenig Daten (n={n})" if n > 0 else None
+    # --- CONFIDENCE axis (unchanged semantics) -----------------------------
+    # Realized WR-LB of PAST calls the KI labelled at THIS SAME tier
+    # (by_confidence group — single-dimension, robust, no fragile intersection).
+    by_conf = stats_d.get("by_confidence")
+    conf_block = by_conf.get(emitted) if isinstance(by_conf, dict) else None
+    conf_lo, conf_n = _lb_and_n(conf_block)
+    conf_fires = (
+        conf_n >= min_n and conf_lo is not None and conf_lo < _TIER_FLOOR[emitted]
+    )
+
+    # --- REGIME axis (new) -------------------------------------------------
+    # Realized WR-LB of the CURRENT live regime tag (by_regime group). Inert for
+    # a missing/"unknown" tag, an absent/broken group, or n < min_sample — i.e.
+    # EXACTLY the old behaviour whenever the regime signal is not trustworthy.
+    regime_key = str(regime or "").strip()
+    reg_lo: float | None = None
+    reg_n = 0
+    if regime_key and regime_key.lower() != "unknown":
+        by_regime = stats_d.get("by_regime")
+        reg_block = by_regime.get(regime_key) if isinstance(by_regime, dict) else None
+        reg_lo, reg_n = _lb_and_n(reg_block)
+    regime_fires = reg_n >= min_n and reg_lo is not None and reg_lo < _REGIME_FLOOR
+
+    # --- Combine: STRONGER (not summed) downgrade --------------------------
+    # At most ONE tier step per call regardless of how many axes fire; size is
+    # the MIN of the per-axis factors, hard-floored so it never collapses to 0.
+    if not (conf_fires or regime_fires):
+        # Nothing fired -> raw. Preserve the honest "too little data" note the
+        # confidence group showed when it existed but was under-sampled.
+        note = f"zu wenig Daten (n={conf_n})" if 0 < conf_n < min_n else None
         return _raw(emitted_confidence, note)
 
-    floor = _TIER_FLOOR[emitted]
-    # Strong enough (or no LB available) -> keep the KI tier (never upgrade).
-    if win_rate_lo is None or win_rate_lo >= floor:
-        return _raw(emitted_confidence)
-
-    # Clearly weak for this tier -> DOWNGRADE one step (never below "low"),
-    # shrink the sizing SUGGESTION. action is untouched — this is display only.
     idx = _TIERS.index(emitted)
     calibrated = _TIERS[max(0, idx - 1)]
     if calibrated == emitted:  # emitted == "low" -> nothing to downgrade
         return _raw(emitted_confidence)
 
-    wr_pct = round(win_rate_lo * 100)
-    # The win-rate/n come from the tier-wide by_confidence group (all setups &
-    # regimes), NOT the setup_type/regime intersection — so DON'T scope the note
-    # to those (would misattribute a tier-wide number to a narrow context).
-    note = (
-        f"KI: {emitted} · kalibriert: {calibrated} — "
-        f"deine {emitted}-Setups insgesamt: {wr_pct} % WR (Wilson-LB, n={n})"
-    )
+    conf_factor = _DOWNGRADE_SIZE_FACTOR if conf_fires else 1.0
+    reg_factor = _DOWNGRADE_SIZE_FACTOR if regime_fires else 1.0
+    size_factor = max(_SIZE_FLOOR, min(conf_factor, reg_factor))
+
+    # Note names the ACTUALLY triggering axis/axes honestly. The confidence
+    # win-rate is the tier-wide by_confidence number (all setups & regimes); the
+    # regime win-rate is scoped to the current regime tag — never conflated.
+    parts: list[str] = []
+    if conf_fires and conf_lo is not None:
+        parts.append(
+            f"deine {emitted}-Setups insgesamt: "
+            f"{round(conf_lo * 100)} % WR (Wilson-LB, n={conf_n})"
+        )
+    if regime_fires and reg_lo is not None:
+        parts.append(
+            f"Regime {regime_key}: {round(reg_lo * 100)} % WR (Wilson-LB, n={reg_n})"
+        )
+    note = f"KI: {emitted} · kalibriert: {calibrated} — " + " · ".join(parts)
     return {
         "calibrated_confidence": calibrated,
-        "size_factor": _DOWNGRADE_SIZE_FACTOR,
+        "size_factor": size_factor,
         "note": note,
     }

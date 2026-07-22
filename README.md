@@ -260,7 +260,11 @@ Analyze-Pfad kennzeichnet jeden Trade mit einem **Regime-Tag** (BTC-Trend ×
 Volatilität) im Journal für spätere Segmentierung (`by_regime`). Aus der eigenen
 realen Trefferquote (Wilson-**Untergrenze**, ab `TM_RECAL_MIN_SAMPLE` Samples)
 **rekalibriert** die App die *angezeigte* Confidence und die *Sizing-Empfehlung*
-(Downgrade + kleinere Empfehlung bei schwacher Quote) — die rohe KI-`setup_confidence`
+(Downgrade + kleinere Empfehlung bei schwacher Quote) — sowohl über die
+Confidence-Tier-Gruppe als auch **regime-gegated** über die reale WR-Untergrenze
+des *aktuellen* Regime-Tags (`by_regime`, Schwelle `_REGIME_FLOOR` 0.45): der
+stärkere der beiden Downgrades greift (max. eine Stufe pro Analyse, Size = Minimum
+beider Achsen). Die rohe KI-`setup_confidence`
 bleibt sichtbar, und es wird **nie** ein Trade geblockt oder `action` geändert
 (zusätzliche Response-Felder `confidence_calibrated`/`calibration_note`/`size_factor`;
 der echte Order-/Gate-Pfad ist unberührt). Jede Analyse nennt zudem ein
