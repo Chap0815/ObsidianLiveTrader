@@ -286,8 +286,11 @@ def regime_tag(btc_regime: dict[str, Any] | None, atr_pct: float | None) -> str:
     Vol bucket: atr_pct < 1.0 -> low; 1.0 <= atr_pct < 3.0 -> normal;
     atr_pct >= 3.0 -> high. A non-numeric/negative/NaN atr_pct -> unknown.
 
-    Advisory only (Block 2/TP2 §3.B): purely a persisted label for later
-    journal segmentation; it never feeds a gate, sizing, or the LLM decision.
+    Advisory only (Block 2/TP2 §3.B): a persisted label for journal
+    segmentation. It never feeds a hard gate or alters the LLM decision. Since
+    P2b it DOES feed the advisory confidence recalibration (recalibrate()),
+    which can downgrade the DISPLAYED confidence and shrink the sizing
+    SUGGESTION via by_regime hit-rate — never a block/veto/hard limit.
     """
     if not isinstance(btc_regime, dict):
         return "unknown"
