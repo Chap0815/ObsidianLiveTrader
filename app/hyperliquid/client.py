@@ -1613,6 +1613,15 @@ class HyperliquidClient:
             except HyperliquidError:
                 status = None
             if isinstance(status, dict) and str(status.get("status")).lower() == "order":
+                if _hl_order_state_is_dead(status.get("order")):
+                    # X-05: the deterministic cloid lookup resolved to a
+                    # terminal-dead order (canceled/rejected/…). Mirror MEXC's
+                    # _mexc_state_is_dead: return {} so the caller runs its
+                    # fail-closed hard error and the trader can consciously
+                    # re-place, instead of reporting a phantom "recovered" fill
+                    # for an order that is actually dead. A dead cloid result is
+                    # definitive — do not fall through to the open-orders scan.
+                    return {}
                 # Echo externalOid so service.py's substring recovery guard passes.
                 return {
                     "externalOid": oid,
@@ -1652,6 +1661,54 @@ class HyperliquidClient:
                 if matched:
                     break
         return hits if hits else {}
+
+
+# Hyperliquid orderStatus inner-status vocabulary (X-05). The deterministic
+# query_order_by_cloid resolves an order to a single lifecycle status. LIVE /
+# recoverable states — open, filled, triggered, resting — are valid recovery
+# hits. TERMINAL-DEAD states are every canceled/rejected variant HL emits
+# (canceled, marginCanceled, reduceOnlyCanceled, scheduledCancel, rejected,
+# tickRejected, perpMarginRejected, …). Rather than enumerate a list HL keeps
+# extending, key off the unambiguous "cancel"/"reject" tokens: NO live state
+# contains either, and every dead one contains exactly one. This is the HL
+# analogue of _mexc_state_is_dead. Fail-safe: a missing/unexpected status is NOT
+# dead — never discard a genuinely recoverable order (that reopens the silent
+# phantom-loss the whole guard exists to prevent).
+_HL_DEAD_STATE_TOKENS = ("cancel", "reject")
+
+
+def _hl_order_state_is_dead(order_wrapper: Any) -> bool:
+    """True only for a ZERO-FILL canceled/rejected HL order.
+
+    `order_wrapper` is ``status["order"]`` from query_order_by_cloid, shaped
+    ``{"order": {<order fields>}, "status": <lifecycle>}``. Unknown/missing or
+    non-string status → False (fail-safe: not treated as dead).
+
+    A cancel/reject STATUS alone is not terminal-dead: an IOC/market order can
+    partially fill and then cancel the remainder (canceled/marginCanceled with a
+    REAL open position). Only a genuine zero-fill (``filled == origSz - sz == 0``)
+    is dead → {} → fail-closed hard error. A partial fill (``filled > 0``) must
+    run the normal recovery/verify+protect path, else the filled part is left
+    unprotected and can bait a double entry. Fail-safe: origSz/sz missing or
+    unparseable → NOT dead (never discard a possibly-filled order).
+    """
+    if not isinstance(order_wrapper, dict):
+        return False
+    st = order_wrapper.get("status")
+    if not isinstance(st, str):
+        return False
+    st_l = st.strip().lower()
+    if not any(tok in st_l for tok in _HL_DEAD_STATE_TOKENS):
+        return False
+    order = order_wrapper.get("order")
+    if not isinstance(order, dict):
+        return False  # fail-safe: cannot prove zero-fill → not dead
+    orig = _opt_f(order.get("origSz"))
+    rem = _opt_f(order.get("sz"))
+    if orig is None or rem is None:
+        return False  # fail-safe: sizes missing/unparseable → not dead
+    # Zero-fill (within float noise) is the only terminal-dead case.
+    return (orig - rem) <= 1e-12
 
 
 def _status_error(result: Any) -> str | None:

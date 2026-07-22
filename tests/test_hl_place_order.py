@@ -139,6 +139,109 @@ async def test_order_by_external_oid_recovers_filled_order_via_cloid():
     info.query_order_by_cloid.assert_called_once()
 
 
+def _cloid_status(inner_status: str, *, orig_sz=None, sz=None) -> dict:
+    """An HL orderStatus-by-cloid response reporting `inner_status`.
+
+    HL order object carries origSz/sz as float-strings; filled = origSz - sz.
+    """
+    order: dict = {"coin": "BTC"}
+    if orig_sz is not None:
+        order["origSz"] = orig_sz
+    if sz is not None:
+        order["sz"] = sz
+    return {
+        "status": "order",
+        "order": {"order": order, "status": inner_status},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dead_status",
+    ["canceled", "rejected", "marginCanceled", "reduceOnlyCanceled", "scheduledCancel"],
+)
+async def test_order_by_external_oid_rejects_zero_fill_dead_cloid_status(dead_status):
+    """X-05: a ZERO-FILL cancel/reject (origSz == sz → filled 0) must NOT be
+    reported as recovered. Mirrors MEXC _mexc_state_is_dead → return {} so the
+    caller runs its fail-closed hard error (no phantom position)."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value=_cloid_status(dead_status, orig_sz="0.01", sz="0.01")
+    )
+    c._info = info
+    # No open/stop fallback either → nothing to recover.
+    c._exchange.open_orders = MagicMock(return_value=[])
+    c._exchange.frontend_open_orders = MagicMock(return_value=[])
+    res = await c.order_by_external_oid("BTC", "mlt-dead")
+    assert res == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_status", ["canceled", "marginCanceled", "reduceOnlyCanceled"]
+)
+async def test_order_by_external_oid_partial_fill_then_cancel_is_recovered(cancel_status):
+    """Money-critical: an IOC/market order can PARTIALLY fill then cancel the
+    remainder (origSz > sz → filled > 0) = a REAL open position. It must run the
+    recovery/verify path, NOT be discarded as dead (else the filled part is
+    unprotected + baits a double entry)."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value=_cloid_status(cancel_status, orig_sz="0.01", sz="0.004")
+    )
+    c._info = info
+    res = await c.order_by_external_oid("BTC", "mlt-partial")
+    assert res and res.get("match") == "cloid"
+    assert "mlt-partial" in str(res)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["filled", "open", "triggered", "resting"])
+async def test_order_by_external_oid_accepts_live_cloid_status(live_status):
+    """Live/recoverable inner states remain valid cloid hits (recovered)."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value=_cloid_status(live_status))
+    c._info = info
+    res = await c.order_by_external_oid("BTC", "mlt-live")
+    assert res and res.get("match") == "cloid"
+    assert "mlt-live" in str(res)
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_missing_inner_status_not_dead():
+    """Fail-safe: a missing/unexpected inner status is NOT treated as dead —
+    a legitimate recoverable order must never be falsely discarded."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value={"status": "order", "order": {"order": {"coin": "BTC"}}}
+    )
+    c._info = info
+    res = await c.order_by_external_oid("BTC", "mlt-nostatus")
+    assert res and res.get("match") == "cloid"
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_cancel_missing_sizes_not_dead():
+    """Fail-safe: a cancel/reject status WITHOUT parseable origSz/sz cannot be
+    proven zero-fill → NOT treated as dead (never discard a possibly-filled
+    order)."""
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value=_cloid_status("canceled"))
+    c._info = info
+    res = await c.order_by_external_oid("BTC", "mlt-nosize")
+    assert res and res.get("match") == "cloid"
+
+
 @pytest.mark.asyncio
 async def test_place_stop_order_maps_reduce_only_trigger():
     c = _client()
