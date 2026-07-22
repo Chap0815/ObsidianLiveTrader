@@ -345,13 +345,38 @@ _DIRECTIONAL = {"BUY", "STRONG_BUY", "SELL", "STRONG_SHORT"}
 
 
 def _geometry_inverted(proposal: TradeProposal) -> bool:
-    """True when a directional proposal has entry/SL/TP1 all set but their
-    geometry is inverted for the side (SL/TP on the wrong side of entry), so
-    compute_simple_rrr can't produce a real RRR. Such a call is untradeable
-    and must be downgraded to STAY_OUT, not shipped with rrr=null (audit A4)."""
+    """True when a directional proposal's geometry is inverted for its side, so
+    it is untradeable and must be downgraded to STAY_OUT rather than shipped
+    with rrr=null (audit A4).
+
+    Two independent inversions, either is sufficient:
+
+    1. SL on the WRONG side of entry — checkable as soon as entry+SL are set,
+       even when tp1 is missing: a BUY/STRONG_BUY needs its stop BELOW entry, a
+       SELL/STRONG_SHORT needs it ABOVE. A wrong-side stop is untradeable
+       regardless of tp1, the apply-path risk gate blocks it, and surfacing it
+       as a full-confidence directional call misleads the UI (previously it
+       slipped through the "incomplete geometry" branch when tp1 was None).
+
+    2. TP1 inverted / no real RRR — needs all three legs set; delegated to
+       compute_simple_rrr (the original A4 check).
+
+    Fail-safe: entry == stop_loss, or any required leg missing, is NOT treated
+    as an inversion, so a legitimate (merely incomplete) proposal is never
+    wrongly downgraded.
+    """
     if proposal.action not in _DIRECTIONAL:
         return False
-    if proposal.entry_price is None or proposal.stop_loss is None or proposal.tp1 is None:
+    entry, stop = proposal.entry_price, proposal.stop_loss
+    # (1) SL-side inversion — independent of tp1.
+    if entry is not None and stop is not None:
+        e, s = float(entry), float(stop)
+        if proposal.action in ("BUY", "STRONG_BUY") and s > e:
+            return True
+        if proposal.action in ("SELL", "STRONG_SHORT") and s < e:
+            return True
+    # (2) TP-inverted / non-computable RRR — requires the full triangle.
+    if entry is None or stop is None or proposal.tp1 is None:
         return False
     return (
         compute_simple_rrr(

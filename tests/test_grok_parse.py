@@ -195,6 +195,172 @@ def test_annotate_stay_out_no_rrr():
     assert out.rrr is None
 
 
+# ── Inverted SL side must downgrade even when tp1 is missing (audit A4 gap) ──
+# A directional call with the stop on the WRONG side of entry is untradeable
+# (the apply-path risk gate blocks it), so it must be downgraded to STAY_OUT
+# and NOT surfaced as a full-confidence BUY/SELL — even if tp1 is None and
+# compute_simple_rrr therefore can't run.
+
+
+def test_annotate_inverted_sl_buy_no_tp1_downgrades():
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=105.0,  # BUY stop ABOVE entry -> inverted
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STAY_OUT"
+    assert out.setup_confidence == "low"
+    assert out.entry_price is None and out.stop_loss is None
+    assert out.rrr is None
+    assert "inverted" in out.rationale.lower()
+
+
+def test_annotate_inverted_sl_sell_no_tp1_downgrades():
+    p = TradeProposal(
+        htf_trend="bearish",
+        ltf_trend="bearish",
+        action="SELL",
+        entry_price=100.0,
+        stop_loss=95.0,  # SELL stop BELOW entry -> inverted
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STAY_OUT"
+    assert out.setup_confidence == "low"
+    assert "inverted" in out.rationale.lower()
+
+
+def test_annotate_legit_sl_no_tp1_unchanged():
+    # BUY with a correctly-placed stop below entry and tp1 missing: an
+    # incomplete-geometry proposal, NOT inverted -> keep it directional.
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "BUY"
+    assert out.setup_confidence == "high"
+    assert out.entry_price == 100.0 and out.stop_loss == 95.0
+
+
+def test_annotate_inverted_sl_with_tp1_still_downgrades():
+    # Existing A4 path (all three legs set, inverted) must be unchanged.
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=105.0,
+        tp1=110.0,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STAY_OUT"
+    assert out.setup_confidence == "low"
+    assert out.rrr is None
+
+
+def test_annotate_inverted_sl_strong_buy_no_tp1_downgrades():
+    # Guard the STRONG_* enum coverage of _DIRECTIONAL: a STRONG_BUY with the
+    # stop above entry must be caught exactly like a plain BUY.
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="STRONG_BUY",
+        entry_price=100.0,
+        stop_loss=105.0,  # STRONG_BUY stop ABOVE entry -> inverted
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STAY_OUT"
+    assert out.setup_confidence == "low"
+    assert "inverted" in out.rationale.lower()
+
+
+def test_annotate_inverted_sl_strong_short_no_tp1_downgrades():
+    p = TradeProposal(
+        htf_trend="bearish",
+        ltf_trend="bearish",
+        action="STRONG_SHORT",
+        entry_price=100.0,
+        stop_loss=95.0,  # STRONG_SHORT stop BELOW entry -> inverted
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STAY_OUT"
+    assert out.setup_confidence == "low"
+    assert "inverted" in out.rationale.lower()
+
+
+def test_annotate_legit_sl_strong_short_no_tp1_unchanged():
+    # STRONG_SHORT with a correctly-placed stop ABOVE entry must NOT downgrade.
+    p = TradeProposal(
+        htf_trend="bearish",
+        ltf_trend="bearish",
+        action="STRONG_SHORT",
+        entry_price=100.0,
+        stop_loss=105.0,
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "STRONG_SHORT"
+    assert out.setup_confidence == "high"
+
+
+def test_annotate_entry_equals_sl_no_tp1_not_downgraded():
+    # Degenerate (entry == stop) with tp1 missing is NOT an unambiguous
+    # inversion -> fail-safe: do not downgrade a possibly-legit proposal.
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=100.0,
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "BUY"
+
+
+def test_annotate_missing_sl_no_tp1_not_downgraded():
+    # No stop at all -> cannot determine inversion -> leave directional (fail-safe).
+    p = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=None,
+        tp1=None,
+        setup_confidence="high",
+        rationale="thesis",
+    )
+    out = annotate_proposal(p)
+    assert out.action == "BUY"
+
+
 def test_extract_json_trailing_prose():
     from app.llm.client import extract_json_object, parse_proposal
 
