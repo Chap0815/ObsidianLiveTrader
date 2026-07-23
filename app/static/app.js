@@ -3708,10 +3708,14 @@
   /** Many partial fills can land on the same candle (e.g. a large order that
    *  ladders in over 30 small executions). One marker per fill turns into an
    *  unreadable column of arrows + text stacked on one bar, and the actual
-   *  entry gets buried. Aggregate fills by (bar, side) into a single marker:
-   *  size = sum, price = size-weighted average. Open fills (per Hyperliquid's
-   *  `dir`, e.g. "Open Long") get the full-strength color so the entry stays
-   *  visually obvious; close-only groups get a dimmed variant. Text labels
+   *  entry gets buried. Aggregate fills by (bar, side, open/close-intent)
+   *  into a single marker: size = sum, price = size-weighted average. Intent
+   *  is split (not just bar/side) so a stop-and-reverse's close fill and
+   *  open fill on the same bar never merge into one marker — that would
+   *  bury the close's realized PnL under a full entry marker. Open fills
+   *  (per Hyperliquid's `dir`, e.g. "Open Long") get the full-strength color
+   *  so the entry stays visually obvious; close-only groups get a dimmed
+   *  variant. Text labels
    *  are capped to the biggest groups by notional so a busy symbol doesn't
    *  regress back into text spam, and the marker count itself is capped. */
   const TRADE_MARKER_TEXT_CAP = 6;
@@ -3761,18 +3765,42 @@
         ? Math.max(lastT, state.liveBar.time)
         : lastT;
 
+    // C3-09: classify + bucket fills before grouping. A stop-and-reverse can
+    // land a "Close X" fill and an "Open Y" fill in the SAME bar/side (two
+    // separate orders); grouping those together under the old time|side key
+    // hid the close behind a full-strength entry marker and swallowed its
+    // realized PnL. Splitting the key by open/close fixes that, but a liq
+    // bucket must keep the original merge-everything behavior — a
+    // liquidation may legitimately also contain the flip's open fill, and
+    // the LIQ marker must still dominate that bucket (see anyLiq below).
+    const relevantFills = [];
     (state.fills || []).forEach(function (f) {
       if (!symMatch(f.symbol, state.symbol) || !(Number(f.time) > 0)) return;
       const side = f.side === "buy" ? "buy" : "sell";
       const time = barOpenTimeSec(f.time, tf);
       if (firstT != null && (time < firstT || time > upperT)) return; // outside window
+      const cls = classifyFillDir(f.dir); // C3-02: "open" | "close" | "liq"
+      relevantFills.push({ f: f, side: side, time: time, cls: cls });
+    });
+    const liqBucket = new Set();
+    relevantFills.forEach(function (it) {
+      if (it.cls === "liq") liqBucket.add(it.time + "|" + it.side);
+    });
+
+    relevantFills.forEach(function (it) {
+      const f = it.f;
+      const side = it.side;
+      const time = it.time;
+      const cls = it.cls;
       const sz = Number(f.sz) || 0;
       const px = Number(f.px) || 0;
-      const cls = classifyFillDir(f.dir); // C3-02: "open" | "close" | "liq"
-      const key = time + "|" + side;
+      const key = liqBucket.has(time + "|" + side)
+        ? time + "|" + side
+        : time + "|" + side + "|" + cls; // split pure open vs pure close
       let g = groups.get(key);
       if (!g) {
         g = {
+          key: key,
           time: time,
           side: side,
           sz: 0,
@@ -3817,7 +3845,7 @@
           })
           .slice(0, TRADE_MARKER_TEXT_CAP)
           .map(function (g) {
-            return g.time + "|" + g.side;
+            return g.key;
           })
       );
     }
@@ -3831,7 +3859,7 @@
     const markers = groupList.map(function (g) {
       const buy = g.side === "buy";
       const avgPx = g.sz > 0 ? g.notional / g.sz : 0;
-      const id = g.time + "|" + g.side; // matches the groups Map key above
+      const id = g.key; // matches the groups Map key above
       // A bucket with ANY open fill is treated as an entry (full color) even
       // if it also contains a close fill — the entry is what must stand out.
       const closeOnly = g.anyClose && !g.anyOpen;
@@ -3873,7 +3901,7 @@
         color: color,
         shape: buy ? "arrowUp" : "arrowDown",
       };
-      const wantText = !textKeys || textKeys.has(g.time + "|" + g.side);
+      const wantText = !textKeys || textKeys.has(g.key);
       if (wantText) {
         let txt = (buy ? "▲ " : "▼ ") + fmt(g.sz, 4) + " @ " + fmt(avgPx, 4);
         // C3-08: the most telling number on a close — what it actually made
