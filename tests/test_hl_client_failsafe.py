@@ -74,6 +74,74 @@ async def test_open_stop_orders_returns_triggers_on_recognized_list():
     assert out[0]["triggerPrice"] == "99000"
 
 
+# ── SL-coverage: HL trigger rows must expose the closing size as `vol` (coins) ──
+# The frontend Deckungsgrad check sums s.vol over SL orders vs hold_vol. HL rows
+# previously carried no top-level size → the check always fell to the conservative
+# "protected" fallback and NEVER warned on HL. Expose the resting reduce-only
+# trigger's `sz` (remaining coins to close, same unit as abs(szi)/hold_vol).
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_exposes_trigger_size_as_vol():
+    """A trigger whose raw row carries sz=0.02 must emit vol == 0.02 (coins) so
+    the frontend coverage check (s.vol) can compare it against hold_vol."""
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(
+        return_value=[
+            {"coin": "BTC", "oid": 7, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "99000", "reduceOnly": True, "sz": "0.02", "origSz": "0.05"},
+        ]
+    )
+    c = _client(info)
+    out = await c.open_stop_orders("BTC")
+    assert len(out) == 1
+    assert out[0]["vol"] == 0.02
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_omits_vol_when_size_unreadable():
+    """Missing / empty / garbage sz must yield vol=None (never 0) so the frontend
+    falls through to the conservative 'protected' fallback instead of reading a
+    false '0 covered' → false partial-coverage alarm."""
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(
+        return_value=[
+            {"coin": "BTC", "oid": 8, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "99000", "reduceOnly": True},  # no sz
+            {"coin": "BTC", "oid": 9, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "98000", "reduceOnly": True, "sz": "abc"},  # garbage sz
+            {"coin": "BTC", "oid": 10, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "97000", "reduceOnly": True, "sz": ""},  # empty sz
+        ]
+    )
+    c = _client(info)
+    out = await c.open_stop_orders("BTC")
+    assert len(out) == 3
+    for row in out:
+        assert row["vol"] is None
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_zero_size_yields_none_not_zero():
+    """A resting trigger with sz<=0 (e.g. a whole-position TP/SL reported with
+    coin size 0) must emit vol=None, NOT 0.0 — a false 0 would read as '0 covered'
+    and raise a false partial-coverage alarm on a fully-protected position."""
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(
+        return_value=[
+            {"coin": "BTC", "oid": 11, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "99000", "reduceOnly": True, "sz": "0"},
+            {"coin": "BTC", "oid": 12, "isTrigger": True, "orderType": "Stop Market",
+             "triggerPx": "98000", "reduceOnly": True, "sz": "0.0"},
+        ]
+    )
+    c = _client(info)
+    out = await c.open_stop_orders("BTC")
+    assert len(out) == 2
+    for row in out:
+        assert row["vol"] is None
+
+
 # ── M-2: a degraded user_state body must NOT be trusted as a flat account ──────
 
 _COMPLETE_STATE = {

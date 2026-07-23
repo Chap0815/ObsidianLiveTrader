@@ -1485,6 +1485,26 @@ class HyperliquidClient:
                 is_trigger = bool(o.get("isTrigger")) or "stop" in otype.lower() or "take" in otype.lower()
                 if not is_trigger:
                     continue
+                # SL-coverage: expose the trigger's closing size as `vol` (the
+                # field the frontend Deckungsgrad check reads first) so a HL stop
+                # that only covers PART of an enlarged position can be detected.
+                # For a RESTING reduce-only trigger, `sz` is the (remaining) size
+                # in COINS that the stop will close — the same unit as hold_vol
+                # (abs(szi)). `origSz` is the ORIGINAL size (filled = origSz - sz,
+                # cf. _hl_order_state_is_dead), so `sz` — not origSz/notional — is
+                # the coverage to compare against hold_vol. Missing/empty/garbage
+                # → None (never 0): a false 0 would read as "0 covered" → false
+                # partial-coverage alarm; None lets the frontend fall through to
+                # its conservative "protected" fallback.
+                vol = _opt_f(o.get("sz"))
+                # Make the "never 0" contract true AT THE SOURCE (defense-in-depth):
+                # a resting trigger with sz<=0 (e.g. a whole-position TP/SL whose
+                # coin size HL reports as 0) must NOT surface as vol=0 — that would
+                # read as "0 covered" for any consumer that sums vol without a >0
+                # gate. Emit None so the coverage check falls through to
+                # "protected" instead of raising a false partial-coverage alarm.
+                if vol is not None and vol <= 0:
+                    vol = None
                 out.append(
                     {
                         "orderId": o.get("oid"),
@@ -1492,6 +1512,7 @@ class HyperliquidClient:
                         "triggerPrice": o.get("triggerPx"),
                         "orderType": otype,
                         "reduceOnly": o.get("reduceOnly"),
+                        "vol": vol,
                         "raw": o,
                     }
                 )
