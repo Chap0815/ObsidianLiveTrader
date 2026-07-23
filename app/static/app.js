@@ -1580,6 +1580,16 @@
       // zieht Daten mit"). Each draw path re-filters by symMatch, but setMarkers
       // persists the old arrows until called again — so wipe them now.
       state.fills = [];
+      // F-lastPx: lastPx/liveBar are symbol-bound (only ever written for the
+      // PREVIOUS coin) but were never reset here — a parallel loadAccount()
+      // resolving before this call's /api/market saw the OLD coin's price and
+      // fed it into updateMarkOffsets()/_positionMarkPrice() for the NEW
+      // symbol, corrupting mark/price-%/liq-distance until the next tick.
+      // Null them so both readers take their existing honest-degrade path
+      // (fall back to overviewData / "—") until THIS symbol's own price
+      // arrives via setLivePrice()/the live-bar seed below.
+      state.lastPx = null;
+      state.liveBar = null;
       try { renderTrades(); } catch (_) {}
       try {
         if (state.candleSeries && typeof state.candleSeries.setMarkers === "function") {
@@ -2364,7 +2374,11 @@
     const im = Number(active.margin != null ? active.margin : active.im);
     const px = Number(state.lastPx);
     let pnl = active.unrealized_pnl != null ? Number(active.unrealized_pnl) : null;
-    if (Number.isFinite(px) && Number.isFinite(entry) && Number.isFinite(vol)) {
+    // F-lastPx: px > 0 too — a nulled state.lastPx (post coin-switch teardown)
+    // casts to 0 via Number(), which IS finite, so without this guard a 0
+    // price would fabricate a bogus 100%-loss pnl instead of keeping the
+    // exchange-reported unrealized_pnl above.
+    if (Number.isFinite(px) && px > 0 && Number.isFinite(entry) && Number.isFinite(vol)) {
       pnl = computePnl(px, entry, vol, cs, short);
     }
     const roe = computeRoe(pnl, im);
