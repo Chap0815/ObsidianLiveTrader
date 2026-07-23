@@ -194,11 +194,21 @@ def validate_order(
             # This is bounded by the exchange-side slippage cap on the ACTUAL
             # order (see exchange_factory / hyperliquid client), which limits how
             # far the fill can move from last.
-        elif ticket.entry is not None and float(ticket.entry) > 0:
-            entry_for_risk = float(ticket.entry)
-            warnings.append("market order risk uses ticket.entry (no last_price)")
         else:
-            errors.append("market order needs last_price (or entry ref) for risk calc")
+            # Fail-closed: a MARKET order with no usable server-side reference
+            # price (last_price None/<=0, e.g. a degraded ticker — service.py
+            # warns this state at preview @~499 and confirm @~993) must NOT fall
+            # back to the caller-controlled ticket.entry. Same distrust the limit
+            # branch below documents: a spoofed entry nudged toward the SL would
+            # understate MAX_RISK_PCT / RRR / notional while the REAL market order
+            # fills at the true market. No server-side reference is plumbed into
+            # the gate here (only last_price), so with it absent there is nothing
+            # trustworthy to price risk against — block instead of warn. Preview
+            # and confirm take this identical fail-closed path.
+            errors.append(
+                "market order needs a server-side reference price (last_price) "
+                "for risk — degraded ticker, fail-closed (ticket.entry not trusted)"
+            )
     else:
         # Limit risk MUST use the limit price — ticket.entry is not trusted
         # (spoofed entry closer to SL would understate MAX_RISK_PCT / pass bad geometry).

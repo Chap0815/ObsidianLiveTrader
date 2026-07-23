@@ -413,6 +413,143 @@ def test_close_position_request_accepts_finite_and_none():
     assert ClosePositionRequest(symbol="BTC_USDT", side="long", vol=0.5).vol == 0.5
 
 
+def test_market_order_without_last_price_blocks_spoofed_entry():
+    """Enforcement-bypass fix: a MARKET order with no usable last_price (degraded
+    ticker) must NOT fall back to the caller-controlled ticket.entry. A spoofed
+    entry nudged toward the SL understates MAX_RISK_PCT/RRR/notional while the real
+    market order fills at the true market — so the gate must fail CLOSED, not pass
+    with only a warning (previous behavior)."""
+    # entry 99_010 sits razor-thin above SL 99_000 → tiny risk if trusted.
+    t = _ticket(
+        order_type="market",
+        price=None,
+        entry=99_010.0,
+        stop_loss=99_000.0,
+        take_profit=100_000.0,  # RRR huge, so only the entry-ref matters
+        vol=1.0,
+    )
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=None,
+    )
+    assert g.ok is False
+    assert any("reference price" in e.lower() for e in g.errors)
+    # ticket.entry must NOT have been adopted as the risk reference.
+    assert g.entry_for_risk is None
+
+
+def test_market_order_without_last_price_blocks_on_confirm():
+    """Preview/Confirm consistency: the same fail-closed block applies on confirm
+    (for_confirm=True) — a degraded confirm ticker must never quietly re-open the
+    ticket.entry bypass."""
+    t = _ticket(
+        order_type="market",
+        price=None,
+        entry=99_010.0,
+        stop_loss=99_000.0,
+        take_profit=100_000.0,
+        vol=1.0,
+    )
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=None,
+        for_confirm=True,
+        preview_last_price=100_000,
+    )
+    assert g.ok is False
+    assert any("reference price" in e.lower() for e in g.errors)
+
+
+def test_market_order_with_last_price_unchanged():
+    """Regression guard: a legitimate MARKET order with a good ticker is still
+    validated against last_price exactly as before (no new block)."""
+    t = _ticket(
+        order_type="market",
+        price=None,
+        entry=100_000.0,
+        stop_loss=99_000.0,
+        take_profit=102_000.0,  # RRR = 2.0
+        vol=1.0,
+    )
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=100_000,
+    )
+    assert g.ok is True
+    assert g.entry_for_risk == 100_000.0
+
+
+def test_market_order_zero_last_price_blocks():
+    """Exact <=0 edge of the fail-closed rule: a last_price of 0.0 is not a real
+    market price and must NOT be adopted as the risk reference — it fails closed
+    just like None (guards a future >0 -> >=0 slip)."""
+    t = _ticket(
+        order_type="market",
+        price=None,
+        entry=99_010.0,
+        stop_loss=99_000.0,
+        take_profit=100_000.0,
+        vol=1.0,
+    )
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=0.0,
+    )
+    assert g.ok is False
+    assert any("reference price" in e.lower() for e in g.errors)
+    assert g.entry_for_risk is None
+
+
+def test_market_order_subcent_positive_last_price_adopts_reference():
+    """A real sub-cent price (>0) must be ACCEPTED as the risk reference, not
+    swept up by the <=0 fail-closed rule — the block targets missing prices, not
+    small ones."""
+    t = _ticket(
+        order_type="market",
+        price=None,
+        entry=0.0000001,
+        stop_loss=0.00000009,
+        take_profit=0.00000012,
+        vol=1.0,
+    )
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=0.0000001,
+    )
+    # The reference was adopted from last_price (>0 branch), not blocked.
+    assert g.entry_for_risk == 0.0000001
+
+
+def test_limit_order_without_last_price_still_validates():
+    """The fix is market-only: a LIMIT order derives its risk reference from the
+    limit price and is unaffected by last_price being absent."""
+    t = _ticket(order_type="limit", price=100_000.0)  # limit defaults are valid
+    g = validate_order(
+        t,
+        _contract(),
+        equity=10_000,
+        settings=_settings(),
+        last_price=None,
+    )
+    assert g.ok is True
+    assert g.entry_for_risk == 100_000.0
+
+
 def test_confirm_warns_when_preview_baseline_price_missing():
     """Drift can't be checked when the preview captured no baseline price — the
     gate must SURFACE that as a warning (not silently skip), and must not error."""
