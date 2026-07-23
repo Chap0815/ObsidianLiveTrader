@@ -1004,9 +1004,14 @@
       });
     }
 
-    // SL/TP resolve through the price/% mode; entry & limit are always prices
+    // SL/TP resolve through the price/% mode; entry & limit are always prices.
+    // For MARKET orders the typed #ticket-entry is NOT the risk reference (the
+    // readout and the backend gate both use last_price), so don't draw an Entry
+    // line off a stale/disabled typed value — that would make the chart lie
+    // relative to the readout. Mirror refEntryPrice's market handling.
+    const lineOrderType = ($("ticket-type") && $("ticket-type").value) || "market";
     const ticketSpecs = [
-      { price: numOrNull($("ticket-entry")), color: chartColors.ticketEntry, title: "Entry" },
+      { price: lineOrderType === "market" ? null : numOrNull($("ticket-entry")), color: chartColors.ticketEntry, title: "Entry" },
       { price: numOrNull($("ticket-price")), color: chartColors.order, title: "Limit" },
       { price: resolveStop(), color: chartColors.short, title: "SL" },
       { price: resolveTp(), color: chartColors.long, title: "TP1" },
@@ -3929,10 +3934,24 @@
    *  only — T3-01: a MARKET order must never size off a stale #ticket-price
    *  left over from a prior limit order), else entry ref, else the live
    *  last price — mirroring the backend gate, which sizes MARKET orders off
-   *  live_price regardless of what #ticket-price contains. */
+   *  live_price regardless of what #ticket-price contains.
+   *
+   *  MARKET orders MUST NOT size/risk off the typed #ticket-entry either —
+   *  the backend gate (risk/gates.py) deliberately never trusts that field
+   *  for market orders (spoofing/stale-input guard) and always prices them
+   *  off the live last price. Letting the readout use the typed number would
+   *  make the UI lie: a trader could type an Entry far from the live price
+   *  and see a green RRR/size that the backend then re-derives completely
+   *  differently (or rejects outright). So the market branch reads ONLY the
+   *  live price, with no typed-field fallback — and if the ticker is
+   *  degraded (no live price yet), it returns null so the readouts degrade
+   *  honestly to "—" instead of quietly resurrecting the stale typed value. */
   function refEntryPrice() {
     const orderType = ($("ticket-type") && $("ticket-type").value) || "market";
-    const limitPx = orderType === "limit" ? numOrNull($("ticket-price")) : null;
+    if (orderType === "market") {
+      return (state.market && state.market.last_price) || state.lastPx || null;
+    }
+    const limitPx = numOrNull($("ticket-price"));
     return (
       limitPx ||
       numOrNull($("ticket-entry")) ||
@@ -8330,6 +8349,14 @@
     // it) once we're on Market — disabled also removes it from tab order.
     const priceEl = $("ticket-price");
     if (priceEl) priceEl.disabled = type === "market";
+
+    // refEntryPrice() no longer reads #ticket-entry for Market orders (it
+    // always sizes/risks off the live price, matching the backend gate) — so
+    // disable the field there too, same as #ticket-price above, instead of
+    // leaving a typed number sitting active that no longer influences
+    // anything the trader sees.
+    const entryEl = $("ticket-entry");
+    if (entryEl) entryEl.disabled = type === "market";
 
     // In % mode the side flips SL/TP price direction — refresh lines + readout
     drawTicketLines();
