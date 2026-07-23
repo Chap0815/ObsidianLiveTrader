@@ -247,3 +247,119 @@ async def test_proxy_sends_hl_app_ping(monkeypatch):
     # The HL pong must not be forwarded to the browser as junk.
     assert not any(f.get("channel") == "pong" for f in client.sent)
     assert _normalize_hl({"channel": "pong"}, coin="BTC") is None
+
+
+# --- Backoff reset only on a *healthy* session (flapping-upstream hardening) --
+#
+# A broken upstream can complete the WS handshake, "accept" our subscribe
+# frames (only local buffer writes, always succeeds) and then drop immediately.
+# The old code reset the backoff to HL_BACKOFF_START right after connect+
+# subscribe, so every such flap restarted at 1.0 → the exponential backoff was
+# never reached → ~60 reconnects/min against the venue. The backoff must only
+# reset once the session has proved itself by forwarding real upstream data.
+
+
+def _never_done_client_task():
+    """A client_task that never completes (browser stays connected)."""
+    return asyncio.ensure_future(asyncio.Event().wait())
+
+
+def test_reset_backoff_after_session_healthy_resets_to_start(monkeypatch):
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 1.0)
+    # A healthy session (real data forwarded) must reset even a grown backoff.
+    assert hl_proxy._reset_backoff_after_session(8.0, session_healthy=True) == 1.0
+
+
+def test_reset_backoff_after_session_unhealthy_keeps_grown_backoff(monkeypatch):
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 1.0)
+    # An unhealthy flap must NOT reset — the grown backoff is kept.
+    assert hl_proxy._reset_backoff_after_session(8.0, session_healthy=False) == 8.0
+
+
+def test_flapping_backoff_ramps_to_cap_not_stuck_at_start(monkeypatch):
+    """RED before fix: a run of unhealthy (0-frame) sessions must let the
+    backoff ramp toward HL_BACKOFF_CAP, NOT reset to START every iteration."""
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 1.0)
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_CAP", 10.0)
+    backoff = hl_proxy.HL_BACKOFF_START
+    slept = []
+    for _ in range(8):
+        backoff = hl_proxy._reset_backoff_after_session(backoff, session_healthy=False)
+        slept.append(backoff)  # value actually slept on this iteration
+        backoff = min(backoff * 2, hl_proxy.HL_BACKOFF_CAP)
+    assert slept == [1.0, 2.0, 4.0, 8.0, 10.0, 10.0, 10.0, 10.0]
+
+
+def test_healthy_then_drop_reconnects_fast(monkeypatch):
+    """Normal case: a long healthy session that then genuinely drops must
+    reset the backoff so the next reconnect is fast — even if the backoff had
+    grown before the session started."""
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 1.0)
+    grown = 8.0
+    after = hl_proxy._reset_backoff_after_session(grown, session_healthy=True)
+    assert after == 1.0
+
+
+@pytest.mark.asyncio
+async def test_session_reports_unhealthy_when_no_data_forwarded(monkeypatch):
+    """A flapping session: connect+subscribe 'succeed' but the upstream drops
+    with 0 forwarded frames → _run_upstream_session must report unhealthy."""
+    monkeypatch.setattr(hl_proxy, "HL_HEARTBEAT_INTERVAL", 100.0)
+    monkeypatch.setattr(hl_proxy, "HL_IDLE_TIMEOUT", 100.0)
+    client = _FakeClientForProxy()
+    up = _FakeUpstream(recv_items=[ConnectionError("dropped immediately")])
+    client_task = _never_done_client_task()
+    try:
+        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+    finally:
+        client_task.cancel()
+    assert healthy is False
+
+
+@pytest.mark.asyncio
+async def test_session_reports_unhealthy_when_only_sub_ack(monkeypatch):
+    """A bare subscriptionResponse (control ack) then drop is NOT proof of a
+    healthy data stream → still unhealthy."""
+    monkeypatch.setattr(hl_proxy, "HL_HEARTBEAT_INTERVAL", 100.0)
+    monkeypatch.setattr(hl_proxy, "HL_IDLE_TIMEOUT", 100.0)
+    client = _FakeClientForProxy()
+    up = _FakeUpstream(
+        recv_items=[
+            json.dumps({"channel": "subscriptionResponse", "data": {}}),
+            ConnectionError("dropped after ack"),
+        ]
+    )
+    client_task = _never_done_client_task()
+    try:
+        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+    finally:
+        client_task.cancel()
+    assert healthy is False
+
+
+@pytest.mark.asyncio
+async def test_session_reports_healthy_when_real_data_forwarded(monkeypatch):
+    """A session that forwards a real trade frame before the upstream drops
+    must report healthy → the caller resets the backoff."""
+    monkeypatch.setattr(hl_proxy, "HL_HEARTBEAT_INTERVAL", 100.0)
+    monkeypatch.setattr(hl_proxy, "HL_IDLE_TIMEOUT", 100.0)
+    client = _FakeClientForProxy()
+    up = _FakeUpstream(
+        recv_items=[
+            json.dumps(
+                {
+                    "channel": "trades",
+                    "data": [
+                        {"px": "1.0", "sz": "1.0", "side": "B", "time": 1000},
+                    ],
+                }
+            ),
+            ConnectionError("dropped after real data"),
+        ]
+    )
+    client_task = _never_done_client_task()
+    try:
+        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+    finally:
+        client_task.cancel()
+    assert healthy is True

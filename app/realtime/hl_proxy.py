@@ -47,6 +47,24 @@ TF_TO_HL = {
 }
 
 
+def _reset_backoff_after_session(current_backoff: float, *, session_healthy: bool) -> float:
+    """Decide the reconnect delay after an upstream session ended.
+
+    A session that proved *healthy* — it forwarded at least one genuine
+    upstream data frame — resets to ``HL_BACKOFF_START`` so a later genuine
+    drop reconnects fast (and a single blip after a long healthy run never
+    inherits a big delay). A session that ended without ever forwarding real
+    data — connect+subscribe "succeeded" but the upstream dropped immediately
+    (flapping) — keeps the grown backoff so repeated flaps ramp toward
+    ``HL_BACKOFF_CAP`` instead of hammering the venue ~60x/min.
+
+    Reads the module-level constants at call time so tests can shrink them.
+    """
+    if session_healthy:
+        return HL_BACKOFF_START
+    return current_backoff
+
+
 def hl_ws_url(settings: Settings) -> str:
     if settings.hl_base_url:
         base = settings.hl_base_url.rstrip("/")
@@ -158,10 +176,22 @@ async def proxy_hyperliquid_market(
                             "subscriptions": ["trades", f"candle:{interval}"],
                         }
                     )
-                    # A full connect+subscribe succeeded → reset backoff so a
-                    # later single blip doesn't inherit a long delay.
-                    backoff = HL_BACKOFF_START
-                    await _run_upstream_session(client_ws, upstream, coin, client_task)
+                    # NOTE: backoff is intentionally NOT reset on a bare
+                    # connect+subscribe. A broken upstream can complete the
+                    # handshake and "accept" our subscribe frames (only local
+                    # buffer writes, always succeeds) then drop immediately;
+                    # resetting here made every such flap restart at
+                    # HL_BACKOFF_START → the exponential backoff was never
+                    # reached → ~60 reconnects/min against the venue. We reset
+                    # only once the session proved healthy (forwarded real data)
+                    # — that still lets a single blip after a long healthy run
+                    # reconnect fast, without inheriting a long delay.
+                    healthy = await _run_upstream_session(
+                        client_ws, upstream, coin, client_task
+                    )
+                    backoff = _reset_backoff_after_session(
+                        backoff, session_healthy=healthy
+                    )
             except WebSocketDisconnect:
                 raise
             except Exception as e:
@@ -203,12 +233,16 @@ async def _run_upstream_session(
     upstream: Any,
     coin: str,
     client_task: asyncio.Task,
-) -> None:
+) -> bool:
     """Pump ONE upstream connection concurrently with the shared client pump.
 
     Returns normally when the *upstream* ended (clean close, error or idle
-    watchdog timeout) → the caller reconnects. Raises ``WebSocketDisconnect``
-    when the *browser* went away → the caller ends the whole proxy.
+    watchdog timeout) → the caller reconnects. The return value is the
+    session's *health*: ``True`` iff at least one genuine upstream data frame
+    was forwarded to the browser (a bare ``subscriptionResponse`` control ack
+    does NOT count — an upstream that flaps right after subscribing must not be
+    mistaken for a working stream). Raises ``WebSocketDisconnect`` when the
+    *browser* went away → the caller ends the whole proxy.
 
     Follows the file's FIRST_COMPLETED + cancel-pending pattern. The upstream
     read/heartbeat tasks are fully torn down (cancelled + awaited) before this
@@ -217,7 +251,10 @@ async def _run_upstream_session(
     session and is owned by the caller.
     """
 
+    forwarded_real_data = False
+
     async def pump_upstream() -> None:
+        nonlocal forwarded_real_data
         while True:
             # Idle watchdog (E3-02): a silent upstream that never closes still
             # gets torn down so the caller can reconnect.
@@ -232,6 +269,11 @@ async def _run_upstream_session(
                 # unhandled frame fall through here → not forwarded.
                 continue
             await client_ws.send_json(out)
+            # A forwarded *data* frame proves the stream is genuinely alive.
+            # The subscription ack ("subscribed") is only a control reply and
+            # is NOT proof — a flapping upstream can ack + drop immediately.
+            if out.get("type") != "subscribed":
+                forwarded_real_data = True
 
     async def heartbeat() -> None:
         # E3-03: HL enforces an app-level ping on inactivity (60s idle kill on
@@ -260,13 +302,14 @@ async def _run_upstream_session(
         exc = client_task.exception()
         if exc is not None:
             raise exc
-        return
+        return forwarded_real_data
     # Upstream side finished. A send to a dead browser raises
     # WebSocketDisconnect → propagate; anything else (idle TimeoutError,
     # ConnectionClosed, …) just means: reconnect.
     for t in done:
         if isinstance(t.exception(), WebSocketDisconnect):
             raise t.exception()
+    return forwarded_real_data
 
 
 def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
