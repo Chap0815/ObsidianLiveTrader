@@ -87,7 +87,8 @@ var state = {
   wsStatus: "off",
   liveBar: null, // { time, open, high, low, close } chart seconds
   lastPx: null,
-  _lastTickTs: null, // ms timestamp of the last live price update (U-02 stale-feed banner)
+  _lastTickTs: null, // ms timestamp of the last live price update from ANY source — WS tick OR REST poll (U-02 stale-feed banner, clock 1)
+  _lastWsTickTs: null, // ms timestamp of the last REAL WS price frame ONLY — never stamped by the REST poll (E3-01 zombie clock 2)
   _lastAppPingTs: 0, // ms timestamp of the last client app-ping sent (Task 4/E3-01)
   _lastPongTs: null, // ms timestamp of the last app-pong received — socket-alive proof, NOT price data
   // Chart line groups (KI-Analyse, echte Positionen, offene Orders/Trigger)

@@ -1162,12 +1162,46 @@
    *  pick the banner's wording. Called from setLivePrice (clears it the
    *  instant a fresh tick lands), setChartMeta and the 5s background poll
    *  (so it also FIRES when no tick arrives at all, not only on the next one). */
+  /** E3-01/zombie-fix: is the price feed stale enough that Manual-SL is no
+   *  longer being monitored? TWO independent staleness clocks are OR-ed so
+   *  BOTH failure shapes are caught without introducing a false alarm:
+   *
+   *   (1) _lastTickTs — stamped by ANY price update (WS tick AND the REST
+   *       poll, via setLivePrice). Fires only when NOTHING refreshes the price
+   *       at all (WS down AND the REST poll also dead: tab hidden, /api/market
+   *       failing). This is the ORIGINAL behavior, byte-for-byte — the REST
+   *       poll keeps it fresh, so a healthy WS-down/REST-alive feed never fires
+   *       (requirement: REST-only path unchanged).
+   *
+   *   (2) _lastWsTickTs — stamped ONLY by real WS frames (applyLiveTrade/
+   *       applyLiveCandle → setLivePrice(px, true)) and evaluated ONLY while
+   *       wsStatus === "live". This catches the ZOMBIE feed: the badge claims
+   *       LIVE but no real tick has arrived for STALE_PRICE_MS (silent HL
+   *       subscription loss, laptop sleep, network change without a socket
+   *       close). The 15s REST poll keeps clock (1) permanently fresh, so (1)
+   *       alone can NEVER see the zombie — that was the E3-01 false-negative.
+   *
+   *  GRACE: _lastWsTickTs is (re)anchored to now on every not-live→live
+   *  transition (WS status/trade/mid/candle handlers), so a freshly connected
+   *  feed gets a full STALE_PRICE_MS window to deliver its first tick before
+   *  clock (2) can fire — no false positive right after a coin switch/reconnect.
+   *  A healthy feed re-stamps it within milliseconds. A null anchor (never was
+   *  live) yields no zombie verdict, which is correct: nothing claims live. */
+  function isFeedStale() {
+    const now = Date.now();
+    const anyAge = state._lastTickTs != null ? now - state._lastTickTs : null;
+    const noSourceStale = anyAge != null && anyAge > STALE_PRICE_MS;
+    const wsAge = state._lastWsTickTs != null ? now - state._lastWsTickTs : null;
+    const zombieStale =
+      state.wsStatus === "live" && wsAge != null && wsAge > STALE_PRICE_MS;
+    return noSourceStale || zombieStale;
+  }
+
   function updateStaleBanner() {
     const el = $("stale-banner");
     const priceEl = $("ctx-price");
     const wsDown = state.wsStatus === "error" || state.wsStatus === "off";
-    const age = state._lastTickTs != null ? Date.now() - state._lastTickTs : null;
-    const stale = age != null && age > STALE_PRICE_MS;
+    const stale = isFeedStale();
     if (el) {
       el.classList.toggle("hidden", !stale);
       if (stale) {
@@ -1255,9 +1289,15 @@
     });
   }
 
-  function setLivePrice(px) {
+  function setLivePrice(px, fromWs) {
     if (px == null || !Number.isFinite(Number(px))) return;
-    state._lastTickTs = Date.now(); // U-02: feed is alive — feeds the stale-banner check
+    state._lastTickTs = Date.now(); // U-02: ANY price update (WS or REST poll) — stale clock (1)
+    // E3-01 zombie-fix: ONLY a real WS frame proves the streamed feed is alive.
+    // The REST poll (loadMarket) calls setLivePrice WITHOUT fromWs, so it never
+    // stamps this — otherwise a zombie-live WS (badge LIVE, 0 ticks) would look
+    // fresh forever and the stale banner could never fire. Grace-anchored on the
+    // not-live→live transition in the WS handlers so a fresh feed isn't flagged.
+    if (fromWs) state._lastWsTickTs = Date.now();
     const prev = state.lastPx;
     state.lastPx = Number(px);
     const priceEl = $("ctx-price");
@@ -1366,7 +1406,7 @@
         // if chart empty, ignore until loadMarket seeds data
       }
     }
-    setLivePrice(px);
+    setLivePrice(px, true); // fromWs: real WS frame — stamps the zombie clock (2)
   }
 
   function applyLiveCandle(barIn) {
@@ -1380,7 +1420,7 @@
       close: Number(barIn.close),
     };
     state.liveBar = bar;
-    setLivePrice(bar.close);
+    setLivePrice(bar.close, true); // fromWs: real WS frame — stamps the zombie clock (2)
     try {
       state.candleSeries.update(bar);
     } catch (e) {
@@ -1488,6 +1528,14 @@
 
       if (msg.type === "status") {
         if (msg.status === "live" || msg.status === "poll_fallback") {
+          // E3-01 zombie-fix GRACE: anchor the WS-tick staleness clock (2) on
+          // the not-live→live EDGE so its STALE_PRICE_MS window starts at this
+          // connect, not from a stale/absent value — a freshly live-but-tickless
+          // feed then gets the full grace window before it is judged a zombie.
+          // Edge-only: re-anchoring on every periodic "live" status heartbeat
+          // would keep resetting the clock and mask a truly tick-less zombie.
+          // (trade/mid/candle transitions self-anchor via applyLive*→setLivePrice.)
+          if (state.wsStatus !== "live") state._lastWsTickTs = Date.now();
           state.wsStatus = "live";
           state.wsRetry = 0; // healthy connection resets the backoff
         } else if (msg.status === "error") {
