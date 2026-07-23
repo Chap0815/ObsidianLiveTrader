@@ -812,7 +812,8 @@ class Database:
                 # STABLE reopen-signature (HL Flat->Open fill time / MEXC
                 # positionId) are known and DIFFER, it is a genuine reopen →
                 # hard-reset the volatile state (be_done latch, stale high-water,
-                # user override) so the fresh position re-arms cleanly. The frozen
+                # user override, one-shot advisory alarms) so the fresh position
+                # re-arms cleanly. The frozen
                 # risk baseline (entry_snap/initial_sl/r1/opened_at) and the user's
                 # armed_rules are preserved (same-entry reopen keeps the same risk
                 # geometry + arming intent — mirrors reset_position_mgmt_baseline).
@@ -828,7 +829,8 @@ class Database:
                         """
                         UPDATE position_management
                         SET be_done = 0, high_water = entry_snap,
-                            user_override_hw = NULL, open_sig = ?,
+                            user_override_hw = NULL, last_alert_state = '{}',
+                            open_sig = ?,
                             invalidation_price = ?, updated_at = ?
                         WHERE id = ?
                         """,
@@ -1052,8 +1054,10 @@ class Database:
         Used when a position REAPPEARS after an absence (a potential same-price
         reopen the entry-deviation check in upsert_position_mgmt can't catch,
         because entry_snap barely moved) so a fresh position never inherits a
-        stale BE latch or a stale trail high-water from the prior trade. Only the
-        one-shot-BE latch + the Chandelier high-water are reset; the frozen risk
+        stale BE latch or a stale trail high-water from the prior trade. The
+        one-shot-BE latch, the Chandelier high-water and the one-shot advisory
+        alarm-state (last_alert_state) are reset so the fresh position re-arms
+        its thesis/time-stop alarms; the frozen risk
         baseline (entry_snap/initial_sl_snap/r1) and the user's armed_rules are
         deliberately preserved (a reopen at ~the same entry keeps the same risk
         geometry and the same arming intent). Idempotent no-op if no OPEN record
@@ -1065,7 +1069,8 @@ class Database:
                 """
                 UPDATE position_management
                 SET be_done = 0, high_water = entry_snap,
-                    user_override_hw = NULL, updated_at = ?
+                    user_override_hw = NULL, last_alert_state = '{}',
+                    updated_at = ?
                 WHERE symbol = ? AND side = ? AND status = 'OPEN'
                 """,
                 (_now_ms(), symbol, side),

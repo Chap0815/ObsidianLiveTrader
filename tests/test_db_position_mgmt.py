@@ -269,3 +269,63 @@ async def test_concurrent_upsert_same_position_converges_to_one_row(db_path):
     rows = await db1.list_open_position_mgmt()
     assert len(rows) == 1  # exactly one OPEN row, no duplicate
     assert ids[0] == ids[1] == rows[0]["id"]  # both returned the one winning id
+
+
+# ── 2026-07-23: reopen re-arms the advisory alarms (thesis/time_stop) ─────────
+# A close+reopen of the SAME (symbol, side) at ~the same entry resets the
+# volatile latches (be_done/high_water/user_override_hw) but historically left
+# last_alert_state stale -> the one-shot thesis/time_stop gate in the monitor
+# (not alert_state.get(...)) stayed tripped from the PRIOR trade and the NEW
+# position's advisory alarm never fired (silent alarm suppression). Both reopen
+# reset paths must clear last_alert_state to '{}' -- exactly like the existing
+# entry-deviation reset -- while the ordinary re-sighting cycle must NOT (that
+# would re-arm every tick and spam alerts).
+
+
+@pytest.mark.asyncio
+async def test_reset_baseline_clears_stale_alert_state(db_path):
+    """reset_position_mgmt_baseline (same-price reopen the entry-deviation check
+    can't catch) must re-arm the advisory alarms: last_alert_state -> {}."""
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs())
+    await db.set_alert_state("BTC_USDT", "long", {"thesis": "fired", "time_stop": "fired"})
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"] == {"thesis": "fired", "time_stop": "fired"}
+
+    await db.reset_position_mgmt_baseline("BTC_USDT", "long")
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    # Re-armed: stale flags gone -> the thesis/time_stop gate can fire again.
+    assert row["last_alert_state"] == {}
+
+
+@pytest.mark.asyncio
+async def test_sig_changed_reopen_clears_stale_alert_state(db_path):
+    """sig_changed branch (same entry, NEW open_sig -> genuine reopen) must
+    re-arm the advisory alarms: last_alert_state -> {}."""
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs(open_sig=1000))
+    await db.set_alert_state("BTC_USDT", "long", {"thesis": "fired"})
+
+    # Same entry (within tolerance) but a DIFFERENT stable reopen signature.
+    await db.upsert_position_mgmt(**_base_kwargs(entry_snap=100.0005, open_sig=2000))
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"] == {}  # re-armed
+    assert row["be_done"] == 0  # sanity: this really took the reopen path
+
+
+@pytest.mark.asyncio
+async def test_non_reopen_cycle_preserves_alert_state(db_path):
+    """ANTI-SPAM: an ordinary re-sighting (same entry, SAME open_sig, no
+    deviation) is NOT a reopen -> last_alert_state must stay UNCHANGED, else the
+    one-shot alarm would re-arm every monitor tick and spam alerts."""
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs(open_sig=1000))
+    await db.set_alert_state("BTC_USDT", "long", {"thesis": "fired"})
+
+    # Same entry (within tolerance), SAME signature -> plain re-sighting.
+    await db.upsert_position_mgmt(**_base_kwargs(entry_snap=100.0005, open_sig=1000))
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"] == {"thesis": "fired"}  # preserved, NOT re-armed
