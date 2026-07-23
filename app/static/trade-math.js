@@ -183,3 +183,28 @@ function classifyTriggers(order, side, entry, includeBeTolerance) {
   else out.tp = trg;
   return out;
 }
+
+/**
+ * SL coverage verdict (HIGH-fix): do the protective stop orders cover the FULL
+ * position? `slVol` is the summed size of the same-side stop-loss orders and
+ * `holdVol` the position's hold volume — BOTH must be in the SAME unit (MEXC:
+ * contracts; Hyperliquid: coins; a contracts-vs-coins mix would be a bug). The
+ * epsilon (default 0.5%) absorbs lot/float rounding, so a stop that covers the
+ * position minus a rounding crumb still reads as fully covered.
+ *
+ * CONSERVATIVE by construction: a non-finite / non-positive `holdVol` or
+ * `slVol` (e.g. a stop order without a readable size — HL triggers carry no
+ * top-level vol) yields `true`, so the caller keeps its existing "protected"
+ * display and never raises a false partial-coverage alarm. Under-coverage is
+ * asserted ONLY on a positive, readable `slVol` that genuinely falls short.
+ *
+ * Pure: no state/DOM access.
+ */
+function slCoverageCovered(slVol, holdVol, eps) {
+  const h = Number(holdVol);
+  const v = Number(slVol);
+  if (!Number.isFinite(h) || h <= 0) return true;
+  if (!Number.isFinite(v) || v <= 0) return true;
+  const tol = Number.isFinite(eps) ? eps : 0.005;
+  return v >= h * (1 - tol);
+}

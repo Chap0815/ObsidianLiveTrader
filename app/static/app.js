@@ -2307,10 +2307,29 @@
     // trigger. The prior inline label rule (`indexOf("tp") === 0`) mis-read
     // MEXC's combined "tpsl" (a stop) as a take-profit; the shared classifier
     // fixes that, so a tpsl-protected position no longer reads "no stop-loss".
+    // HIGH-fix (Deckungsgrad): also SUM the sizes of every same-side protective
+    // SL order and compare against hold_vol, so a stop that only covers PART of
+    // an enlarged position (add-on: hold_vol=20, old stop vol=10) no longer
+    // reads as "voll geschützt". Units are consistent per exchange: MEXC's
+    // hold_vol and stop `vol` are BOTH contracts; HL's hold_vol is coins and its
+    // trigger rows carry NO top-level vol/sz/quantity → the sum stays
+    // unreadable and the conservative fallback keeps the prior "protected"
+    // display (never a false partial-coverage alarm).
+    let slVol = 0;
+    let slVolAllReadable = true;
+    let sawSlOrder = false;
     stops.forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, p.symbol)) return;
       const c = classifyTriggers(s, short ? "short" : "long", entry);
-      if (c.sl != null) sl = c.sl;
+      if (c.sl != null) {
+        sl = c.sl;
+        sawSlOrder = true;
+        // Same vol read as the trigger-order list (N3-11): field name varies by
+        // exchange (MEXC `vol`, others `sz`/`quantity`).
+        const v = Number(s.vol != null ? s.vol : s.sz != null ? s.sz : s.quantity);
+        if (Number.isFinite(v) && v > 0) slVol += v;
+        else slVolAllReadable = false;
+      }
       if (c.tp != null) tp = c.tp;
     });
     const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
@@ -2319,7 +2338,20 @@
       if (sl == null && mk.sl) { sl = mk.sl; manual = !!mk.manual; }
       if (tp == null && mk.tp) tp = mk.tp;
     }
-    return { sl: sl, tp: tp, ordersKnown: ordersKnown, manual: manual };
+    // Coverage verdict — CONSERVATIVE: only assert under-coverage when the SL
+    // came from exchange orders whose sizes were ALL readable. A manual-marker
+    // SL (no exchange size), an unreadable size, or an unknown hold_vol all fall
+    // through to slCovered=true (keep the prior "protected" behavior — no new
+    // false alarm), while never falsely GUARANTEEING full coverage.
+    const holdVol = Number(p.hold_vol);
+    let slCovered = true;
+    if (sawSlOrder && slVolAllReadable) {
+      slCovered = slCoverageCovered(slVol, holdVol);
+    }
+    return {
+      sl: sl, tp: tp, ordersKnown: ordersKnown, manual: manual,
+      slCovered: slCovered, slVol: slVol, holdVol: holdVol,
+    };
   }
 
   /** N3-02: TP suffix for the SL banner — "· TP 0.026 (+9.8%)" when a
@@ -2359,6 +2391,19 @@
     }
     if (prot.sl != null && Number.isFinite(entry) && entry > 0) {
       const pct = ((prot.sl - entry) / entry) * 100;
+      // HIGH-fix: an SL that covers only PART of the position (e.g. after an
+      // add-on the old stop's size lags hold_vol) is a real protection gap on
+      // the uncovered remainder — render a loud warning (reuses the missing-SL
+      // alarm visual; the text keeps it distinct from a total-miss) instead of
+      // the green "voll geschützt" chip. Full coverage stays green.
+      if (prot.slCovered === false) {
+        return (
+          '<div class="cp-sl-status cp-sl-missing cp-sl-partial">⚠ SL nur Teil-Deckung ' +
+          fmt(prot.slVol, 4) + "/" + fmt(prot.holdVol, 4) +
+          " — Rest ungeschützt · SL " + fmt(prot.sl, 4) +
+          " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
+        );
+      }
       return (
         '<div class="cp-sl-status cp-sl-ok">🛡 Stop-Loss ' + fmt(prot.sl, 4) +
         " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
