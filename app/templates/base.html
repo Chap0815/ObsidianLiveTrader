@@ -8,7 +8,7 @@
   {# T49: IBM Plex is vendored locally (@font-face in app.css → /static/fonts),
      so there is NO external font request on first-start/setup and the CSP needs
      no Google Fonts host. #}
-  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r22') }}" />
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r23') }}" />
   {# S3-14: wrapped in a block so a page that doesn't need the chart lib
      (e.g. setup.html) can override it to empty instead of paying for an
      unused vendor bundle. Dashboard doesn't override — same tag as before. #}
@@ -33,27 +33,27 @@
      `PERSIST` are globals every later script references by bare name. `state`
      used to live inside app.js's IIFE; loading it first makes it the ONE object
      all modules see (api.js reads PERSIST.TOKEN; app.js references `state`). #}
-  <script src="/static/store.js?v={{ asset_version|default('r22') }}"></script>
+  <script src="/static/store.js?v={{ asset_version|default('r23') }}"></script>
   {# A3-01: pure format helpers extracted to utils.js. Classic script (NOT a
      module) loaded IMMEDIATELY BEFORE app.js so its top-level functions are
      globals app.js can call by bare name — same-origin /static under CSP
      'self', matching the app.js tag pattern (no nonce needed for src). #}
-  <script src="/static/utils.js?v={{ asset_version|default('r22') }}"></script>
+  <script src="/static/utils.js?v={{ asset_version|default('r23') }}"></script>
   {# A3-06 (T41b): pure money-math (PnL, ROE, break-even, R-multiple,
      contract-size fallback, SL/TP trigger-classification) extracted to
      trade-math.js — the ONE frontend source per formula, mirroring the
      backend classifier app/orders/protection.py. Classic script loaded AFTER
      utils.js and IMMEDIATELY BEFORE app.js so its functions are globals app.js
      calls by bare name (same tag pattern as utils.js). #}
-  <script src="/static/trade-math.js?v={{ asset_version|default('r22') }}"></script>
+  <script src="/static/trade-math.js?v={{ asset_version|default('r23') }}"></script>
   {# A3-07/A3-08 (Task 42): pure, STATE-FREE network core — authHeaders,
      apiFetch, and the per-resource AbortController helpers (apiFetchAbortable /
      abortResource). Classic script loaded AFTER trade-math.js and IMMEDIATELY
      BEFORE app.js so its functions are globals app.js calls by bare name (same
      tag pattern as utils.js / trade-math.js). Loading BEFORE app.js is why it
      must not reference app.js's `state` — the state object is not yet defined. #}
-  <script src="/static/api.js?v={{ asset_version|default('r22') }}"></script>
-  <script src="/static/app.js?v={{ asset_version|default('r22') }}"></script>
+  <script src="/static/api.js?v={{ asset_version|default('r23') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r23') }}"></script>
   {% endblock %}
   {% block scripts %}{% endblock %}
 </body>

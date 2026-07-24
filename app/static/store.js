@@ -160,6 +160,7 @@ var state = {
   journalClearBusy: false, // journal reset in flight (double-submit guard)
   wsRetry: 0, // WS reconnect backoff counter
   _chartKey: null, // last-drawn chart identity (symbol|tf) — change guard
+  _chartPricePrecision: null, // last applied candle-series price precision — change guard (updateChartPriceFormat); MUST be declared or the sealed store throws on first paint
   _chartResizeObserver: null, // ResizeObserver on the chart container
   _fillAggById: null, // Map: fill id -> aggregated fill (marker tooltips)
   _fillsSeq: 0, // fills fetch sequence guard (drop superseded responses)
