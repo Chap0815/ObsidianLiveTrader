@@ -376,15 +376,17 @@ def restrict_env_permissions(path: Path) -> None:
         if os.name == "nt":
             # Never interpolate a filename into PowerShell code. Resolve the
             # real process identity rather than trusting USERNAME/USERDOMAIN.
+            # Use .NET directly: inherited PowerShell 7 module paths can make
+            # Windows PowerShell's Get-Acl/Set-Acl modules fail to load.
             script = (
                 "$ErrorActionPreference = 'Stop'; "
                 "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
-                "$acl = New-Object System.Security.AccessControl.FileSecurity; "
+                "$acl = [System.Security.AccessControl.FileSecurity]::new(); "
                 "$acl.SetAccessRuleProtection($true, $false); "
-                "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule"
+                "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new"
                 "($sid, 'FullControl', 'Allow'); "
                 "$acl.AddAccessRule($rule); "
-                "Set-Acl -LiteralPath $env:OBSIDIAN_ENV_ACL_PATH -AclObject $acl"
+                "[System.IO.File]::SetAccessControl($env:OBSIDIAN_ENV_ACL_PATH, $acl)"
             )
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],

@@ -394,7 +394,6 @@ def test_mainnet_with_ack_starts(monkeypatch):
 
 
 def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_path, monkeypatch):
-    import json
     import os
     import subprocess
 
@@ -411,16 +410,27 @@ def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_p
     # A forged display name must not change which actual identity receives access.
     monkeypatch.setenv("USERNAME", "nonexistent-display-name")
     monkeypatch.setenv("USERDOMAIN", "nonexistent-domain")
+    # Exercise the writer without autoloadable PowerShell modules, as on
+    # runners launched from another PowerShell version.
+    run = subprocess.run
+
+    def without_modules(args, **kwargs):
+        args = [*args]
+        args[-1] = "$PSModuleAutoLoadingPreference = 'None'; " + args[-1]
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", without_modules)
     restrict_env_permissions(p)
     script = (
-        "$acl = Get-Acl -LiteralPath $env:TEST_ACL_PATH; "
+        "$ErrorActionPreference = 'Stop'; "
+        "$acl = [System.IO.File]::GetAccessControl($env:TEST_ACL_PATH); "
         "$rules = @($acl.GetAccessRules($true, $true, "
         "[System.Security.Principal.SecurityIdentifier])); "
         "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
-        "@{count=$rules.Count; protected=$acl.AreAccessRulesProtected; "
-        "currentOnly=($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $sid); "
-        "fullControl=($rules[0].FileSystemRights -eq 'FullControl'); "
-        "allow=($rules[0].AccessControlType -eq 'Allow')} | ConvertTo-Json -Compress"
+        "[Console]::WriteLine((@($rules.Count, $acl.AreAccessRulesProtected, "
+        "($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $sid), "
+        "($rules[0].FileSystemRights -eq 'FullControl'), "
+        "($rules[0].AccessControlType -eq 'Allow')) -join ','))"
     )
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -428,10 +438,7 @@ def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_p
         capture_output=True, text=True, check=False, timeout=10,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
-        "count": 1, "protected": True, "currentOnly": True,
-        "fullControl": True, "allow": True,
-    }
+    assert result.stdout.strip() == "1,True,True,True,True"
     assert p.read_text(encoding="utf-8") == "synthetic configuration\n"
 
 
@@ -483,7 +490,7 @@ def test_env_file_written_restrictive_perms(tmp_path):
         assert user.lower() in low
         # Windows grants SYSTEM + BUILTIN\Administrators on new files by
         # default (inherited from the parent dir) — real evidence the
-            # hardening ran is that the replacement ACL stripped those
+        # hardening ran is that the replacement ACL stripped those
         # inherited ACEs, leaving only the current user's grant.
         assert "nt authority\\system" not in low
         assert "builtin\\administrators" not in low
