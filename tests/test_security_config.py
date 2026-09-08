@@ -425,8 +425,9 @@ def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_p
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
         env={**os.environ, "TEST_ACL_PATH": str(p)},
-        capture_output=True, text=True, check=True, timeout=10,
+        capture_output=True, text=True, check=False, timeout=10,
     )
+    assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
         "count": 1, "protected": True, "currentOnly": True,
         "fullControl": True, "allow": True,
