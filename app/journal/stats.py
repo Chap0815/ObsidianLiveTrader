@@ -3,8 +3,9 @@
 Honest by construction: every rate ships with its raw sample size, a Wilson
 95% score interval on the overall win rate, and a low_sample flag so a 2/2=100%
 is never mistaken for signal. See app/journal/resolver.py for the shadow-fill
-limitations that these numbers inherit (fill at entry_price, no fees/slippage,
-only tp1 tracked, intrabar ambiguity resolved pessimistically to LOSS).
+limitations that these numbers inherit (limits require a price touch; fills use
+the exact entry price; gross R excludes costs while net R uses a flat cost
+model; only tp1 is tracked; intrabar ambiguity resolves to LOSS).
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def wilson_ci(wins: int, losses: int, z: float = _Z) -> list[float] | None:
 
 
 def _round(x: float | None, digits: int = 3) -> float | None:
-    return None if x is None else round(x, digits)
+    return None if x is None or not math.isfinite(x) else round(x, digits)
 
 
 def _fill_rate(resolved: int, no_fill: int) -> float | None:
@@ -137,7 +138,9 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             f"Sample < {min_sample} in: {', '.join(low_named)} — treat rates as noise."
         )
     caveats.append(
-        "Shadow eval assumes fill at entry_price, no fees/slippage; only tp1 tracked."
+        "Shadow eval: market entries fill immediately; limits only after price "
+        "touch, at exact entry_price. Gross R excludes costs; net R uses a flat "
+        "fee/slippage model. Only tp1 is tracked."
     )
 
     return {

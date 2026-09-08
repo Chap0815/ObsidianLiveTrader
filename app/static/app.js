@@ -16,6 +16,78 @@
     return document.getElementById(id);
   }
 
+  let activeDialog = null;
+  let dialogReturnFocus = null;
+  let pendingDialogFocus = null;
+  let dialogBackground = [];
+  let confirmSubmitting = false;
+
+  function dialogFocusables(modal) {
+    return Array.from(modal.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]'
+    )).filter(function (el) { return el.getClientRects().length && !el.closest('[inert]'); });
+  }
+
+  function restoreDialogFocus() {
+    if (activeDialog || !pendingDialogFocus) return;
+    if (!pendingDialogFocus.isConnected) {
+      pendingDialogFocus = null;
+      return;
+    }
+    if (pendingDialogFocus.disabled || pendingDialogFocus.closest('[inert]')) return;
+    const restore = pendingDialogFocus;
+    pendingDialogFocus = null;
+    restore.focus();
+  }
+
+  function showDialog(modal, initialFocus, returnFocus) {
+    const toast = $('toast');
+    if (toast) toast.classList.add('hidden');
+    if (activeDialog !== modal) {
+      if (activeDialog) hideDialog(activeDialog);
+      dialogReturnFocus = returnFocus || document.activeElement;
+      pendingDialogFocus = null;
+      activeDialog = modal;
+      dialogBackground = Array.from(document.body.children).filter(function (el) {
+        return el !== modal && !/^(SCRIPT|STYLE)$/.test(el.tagName);
+      }).map(function (el) {
+        const entry = { el: el, inert: el.inert };
+        el.inert = true;
+        return entry;
+      });
+    }
+    modal.classList.remove('hidden');
+    modal.tabIndex = -1;
+    (initialFocus || dialogFocusables(modal)[0] || modal).focus();
+  }
+
+  function hideDialog(modal) {
+    if (!modal) return;
+    modal.classList.add('hidden');
+    if (activeDialog !== modal) return;
+    dialogBackground.forEach(function (entry) { entry.el.inert = entry.inert; });
+    dialogBackground = [];
+    activeDialog = null;
+    pendingDialogFocus = dialogReturnFocus;
+    dialogReturnFocus = null;
+    restoreDialogFocus();
+  }
+
+  function setConfirmSubmitting(on) {
+    confirmSubmitting = on;
+    const modal = $('confirm-modal');
+    if (!modal) return;
+    modal.setAttribute('aria-busy', on ? 'true' : 'false');
+    modal.querySelectorAll('button[data-close-modal]').forEach(function (btn) { btn.disabled = on; });
+  }
+
+  function confirmActionLabel() {
+    const health = state.health || {};
+    if (health.trading_enabled !== true) return "Trading is locked";
+    return health.exchange === "hyperliquid" && health.hl_testnet === true
+      ? "Submit to testnet" : "Submit live order";
+  }
+
   // A3-07 (Task 42): authHeaders / apiFetch moved to api.js (the pure,
   // STATE-FREE network core), loaded as a global classic script BEFORE app.js
   // — call sites below reference them by bare name, unchanged. The per-resource
@@ -27,10 +99,13 @@
     const btn = $("btn-send-order");
     if (!btn) return;
     const blocked = state.apiAllowed === false;
-    btn.disabled = blocked || state.orderBusy;
-    btn.title = blocked
-      ? "apiAllowed=false — API-Orders für dieses Symbol gesperrt"
+    const loading = !state.market;
+    btn.disabled = blocked || loading || state.orderBusy;
+    btn.title = loading ? "Market data for this symbol is required"
+      : blocked
+      ? "apiAllowed=false — API orders are disabled for this symbol"
       : "Preview → Confirm";
+    restoreDialogFocus();
   }
 
   // A3-01: fmt, fmtPct, toChartTime moved to utils.js (pure format helpers,
@@ -51,7 +126,11 @@
     const d = new Date(sec * 1000);
     return withSeconds
       ? d.toLocaleTimeString("de-DE")
-      : d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+      : d.toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
   }
 
   // U-06: `ok` is normally boolean, but `null`/`undefined` (status not yet
@@ -547,7 +626,7 @@
         }
         // wrong-side hint so the trader sees the drop will be rejected
         const wrongSide = drag.side === "long" ? drag.newSl >= drag.entry : drag.newSl <= drag.entry;
-        if (wrongSide) lbl += "  ⚠ falsche Seite";
+        if (wrongSide) lbl += "  ⚠ wrong side";
         ctx.fillStyle = chartColors.short;
         ctx.font = "11px 'IBM Plex Mono', monospace";
         ctx.fillText(lbl, 8, gy - 5);
@@ -909,11 +988,11 @@
       const slPx = Number(s.stopLossPrice);
       const tpPx = Number(s.takeProfitPrice);
       if (Number.isFinite(slPx) && slPx > 0) {
-        addChartLine(specs, slPx, chartColors.short, 2, "SL aktiv");
+        addChartLine(specs, slPx, chartColors.short, 2, "SL active");
         drew = true;
       }
       if (Number.isFinite(tpPx) && tpPx > 0) {
-        addChartLine(specs, tpPx, chartColors.long, 2, "TP aktiv");
+        addChartLine(specs, tpPx, chartColors.long, 2, "TP active");
         drew = true;
       }
       if (!drew) {
@@ -929,7 +1008,7 @@
           px,
           isTp ? chartColors.long : chartColors.short,
           2,
-          isTp ? "TP aktiv" : "SL aktiv"
+          isTp ? "TP active" : "SL active"
         );
       }
     });
@@ -1033,7 +1112,7 @@
   }
 
   function updateContext(data) {
-    $("ctx-price").textContent = fmt(data.last_price, 6);
+    $("ctx-price").textContent = fmtPx(data.last_price);
 
     const funding = data.funding || {};
     const fr = funding.fundingRate != null ? funding.fundingRate : null;
@@ -1090,7 +1169,7 @@
 
     const c = data.contract || {};
     $("ctx-contract").textContent = c.contractSize != null
-      ? "size " + c.contractSize + " · maxLev " + (c.maxLeverage ?? "—")
+      ? c.contractSize + " per contract · max. " + (c.maxLeverage ?? "—") + "×"
       : "—";
     const allowed = c.apiAllowed;
     state.apiAllowed = allowed === true ? true : allowed === false ? false : null;
@@ -1100,9 +1179,9 @@
     // .pnl-neg classes used everywhere else (var(--long)/var(--short),
     // the identical color values), toggled off for the unknown/null case.
     if (allowed === true) {
-      allowEl.textContent = "true";
+      allowEl.textContent = "Allowed";
     } else if (allowed === false) {
-      allowEl.textContent = "false — Orders gesperrt";
+      allowEl.textContent = "Blocked";
     } else {
       allowEl.textContent = "—";
     }
@@ -1206,8 +1285,8 @@
       el.classList.toggle("hidden", !stale);
       if (stale) {
         el.textContent = wsDown
-          ? "WS getrennt — Preis veraltet, Manual-SL wird NICHT überwacht"
-          : "Feed eingefroren — Preis veraltet, Manual-SL wird NICHT überwacht";
+          ? "WebSocket disconnected — price is stale; manual stop monitoring is inactive"
+          : "Price feed stalled — price is stale; manual stop monitoring is inactive";
       }
     }
     if (priceEl) priceEl.classList.toggle("price-stale", stale);
@@ -1261,8 +1340,8 @@
       if (touched && !state.slAlarm[key]) {
         state.slAlarm[key] = true;
         showToast(
-          "⚠ SL BERÜHRT (MANUELL) " + key + " @ " + fmt(px, 4) +
-            " — jetzt selbst schließen! Schutz greift nur bei offenem Browser.",
+          "⚠ MANUAL STOP REACHED " + key + " @ " + fmt(px, 4) +
+            " — close the position now. Monitoring works only while the browser is open.",
           "err"
         );
         const banner = document.querySelector(
@@ -1487,7 +1566,9 @@
       encodeURIComponent(tf);
 
     state.wsStatus = "connecting";
-    setChartMeta(symbol, tf, state.htf || "1H", "…");
+    const loadedCandles = state._chartKey === symbol + "|" + tf && state.market && state.market.ltf
+      ? state.market.ltf.candles : null;
+    setChartMeta(symbol, tf, state.htf || "1H", loadedCandles ? loadedCandles.length : "…");
 
     let ws;
     try {
@@ -1643,6 +1724,9 @@
       // arrives via setLivePrice()/the live-bar seed below.
       state.lastPx = null;
       state.liveBar = null;
+      state.market = null;
+      state.apiAllowed = null;
+      updateOrderButtonsEnabled();
       try { renderTrades(); } catch (_) {}
       try {
         if (state.candleSeries && typeof state.candleSeries.setMarkers === "function") {
@@ -1670,6 +1754,8 @@
       // and the risk readout until overwritten (audit F2).
       ["ticket-entry", "ticket-price", "ticket-sl", "ticket-tp1", "ticket-tp2", "ticket-tp3"]
         .forEach(function (id) { const el = $(id); if (el) el.value = ""; });
+      state.ticketProposalId = null;
+      state.ticketProposalSymbol = null;
       _clearTpLadderReminder();
       try { updateRiskReadout(); } catch (_) {}
     }
@@ -1888,6 +1974,9 @@
       if (!res.ok) throw new Error("health " + res.status);
       const h = await res.json();
       state.health = h;
+      // Health is the authoritative exchange identity. Re-sync once it lands
+      // so a server-rendered/default LIMIT cannot remain selectable on HL.
+      try { syncTicketSegments(); } catch (_) {}
 
       const arm = $("arm-status");
       if (arm) {
@@ -1914,8 +2003,7 @@
       const llmLabel = $("llm-label");
       if (llmLabel) {
         const p = (h.llm_provider || "claude").toLowerCase();
-        llmLabel.textContent =
-          p === "xai" || p === "grok" ? "xAI" : "Claude";
+        llmLabel.textContent = _llmProviderLabel(p);
       }
 
       const ccyEl = $("equity-ccy");
@@ -1934,11 +2022,11 @@
       const sugBtn = $("btn-suggest-vol");
       if (sugBtn) {
         const rp = maxRiskPct();
-        sugBtn.textContent = fmt(rp, 2) + " % Risiko";
+        sugBtn.textContent = fmt(rp, 2) + "% risk";
         sugBtn.setAttribute(
           "data-tip",
-          "Berechnet die Größe so, dass der Stop-Loss genau " + fmt(rp, 2) +
-            " % deines Equity riskiert (Stop-Loss vorher eintragen)."
+          "Calculates size so the stop-loss risks exactly " + fmt(rp, 2) +
+            "% of your equity. Enter a stop first."
         );
       }
       return h;
@@ -2076,8 +2164,8 @@
       // Ein-/Auszahlungen verzerren sie. Daher "≈"-Praefix + Tooltip, damit die
       // Zahl nicht wie eine belastbare Boersen-Groesse gelesen wird.
       dpEl.title =
-        "Naeherung: Equity jetzt minus erstem Kontostand-Abruf heute. " +
-        "KEIN echtes realisiertes PnL — Ein-/Auszahlungen verzerren den Wert.";
+        "Estimate: current equity minus today's first account snapshot. " +
+        "This is not realized PnL; deposits and withdrawals distort it.";
       if (dp != null) {
         dpEl.textContent = "≈ " + (dp >= 0 ? "+" : "") + fmt(dp, 2) + " " + c;
         dpEl.className = "pulse-val " + (dp > 0 ? "pnl-pos" : dp < 0 ? "pnl-neg" : "");
@@ -2224,7 +2312,7 @@
     if (!isHlExchange()) {
       return (
         '<button type="button" class="cp-arm-btn cp-arm-disabled" disabled ' +
-        'title="Auto-BE (automatisches SL auf Break-Even ab +1R) ist nur auf Hyperliquid verfügbar">' +
+        'title="Auto break-even is available only on Hyperliquid">' +
         "⚡ Auto-BE</button>"
       );
     }
@@ -2236,8 +2324,8 @@
       '<button type="button" class="cp-arm-btn' + (armed ? " cp-arm-active" : "") + '"' +
       ' data-action="arm-be" data-armed="' + (armed ? "1" : "0") + '"' +
       (busy ? " disabled" : "") +
-      ' title="Auto-BE: zieht den Stop-Loss automatisch auf Break-Even, sobald die Position +1R im Gewinn steht. Der SERVER führt die Aktion aus — dieser Schalter aktiviert/deaktiviert sie nur.">' +
-      "⚡ Auto-BE: " + (armed ? "An" : "Aus") +
+      ' title="Auto break-even moves the stop to break-even after the position reaches +1R. The server performs the action; this switch only enables or disables it.">' +
+      "⚡ Auto-BE: " + (armed ? "On" : "Off") +
       "</button>"
     );
   }
@@ -2254,7 +2342,7 @@
     if (!isHlExchange()) {
       return (
         '<button type="button" class="cp-arm-btn cp-arm-disabled" disabled ' +
-        'title="Auto-Trail (automatisches SL-Nachziehen per ATR) ist nur auf Hyperliquid verfügbar">' +
+        'title="ATR auto-trailing is available only on Hyperliquid">' +
         "⚡ Trail</button>"
       );
     }
@@ -2266,8 +2354,8 @@
       '<button type="button" class="cp-arm-btn cp-arm-trail-btn' + (armed ? " cp-arm-trail-active" : "") + '"' +
       ' data-action="arm-trail" data-armed="' + (armed ? "1" : "0") + '"' +
       (busy ? " disabled" : "") +
-      ' title="Auto-Trail: zieht den Stop-Loss per ATR-Chandelier nach, sobald die Position die Aktivierungs-R erreicht hat. Der SERVER führt die Aktion aus — dieser Schalter aktiviert/deaktiviert sie nur.">' +
-      "⚡ Trail: " + (armed ? "An" : "Aus") +
+      ' title="Auto-trailing follows an ATR chandelier after the activation R is reached. The server performs the action; this switch only enables or disables it.">' +
+      "⚡ Trail: " + (armed ? "On" : "Off") +
       "</button>"
     );
   }
@@ -2369,9 +2457,9 @@
       );
     }
     if (!prot.ordersKnown) {
-      return ' · <span class="cp-tp-status cp-tp-unknown">TP-Status unbekannt</span>';
+      return ' · <span class="cp-tp-status cp-tp-unknown">TP status unknown</span>';
     }
-    return ' · <span class="cp-tp-status cp-tp-none">kein TP</span>';
+    return ' · <span class="cp-tp-status cp-tp-none">no TP</span>';
   }
 
   /** SL-status banner HTML for a position — green when protected, loud red when
@@ -2385,8 +2473,8 @@
     if (prot.manual && prot.sl != null && Number.isFinite(entry) && entry > 0) {
       const pct = ((prot.sl - entry) / entry) * 100;
       return (
-        '<div class="cp-sl-status cp-sl-manual">SL: MANUELL ' + fmt(prot.sl, 4) +
-        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%) — nur bei offenem Browser" + tp + "</div>"
+        '<div class="cp-sl-status cp-sl-manual">SL: MANUAL ' + fmt(prot.sl, 4) +
+        " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%) — browser must remain open" + tp + "</div>"
       );
     }
     if (prot.sl != null && Number.isFinite(entry) && entry > 0) {
@@ -2398,9 +2486,9 @@
       // the green "voll geschützt" chip. Full coverage stays green.
       if (prot.slCovered === false) {
         return (
-          '<div class="cp-sl-status cp-sl-missing cp-sl-partial">⚠ SL nur Teil-Deckung ' +
+          '<div class="cp-sl-status cp-sl-missing cp-sl-partial">⚠ PARTIAL SL COVERAGE ' +
           fmt(prot.slVol, 4) + "/" + fmt(prot.holdVol, 4) +
-          " — Rest ungeschützt · SL " + fmt(prot.sl, 4) +
+          " — remainder unprotected · SL " + fmt(prot.sl, 4) +
           " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
         );
       }
@@ -2410,10 +2498,10 @@
       );
     }
     if (!prot.ordersKnown) {
-      return '<div class="cp-sl-status cp-sl-unknown">Stop-Loss-Status wird geladen…' + tp + "</div>";
+      return '<div class="cp-sl-status cp-sl-unknown">Loading stop-loss status…' + tp + "</div>";
     }
     return (
-      '<div class="cp-sl-status cp-sl-missing">⚠ KEIN STOP-LOSS AKTIV — Position ungeschützt' +
+      '<div class="cp-sl-status cp-sl-missing">⚠ NO ACTIVE STOP-LOSS — position is unprotected' +
       tp + "</div>"
     );
   }
@@ -2459,8 +2547,8 @@
       inst.className = "ir-position ir-flat";
       const msg =
         positions.length > 0
-          ? positions.length + " Position(en) offen — Coin wechseln zum Ansehen"
-          : "Keine offene Position";
+          ? positions.length + " open position(s) — switch coin to view"
+          : "No open position";
       inst.innerHTML = '<span class="ir-flatmsg">' + escapeHtml(msg) + "</span>";
       return;
     }
@@ -2489,13 +2577,13 @@
     const pnlCls = pnl == null ? "" : pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "";
     let protHtml;
     if (prot.sl != null && prot.manual) {
-      protHtml = '<span class="ir-shield warn">SL MANUELL ' + fmt(prot.sl, 4) + "</span>";
+      protHtml = '<span class="ir-shield warn">SL MANUAL ' + fmt(prot.sl, 4) + "</span>";
     } else if (prot.sl != null) {
       protHtml = '<span class="ir-shield ok">🛡 SL ' + fmt(prot.sl, 4) + "</span>";
     } else if (!prot.ordersKnown) {
-      protHtml = '<span class="ir-shield">SL lädt…</span>';
+      protHtml = '<span class="ir-shield">Loading SL…</span>';
     } else {
-      protHtml = '<span class="ir-shield danger">⚠ KEIN SL</span>';
+      protHtml = '<span class="ir-shield danger">⚠ NO SL</span>';
     }
     // liq gauge: fills as price nears liq (small distance = high fill)
     const gaugeFill =
@@ -2680,21 +2768,21 @@
         const entry = Number(box.getAttribute("data-entry"));
         const px = Number(input && input.value);
         if (!Number.isFinite(px) || px <= 0) {
-          showToast("Bitte einen gültigen SL-Preis eingeben.", "err");
+          showToast("Enter a valid stop-loss price.", "err");
           return;
         }
         if (Number.isFinite(entry) && entry > 0) {
           const isLong = String(side).toLowerCase() !== "short";
           if (isLong && px >= entry) {
             showToast(
-              "SL für LONG muss unter dem Entry (" + fmt(entry, 6) + ") liegen.",
+              "A LONG stop-loss must be below entry (" + fmt(entry, 6) + ").",
               "err"
             );
             return;
           }
           if (!isLong && px <= entry) {
             showToast(
-              "SL für SHORT muss über dem Entry (" + fmt(entry, 6) + ") liegen.",
+              "A SHORT stop-loss must be above entry (" + fmt(entry, 6) + ").",
               "err"
             );
             return;
@@ -2851,20 +2939,20 @@
     // only when present (the fp above still folds bePrice in either way).
     const beBtn =
       bePrice != null
-        ? '<button type="button" class="cp-be-btn" data-action="be" title="Stop-Loss auf Break-Even (inkl. Gebühren) setzen — ersetzt einen bestehenden Stop">SL → Break-Even</button>'
+        ? '<button type="button" class="cp-be-btn" data-action="be" title="Move stop-loss to fee-adjusted break-even; replaces the existing stop">SL → Break-even</button>'
         : "";
     const beRow =
       '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
       (bePrice != null ? ' data-be="' + escapeHtml(String(bePrice)) + '"' : "") + ">" +
       '<span class="cp-actions-label">Stop</span>' +
       beBtn +
-      '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Stop-Loss auf einen beliebigen Preis nachziehen">✎ SL</button>' +
+      '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Move stop-loss to a new price">✎ SL</button>' +
       armHtml +
       armTrailHtml +
       '<span class="cp-sl-edit hidden">' +
-      '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL-Preis" aria-label="Neuer Stop-Loss-Preis" />' +
-      '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Setzen</button>' +
-      '<button type="button" class="cp-sl-cancel-btn" data-action="sl-edit-cancel" title="Abbrechen" aria-label="Abbrechen">✕</button>' +
+      '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL price" aria-label="New stop-loss price" />' +
+      '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Set</button>' +
+      '<button type="button" class="cp-sl-cancel-btn" data-action="sl-edit-cancel" title="Cancel" aria-label="Cancel">✕</button>' +
       "</span>" +
       "</div>";
     // Structural fingerprint: everything the user needs EXCEPT the live pnl/roe
@@ -2900,7 +2988,7 @@
       // folds isActive — and can't churn the volatile fp or flicker the patcher.
       (isActive
         ? ""
-        : '<span class="cp-fresh" title="Nicht live — Momentaufnahme, bis zu 30 s alt (Konto-Poll)">·30s</span>') +
+        : '<span class="cp-fresh" title="Not live — account snapshot, up to 30 seconds old">·30s</span>') +
       "</div>" +
       slHtml +
       '<div class="cp-pnl js-upnl-big ' + pnlCls + '">' +
@@ -2912,7 +3000,7 @@
       _cpCell("Entry", fmt(p.entry_price, 4)) +
       _cpCell("Mark", mark != null ? fmt(mark, 4) : "—", "", "js-mark-val") +
       _cpCell(
-        "Größe",
+        "Size",
         fmt(p.hold_vol, 4) + (notional != null ? " · " + fmt(notional, 0) + " " + ccy() : "")
       ) +
       _cpCell("Liq", liqCellText, "cp-liq" + (liqCls ? " " + liqCls : ""), "js-liq-val") +
@@ -2920,7 +3008,7 @@
       "</div>" +
       beRow +
       '<div class="cp-close" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
-      '<span class="cp-close-label">Schließen</span>' +
+      '<span class="cp-close-label">Close</span>' +
       '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.25">25%</button>' +
       '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.5">50%</button>' +
       '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.75">75%</button>' +
@@ -2928,7 +3016,7 @@
       "</div>" +
       '<div class="cp-reeval">' +
       '<button type="button" class="cp-reeval-btn" data-action="reeval" data-sym="' +
-      escapeHtml(String(p.symbol || "")) + '">KI: Position bewerten</button>' +
+      escapeHtml(String(p.symbol || "")) + '">AI: Review position</button>' +
       '<div class="cp-reeval-result" data-sym-result="' +
       escapeHtml(String(p.symbol || "").toUpperCase()) + '">' +
       reevalHtml +
@@ -3043,7 +3131,7 @@
     });
     if (!open.length) {
       _renderPositionsSummary([]);
-      const msg = data && data.error ? String(data.error) : "Keine offenen Positionen.";
+      const msg = data && data.error ? String(data.error) : "No open positions.";
       const emptyFp = "EMPTY" + msg;
       if (state._positionsFp === emptyFp) return;
       state._positionsFp = emptyFp;
@@ -3166,13 +3254,13 @@
     );
   }
 
-  /** German label for a /api/reevaluate action code. */
+  /** User-facing label for a /api/reevaluate action code. */
   function _reevalActionLabel(action) {
     switch (String(action || "").toUpperCase()) {
-      case "HOLD": return "Halten";
+      case "HOLD": return "Hold";
       case "MOVE_SL_BE": return "SL → Break-Even";
-      case "PARTIAL_CLOSE": return "Teilweise schließen";
-      case "CLOSE": return "Ganz schließen";
+      case "PARTIAL_CLOSE": return "Close partially";
+      case "CLOSE": return "Close fully";
       default: return action || "—";
     }
   }
@@ -3184,7 +3272,7 @@
 
   function _reevalConfLabel(conf) {
     const c = String(conf || "").toLowerCase();
-    return c === "high" ? "Hoch" : c === "medium" ? "Mittel" : "Niedrig";
+    return c === "high" ? "High" : c === "medium" ? "Medium" : "Low";
   }
 
   /** Render the cached /api/reevaluate result (or error) for one symbol, or
@@ -3220,14 +3308,14 @@
 
     const levels = [];
     if (r.new_sl != null) {
-      levels.push('<span class="cp-reeval-lvl"><b>neuer SL:</b> ' + fmt(r.new_sl, 6) + "</span>");
+      levels.push('<span class="cp-reeval-lvl"><b>new SL:</b> ' + fmt(r.new_sl, 6) + "</span>");
     }
     if (r.new_tp != null) {
-      levels.push('<span class="cp-reeval-lvl"><b>neuer TP:</b> ' + fmt(r.new_tp, 6) + "</span>");
+      levels.push('<span class="cp-reeval-lvl"><b>new TP:</b> ' + fmt(r.new_tp, 6) + "</span>");
     }
     if (r.partial_close_pct != null) {
       levels.push(
-        '<span class="cp-reeval-lvl"><b>Anteil:</b> ' + fmt(r.partial_close_pct, 0) + "%</span>"
+        '<span class="cp-reeval-lvl"><b>Share:</b> ' + fmt(r.partial_close_pct, 0) + "%</span>"
       );
     }
     if (levels.length) html += '<div class="cp-reeval-levels">' + levels.join(" ") + "</div>";
@@ -3237,8 +3325,8 @@
       html += '<div class="cp-reeval-risk">⚠ ' + escapeHtml(r.risk_notes) + "</div>";
     }
     html +=
-      '<div class="cp-reeval-foot">Nur Vorschlag — keine automatische Ausführung. ' +
-      "Halten/SL/Schließen macht der Trader selbst.</div>";
+      '<div class="cp-reeval-foot">Advisory only; no automatic execution. ' +
+      "The trader decides whether to hold, move the stop, or close.</div>";
     html += "</div>";
     return html;
   }
@@ -3280,7 +3368,7 @@
       }
       if (!res.ok) {
         const detail =
-          (data && (data.detail || data.message)) || res.statusText || "Bewertung fehlgeschlagen";
+          (data && (data.detail || data.message)) || res.statusText || "Position review failed";
         const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
         state.reevalResults[key] = { error: msg };
       } else {
@@ -3288,7 +3376,7 @@
       }
     } catch (err) {
       state.reevalResults[key] = {
-        error: "Netzwerkfehler: " + (err && err.message ? err.message : err),
+        error: "Network error: " + (err && err.message ? err.message : err),
       };
     } finally {
       state.reevalBusy[key] = false;
@@ -3304,7 +3392,7 @@
       const btn2 = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
       if (btn2) {
         btn2.disabled = false;
-        btn2.textContent = "KI: Position bewerten";
+        btn2.textContent = "AI: Review position";
       }
     }
   }
@@ -3324,7 +3412,7 @@
     (otherStops || []).forEach(function (s) { bump(s.symbol, "trig"); });
     const syms = Object.keys(bySym).sort();
     if (!syms.length) return "";
-    let h = '<div class="other-coins-head">↔ Auch offen auf anderen Coins</div>';
+    let h = '<div class="other-coins-head">↔ Also open on other coins</div>';
     h += syms
       .map(function (k) {
         const c = bySym[k];
@@ -3336,7 +3424,7 @@
           escapeHtml(k) + '">' +
           '<span class="pos-sym">' + escapeHtml(k) + "</span>" +
           '<span class="other-coin-detail">' + parts.join(" · ") + "</span>" +
-          '<span class="other-coin-go">ansehen →</span>' +
+          '<span class="other-coin-go">view →</span>' +
           "</button>"
         );
       })
@@ -3344,15 +3432,48 @@
     return h;
   }
 
+  function markOpenOrdersUnknown(el) {
+    state.openOrders = null;
+    drawOrderLines();
+    drawTradeZones();
+    if (state.account) {
+      try { renderPositions(state.account); } catch (_) {}
+    }
+    if (el) {
+      el.className = "orders-body muted";
+      el.textContent = "Open orders are currently unavailable";
+    }
+  }
+
   async function loadOpenOrders() {
+    if (state._ordersLoadPromise) {
+      // Keep one post-action reconciliation, but collapse larger UI/poll
+      // bursts so identical account-wide exchange reads never overlap.
+      state._ordersLoadQueued = true;
+      return state._ordersLoadPromise;
+    }
+
+    const request = _loadOpenOrdersOnce();
+    state._ordersLoadPromise = request;
+    try {
+      return await request;
+    } finally {
+      if (state._ordersLoadPromise === request) {
+        state._ordersLoadPromise = null;
+        if (state._ordersLoadQueued) {
+          state._ordersLoadQueued = false;
+          void loadOpenOrders();
+        }
+      }
+    }
+  }
+
+  async function _loadOpenOrdersOnce() {
     const el = $("open-orders-body");
-    // Sequence guard: loadOpenOrders() is called from many places (30s poll,
-    // cancelOrder, symbol switch, WS fill handler, manual refresh). Two calls
-    // can overlap and resolve out of order — e.g. the periodic poll fires
-    // right before the user cancels an order, and its (now-stale) response
-    // lands AFTER cancelOrder's own refresh, silently resurrecting the
-    // just-cancelled order (and its chart line) until the next poll. Stamp
-    // each call and drop any response that isn't the most recent one.
+    // Defense-in-depth sequence guard: the wrapper serializes ordinary bursts,
+    // while this still rejects a superseded response if future code explicitly
+    // bypasses/re-enters the loader. A stale pre-cancel response must never
+    // resurrect a cancelled order or its chart line.
     const reqSeq = (state._ordersSeq || 0) + 1;
     state._ordersSeq = reqSeq;
     try {
@@ -3362,9 +3483,18 @@
       // rest as a compact "also open on…" overview so you never forget a
       // resting order/stop on another coin while looking at this chart.
       const res = await apiFetch("/api/orders/open");
+      if (reqSeq !== state._ordersSeq) return null;
+      if (!res.ok) {
+        markOpenOrdersUnknown(el);
+        return null;
+      }
       const data = await res.json();
       if (reqSeq !== state._ordersSeq) return null; // superseded by a newer call
-      state.openOrders = data && !data.error ? data : null;
+      if (data.error) {
+        markOpenOrdersUnknown(el);
+        return data;
+      }
+      state.openOrders = data;
       drawOrderLines(); // these already filter to the active symbol internally
       drawTradeZones();
       // Refresh the position cockpit so its SL-status chip reflects the freshly
@@ -3373,11 +3503,6 @@
         try { renderPositions(state.account); } catch (_) {}
       }
       if (!el) return data;
-      if (data.error) {
-        el.className = "orders-body muted";
-        el.textContent = String(data.error);
-        return data;
-      }
       const allOrders = data.orders || [];
       const allStops = data.stop_orders || [];
       const isActive = function (s) {
@@ -3392,9 +3517,12 @@
         return s.symbol && !symMatch(s.symbol, sym);
       });
       const otherHtml = renderOtherCoinOrders(otherOrders, otherStops);
+      const stopsUnknown = !!data.stops_error;
       if (!orders.length && !stops.length && !otherHtml) {
         el.className = "orders-body muted";
-        el.textContent = "Keine offenen Orders";
+        el.textContent = stopsUnknown
+          ? "No regular open orders · protective orders are currently unavailable"
+          : "No open orders";
         return data;
       }
       el.className = "orders-body";
@@ -3405,7 +3533,7 @@
           // price reaches it — flag it so it is never mistaken for an open position.
           const waiting = o.reduceOnly
             ? ""
-            : '<span class="side-tag tag-wait">⏳ wartet auf Fill</span>';
+            : '<span class="side-tag tag-wait">⏳ waiting for fill</span>';
           return (
             '<div class="order-row">' +
             '<span class="pos-sym">' +
@@ -3414,7 +3542,7 @@
             orderSideTag(o) +
             waiting +
             posKv("Vol", fmt(o.vol != null ? o.vol : o.quantity, 4)) +
-            posKv("Preis", fmt(o.price, 4)) +
+            posKv("Price", fmt(o.price, 4)) +
             '<span class="order-oid">#' +
             escapeHtml(String(oid)) +
             "</span>" +
@@ -3456,7 +3584,7 @@
               : null;
           const distKv =
             distPct != null
-              ? posKv("Distanz", (distPct >= 0 ? "+" : "") + fmt(distPct, 2) + "%")
+              ? posKv("Distance", (distPct >= 0 ? "+" : "") + fmt(distPct, 2) + "%")
               : "";
           // N3-11: cancel a resting trigger. Wired to the EXISTING
           // /api/orders/cancel path via cancelTriggerOrder(), which prepends a
@@ -3474,7 +3602,7 @@
             '<div class="order-row order-row-trigger">' +
             '<span class="pos-sym">' + escapeHtml(s.symbol || "—") + "</span>" +
             '<span class="side-tag ' + (isTp ? "tag-long" : "tag-short") + '">' +
-            (isTp ? "TP AKTIV" : "SL AKTIV") + "</span>" +
+            (isTp ? "TP ACTIVE" : "SL ACTIVE") + "</span>" +
             posKv("Trigger", fmt(px, 4)) +
             volKv +
             distKv +
@@ -3487,7 +3615,10 @@
       // U-04: build the full fragment in memory and assign innerHTML ONCE —
       // three separate `+=` assignments each re-parse and re-render the
       // entire (already-inserted) HTML, which thrashes the DOM for no reason.
-      el.innerHTML = ordersHtml + stopsHtml + otherHtml;
+      const stopsWarning = stopsUnknown
+        ? '<p class="muted">Protective orders are currently unavailable · status unknown</p>'
+        : "";
+      el.innerHTML = stopsWarning + ordersHtml + stopsHtml + otherHtml;
       el.querySelectorAll(".btn-cancel-order:not(.btn-cancel-trigger)").forEach(function (btn) {
         btn.addEventListener("click", function () {
           cancelOrder(btn.getAttribute("data-oid"));
@@ -3510,11 +3641,8 @@
       });
       return data;
     } catch (err) {
-      console.error("loadOpenOrders", err);
-      if (el) {
-        el.className = "orders-body muted";
-        el.textContent = "Orders laden fehlgeschlagen";
-      }
+      console.warn("loadOpenOrders", err);
+      markOpenOrdersUnknown(el);
       return null;
     }
   }
@@ -3542,12 +3670,12 @@
         showToast(detailToText(data.detail || data), "err");
         return;
       }
-      showToast("Cancel gesendet", data.ok === false ? "err" : "ok");
+      showToast("Cancel request sent", data.ok === false ? "err" : "ok");
       loadOpenOrders();
       loadAccount();
       loadHistory();
     } catch (err) {
-      showToast("Cancel Fehler: " + (err && err.message), "err");
+      showToast("Cancel failed: " + (err && err.message), "err");
     } finally {
       delete state._cancelBusy[orderId];
     }
@@ -3560,9 +3688,9 @@
   function cancelTriggerOrder(orderId, isSl) {
     if (!orderId) return;
     const text = isSl
-      ? "Stop-Loss #" + orderId + " stornieren?\n\n" +
-        "Die Position wird dann UNGESCHÜTZT — trotzdem stornieren?"
-      : "Take-Profit-Trigger #" + orderId + " stornieren?";
+      ? "Cancel stop-loss #" + orderId + "?\n\n" +
+        "This will leave the position UNPROTECTED. Continue?"
+      : "Cancel take-profit trigger #" + orderId + "?";
     if (!window.confirm(text)) return;
     cancelOrder(orderId);
   }
@@ -3622,6 +3750,30 @@
   }
 
   async function loadAccount() {
+    if (state._accountLoadPromise) {
+      // A trade/SL/visibility event that arrives during an older poll still
+      // needs one later reconciliation. Collapse any larger burst to exactly
+      // one trailing read instead of stacking parallel exchange requests.
+      state._accountLoadQueued = true;
+      return state._accountLoadPromise;
+    }
+
+    const request = _loadAccountOnce();
+    state._accountLoadPromise = request;
+    try {
+      return await request;
+    } finally {
+      if (state._accountLoadPromise === request) {
+        state._accountLoadPromise = null;
+        if (state._accountLoadQueued) {
+          state._accountLoadQueued = false;
+          void loadAccount();
+        }
+      }
+    }
+  }
+
+  async function _loadAccountOnce() {
     let data;
     try {
       const res = await apiFetch("/api/account");
@@ -3631,7 +3783,12 @@
       console.error("loadAccount fetch", err);
       // Transient fetch error: keep the last-known account instead of wiping
       // equity + positions. Only blank if we never had any data at all.
-      if (!state.account) {
+      if (state.account) {
+        if (!state._accountStaleWarned) {
+          showToast("Account data is stale — exchange request failed.", "err");
+          state._accountStaleWarned = true;
+        }
+      } else {
         updateEquity(null);
         renderPositions(null);
       }
@@ -3644,12 +3801,17 @@
       data.error &&
       !(data.positions && data.positions.length) &&
       state.account &&
-      state.account.positions &&
-      state.account.positions.length
+      (!state.account.error ||
+        (state.account.positions && state.account.positions.length))
     ) {
       console.warn("account soft-error, keeping last snapshot:", data.error);
+      if (!state._accountStaleWarned) {
+        showToast("Account data is stale — exchange request failed.", "err");
+        state._accountStaleWarned = true;
+      }
       return state.account;
     }
+    if (!data.error) state._accountStaleWarned = false;
     state.account = data;
     updateMarkOffsets(data); // E3-06: refresh per-symbol Mark−Last basis before any render
     pruneTradeMarkers();
@@ -3675,6 +3837,12 @@
   }
 
   /* ── Trade markers (E7): real executions on the time axis ───────────── */
+  function warnFillsStale() {
+    if (state._fillsStaleWarned) return;
+    showToast("Trade history is stale — fill request failed.", "err");
+    state._fillsStaleWarned = true;
+  }
+
   async function loadFills() {
     if (!state.symbol) return null;
     // Sequence guard: a fast coin switch can leave an in-flight request from
@@ -3684,12 +3852,22 @@
     const reqSeq = (state._fillsSeq || 0) + 1;
     state._fillsSeq = reqSeq;
     try {
-      const res = await apiFetch(
+      const res = await apiFetchAbortable(
+        "fills",
         "/api/fills?symbol=" + encodeURIComponent(state.symbol) + "&limit=100"
       );
-      if (!res.ok) return null;
+      if (!res.ok) {
+        warnFillsStale();
+        return null;
+      }
       const data = await res.json();
       if (reqSeq !== state._fillsSeq) return null; // superseded by a newer call
+      if (data.error) {
+        console.warn("fills soft-error, keeping last history:", data.error);
+        warnFillsStale();
+        return data;
+      }
+      state._fillsStaleWarned = false;
       // C3-01: feature-detect via the endpoint's own `supported` flag
       // instead of hardcoding "only HL has fills" — the backend already
       // reports supported=false for any exchange client without a working
@@ -3700,7 +3878,9 @@
       try { renderTrades(); } catch (_) {}
       return data;
     } catch (e) {
-      console.error("loadFills", e);
+      if (e && e.name === "AbortError") return null;
+      console.warn("loadFills", e);
+      warnFillsStale();
       return null;
     }
   }
@@ -3976,7 +4156,7 @@
     let html =
       '<div class="mt-row">' + escapeHtml(chartLocalTime(agg.time, true)) + "</div>" +
       '<div class="mt-row">' + escapeHtml(dirLabel) + "</div>" +
-      '<div class="mt-row">Größe: ' + escapeHtml(fmt(agg.sz, 4)) + "</div>" +
+      '<div class="mt-row">Size: ' + escapeHtml(fmt(agg.sz, 4)) + "</div>" +
       '<div class="mt-row">VWAP: ' + escapeHtml(fmt(agg.avgPx, 4)) + "</div>";
     // C3-08: realized PnL only means something on a close-only bucket —
     // an open/add has none yet (mirrors the marker-text rule above).
@@ -4166,7 +4346,7 @@
       const cur = Number(el.value);
       if (Number.isFinite(cur) && cur > max) {
         el.value = String(max);
-        showToast("Hebel auf " + max + "× begrenzt (Börsen-Cap)", "warn");
+        showToast("Leverage capped at " + max + "× by the exchange", "warn");
       }
     }
   }
@@ -4273,11 +4453,11 @@
     const sl = $("ticket-sl");
     const tp = $("ticket-tp1");
     if (state.sltpMode === "pct") {
-      if (sl) sl.placeholder = "Abstand %, z.B. 2";
-      if (tp) tp.placeholder = "Abstand %, z.B. 4";
+      if (sl) sl.placeholder = "Abstand in %";
+      if (tp) tp.placeholder = "Abstand in %";
     } else {
-      if (sl) sl.placeholder = "Kurs, z.B. 61000";
-      if (tp) tp.placeholder = "Kurs, z.B. 64000";
+      if (sl) sl.placeholder = "Price";
+      if (tp) tp.placeholder = "Price";
     }
     updateSltpUnitSuffix();
     updatePriceFieldSteps(); // T3-10: %-mode uses a flat step, price-mode uses the tick
@@ -4336,7 +4516,7 @@
       b.classList.toggle("active", b.getAttribute("data-size-mode") === next);
     });
     const lbl = $("size-mode-label");
-    if (lbl) lbl.textContent = (next === "margin" ? "Margin (" : "Größe (") + ccy() + ")";
+    if (lbl) lbl.textContent = (next === "margin" ? "Margin (" : "Size (") + ccy() + ")";
     updateRiskReadout();
   }
 
@@ -4384,7 +4564,7 @@
       return;
     }
     if (sizeMode() === "margin" && (!lev || lev <= 0)) {
-      el.textContent = "Hebel eintragen für Margin-Modus";
+      el.textContent = "Enter leverage to use margin mode";
       return;
     }
     const notional = notionalFromField();
@@ -4556,10 +4736,10 @@
           (p != null ? (p > 0 ? "+" : "") + fmt(p, 2) + "%" : "—") +
           (m != null ? ' <span class="rr-money">−' + fmt(m, 2) + " " + ccy() + "</span>" : "") +
           (eqPct != null ? ' <span class="rr-money">= ' + fmt(eqPct, 2) + "% Equity</span>" : "") +
-          (bad ? ' <span class="rr-bad">falsche Seite!</span>' : "");
+          (bad ? ' <span class="rr-bad">wrong side</span>' : "");
         slEl.className = "risk-val" + (bad ? " rr-error" : "");
       } else {
-        slEl.textContent = "Kurs eintragen";
+        slEl.textContent = "Enter price";
         slEl.className = "risk-val rr-dim";
       }
     }
@@ -4636,8 +4816,8 @@
     if (liqEl) {
       if (dist != null) {
         liqEl.innerHTML =
-          "Hebel " + fmt(lev, 0) + "× → Liq ≈ " + (isLong ? "−" : "+") +
-          fmt(dist * 100, 1) + "% vom Entry" +
+          "Leverage " + fmt(lev, 0) + "× → Liq ≈ " + (isLong ? "−" : "+") +
+          fmt(dist * 100, 1) + "% from entry" +
           (liqPrice != null ? ' <span class="liq-price">(' + fmt(liqPrice, 4) + ")</span>" : "");
       } else {
         liqEl.textContent = "";
@@ -4656,7 +4836,7 @@
         tooClose = slDist > dist;
       }
       liqWarnEl.classList.toggle("hidden", !tooClose);
-      liqWarnEl.textContent = tooClose ? "⚠ Liquidation näher als dein Stop!" : "";
+      liqWarnEl.textContent = tooClose ? "⚠ Liquidation is closer than your stop-loss" : "";
     }
   }
 
@@ -4668,7 +4848,7 @@
     // distance/price can never be written into the current ticket (M-1).
     const reqSymbol = ticket.symbol;
     if (ticket.stop_loss == null) {
-      setTicketError("Erst Stop-Loss-Kurs eintragen — dann kann die Größe berechnet werden.");
+      setTicketError("Enter a stop-loss price before calculating size.");
       return;
     }
     // T3-04: margin mode needs a real leverage to turn notional into margin.
@@ -4677,7 +4857,7 @@
     if (sizeMode() === "margin") {
       const levCheck = numOrNull($("ticket-leverage"));
       if (!levCheck || levCheck <= 0) {
-        setTicketError("Hebel eintragen — Margin-Größe kann sonst nicht berechnet werden.");
+        setTicketError("Enter leverage before calculating a margin-based size.");
         return;
       }
     }
@@ -4704,8 +4884,8 @@
       }
       if (!data.vol || Number(data.vol) <= 0) {
         setTicketError(
-          "Kein gate-sicheres Volumen: Risk-Budget liegt unter der Börsen-Mindestgröße. " +
-            "Stop enger setzen oder Equity/Risk erhöhen."
+          "No gate-safe size is available: the risk budget is below the exchange minimum. " +
+            "Move the stop closer or increase equity/risk."
         );
         return;
       }
@@ -4719,7 +4899,7 @@
           // user later fills in the real leverage.
           const lev = numOrNull($("ticket-leverage"));
           if (!lev || lev <= 0) {
-            setTicketError("Hebel eintragen — Margin-Größe kann sonst nicht berechnet werden.");
+            setTicketError("Enter leverage before calculating a margin-based size.");
             return;
           }
           val = data.notional_usdt / lev;
@@ -4728,7 +4908,7 @@
       }
       updateRiskReadout();
       showToast(
-        "Größe für " + fmt(rp, 2) + " % Risiko: " +
+        "Size for " + fmt(rp, 2) + "% risk: " +
           fmt(data.notional_usdt, 2) + " " + ccy() +
           " ≈ " + fmt(data.base_amount, 6) + " " + (state.symbol || ""),
         "ok"
@@ -4758,7 +4938,7 @@
 
     if (!data) {
       body.className = "placeholder";
-      body.textContent = "Historie nicht geladen.";
+      body.textContent = "History is not loaded.";
       return;
     }
 
@@ -4767,17 +4947,17 @@
 
     if (!proposals.length && !orders.length) {
       body.className = "placeholder";
-      body.textContent = "Noch keine Einträge.";
+      body.textContent = "No entries yet.";
       return;
     }
 
     let html = '<div class="history-content">';
 
-    html += '<div class="history-section"><h3>Proposals (letzte ' + proposals.length + ")</h3>";
+    html += '<div class="history-section"><h3>Proposals (latest ' + proposals.length + ")</h3>";
     if (proposals.length) {
       html +=
         '<table class="history-table"><thead><tr>' +
-        "<th>Zeit</th><th>Symbol</th><th>Action</th><th>Entry</th><th>SL</th><th>RRR</th>" +
+        "<th>Time</th><th>Symbol</th><th>Action</th><th>Entry</th><th>SL</th><th>RRR</th>" +
         "</tr></thead><tbody>";
       for (const row of proposals) {
         const p = row.proposal || {};
@@ -4807,15 +4987,15 @@
       }
       html += "</tbody></table>";
     } else {
-      html += '<p class="muted history-empty">Keine Proposals.</p>';
+      html += '<p class="muted history-empty">No proposals.</p>';
     }
     html += "</div>";
 
-    html += '<div class="history-section"><h3>Orders (letzte ' + orders.length + ")</h3>";
+    html += '<div class="history-section"><h3>Orders (latest ' + orders.length + ")</h3>";
     if (orders.length) {
       html +=
         '<table class="history-table"><thead><tr>' +
-        "<th>Zeit</th><th>Symbol</th><th>Side</th><th>Status</th><th>Fehler</th>" +
+        "<th>Time</th><th>Symbol</th><th>Side</th><th>Status</th><th>Error</th>" +
         "</tr></thead><tbody>";
       for (const o of orders) {
         const st = o.status || "—";
@@ -4849,7 +5029,7 @@
       }
       html += "</tbody></table>";
     } else {
-      html += '<p class="muted history-empty">Keine Orders.</p>';
+      html += '<p class="muted history-empty">No orders.</p>';
     }
     html += "</div></div>";
 
@@ -4859,18 +5039,22 @@
 
   async function loadHistory() {
     const body = $("history-body");
+    const reqSeq = (state._historySeq || 0) + 1;
+    state._historySeq = reqSeq;
     try {
-      const res = await apiFetch("/api/history?limit=20");
+      const res = await apiFetchAbortable("history", "/api/history?limit=20");
       if (!res.ok) throw new Error("history " + res.status);
       const data = await res.json();
+      if (reqSeq !== state._historySeq) return null;
       renderHistory(data);
       return data;
     } catch (err) {
+      if (err && err.name === "AbortError") return null;
       console.error("loadHistory", err);
       if (body) {
         body.className = "placeholder";
         body.textContent =
-          "Historie-Fehler: " + (err && err.message ? err.message : err);
+          "History error: " + (err && err.message ? err.message : err);
       }
       return null;
     }
@@ -4901,7 +5085,7 @@
     html += "<h4>" + escapeHtml(title) + "</h4>";
     html +=
       '<table class="journal-breakdown-table"><thead><tr>' +
-      "<th></th><th>n</th><th>Win-Rate</th><th>Ø R</th>" +
+      "<th></th><th>n</th><th>Win rate</th><th>Ø R</th>" +
       "</tr></thead><tbody>";
     for (const k of keys) {
       const g = groups[k] || {};
@@ -4915,8 +5099,8 @@
       html +=
         '<tr class="' + (g.low_sample ? "low-sample" : "") + '" ' +
         'data-jf-field="' + escapeHtml(field) + '" data-jf-value="' + escapeHtml(k) + '" ' +
-        'title="Klicken: Entries-Tabelle auf ' + escapeHtml(_journalFieldLabel(field)) +
-        " = " + escapeHtml(k) + ' filtern" style="' + rowStyle + '">' +
+        'title="Filter the entries table by ' + escapeHtml(_journalFieldLabel(field)) +
+        " = " + escapeHtml(k) + '" style="' + rowStyle + '">' +
         "<td>" + escapeHtml(k) + "</td>" +
         "<td>" + fmt(g.sample, 0) + "</td>" +
         "<td>" +
@@ -4943,7 +5127,7 @@
 
     if (!hasStats && !entries.length) {
       body.className = "placeholder";
-      body.textContent = "Noch keine Journal-Einträge.";
+      body.textContent = "No journal entries yet.";
       return;
     }
 
@@ -4958,14 +5142,14 @@
       html += '<div class="journal-stats">';
       if (!sample) {
         html +=
-          '<p class="muted journal-empty-stats">Noch keine aufgelösten Einträge — ' +
-          "zu wenig Daten für eine belastbare Trefferquote.</p>";
+          '<p class="muted journal-empty-stats">No resolved entries yet — ' +
+          "there is not enough data for a reliable win rate.</p>";
       } else {
         html +=
           '<div class="journal-overall' +
           (ov.low_sample ? " low-sample" : "") +
           '">' +
-          '<span class="journal-stat"><b>Win-Rate:</b> ' +
+          '<span class="journal-stat"><b>Win rate:</b> ' +
           (ov.win_rate != null ? fmt(ov.win_rate * 100, 1) + "%" : "—") +
           " (n=" + fmt(sample, 0) + ")" +
           (ci
@@ -4980,23 +5164,23 @@
           (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
           "</span>" +
           (ov.low_sample
-            ? '<span class="journal-lowflag">zu wenig Daten</span>'
+            ? '<span class="journal-lowflag">insufficient data</span>'
             : "") +
           "</div>";
       }
       html +=
         '<div class="journal-totals muted">' +
         "Proposals: " + fmt(tot.proposals, 0) +
-        " · STAY_OUT-Rate: " +
+        " · STAY_OUT rate: " +
         (tot.stay_out_rate != null ? fmt(tot.stay_out_rate * 100, 1) + "%" : "—") +
         " · Pending: " + fmt(tot.pending, 0) +
         " · Expired: " + fmt(tot.expired, 0) +
         " · Skipped: " + fmt(tot.skipped, 0) +
         "</div>";
 
-      html += renderJournalBreakdown("Nach Confidence", stats.by_confidence, "setup_confidence");
-      html += renderJournalBreakdown("Nach Action", stats.by_action, "action");
-      html += renderJournalBreakdown("Nach Provider", stats.by_provider, "provider");
+      html += renderJournalBreakdown("By confidence", stats.by_confidence, "setup_confidence");
+      html += renderJournalBreakdown("By action", stats.by_action, "action");
+      html += renderJournalBreakdown("By provider", stats.by_provider, "provider");
 
       const caveats = Array.isArray(stats.caveats) ? stats.caveats : [];
       if (caveats.length) {
@@ -5030,16 +5214,16 @@
           '<div class="muted journal-filter-chip">' +
           "<span>Filter: <b>" + escapeHtml(_journalFieldLabel(activeFilter.field)) + " = " +
           escapeHtml(activeFilter.value) + "</b> (" + fmt(filteredEntries.length, 0) +
-          " von " + fmt(entries.length, 0) + ")</span>" +
+          " of " + fmt(entries.length, 0) + ")</span>" +
           '<button type="button" class="journal-filter-clear" data-jf-clear="1">' +
-          "✕ Filter löschen</button>" +
+          "✕ Clear filter</button>" +
           "</div>";
       }
 
       if (filteredEntries.length) {
         html +=
           '<table class="history-table journal-table"><thead><tr>' +
-          "<th>Zeit</th><th>Symbol</th><th>Action</th><th>Conf</th><th>Entry</th>" +
+          "<th>Time</th><th>Symbol</th><th>Action</th><th>Conf</th><th>Entry</th>" +
           "<th>SL</th><th>TP1</th><th>RRR</th><th>Outcome</th>" +
           "</tr></thead><tbody>";
         for (const e of filteredEntries) {
@@ -5065,17 +5249,17 @@
             escapeHtml(st) +
             "</span>" +
             (e.ambiguous
-              ? ' <span class="journal-ambiguous" title="tp1 und SL im selben Candle — pessimistisch als LOSS gewertet">~</span>'
+              ? ' <span class="journal-ambiguous" title="TP1 and SL touched in the same candle — conservatively counted as LOSS">~</span>'
               : "") +
             "</td>" +
             "</tr>";
         }
         html += "</tbody></table>";
       } else {
-        html += '<p class="muted history-empty">Keine Einträge für diesen Filter.</p>';
+        html += '<p class="muted history-empty">No entries match this filter.</p>';
       }
     } else {
-      html += '<p class="muted history-empty">Noch keine Journal-Einträge.</p>';
+      html += '<p class="muted history-empty">No journal entries yet.</p>';
     }
 
     html += "</div>";
@@ -5116,26 +5300,30 @@
    *  pane and never throws further (journal is measurement-only). */
   async function loadJournal() {
     const body = $("journal-body");
+    const reqSeq = (state._journalSeq || 0) + 1;
+    state._journalSeq = reqSeq;
     try {
       const [statsRes, entriesRes] = await Promise.all([
-        apiFetch("/api/journal/stats"),
-        apiFetch("/api/journal?limit=50"),
+        apiFetchAbortable("journal-stats", "/api/journal/stats"),
+        apiFetchAbortable("journal-entries", "/api/journal?limit=50"),
       ]);
       if (!statsRes.ok) throw new Error("journal stats " + statsRes.status);
       if (!entriesRes.ok) throw new Error("journal " + entriesRes.status);
       const stats = await statsRes.json();
       const data = await entriesRes.json();
+      if (reqSeq !== state._journalSeq) return null;
       const entries = Array.isArray(data.entries) ? data.entries : [];
       state.journalStats = stats;
       state.journalEntries = entries;
       renderJournal(stats, entries);
       return { stats: stats, entries: entries };
     } catch (err) {
+      if (err && err.name === "AbortError") return null;
       console.error("loadJournal", err);
       if (body) {
         body.className = "placeholder";
         body.textContent =
-          "Journal-Fehler: " + (err && err.message ? err.message : err);
+          "Journal error: " + (err && err.message ? err.message : err);
       }
       return null;
     }
@@ -5226,8 +5414,8 @@
       return {
         cls: "cal-ok",
         text:
-          "✓ Kalibriert: high (" + hiWr + "%) schlägt low (" + loWr +
-          "%) — die Wilson-Intervalle überlappen nicht, die KI-Confidence trägt Information.",
+          "✓ Calibrated: high (" + hiWr + "%) outperforms low (" + loWr +
+          "%); the Wilson intervals do not overlap, so AI confidence carries information.",
       };
     }
     // Symmetric: high provably WORSE than low.
@@ -5235,15 +5423,15 @@
       return {
         cls: "cal-warn",
         text:
-          "⚠ Fehlkalibriert: high (" + hiWr + "%) liegt nachweislich UNTER low (" +
-          loWr + "%). Die aktive Rekalibrierung (ab n≥20) stuft solche high-Setups runter.",
+          "⚠ Miscalibrated: high (" + hiWr + "%) is demonstrably BELOW low (" +
+          loWr + "%). Active recalibration (from n≥20) downgrades these high setups.",
       };
     }
     return {
       cls: "cal-neutral",
       text:
-        "○ Noch nicht unterscheidbar: high (" + hiWr + "%) vs low (" + loWr +
-        "%) — die Wilson-Intervalle überlappen, die Stichprobe reicht noch nicht für ein Urteil.",
+        "○ Not distinguishable yet: high (" + hiWr + "%) vs low (" + loWr +
+        "%); the Wilson intervals overlap, so the sample is not yet conclusive.",
     };
   }
 
@@ -5257,34 +5445,34 @@
     if (!stats || !stats.overall || !sample) {
       body.className = "placeholder";
       body.textContent =
-        "Noch keine aufgelösten Trades — sobald genug Journal-Einträge WIN/LOSS " +
-        "haben, erscheint hier deine echte Trefferquote nach Confidence, Setup und Regime.";
+        "No resolved trades yet. Once enough journal entries reach WIN/LOSS, " +
+        "your observed win rate by confidence, setup, and regime will appear here.";
       return;
     }
 
     const ci = Array.isArray(ov.win_rate_ci95) ? ov.win_rate_ci95 : null;
     let html = '<div class="journal-content calibration-content">';
     html +=
-      '<p class="muted calibration-intro">Vorwärts-Statistik aus deinen echten ' +
-      "(Shadow-)Trades — kein Backtest. <b>Wilson-LB</b> = unterer 95%-Konfidenzrand " +
-      "der Trefferquote (die ehrliche Untergrenze; kleine n lesen sich automatisch " +
-      "vorsichtig). Gruppen-<b>Ø R ist brutto</b> (Fees/Slippage nur im Netto-" +
-      "Gesamtwert unten). Ein Urteil „kalibriert“ erscheint erst ab n≥20 pro Stufe " +
-      "und nicht-überlappenden Intervallen. Korrelierte Journal-Einträge sind " +
-      "möglich → die Intervalle sind eher etwas zu eng.</p>";
+      '<p class="muted calibration-intro">Forward statistics from your actual ' +
+      "shadow trades; this is not a backtest. <b>Wilson LB</b> is the lower 95% " +
+      "confidence bound for the win rate, so small samples remain conservative. " +
+      "Group <b>average R is gross</b>; fees and slippage appear only in the net " +
+      "overall value. A calibration verdict requires n≥20 per tier " +
+      "and non-overlapping intervals. Journal entries may be correlated, so the " +
+      "intervals can be slightly too narrow.</p>";
 
     html +=
       '<div class="journal-stats"><div class="journal-overall' +
       (ov.low_sample ? " low-sample" : "") + '">' +
-      '<span class="journal-stat"><b>Gesamt-Win-Rate:</b> ' +
+      '<span class="journal-stat"><b>Overall win rate:</b> ' +
       (ov.win_rate != null ? fmt(ov.win_rate * 100, 1) + "%" : "—") +
       " (n=" + fmt(sample, 0) + ")" +
       (ci && ci[0] != null ? " · Wilson-LB " + fmt(ci[0] * 100, 1) + "%" : "") + "</span>" +
       '<span class="journal-stat"><b>Ø realized R:</b> ' +
       (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
-      (ov.avg_realized_rrr_net != null ? " (netto " + fmt(ov.avg_realized_rrr_net, 2) + ")" : "") +
+      (ov.avg_realized_rrr_net != null ? " (net " + fmt(ov.avg_realized_rrr_net, 2) + ")" : "") +
       "</span>" +
-      (ov.low_sample ? '<span class="journal-lowflag">zu wenig Daten</span>' : "") +
+      (ov.low_sample ? '<span class="journal-lowflag">insufficient data</span>' : "") +
       "</div></div>";
 
     const verdict = _calibrationVerdict(stats.by_confidence);
@@ -5294,9 +5482,9 @@
         '">' + escapeHtml(verdict.text) + "</div>";
     }
 
-    html += renderCalibrationBreakdown("Nach Confidence (Kalibrierungs-Check)", stats.by_confidence, { order: _CAL_CONF_ORDER });
-    html += renderCalibrationBreakdown("Nach Setup", stats.by_setup, { sortByWilsonLo: true });
-    html += renderCalibrationBreakdown("Nach Regime", stats.by_regime, { sortByWilsonLo: true });
+    html += renderCalibrationBreakdown("By confidence (calibration check)", stats.by_confidence, { order: _CAL_CONF_ORDER });
+    html += renderCalibrationBreakdown("By setup", stats.by_setup, { sortByWilsonLo: true });
+    html += renderCalibrationBreakdown("By regime", stats.by_regime, { sortByWilsonLo: true });
 
     const caveats = Array.isArray(stats.caveats) ? stats.caveats : [];
     if (caveats.length) {
@@ -5313,19 +5501,23 @@
    *  Soft-fail like loadJournal — measurement-only, never throws. */
   async function loadCalibration() {
     const body = $("calibration-body");
+    const reqSeq = (state._calibrationSeq || 0) + 1;
+    state._calibrationSeq = reqSeq;
     try {
-      const res = await apiFetch("/api/journal/stats");
+      const res = await apiFetchAbortable("calibration", "/api/journal/stats");
       if (!res.ok) throw new Error("calibration stats " + res.status);
       const stats = await res.json();
+      if (reqSeq !== state._calibrationSeq) return null;
       state.calibrationData = stats;
       renderCalibration(stats);
       return stats;
     } catch (err) {
+      if (err && err.name === "AbortError") return null;
       console.error("loadCalibration", err);
       if (body) {
         body.className = "placeholder";
         body.textContent =
-          "Kalibrierungs-Fehler: " + (err && err.message ? err.message : err);
+          "Calibration error: " + (err && err.message ? err.message : err);
       }
       return null;
     }
@@ -5510,12 +5702,12 @@
     let html = "";
     if (!folded.closed.length) {
       html +=
-        '<div class="trades-empty">Noch keine abgeschlossenen Round-Trips für ' +
+        '<div class="trades-empty">No completed round trips for ' +
         escapeHtml(symLabel) + ".</div>";
     } else {
       html +=
         '<table class="history-table rt-table"><thead><tr>' +
-        "<th>Zeit</th><th>Seite</th><th>Größe</th><th>Entry Ø</th><th>Exit Ø</th>" +
+        "<th>Time</th><th>Side</th><th>Size</th><th>Avg entry</th><th>Avg exit</th>" +
         "<th>PnL</th><th>Fees</th><th>Netto</th><th>Fills</th><th></th>" +
         "</tr></thead><tbody>";
       folded.closed.forEach(function (rt) {
@@ -5531,13 +5723,13 @@
             : "—";
         const flags = [];
         if (rt.isLiq) {
-          flags.push('<span class="hist-err" title="Round-Trip enthält eine Liquidation">LIQ</span>');
+          flags.push('<span class="hist-err" title="Round trip includes a liquidation">LIQ</span>');
         }
         if (rt.truncatedStart) {
           flags.push(
-            '<span class="muted" title="Position begann vor dem geladenen Fill-Fenster ' +
-            '(letzte 100 Fills) — Seite kann invertiert und PnL/Beträge ' +
-            'unvollständig sein">Fenster-Anfang ⚠</span>'
+            '<span class="muted" title="Position began before the loaded fill window ' +
+            '(latest 100 fills) — side may be inverted and PnL/amounts may be ' +
+            'incomplete">Window starts mid-position ⚠</span>'
           );
         }
         html +=
@@ -5564,23 +5756,23 @@
       const otHasPnl = Math.abs(otPnl) > 1e-9;
       const sinceTxt =
         Number.isFinite(t0) && t0 > 0
-          ? ", seit " + escapeHtml(relTime(new Date(t0).toISOString()))
+          ? ", since " + escapeHtml(relTime(new Date(t0).toISOString()))
           : "";
       const head =
-        "Aktuell offene Position (" +
+        "Currently open position (" +
         fmt(ot.fillCount, 0) + " Fill" + (ot.fillCount === 1 ? "" : "s") + sinceTxt + ")";
       let msg;
       if (ot.truncatedStart || otHasPnl) {
         // Window began mid-position: side/totals may be off, and a real PnL was
         // already booked before the window. NEVER claim "noch kein Realized-PnL".
         msg =
-          head + ". ⚠ Fill-Fenster beginnt mitten in der Position — Seite und " +
-          "Beträge ggf. unvollständig" +
+          head + ". ⚠ The fill window starts mid-position; side and " +
+          "amounts may be incomplete" +
           (otHasPnl
-            ? "; im Fenster bereits realisiert: " + (otPnl >= 0 ? "+" : "") + fmt(otPnl, 2)
+            ? "; already realized in this window: " + (otPnl >= 0 ? "+" : "") + fmt(otPnl, 2)
             : "") + ".";
       } else {
-        msg = head + " — noch kein Realized-PnL, Position läuft weiter.";
+        msg = head + " — no realized PnL yet; the position remains open.";
       }
       html += '<div class="trades-empty">' + msg + "</div>";
     }
@@ -5655,7 +5847,7 @@
     if (!fills.length) {
       el.className = "trades-body muted";
       el.innerHTML =
-        '<div class="trades-empty">Noch keine ausgeführten Trades für ' +
+        '<div class="trades-empty">No executed trades for ' +
         escapeHtml(symLabel) + ".</div>";
       return;
     }
@@ -5666,14 +5858,14 @@
     if (hl) {
       html +=
         '<div class="rt-subtabs">' +
-        _rtSubtabBtn("roundtrips", "Round-Trips", sub === "roundtrips") +
-        _rtSubtabBtn("fills", "Einzel-Fills", sub === "fills") +
+        _rtSubtabBtn("roundtrips", "Round Trips", sub === "roundtrips") +
+        _rtSubtabBtn("fills", "Individual Fills", sub === "fills") +
         "</div>";
     } else {
       html +=
         '<div class="trades-empty" style="padding-bottom:0;">' +
-        "Round-Trip-Auswertung aktuell nur für Hyperliquid (MEXC folgt in Stufe 2) " +
-        "— Einzel-Fills unten." +
+        "Round-trip analysis is currently available only for Hyperliquid " +
+        "— individual fills are shown below." +
         "</div>";
     }
     html += sub === "roundtrips" ? renderRoundTripsHtml(fills, symLabel) : renderFillsListHtml(fills);
@@ -5692,6 +5884,7 @@
       const on = t.getAttribute("data-tab") === name;
       t.classList.toggle("active", on);
       t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
     });
     document.querySelectorAll(".data-pane").forEach(function (p) {
       const on = p.getAttribute("data-pane") === name;
@@ -5720,10 +5913,10 @@
   async function clearHistory() {
     if (state.historyClearBusy) return;
     const text =
-      "Alles für sauberen Produktionsstart zurücksetzen?\n\n" +
-      "• Lokale Audit-Historie (KI-Vorschläge + Order-Log)\n" +
-      "• Persistierte Chart-Marker\n\n" +
-      "Börsen-Positionen und -Fills bleiben unberührt. Nicht umkehrbar.";
+      "Reset local data for a clean production start?\n\n" +
+      "• Local audit history (AI proposals and order log)\n" +
+      "• Saved chart markers\n\n" +
+      "Exchange positions and fills remain unchanged. This cannot be undone.";
     if (!window.confirm(text)) return;
     state.historyClearBusy = true;
     try {
@@ -5741,17 +5934,17 @@
       resetTradeMarkers(); // clean slate: also drop persisted chart markers
       const del = data.deleted || {};
       showToast(
-        "Zurückgesetzt: " +
+        "Reset complete: " +
           fmt(del.proposals, 0) +
-          " Vorschläge, " +
+          " proposals, " +
           fmt(del.orders, 0) +
-          " Orders, Chart-Marker",
+          " orders, chart markers",
         "ok"
       );
       loadHistory();
     } catch (err) {
       showToast(
-        "Historie leeren fehlgeschlagen: " + (err && err.message),
+        "Could not clear history: " + (err && err.message),
         "err"
       );
     } finally {
@@ -5765,10 +5958,10 @@
   async function clearJournal() {
     if (state.journalClearBusy) return;
     const text =
-      "Journal (KI-Shadow-Book) wirklich leeren?\n\n" +
-      "Löscht alle geloggten Analyse-Einträge samt Win/Loss-Auswertung. " +
-      "Das Journal überlebt normalerweise einen Historie-Reset — nur dieser " +
-      "Button löscht es. Nicht umkehrbar.";
+      "Clear the AI shadow journal?\n\n" +
+      "Delete all logged analysis entries and their win/loss evaluation. " +
+      "A history reset normally keeps the journal; this action clears it. " +
+      "This cannot be undone.";
     if (!window.confirm(text)) return;
     state.journalClearBusy = true;
     try {
@@ -5784,13 +5977,13 @@
         return;
       }
       showToast(
-        "Journal geleert: " + fmt(data.deleted, 0) + " Einträge",
+        "Journal cleared: " + fmt(data.deleted, 0) + " entries",
         "ok"
       );
       loadJournal();
     } catch (err) {
       showToast(
-        "Journal leeren fehlgeschlagen: " + (err && err.message),
+        "Could not clear journal: " + (err && err.message),
         "err"
       );
     } finally {
@@ -5836,18 +6029,18 @@
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
         showToast(
-          "Scharfschalten fehlgeschlagen: " + detailToText(data.detail || data),
+          "Could not update automation: " + detailToText(data.detail || data),
           "err"
         );
         return;
       }
       showToast(
-        (nextArmed ? "Auto-BE scharf: " : "Auto-BE entschärft: ") +
+        (nextArmed ? "Auto-BE enabled: " : "Auto-BE disabled: ") +
           String(symbol || "") + " (" + String(side || "") + ")",
         "ok"
       );
     } catch (err) {
-      showToast("Scharfschalten fehlgeschlagen: " + (err && err.message), "err");
+      showToast("Could not update automation: " + (err && err.message), "err");
     } finally {
       state.armBusy[key] = false;
       // Refresh from the server immediately — the toggle must show what the
@@ -5872,18 +6065,18 @@
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
         showToast(
-          "Scharfschalten fehlgeschlagen: " + detailToText(data.detail || data),
+          "Could not update automation: " + detailToText(data.detail || data),
           "err"
         );
         return;
       }
       showToast(
-        (nextArmed ? "Auto-Trail scharf: " : "Auto-Trail entschärft: ") +
+        (nextArmed ? "Auto-Trail enabled: " : "Auto-Trail disabled: ") +
           String(symbol || "") + " (" + String(side || "") + ")",
         "ok"
       );
     } catch (err) {
-      showToast("Scharfschalten fehlgeschlagen: " + (err && err.message), "err");
+      showToast("Could not update automation: " + (err && err.message), "err");
     } finally {
       state.armBusy[key] = false;
       try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
@@ -5995,7 +6188,7 @@
     if (state.killswitchBusy) return;
     if (
       !window.confirm(
-        "Alle Auto-Regeln (z. B. Auto-BE) für ALLE offenen Positionen sofort entschärfen?"
+        "Disable all automation rules for every open position now?"
       )
     ) {
       return;
@@ -6006,14 +6199,14 @@
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
         showToast(
-          "Kill-Switch fehlgeschlagen: " + detailToText(data.detail || data),
+          "Kill switch failed: " + detailToText(data.detail || data),
           "err"
         );
         return;
       }
-      showToast("Entschärft: " + fmt(data.disarmed, 0) + " Position(en).", "ok");
+      showToast("Automation disabled for " + fmt(data.disarmed, 0) + " position(s).", "ok");
     } catch (err) {
-      showToast("Kill-Switch fehlgeschlagen: " + (err && err.message), "err");
+      showToast("Kill switch failed: " + (err && err.message), "err");
     } finally {
       state.killswitchBusy = false;
       try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
@@ -6026,9 +6219,9 @@
     if (!btn) return;
     btn.disabled = !enabled;
     if (!enabled) {
-      btn.title = "Nur bei Aktion ungleich STAY_OUT";
+      btn.title = "Available only when the action is not STAY_OUT";
     } else {
-      btn.title = "Proposal in Order-Ticket übernehmen";
+      btn.title = "Copy proposal to the order ticket";
     }
   }
 
@@ -6038,9 +6231,10 @@
 
     if (!data || !data.proposal) {
       body.className = "placeholder";
-      body.innerHTML = "Noch keine Analyse. Klicke Analysieren.";
+      body.innerHTML = "No analysis yet. Click Analyze.";
       state.proposal = null;
       state.proposalSymbol = null;
+      state.proposalId = null;
       state.proposalAt = null;
       drawProposalLines();
       setApplyEnabled(false);
@@ -6058,6 +6252,10 @@
     const anno = data.annotations || {};
     state.proposal = p;
     state.proposalSymbol = data.symbol || state.symbol;
+    state.proposalId = data.proposal_id != null &&
+      Number.isSafeInteger(Number(data.proposal_id)) && Number(data.proposal_id) > 0
+      ? Number(data.proposal_id)
+      : null;
     state.proposalApplied = false;
     // U2-04: the age shown must reflect the ORIGINAL analysis time, not the
     // moment this render runs — a cache hit (data.cached_age_s) or the "neu"
@@ -6086,9 +6284,9 @@
       '<span class="an-sym">' + escapeHtml(state.proposalSymbol || state.symbol || "") + "</span>" +
       '<span class="an-lev">' + escapeHtml(p.recommended_leverage || "") + "</span>" +
       (data.cached
-        ? '<span class="an-cache-badge" title="Aus dem Cache — keine erneute KI-Anfrage">' +
-          "gecacht vor " + escapeHtml(String(data.cached_age_s != null ? data.cached_age_s : 0)) + "s" +
-          ' <button type="button" class="an-cache-refresh">neu</button></span>'
+        ? '<span class="an-cache-badge" title="From cache — no additional AI request">' +
+          "cached " + escapeHtml(String(data.cached_age_s != null ? data.cached_age_s : 0)) + "s ago" +
+          ' <button type="button" class="an-cache-refresh">refresh</button></span>'
         : "") +
       "</div>";
 
@@ -6101,12 +6299,12 @@
     html +=
       '<div class="an-subhead">' +
       (providerLabel || data.model
-        ? '<span class="an-provider-badge" title="Von der KI-Analyse tatsächlich verwendeter Provider/Modell">' +
+        ? '<span class="an-provider-badge" title="Provider and model actually used for this analysis">' +
           escapeHtml(providerLabel) +
           (data.model ? " · " + escapeHtml(String(data.model)) : "") +
           "</span>" +
           (data.provider_fallback
-            ? '<span class="an-fallback-flag" title="Konfigurierter Provider war nicht einsatzbereit — automatischer Fallback auf diesen Provider">⚠ Fallback</span>'
+            ? '<span class="an-fallback-flag" title="Configured provider was unavailable; this provider was selected automatically">⚠ Fallback</span>'
             : "")
         : "") +
       '<span id="proposal-drift" class="an-drift"></span>' +
@@ -6128,7 +6326,7 @@
       const scCls =
         sconf === "high" ? "conf-high" : sconf === "medium" ? "conf-med" : "conf-low";
       const scLabel =
-        sconf === "high" ? "Hoch" : sconf === "medium" ? "Mittel" : "Niedrig";
+        sconf === "high" ? "High" : sconf === "medium" ? "Medium" : "Low";
       confBadge = '<span class="pattern-conf ' + scCls + '">' + scLabel + "</span>";
     }
 
@@ -6154,25 +6352,25 @@
     const actDir = _actionDir(p.action);
     html += '<div class="setup-tiles">';
     html += _tileHtml(
-      "Aktion",
+      "Action",
       '<span class="tile-action-val">' +
         escapeHtml((p.action || "—").replace(/_/g, " ")) +
         "</span>",
       "",
       "tile-action" + (actDir ? " tile-dir-" + actDir : "")
     );
-    html += _tileHtml("Setup-Konfidenz", confBadge || "—", "", "tile-conf");
+    html += _tileHtml("Setup confidence", confBadge || "—", "", "tile-conf");
     if (!stayOut) {
       html +=
         _tile("Entry", fmtN(p.entry_price),
-              anno.entry_vs_last_pct != null ? fmt(anno.entry_vs_last_pct, 2) + "% vs. Preis" : "", "tile-entry") +
+              anno.entry_vs_last_pct != null ? fmt(anno.entry_vs_last_pct, 2) + "% vs. price" : "", "tile-entry") +
         _tile("Stop-Loss", fmtN(p.stop_loss),
               anno.sl_distance_atr != null ? fmt(anno.sl_distance_atr, 2) + "× ATR" : "-1R", "tile-sl") +
         _tile("Take-Profit 1", fmtN(p.tp1), rMult(p.tp1), "tile-tp") +
         (p.tp2 != null ? _tile("Take-Profit 2", fmtN(p.tp2), rMult(p.tp2), "tile-tp") : "") +
         (p.tp3 != null ? _tile("Take-Profit 3", fmtN(p.tp3), rMult(p.tp3), "tile-tp") : "") +
-        _tile("Chance/Risiko", p.rrr != null ? "1 : " + fmt(p.rrr, 2) : "—",
-              p.rrr != null && p.rrr >= minRrr() ? "solide" : "knapp", "tile-rrr");
+        _tile("Reward/Risk", p.rrr != null ? "1 : " + fmt(p.rrr, 2) : "—",
+              p.rrr != null && p.rrr >= minRrr() ? "solid" : "tight", "tile-rrr");
     }
     html += "</div>";
 
@@ -6188,14 +6386,14 @@
     const calConf = String(data.confidence_calibrated || "").toLowerCase();
     const calNote = data.calibration_note ? String(data.calibration_note).trim() : "";
     const confLabel = (t) =>
-      t === "high" ? "Hoch" : t === "medium" ? "Mittel" : t === "low" ? "Niedrig" : (t || "—");
+      t === "high" ? "High" : t === "medium" ? "Medium" : t === "low" ? "Low" : (t || "—");
     if (calConf && sconf && calConf !== sconf) {
       // A downgrade actually fired -- surface it clearly (warn-toned "be more
       // careful" hint), badge + the full transparency note below it.
       html +=
         '<div class="an-calibration an-calibration-changed">' +
-        '<span class="an-calibration-badge">KI: ' + escapeHtml(confLabel(sconf)) +
-        " · kalibriert: " + escapeHtml(confLabel(calConf)) + "</span>" +
+        '<span class="an-calibration-badge">AI: ' + escapeHtml(confLabel(sconf)) +
+        " · calibrated: " + escapeHtml(confLabel(calConf)) + "</span>" +
         (calNote ? '<div class="an-calibration-note">' + escapeHtml(calNote) + "</div>" : "") +
         "</div>";
     } else if (calNote) {
@@ -6203,11 +6401,11 @@
       // Daten (n=…)") -- low-key, must not compete with the unchanged
       // confidence tile above.
       html +=
-        '<div class="an-calibration an-calibration-subtle">Kalibrierung: ' +
+        '<div class="an-calibration an-calibration-subtle">Calibration: ' +
         escapeHtml(calNote) + "</div>";
     }
     if (!stayOut && p.trigger_entry_zone) {
-      html += '<div class="an-zone"><b>Einstiegszone:</b> ' +
+      html += '<div class="an-zone"><b>Entry zone:</b> ' +
         escapeHtml(p.trigger_entry_zone) + "</div>";
     }
 
@@ -6226,7 +6424,7 @@
     // reason for THIS trade, before entry. Purely display/advisory: only
     // rendered when present, never affects any control/enable state below.
     if (p.pre_mortem) {
-      html += '<div class="an-premortem"><b>Pre-Mortem · grösstes Risiko:</b> ' +
+      html += '<div class="an-premortem"><b>Pre-mortem · largest risk:</b> ' +
         escapeHtml(p.pre_mortem) + "</div>";
     }
 
@@ -6252,20 +6450,20 @@
     if (sizingNote || sizingNoteCalibrated || mgmt.move_sl_to_be || mgmt.early_invalidation || hasInvPx) {
       html +=
         '<div class="an-mgmt">' +
-        (sizingNote ? '<div><b>Größe (KI):</b> ' + escapeHtml(sizingNote) + "</div>" : "") +
+        (sizingNote ? '<div><b>Size (AI):</b> ' + escapeHtml(sizingNote) + "</div>" : "") +
         (sizingNoteCalibrated
-          ? '<div class="an-sizing-calibrated"><b>Größe (kalibriert, Vorschlag):</b> ' +
+          ? '<div class="an-sizing-calibrated"><b>Size (calibrated suggestion):</b> ' +
             escapeHtml(sizingNoteCalibrated) + "</div>"
           : "") +
         (mgmt.move_sl_to_be ? '<div><b>SL→BE:</b> ' + escapeHtml(mgmt.move_sl_to_be) + "</div>" : "") +
         (hasInvPx
-          ? '<div><b>Invalidierung:</b> ' + fmtN(invPx) +
+          ? '<div><b>Invalidation:</b> ' + fmtN(invPx) +
             (p.invalidation_tf ? " (" + escapeHtml(p.invalidation_tf) + ")" : "") + "</div>"
           : "") +
-        (mgmt.early_invalidation ? '<div><b>Hinweis:</b> ' + escapeHtml(mgmt.early_invalidation) + "</div>" : "") +
+        (mgmt.early_invalidation ? '<div><b>Note:</b> ' + escapeHtml(mgmt.early_invalidation) + "</div>" : "") +
         "</div>";
     }
-    html += '<div class="an-foot">Nur Vorschlag — jede Order wird von den Risk-Gates neu geprüft. Kein Auto-Trading.</div>';
+    html += '<div class="an-foot">Advisory only. Every order is rechecked by the risk gates. No automatic entry.</div>';
 
     body.className = "proposal-body analysis-mode";
     body.innerHTML = html;
@@ -6302,7 +6500,7 @@
       return;
     }
     const ageMin = (Date.now() - state.proposalAt) / 60000;
-    const ageLabel = ageMin < 1 ? "gerade eben" : Math.floor(ageMin) + " min alt";
+    const ageLabel = ageMin < 1 ? "just now" : Math.floor(ageMin) + " min old";
     let driftPct = null;
     if (p.entry_price != null && state.lastPx != null && Number(p.entry_price) > 0) {
       driftPct =
@@ -6313,7 +6511,7 @@
       ageMin > PROPOSAL_DRIFT_STALE_MIN ||
       (driftPct != null && Math.abs(driftPct) > PROPOSAL_DRIFT_STALE_PCT);
     el.textContent =
-      "Analyse " + ageLabel + " · Preis " + driftLabel + (stale ? " · neu analysieren" : "");
+      "Analysis " + ageLabel + " · Price " + driftLabel + (stale ? " · analyze again" : "");
     el.classList.toggle("an-drift-stale", stale);
   }
 
@@ -6420,7 +6618,7 @@
   function llmWarnBannerHtml(text) {
     return (
       '<div class="error-text error-llm-warn">' + escapeHtml(text) + "</div>" +
-      '<button type="button" class="btn-ki-switch">KI wechseln</button>'
+      '<button type="button" class="btn-ki-switch">Switch AI</button>'
     );
   }
 
@@ -6468,7 +6666,7 @@
     // for a different active symbol than the one it was generated for.
     if (!symMatch(state.proposalSymbol, state.symbol)) {
       setTicketError(
-        "Vorschlag gehört zu " + state.proposalSymbol + ", nicht zum aktiven Symbol."
+        "This proposal belongs to " + state.proposalSymbol + ", not the active symbol."
       );
       return;
     }
@@ -6493,9 +6691,12 @@
     if (entryEl && p.entry_price != null) {
       entryEl.value = String(p.entry_price);
     }
-    // Prefer limit when entry present; user can switch to market
+    // Hyperliquid limit entries are deliberately blocked server-side until a
+    // durable watcher can attach protection to every later/partial fill.
+    // Apply such proposals as MARKET so the ticket cannot create naked future
+    // exposure. MEXC keeps its atomic create-body trigger behavior.
     if (typeEl && p.entry_price != null) {
-      typeEl.value = "limit";
+      typeEl.value = isHlExchange() ? "market" : "limit";
     }
     if (priceEl && p.entry_price != null) {
       priceEl.value = String(p.entry_price);
@@ -6517,14 +6718,18 @@
     // the first and a warning is silently lost (e.g. the LIMIT notice would
     // vanish behind the TP2/TP3 notice in the common tiered-TP + pullback case).
     const applyNotices = [];
+    if (isHlExchange() && p.entry_price != null) {
+      applyNotices.push(
+        "Hyperliquid limit entries are disabled for safety; copied as a market order."
+      );
+    }
     // The proposal turned the ticket into a LIMIT order (pullback entry). Make
     // that unmistakable — otherwise the trader sends a resting limit thinking
     // they are in the market now (exactly the AVAX confusion).
     if (typeEl && typeEl.value === "limit" && p.entry_price != null) {
       applyNotices.push(
-        "⏳ Als LIMIT bei " + fmt(p.entry_price, 4) + " übernommen — die Order " +
-          "wartet, bis der Kurs dieses Niveau erreicht. Für sofortigen Einstieg " +
-          'auf „Market" wechseln.'
+        "⏳ Copied as a LIMIT at " + fmt(p.entry_price, 4) + ". The order " +
+          "waits until the market reaches this level. Select Market for immediate entry."
       );
     }
 
@@ -6539,11 +6744,11 @@
       const reminderEl = _ensureTpLadderReminderEl();
       if (reminderEl) {
         reminderEl.textContent =
-          "KI-Leiter zusätzlich: " + parts.join(" · ") +
-          " — nicht als Order übernommen, ggf. manuell nachziehen.";
+          "Additional AI targets: " + parts.join(" · ") +
+          ". They were not copied to the order; manage them manually if needed.";
         reminderEl.classList.remove("hidden");
       }
-      applyNotices.push("TP2/TP3 nicht als Order übernommen — siehe Hinweis im Ticket.");
+      applyNotices.push("TP2/TP3 were not copied to the order; see the ticket note.");
     } else {
       _clearTpLadderReminder();
     }
@@ -6554,6 +6759,8 @@
 
     // Core KI lines are now represented by the ticket lines — keep only levels
     state.proposalApplied = true;
+    state.ticketProposalId = state.proposalId;
+    state.ticketProposalSymbol = state.proposalSymbol;
     drawProposalLines();
     drawTicketLines();
   }
@@ -6586,7 +6793,7 @@
       // while a manual "Analysieren" click is already in flight — the button
       // itself is disabled during a manual click, so this path otherwise
       // fires silently and leaves the trader waiting for nothing (M-2).
-      showToast("Analyse läuft bereits — bitte warten.", null);
+      showToast("Analysis is already running. Please wait.", null);
       return;
     }
     const btn = $("btn-analyze");
@@ -6669,7 +6876,7 @@
         const detail =
           (data && (data.detail || data.message)) ||
           res.statusText ||
-          "Analyse fehlgeschlagen";
+          "Analysis failed";
         const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
         showProposalError(msg);
         return;
@@ -6681,12 +6888,12 @@
       // already torn down by loadMarket; don't surface it as a network error.
       if (err && err.name === "AbortError") return;
       console.error("runAnalyze", err);
-      showProposalError("Netzwerkfehler: " + (err && err.message ? err.message : err));
+      showProposalError("Network error: " + (err && err.message ? err.message : err));
     } finally {
       state.analyzeBusy = false;
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "Analysieren";
+        btn.textContent = "Analyze";
       }
     }
   }
@@ -6698,10 +6905,29 @@
     if (state.allSymbols.indexOf(sym) === -1) state.allSymbols.push(sym);
   }
 
+  function warnSymbolsStale() {
+    if (state._symbolsStaleWarned) return;
+    showToast(
+      "The current symbol list could not be confirmed; using the local or last known selection.",
+      "err"
+    );
+    state._symbolsStaleWarned = true;
+  }
+
   async function loadSymbols() {
     try {
       const res = await apiFetch("/api/symbols");
+      if (!res.ok) {
+        warnSymbolsStale();
+        return;
+      }
       const data = await res.json();
+      const degraded = !!(data.error || data.fallback || data.stale);
+      if (degraded) {
+        warnSymbolsStale();
+      } else if (!degraded) {
+        state._symbolsStaleWarned = false;
+      }
       if (!Array.isArray(data.symbols) || !data.symbols.length) return;
       state.allSymbols = data.symbols.map(function (s) {
         return String(s).toUpperCase();
@@ -6709,7 +6935,8 @@
       ensureSymbolOption(state.symbol); // A3-11: active symbol from state
       renderSymbolTabs();
     } catch (err) {
-      console.error("loadSymbols", err);
+      console.warn("loadSymbols", err);
+      warnSymbolsStale();
     }
   }
 
@@ -6733,7 +6960,9 @@
     const box = $("symbol-dropdown");
     if (!box) return;
     if (!picker.items.length) {
-      box.innerHTML = '<div class="symbol-empty">Kein Treffer</div>';
+      box.innerHTML = '<div class="symbol-empty">No matches</div>';
+      const input = $("symbol-input");
+      if (input) input.removeAttribute("aria-activedescendant");
       return;
     }
     const cur = String(state.symbol || "").toUpperCase();
@@ -6742,9 +6971,12 @@
         const cls =
           "symbol-option" + (i === picker.hl ? " hl" : "") + (s === cur ? " current" : "");
         const safe = escapeHtml(s);
-        return '<div class="' + cls + '" data-symbol="' + safe + '" role="option">' + safe + "</div>";
+        return '<div id="symbol-option-' + i + '" class="' + cls + '" data-symbol="' + safe +
+          '" role="option" aria-selected="' + (i === picker.hl ? "true" : "false") + '">' + safe + "</div>";
       })
       .join("");
+    const input = $("symbol-input");
+    if (input && picker.hl >= 0) input.setAttribute("aria-activedescendant", "symbol-option-" + picker.hl);
   }
 
   function openSymbolDropdown() {
@@ -6763,7 +6995,10 @@
     const box = $("symbol-dropdown");
     const input = $("symbol-input");
     if (box) box.classList.add("hidden");
-    if (input) input.setAttribute("aria-expanded", "false");
+    if (input) {
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+    }
     picker.open = false;
     picker.hl = -1;
   }
@@ -6813,11 +7048,8 @@
       saveOpenTabs();
     }
 
-    // A3-11: update state FIRST (single source of truth), THEN reflect to the
-    // DOM. loadMarket() re-affirms state.symbol, but setting it here makes the
-    // active symbol authoritative the instant the switch begins. (The tab-rename
-    // above still ran against the PREVIOUS state.symbol, as it must.)
-    state.symbol = sym;
+    // loadMarket updates state synchronously before its first await. Let it
+    // observe the previous symbol so its cross-symbol cleanup actually runs.
     const input = $("symbol-input");
     if (input) {
       input.value = sym;
@@ -6873,9 +7105,13 @@
         e.preventDefault();
         picker.open ? moveSymbolHighlight(-1) : openSymbolDropdown();
       } else if (e.key === "Enter") {
-        if (picker.open) {
-          e.preventDefault();
+        e.preventDefault();
+        input.dataset.touched = "1";
+        if (picker.open && picker.hl >= 0) {
           pickHighlightedSymbol();
+        } else {
+          goToSymbol(input.value);
+          closeSymbolDropdown();
         }
       } else if (e.key === "Escape") {
         closeSymbolDropdown();
@@ -6976,7 +7212,7 @@
     ov.className = "symbol-tab" + (!inChart ? " active" : "");
     ov.setAttribute("role", "tab");
     ov.setAttribute("data-view", "overview");
-    ov.innerHTML = '<span class="tab-dot"></span><span>Übersicht</span>';
+    ov.innerHTML = '<span class="tab-dot"></span><span>Overview</span>';
     ov.addEventListener("click", function () {
       showOverview();
     });
@@ -6992,7 +7228,7 @@
       tab.innerHTML =
         '<span class="tab-dot' + (side ? " " + side : "") + '"></span><span>' +
         escapeHtml(sym) + "</span>" +
-        '<span class="tab-close" data-close="' + escapeHtml(sym) + '" title="Schließen">×</span>';
+        '<span class="tab-close" data-close="' + escapeHtml(sym) + '" title="Close">×</span>';
       tab.addEventListener("click", function (e) {
         if (!e.target.closest(".tab-close")) switchSymbol(sym);
       });
@@ -7103,18 +7339,18 @@
     const box = $("overview-news");
     if (!box) return;
     const staleBadge = state.newsStale
-      ? '<span class="news-stale-badge" title="Feeds gerade nicht erreichbar — letzter bekannter Stand">Veraltet</span>'
+      ? '<span class="news-stale-badge" title="Feeds are currently unavailable — showing the latest cached data">Stale</span>'
       : "";
     const head =
-      '<div class="news-head"><h3 class="overview-subhead">Nachrichten</h3>' +
+      '<div class="news-head"><h3 class="overview-subhead">News</h3>' +
       staleBadge + "</div>";
     const all = state.newsItems || [];
     if (!all.length) {
       const errs = state.newsErrors || [];
       const body = errs.length
-        ? '<div class="news-empty news-error">Newsfeeds nicht erreichbar: ' +
+        ? '<div class="news-empty news-error">News feeds unavailable: ' +
           escapeHtml(errs.join("; ")) + "</div>"
-        : '<div class="news-empty">Keine aktuellen Schlagzeilen.</div>';
+        : '<div class="news-empty">No current headlines.</div>';
       box.innerHTML = head + body;
       return;
     }
@@ -7306,7 +7542,7 @@
       // keeps showing it (better a slightly stale chart than none), but a
       // fresh request must not fail silently.
       syms.forEach(function (s) {
-        if (!state.overviewData[s]) state.overviewErrors[s] = "Abruf fehlgeschlagen";
+        if (!state.overviewData[s]) state.overviewErrors[s] = "Request failed";
       });
     }
     if (state.activeView === "overview") renderOverviewGrid();
@@ -7408,7 +7644,7 @@
     tile.setAttribute("data-canvasfp", m.canvasFp);
 
     tile.innerHTML =
-      (m.isWatch ? '<button type="button" class="mini-remove" title="Entfernen">×</button>' : "") +
+      (m.isWatch ? '<button type="button" class="mini-remove" title="Remove">×</button>' : "") +
       '<div class="mini-head"><span class="mini-sym">' + escapeHtml(m.key) + "</span>" +
       '<span class="mini-price">' + (Number.isFinite(m.last) ? fmtPx(m.last) : "—") + "</span></div>" +
       '<div class="mini-badges">' + _miniPnlHtml(m.pnl) +
@@ -7471,7 +7707,7 @@
       if (state._gridStructFp !== "EMPTY") {
         state._gridStructFp = "EMPTY";
         grid.innerHTML =
-          '<div class="overview-empty">Keine offenen Positionen. Coins über „+ Beobachten" hinzufügen.</div>';
+          '<div class="overview-empty">No open positions. Add coins with “+ Watch”.</div>';
       }
       return;
     }
@@ -7521,7 +7757,7 @@
     }
 
     if (posSyms.length) {
-      addGroupHead("Positionen · nach Risiko (" + posSyms.length + ")");
+      addGroupHead("Positions · by risk (" + posSyms.length + ")");
       posSyms.forEach(function (s) {
         grid.appendChild(buildMiniTile(s, chartColors, cs));
       });
@@ -7653,7 +7889,7 @@
         });
         if (opt) {
           opt.disabled = !p.configured;
-          opt.textContent = p.label + (p.configured ? "" : " — kein Key");
+          opt.textContent = p.label + (p.configured ? "" : " — no key");
         }
       });
     }
@@ -7679,9 +7915,9 @@
         return;
       }
       applyLlmStatus(data);
-      showToast("KI gewechselt: " + llmLabelFor(data, data.provider), "ok");
+      showToast("AI provider changed: " + llmLabelFor(data, data.provider), "ok");
     } catch (err) {
-      showToast("KI-Wechsel fehlgeschlagen: " + (err && err.message), "err");
+      showToast("Could not switch AI provider: " + (err && err.message), "err");
       loadLlm();
     }
   }
@@ -7726,9 +7962,9 @@
       txt.textContent =
         p.label +
         " — " +
-        (p.configured ? "konfiguriert" : "kein Key") +
+        (p.configured ? "configured" : "no key") +
         (p.model ? " · " + p.model : "") +
-        (p.id === data.active ? "  (aktiv)" : "");
+        (p.id === data.active ? "  (active)" : "");
       li.appendChild(dot);
       li.appendChild(txt);
       ul.appendChild(li);
@@ -7760,6 +7996,7 @@
   }
 
   function openKiModal() {
+    if (activeDialog && activeDialog.id === 'confirm-modal') return;
     const modal = $("ki-keys-modal");
     if (!modal) return;
     kiFail("");
@@ -7768,18 +8005,18 @@
     var modelInput = $("ki-model");
     if (modelInput) modelInput.value = "";
     kiSyncProvider();
-    modal.classList.remove("hidden");
+    showDialog(modal, $("ki-provider"));
     loadKiStatus();
   }
 
   function closeKiModal() {
     const modal = $("ki-keys-modal");
-    if (modal) modal.classList.add("hidden");
+    hideDialog(modal);
   }
 
   async function kiTestProvider() {
     var p = $("ki-provider").value;
-    kiPill(true, "teste…");
+    kiPill(true, "Testing…");
     try {
       const res = await apiFetch("/api/settings/test-provider", {
         method: "POST",
@@ -7793,13 +8030,13 @@
         return {};
       });
       if (!res.ok) {
-        kiPill(false, detailToText(data.detail || data) || "Fehler");
+        kiPill(false, detailToText(data.detail || data) || "Connection failed");
         return;
       }
       var ms = data.latency_ms != null ? " (" + data.latency_ms + " ms)" : "";
-      kiPill(!!data.ok, (data.detail || (data.ok ? "OK" : "Fehler")) + ms);
+      kiPill(!!data.ok, (data.detail || (data.ok ? "Connected" : "Connection failed")) + ms);
     } catch (err) {
-      kiPill(false, "Netzwerkfehler");
+      kiPill(false, "Network error");
     }
   }
 
@@ -7809,7 +8046,7 @@
     var apiKey = $("ki-api-key").value.trim();
     var model = $("ki-model").value.trim();
     if (p !== "ollama" && !apiKey && !model) {
-      return kiFail("Nichts zu speichern — Key oder Modell eingeben.");
+      return kiFail("Nothing to save — enter a key or model.");
     }
     var btn = $("btn-ki-save");
     btn.disabled = true;
@@ -7822,17 +8059,17 @@
         return {};
       });
       if (!res.ok) {
-        kiFail(detailToText(data.detail || data) || "Speichern fehlgeschlagen");
+        kiFail(detailToText(data.detail || data) || "Could not save key");
         return;
       }
       renderKiStatus(data);
       $("ki-api-key").value = "";
-      showToast("KI-Key gespeichert", "ok");
+      showToast("AI key saved", "ok");
       // Refresh the existing provider dropdown so the newly-configured
       // provider becomes selectable in the hot-swap.
       loadLlm();
     } catch (err) {
-      kiFail("Netzwerkfehler: " + (err && err.message ? err.message : err));
+      kiFail("Network error: " + (err && err.message ? err.message : err));
     } finally {
       btn.disabled = false;
     }
@@ -7845,8 +8082,8 @@
     if (!symbol || !side) return;
     const pct = Math.round((fraction || 1) * 100);
     const text =
-      pct + "% der " + side.toUpperCase() + "-Position " + symbol +
-      " jetzt per MARKET schließen?";
+      "Close " + pct + "% of the " + side.toUpperCase() + " position " + symbol +
+      " with a MARKET order now?";
     if (!window.confirm(text)) return;
     state.closeBusy = true;
     try {
@@ -7871,7 +8108,7 @@
         return;
       }
       const closedTxt =
-        "Geschlossen: " + fmt(data.closed_vol, 4) + " von " + fmt(data.hold_vol, 4);
+        "Closed: " + fmt(data.closed_vol, 4) + " of " + fmt(data.hold_vol, 4);
       const warns = Array.isArray(data.warnings)
         ? data.warnings.filter(Boolean)
         : [];
@@ -7884,7 +8121,7 @@
           closedTxt +
             (notFlat ? " · " + escapeHtml(String(data.status)) : "") +
             (warns.length ? " — " + escapeHtml(warns.join("; ")) : "") +
-            " — Position prüfen!",
+            " — check the position on the exchange",
           "err"
         );
       } else {
@@ -7901,8 +8138,8 @@
       // "nothing happened": warn to check the exchange, block a blind retry,
       // and reconcile from the exchange.
       showToast(
-        "⚠ Antwort verloren — Aktion evtl. ausgeführt. Position/Orders auf " +
-          "der Börse prüfen, NICHT blind wiederholen. (" +
+        "⚠ Response lost — the action may have executed. Check positions and orders " +
+          "on the exchange; do not retry blindly. (" +
           (err && err.message ? err.message : err) + ")",
         "err"
       );
@@ -7930,10 +8167,10 @@
     const isBe = !!opts.be;
     const target = isBe ? "Break-Even " + fmt(px, 6) : fmt(px, 6);
     const text =
-      "Stop-Loss der " + String(side).toUpperCase() + "-Position " + symbol +
-      " auf " + target + " setzen?\n\n" +
-      "Ein neuer Stop wird platziert und verifiziert, danach ein bestehender " +
-      "alter Stop gecancelt. Dies ist eine echte Order-Aktion.";
+      "Move the stop-loss for the " + String(side).toUpperCase() + " position " + symbol +
+      " to " + target + "?\n\n" +
+      "A new stop is placed and verified before the existing stop is canceled. " +
+      "This is a real order action.";
     if (!window.confirm(text)) return;
     state.slBusy = true;
     try {
@@ -7954,7 +8191,7 @@
           ? " — ⚠ " + data.warnings.join("; ")
           : "";
       showToast(
-        (isBe ? "SL → Break-Even gesetzt: " : "SL gesetzt: ") +
+        (isBe ? "SL moved to break-even: " : "SL set: ") +
           fmt(data.new_sl != null ? data.new_sl : px, 6) +
           warn,
         warn ? "err" : "ok"
@@ -7969,8 +8206,8 @@
       // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
       // check the exchange, block a blind retry, and reconcile.
       showToast(
-        "⚠ Antwort verloren — SL-Aktion evtl. ausgeführt. Position/Orders " +
-          "auf der Börse prüfen, NICHT blind wiederholen. (" +
+        "⚠ Response lost — the stop action may have executed. Check positions and orders " +
+          "on the exchange; do not retry blindly. (" +
           (err && err.message ? err.message : err) + ")",
         "err"
       );
@@ -8081,7 +8318,7 @@
     const geom = state._slHoverGeom || getActiveSlGeom();
     if (!geom || !state.candleSeries) return;
     if (state.orderBusy || state.slBusy || state.closeBusy) {
-      showToast("Order in Arbeit — SL-Drag gesperrt.", null);
+      showToast("An order action is in progress; stop dragging is locked.", null);
       return;
     }
     ev.preventDefault();
@@ -8121,9 +8358,9 @@
     const wrongSide = d.side === "long" ? newSl >= d.entry : newSl <= d.entry;
     if (wrongSide) {
       showToast(
-        "SL auf falscher Seite des Entrys (" +
-          (d.side === "long" ? "Long-SL über" : "Short-SL unter") +
-          " Entry) — abgebrochen.",
+        "Stop-loss is on the wrong side of entry (" +
+          (d.side === "long" ? "LONG SL above" : "SHORT SL below") +
+          " entry); move canceled.",
         "err"
       );
       return;
@@ -8153,15 +8390,15 @@
    *  slBusy/orderBusy guards block a confirm while another order is in flight. */
   async function moveStopViaDrag(symbol, side, newSl) {
     if (state.slBusy || state.closeBusy || state.orderBusy) {
-      showToast("Order in Arbeit — SL-Verschiebung nicht gesendet.", null);
+      showToast("An order action is in progress; the stop move was not sent.", null);
       return;
     }
     if (!symbol || !side || !Number.isFinite(newSl) || newSl <= 0) return;
     const text =
-      "Stop-Loss der " + String(side).toUpperCase() + "-Position " + symbol +
-      " per Drag auf " + fmt(newSl, 6) + " verschieben?\n\n" +
-      "Ein neuer Stop wird platziert und verifiziert, danach ein bestehender " +
-      "alter Stop gecancelt. Dies ist eine echte Order-Aktion.";
+      "Move the stop-loss for the " + String(side).toUpperCase() + " position " + symbol +
+      " to " + fmt(newSl, 6) + "?\n\n" +
+      "A new stop is placed and verified before the existing stop is canceled. " +
+      "This is a real order action.";
     if (!window.confirm(text)) return; // explicit confirm — the ONLY send gate
     state.slBusy = true;
     try {
@@ -8182,7 +8419,7 @@
           ? " — ⚠ " + data.warnings.join("; ")
           : "";
       showToast(
-        "SL verschoben: " +
+        "SL moved: " +
           fmt(data.new_sl != null ? data.new_sl : newSl, 6) +
           warn,
         warn ? "err" : "ok"
@@ -8197,8 +8434,8 @@
       // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
       // check the exchange, block a blind retry, and reconcile.
       showToast(
-        "⚠ Antwort verloren — SL-Aktion evtl. ausgeführt. Position/Orders " +
-          "auf der Börse prüfen, NICHT blind wiederholen. (" +
+        "⚠ Response lost — the stop action may have executed. Check positions and orders " +
+          "on the exchange; do not retry blindly. (" +
           (err && err.message ? err.message : err) + ")",
         "err"
       );
@@ -8218,7 +8455,7 @@
     // auto-analyse. The detail analysis is a deliberate second step ("Analysieren"),
     // so browsing scan hits never spends an LLM call on its own (user request).
     goToSymbol(sym, { newTab: true });
-    showToast("Chart geladen — 'Analysieren' für die KI-Detailanalyse.", "ok");
+    showToast("Chart loaded. Select Analyze for detailed AI analysis.", "ok");
   }
 
   function highlightScanChip(sym) {
@@ -8261,8 +8498,8 @@
   function scanAgeLabel(scannedAt) {
     const mins = scanAgeMinutes(scannedAt);
     if (mins === null) return "";
-    if (mins < 1) return "gerade eben";
-    return "vor " + Math.floor(mins) + "m";
+    if (mins < 1) return "just now";
+    return Math.floor(mins) + "m ago";
   }
 
   /** Refresh just the "vor Xm" age label + stale hint on the already-rendered
@@ -8282,7 +8519,7 @@
     if (stale && head && !hintEl) {
       hintEl = document.createElement("span");
       hintEl.className = "scan-stale-hint";
-      hintEl.textContent = " · veraltet — neu scannen";
+      hintEl.textContent = " · stale — scan again";
       head.appendChild(hintEl);
     } else if (!stale && hintEl) {
       hintEl.remove();
@@ -8311,10 +8548,10 @@
     if (!rows.length) {
       strip.className = "scan-strip";
       const emptyMsg = allRows.length
-        ? "Alle Top-Kandidaten bereits offen (Position oder Order) — nichts Neues vorzuschlagen."
-        : "Kein Setup mit klarem Edge — auch das ist ein Ergebnis.";
+        ? "All top candidates already have an open position or order."
+        : "No setup with a clear edge was found.";
       strip.innerHTML =
-        '<div class="scan-strip-head">Markt-Scan · ' +
+        '<div class="scan-strip-head">Market scan · ' +
         escapeHtml(String(data.model_used || "?")) + " · " +
         ((data.scanned || []).length || 0) + " Coins" + ageSpan + "</div>" +
         '<div class="scan-empty">' + emptyMsg + '</div>';
@@ -8323,21 +8560,21 @@
       if (body) {
         body.className = "placeholder";
         body.textContent = allRows.length
-          ? "Alle gefundenen Setups laufen bereits (offene Position/Order). Einzelnen Coin wählen und Analysieren nutzen, oder später erneut scannen."
-          : "Kein Coin mit klarem Setup gefunden. Einzelnen Coin wählen und Analysieren nutzen, oder später erneut scannen.";
+          ? "Every detected setup already has an open position or order. Select a coin and use Analyze, or scan again later."
+          : "No coin with a clear setup was found. Select a coin and use Analyze, or scan again later.";
       }
       return;
     }
 
     let html =
-      '<div class="scan-strip-head">Markt-Scan · ' +
+      '<div class="scan-strip-head">Market scan · ' +
       escapeHtml(String(data.model_used || "?")) + " · Top " + rows.length +
-      " von " + ((data.scanned || []).length || 0) + " Coins" +
+      " of " + ((data.scanned || []).length || 0) + " coins" +
       (hiddenCount
-        ? " (" + hiddenCount + " bereits offen ausgeblendet)"
+        ? " (" + hiddenCount + " already open and hidden)"
         : "") +
       ageSpan +
-      ' <span class="scan-hint">— Coin anklicken für Detail-Analyse</span></div>' +
+      ' <span class="scan-hint">— select a coin for detailed analysis</span></div>' +
       '<div class="scan-chips">';
     rows.forEach(function (r) {
       const long = String(r.bias || "").toLowerCase() === "long";
@@ -8367,8 +8604,8 @@
     if (body && (!state.proposal || state.proposalSymbol !== state.symbol)) {
       body.className = "placeholder";
       body.textContent =
-        "Scan fertig — " + rows.length +
-        " Setups gefunden. Klick auf einen Coin oben startet die Detail-Analyse.";
+        "Scan complete — " + rows.length +
+        " setups found. Select a coin above to start the detailed analysis.";
     }
   }
 
@@ -8378,13 +8615,13 @@
     state.scanBusy = true;
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Scanne Markt…";
+      btn.textContent = "Scanning market…";
     }
     const body = $("proposal-body");
     if (body) {
       body.className = "placeholder";
       body.textContent =
-        "Scanner lädt die Top-Coins und sucht nach Setups (dauert ~20-40 s)…";
+        "Loading top coins and scanning for setups (about 20–40 seconds)…";
     }
     // Explicit timeout so a slow/hung scan gives a clear message instead of
     // the browser's opaque "Failed to fetch".
@@ -8413,14 +8650,14 @@
     } catch (err) {
       if (err && err.name === "AbortError") {
         showProposalError(
-          "Scan-Zeitüberschreitung (>3 min) — Börse oder KI zu langsam. " +
-            "Erneut versuchen oder ein schnelleres KI-Modell wählen."
+          "Scan timed out after 3 minutes. The exchange or AI provider is too slow. " +
+            "Try again or select a faster AI model."
         );
       } else {
         showProposalError(
-          "Netzwerkfehler beim Scan: " +
+          "Network error during scan: " +
             (err && err.message ? err.message : err) +
-            " — läuft der Server noch?"
+            " — is the server still running?"
         );
       }
     } finally {
@@ -8428,7 +8665,7 @@
       state.scanBusy = false;
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "◎ Markt scannen";
+        btn.textContent = "◎ Scan market";
       }
     }
   }
@@ -8442,8 +8679,8 @@
     const btn = $("btn-send-order");
     if (btn && !state.orderBusy) {
       btn.textContent = manual
-        ? "Order prüfen — MANUELL (kein Börsen-Stop)"
-        : "Order prüfen (Preview)";
+        ? "Review order — MANUAL (no exchange stop)"
+        : "Review order";
     }
   }
 
@@ -8451,7 +8688,20 @@
    *  Also tints the ticket panel and dims the limit-price field for market. */
   function syncTicketSegments() {
     const side = ($("ticket-side") && $("ticket-side").value) || "long";
-    const type = ($("ticket-type") && $("ticket-type").value) || "market";
+    let type = ($("ticket-type") && $("ticket-type").value) || "market";
+    const limitBlocked = isHlExchange();
+    const limitBtn = document.querySelector('.type-btn[data-type="limit"]');
+    if (limitBtn) {
+      limitBtn.disabled = limitBlocked;
+      limitBtn.title = limitBlocked
+        ? "Hyperliquid limit disabled: later or partial fills cannot be guaranteed stop-loss protection"
+        : "";
+    }
+    if (limitBlocked && type === "limit") {
+      const typeSelect = $("ticket-type");
+      if (typeSelect) typeSelect.value = "market";
+      type = "market";
+    }
 
     document.querySelectorAll(".side-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-side") === side);
@@ -8488,12 +8738,27 @@
     document.querySelectorAll(".side-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
         const sel = $("ticket-side");
-        if (sel) sel.value = btn.getAttribute("data-side") || "long";
+        const nextSide = btn.getAttribute("data-side") || "long";
+        if (sel && sel.value !== nextSide) {
+          // A deliberate direction flip is no longer the applied proposal's
+          // trade; drop provenance instead of sending a knowingly mismatched ID.
+          state.ticketProposalId = null;
+          state.ticketProposalSymbol = null;
+          state.proposalApplied = false;
+          sel.value = nextSide;
+        }
         syncTicketSegments();
       });
     });
     document.querySelectorAll(".type-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
+        if (btn.getAttribute("data-type") === "limit" && isHlExchange()) {
+          showToast(
+            "Hyperliquid limit disabled: later or partial fills are not guaranteed protection without a persistent fill watcher.",
+            "err"
+          );
+          return;
+        }
         const sel = $("ticket-type");
         if (sel) sel.value = btn.getAttribute("data-type") || "market";
         syncTicketSegments();
@@ -8555,12 +8820,7 @@
     if (sym) {
       sym.addEventListener("change", () => {
         sym.dataset.touched = "1";
-        goToSymbol(sym.value);
-      });
-      sym.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          sym.dataset.touched = "1";
+        if (sym.value.trim().toUpperCase() !== String(state.symbol || "").toUpperCase()) {
           goToSymbol(sym.value);
         }
       });
@@ -8615,9 +8875,25 @@
     }
 
     document.addEventListener("keydown", (e) => {
+      if (activeDialog && e.key === "Tab") {
+        const focusable = dialogFocusables(activeDialog);
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (!first) {
+          e.preventDefault();
+          activeDialog.focus();
+        } else if (e.shiftKey && (document.activeElement === first || !focusable.includes(document.activeElement))) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && (document.activeElement === last || !focusable.includes(document.activeElement))) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
       if (e.key === "Escape") {
-        closeConfirmModal();
-        closeKiModal();
+        if (activeDialog) e.preventDefault();
+        if (activeDialog && activeDialog.id === "ki-keys-modal") closeKiModal();
+        else closeConfirmModal();
       }
     });
 
@@ -8669,8 +8945,28 @@
 
     // Tabbed data panel: Positionen · Offene Orders · Historie · Trades
     document.querySelectorAll(".data-tab").forEach(function (t) {
+      const name = t.getAttribute("data-tab");
+      t.id = "data-tab-" + name;
+      t.setAttribute("aria-controls", "data-pane-" + name);
+      t.tabIndex = t.classList.contains("active") ? 0 : -1;
+      const pane = document.querySelector('.data-pane[data-pane="' + name + '"]');
+      if (pane) {
+        pane.id = "data-pane-" + name;
+        pane.setAttribute("aria-labelledby", t.id);
+        pane.tabIndex = 0;
+      }
       t.addEventListener("click", function () {
         switchDataTab(t.getAttribute("data-tab"));
+      });
+      t.addEventListener("keydown", function (e) {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+        e.preventDefault();
+        const tabs = Array.from(document.querySelectorAll(".data-tab"));
+        const index = tabs.indexOf(t);
+        const next = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1
+          : (index + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        switchDataTab(tabs[next].getAttribute("data-tab"));
+        tabs[next].focus();
       });
     });
     // Sync the default tab's action-button visibility (default = Positionen).
@@ -8737,51 +9033,26 @@
   /** T3-09: a native <input type=number> simply refuses a de-DE formatted
    *  paste like "61.234,56" — a comma is not a legal character in a number
    *  input's value, so the browser drops/mangles it on paste instead of
-   *  parsing it. We intercept the raw clipboard text ourselves and resolve
-   *  it to a plain float before it ever reaches the input.
-   *
-   *  Heuristic: when BOTH separators are present, whichever comes LAST is
-   *  the decimal separator (the other is thousands-grouping and gets
-   *  stripped) — "61.234,56" -> comma is last -> 61234.56; "61,234.56" ->
-   *  dot is last -> 61234.56. When only a comma is present, a single comma
-   *  followed by 1-2 trailing digits is read as a de-DE decimal comma
-   *  ("1234,5" -> 1234.5); anything else (multiple commas, or 3+ trailing
-   *  digits) is thousands-grouping and the commas are stripped.
-   *
-   *  A lone dot ("1.234") is deliberately NOT reinterpreted as a thousands
-   *  separator — that is genuinely ambiguous (US decimal vs. de-DE
-   *  thousands with no decimal shown) and guessing wrong would silently
-   *  10x/1000x a price. We take the standard/native reading (1.234) rather
-   *  than guess; a value that still can't parse (e.g. two lone dots,
-   *  "1.234.567" with no comma to disambiguate) reports null so the caller
-   *  can toast instead of writing garbage into the field. */
+   *  parsing it. A single comma is the German decimal separator regardless
+   *  of precision. Mixed separators require valid thousands groups. Invalid
+   *  text is rejected instead of stripping arbitrary characters into a price. */
   function parsePastedPrice(raw) {
     let s = String(raw == null ? "" : raw).trim();
     if (!s) return null;
-    // Strip whitespace (incl. thin/nbsp used as thousands grouping) and any
-    // currency/unit noise, keep only digits, separators and a leading sign.
-    s = s.replace(/[\s  ]/g, "");
-    s = s.replace(/[^0-9.,\-]/g, "");
-    if (!s) return null;
-
-    const hasComma = s.indexOf(",") !== -1;
-    const hasDot = s.indexOf(".") !== -1;
-
-    if (hasComma && hasDot) {
-      if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
-        s = s.replace(/\./g, "").replace(",", "."); // de-DE: 61.234,56
-      } else {
-        s = s.replace(/,/g, ""); // en-US: 61,234.56
-      }
-    } else if (hasComma) {
-      const parts = s.split(",");
-      if (parts.length === 2 && parts[1].length >= 1 && parts[1].length <= 2) {
-        s = parts[0] + "." + parts[1]; // de-DE decimal comma: 1234,5
-      } else {
-        s = s.replace(/,/g, ""); // thousands grouping: 61,234 / 1,234,567
-      }
+    // Spaces only represent grouping if every group contains three digits.
+    if (/[\s  ]/.test(s)) {
+      if (!/^[+-]?\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?$/.test(s)) return null;
+      s = s.replace(/[   ]/g, "");
     }
-
+    if (/^[+-]?\d{1,3}(?:\.\d{3})+,\d+$/.test(s)) {
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else if (/^[+-]?\d{1,3}(?:,\d{3})+\.\d+$/.test(s)) {
+      s = s.replace(/,/g, "");
+    } else if (/^[+-]?(?:\d+(?:,\d*)?|,\d+)$/.test(s)) {
+      s = s.replace(",", ".");
+    } else if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) {
+      return null;
+    }
     const n = Number(s);
     return Number.isFinite(n) ? n : null;
   }
@@ -8799,7 +9070,7 @@
       if (n == null) {
         e.preventDefault();
         showToast(
-          'Eingefügter Wert "' + raw.trim() + '" ist nicht lesbar — bitte Zahl manuell eintragen.',
+          'The pasted value "' + raw.trim() + '" is not a valid number. Enter it manually.',
           "err"
         );
         return;
@@ -8841,6 +9112,12 @@
     if (entry != null) ticket.entry = entry;
     if (stopLoss != null) ticket.stop_loss = stopLoss;
     if (takeProfit != null) ticket.take_profit = takeProfit;
+    if (
+      state.ticketProposalId != null &&
+      symMatch(state.ticketProposalSymbol, symbol)
+    ) {
+      ticket.proposal_id = state.ticketProposalId;
+    }
     return ticket;
   }
 
@@ -8869,7 +9146,7 @@
   }
 
   function detailToText(detail) {
-    if (detail == null) return "Unbekannter Fehler";
+    if (detail == null) return "Unknown error";
     if (typeof detail === "string") return detail;
     if (detail.message) return detail.message;
     if (Array.isArray(detail.errors)) return detail.errors.join("; ");
@@ -8881,7 +9158,7 @@
     return JSON.stringify(detail);
   }
 
-  function openConfirmModal(preview) {
+  function openConfirmModal(preview, returnFocus) {
     const modal = $("confirm-modal");
     const body = $("confirm-body");
     const errEl = $("confirm-error");
@@ -8895,7 +9172,13 @@
     const gate = preview.gate || {};
     const okGates = preview.ok === true && !!preview.token;
     const armed = state.health && state.health.trading_enabled === true;
+    const testnet = state.health && state.health.exchange === "hyperliquid" && state.health.hl_testnet === true;
     const canConfirm = okGates && armed;
+    const title = $("confirm-title");
+    if (title) title.textContent = !armed ? "Order Preview"
+      : testnet ? "Confirm Order · Testnet"
+      : state.health.live_trading === true ? "Confirm Order · Real Funds" : "Confirm Order";
+    if (confirmBtn) confirmBtn.textContent = confirmActionLabel();
     const errors = preview.errors || gate.errors || [];
 
     let html = "";
@@ -8904,16 +9187,16 @@
     if (!okGates && errors.length) {
       html +=
         '<div class="blocker-box">' +
-        '<div class="blocker-title">⛔ Order blockiert — diese Punkte zuerst lösen:</div>' +
+        '<div class="blocker-title">⛔ Order blocked — resolve these items first:</div>' +
         '<ul class="blocker-list">' +
         errors.map((e) => "<li>" + escapeHtml(_humanGate(e)) + "</li>").join("") +
         "</ul></div>";
     } else if (okGates && !armed) {
       html +=
         '<div class="blocker-box blocker-disarmed">' +
-        '<div class="blocker-title">🔒 DISARMED — Live-Trading ist aus</div>' +
-        '<p>Alle Risk-Gates sind grün. Zum echten Senden <code>TRADING_ENABLED=true</code> ' +
-        "in der <code>.env</code> setzen und die App neu starten.</p></div>";
+        '<div class="blocker-title">🔒 DISARMED — live trading is off</div>' +
+        '<p>All risk gates pass. To enable submission, set <code>TRADING_ENABLED=true</code> ' +
+        "in <code>.env</code> and restart the app.</p></div>";
     }
 
     // 2) Order summary as a compact, readable card
@@ -8927,18 +9210,18 @@
       (s.price != null ? " @ " + fmt(s.price, 6) : " @ Market") + "</span>" +
       "</div>" +
       '<div class="sum-grid">' +
-      _sumCell("Größe", fmt(s.notional_usdt, 2) + " " + ccy(), "≈ " + fmt(s.vol, 6) + " Kontrakte") +
-      _sumCell("Hebel", (s.leverage != null ? s.leverage + "×" : "—"),
+      _sumCell("Size", fmt(s.notional_usdt, 2) + " " + ccy(), "≈ " + fmt(s.vol, 6) + " contracts") +
+      _sumCell("Leverage", (s.leverage != null ? s.leverage + "×" : "—"),
                s.notional_usdt != null && s.leverage ? "Margin " + fmt(s.notional_usdt / s.leverage, 2) : "") +
-      _sumCell("Entry", fmt(s.entry_for_risk, 6), "Risk-Referenz") +
+      _sumCell("Entry", fmt(s.entry_for_risk, 6), "Risk reference") +
       _sumCell("Stop-Loss", s.stop_loss != null ? fmt(s.stop_loss, 6) : "—",
                _pctVs(s.stop_loss, s.entry_for_risk), "sum-sl") +
       _sumCell("Take-Profit", s.take_profit != null ? fmt(s.take_profit, 6) : "—",
                _pctVs(s.take_profit, s.entry_for_risk), "sum-tp") +
-      _sumCell("Risiko", fmt(s.risk_usdt, 2) + " " + ccy(),
+      _sumCell("Risk", fmt(s.risk_usdt, 2) + " " + ccy(),
                s.risk_pct != null ? fmt(s.risk_pct, 2) + "% Equity" : "", "sum-sl") +
-      _sumCell("Chance/Risiko", s.rrr != null ? "1 : " + fmt(s.rrr, 2) : "—",
-               s.rrr != null && s.rrr >= minRrr() ? "gut" : "") +
+      _sumCell("Reward/Risk", s.rrr != null ? "1 : " + fmt(s.rrr, 2) : "—",
+               s.rrr != null && s.rrr >= minRrr() ? "good" : "") +
       "</div></div>";
 
     // 3) Warnings (non-blocking) — T3-05: still shown when a gate blocks (the
@@ -8949,7 +9232,7 @@
     if (warnings.length) {
       html +=
         '<div class="warn-box"><div class="warn-title">' +
-        (okGates ? "Hinweise:" : "Außerdem:") +
+        (okGates ? "Notes:" : "Also:") +
         '</div><ul class="warn-list">' +
         warnings.map((w) => "<li>" + escapeHtml(_humanGate(w)) + "</li>").join("") +
         "</ul></div>";
@@ -8961,12 +9244,12 @@
     if (canConfirm && manual) {
       html +=
         '<div class="blocker-box manual-warn">' +
-        '<div class="blocker-title">⚠ Manueller SL/TP — kein Börsen-Schutz</div>' +
-        "<p>Diese Order wird <strong>ohne</strong> Stop-Loss/Take-Profit auf der " +
-        "Börse platziert. Du musst die Position selbst schließen. Bei geschlossenem " +
-        "Browser oder Verbindungsabbruch ist sie <strong>ungeschützt</strong>.</p>" +
+        '<div class="blocker-title">⚠ Manual SL/TP — no exchange protection</div>' +
+        "<p>This order is placed <strong>without</strong> exchange stop-loss or take-profit. " +
+        "You must close the position yourself. It is <strong>unprotected</strong> if the browser " +
+        "closes or the connection drops.</p>" +
         '<label class="manual-ack"><input type="checkbox" id="manual-ack-box" /> ' +
-        "Ich verstehe das und manage den Exit selbst.</label></div>";
+        "I understand and will manage the exit myself.</label></div>";
     }
     // Weak reward:risk is real send-friction too — require an explicit ack
     // checkbox before the confirm button unlocks, same as the manual warning.
@@ -8974,16 +9257,17 @@
     if (weakRrr) {
       html +=
         '<div class="blocker-box rrr-confirm">' +
-        '<div class="blocker-title">⚠ Schwaches Chance/Risiko — 1 : ' + fmt(s.rrr, 2) + "</div>" +
+        '<div class="blocker-title">⚠ Weak reward/risk — 1 : ' + fmt(s.rrr, 2) + "</div>" +
         '<label class="manual-ack"><input type="checkbox" id="rrr-ack-box" /> ' +
-        "Ich bestätige das schwache Chance/Risiko 1:" + fmt(s.rrr, 2) + "</label></div>";
+        "I accept the weak reward/risk ratio of 1:" + fmt(s.rrr, 2) + "</label></div>";
     }
 
     if (canConfirm) {
       const ttl = preview.expires_in_seconds || 60;
       html +=
-        '<p class="live-warn">⚠ LIVE-ORDER — nach Confirm sofort echt und irreversibel. ' +
-        'Token läuft in <strong id="confirm-ttl">' + ttl + "</strong>s ab.</p>";
+        '<p class="live-warn">⚠ ' + (testnet ? "TESTNET ORDER — submitted to testnet after confirmation. "
+          : "LIVE ORDER — submitted with real funds after confirmation. ") +
+        'Token expires in <strong id="confirm-ttl">' + ttl + "</strong>s.</p>";
     }
 
     body.innerHTML = html;
@@ -9008,9 +9292,9 @@
       }
       confirmBtn.disabled = !canConfirm || needManualAck || needRrrAck;
       confirmBtn.title = canConfirm
-        ? (needManualAck || needRrrAck ? "Bitte alle Bestätigungen ankreuzen" : "Live-Order jetzt senden")
+        ? (needManualAck || needRrrAck ? "Select all required acknowledgements" : "Submit order now")
         : !okGates
-          ? "Risk-Gates blockieren die Order (siehe oben)"
+          ? "Risk gates block this order; see details above"
           : "DISARMED — TRADING_ENABLED=false";
       if (needManualAck) {
         const ack = $("manual-ack-box");
@@ -9031,12 +9315,11 @@
         }
       }
     }
-    modal.classList.remove("hidden");
     // T3-07: focus the Abbrechen button (not the browser default of the
     // first focusable/first confirm-ish control) so an already-fingers-on-
     // Enter user lands on "cancel", never accidentally on "send live".
     const cancelBtn = $("btn-confirm-cancel");
-    if (cancelBtn) cancelBtn.focus();
+    showDialog(modal, cancelBtn, returnFocus);
 
     if (state._ttlTimer) clearInterval(state._ttlTimer);
     if (canConfirm) {
@@ -9054,9 +9337,9 @@
             // and re-find the send button themselves.
             errEl.classList.remove("hidden");
             errEl.innerHTML =
-              "Token abgelaufen — bitte erneut prüfen. " +
+              "Preview expired. Run the review again. " +
               '<button type="button" id="btn-confirm-expired-retry" class="btn btn-secondary">' +
-              "Abgelaufen — neu prüfen</button>";
+              "Review again</button>";
             const retryBtn = $("btn-confirm-expired-retry");
             if (retryBtn) {
               retryBtn.addEventListener("click", function () {
@@ -9071,29 +9354,29 @@
     }
   }
 
-  /** Turn a raw gate message into plain German for the modal. */
+  /** Turn a raw gate message into clear English for the modal. */
   function _humanGate(msg) {
     const m = String(msg || "");
     if (/stop_loss required/i.test(m))
-      return "Stop-Loss fehlt — ohne SL sind Live-Einstiege gesperrt. SL-Kurs eintragen.";
+      return "Stop-loss is required. Enter an SL price before submitting a live entry.";
     if (/below exchange minimum/i.test(m)) {
       const mm = m.match(/minimum\s+([\d.]+)/i);
-      return "Position zu klein für die Börse (Minimum " +
-        (mm ? mm[1] : "?") + " " + ccy() + "). Positionsgröße erhöhen.";
+      return "Position is below the exchange minimum (" +
+        (mm ? mm[1] : "?") + " " + ccy() + "). Increase the position size.";
     }
     if (/exceeds MAX_NOTIONAL/i.test(m))
-      return "Position über dem erlaubten Maximum (MAX_NOTIONAL_USDT). Größe reduzieren.";
+      return "Position exceeds MAX_NOTIONAL_USDT. Reduce the size.";
     if (/risk .* exceeds MAX_RISK_PCT/i.test(m))
-      return "Risiko über dem Limit (MAX_RISK_PCT). SL enger setzen oder Größe reduzieren.";
+      return "Risk exceeds MAX_RISK_PCT. Move the stop closer or reduce size.";
     if (/RRR .* < MIN_RRR|take_profit required/i.test(m))
-      return "Chance/Risiko zu niedrig — Take-Profit weiter setzen oder SL enger (min. 1:" +
+      return "Reward/risk is too low. Move take-profit farther away or tighten the stop (minimum 1:" +
         fmt(minRrr(), 1) + ").";
     if (/leverage .* exceeds/i.test(m))
-      return "Hebel über dem Limit — Hebel reduzieren.";
+      return "Leverage exceeds the limit. Reduce leverage.";
     if (/available|margin/i.test(m) && /exceeds|used/i.test(m))
-      return "Nicht genug freie Margin für diese Größe.";
+      return "Available margin is insufficient for this size.";
     if (/DISARMED/i.test(m))
-      return "DISARMED: Live-Trading ist aus (TRADING_ENABLED=false).";
+      return "DISARMED: live trading is off (TRADING_ENABLED=false).";
     return m;
   }
 
@@ -9114,8 +9397,9 @@
   }
 
   function closeConfirmModal() {
+    if (confirmSubmitting) return;
     const modal = $("confirm-modal");
-    if (modal) modal.classList.add("hidden");
+    hideDialog(modal);
     state.previewToken = null;
     state.previewSummary = null;
     if (state._ttlTimer) {
@@ -9132,28 +9416,36 @@
     const openModal = $("confirm-modal");
     if (openModal && !openModal.classList.contains("hidden")) return;
     if (state.orderBusy) return;
+    if (!state.market) {
+      setTicketError("Market data for this symbol is missing. Load it first.");
+      return;
+    }
     // U-03: the send button is disabled via updateOrderButtonsEnabled() when
     // apiAllowed===false, but a focused form field still submits on Enter,
     // bypassing that disabled state. Guard here too so Enter can't slip an
     // order through on a symbol where API orders are locked.
     if (state.apiAllowed === false) {
-      setTicketError("apiAllowed=false — API-Orders für dieses Symbol gesperrt");
+      setTicketError("apiAllowed=false — API orders are disabled for this symbol");
       return;
     }
     setTicketError("");
     const ticket = readTicket();
     if (ticket.vol == null || ticket.vol <= 0) {
       setTicketError(
-        "Positionsgröße (" + ccy() + ") eintragen — und ein Symbol laden, damit der Preis bekannt ist."
+        "Enter a position size (" + ccy() + ") and load a symbol so its price is known."
       );
       return;
     }
 
     const btn = $("btn-send-order");
+    // Disabling a focused submit button can move focus to the body. Capture
+    // the invoking control now, before disabling it or awaiting the preview.
+    const returnFocus = document.activeElement && document.activeElement !== document.body
+      ? document.activeElement : btn;
     state.orderBusy = true;
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Prüfe Risk-Gates…";
+      btn.textContent = "Checking risk gates…";
     }
 
     try {
@@ -9183,17 +9475,17 @@
       // ok OR not-ok: the modal now renders blockers, summary and confirm
       // state itself, so the user always sees WHY confirm is (un)available.
       if (data.summary) {
-        openConfirmModal(data);
+        openConfirmModal(data, returnFocus);
       } else {
-        const errs = (data.errors || []).map(_humanGate).join(" · ") || "Gates abgelehnt";
+        const errs = (data.errors || []).map(_humanGate).join(" · ") || "Risk gates rejected the order";
         setTicketError(errs);
       }
     } catch (err) {
       console.error("runPreview", err);
-      setTicketError("Netzwerkfehler: " + (err && err.message ? err.message : err));
+      setTicketError("Network error: " + (err && err.message ? err.message : err));
     } finally {
       state.orderBusy = false;
-      if (btn) btn.disabled = false;
+      updateOrderButtonsEnabled();
       updateTriggerModeUi();
     }
   }
@@ -9230,18 +9522,27 @@
       const errEl = $("confirm-error");
       if (errEl) {
         errEl.classList.remove("hidden");
-        errEl.textContent = "Kein Preview-Token — zuerst Preview.";
+        errEl.textContent = "No preview token. Review the order again.";
       }
       return;
     }
 
     const confirmBtn = $("btn-confirm-live");
     const token = state.previewToken;
+    const summary = Object.assign({}, state.previewSummary || {});
+    const entryBarTime = state.liveBar && state.liveBar.time;
+    setConfirmSubmitting(true);
+    if (state._ttlTimer) {
+      clearInterval(state._ttlTimer);
+      state._ttlTimer = null;
+    }
+    const ttl = $("confirm-ttl");
+    if (ttl && ttl.parentElement) ttl.parentElement.textContent = "Submitting order — waiting for confirmation.";
     state.orderBusy = true;
     state.previewToken = null; // one-shot client-side; server also consumes
     if (confirmBtn) {
       confirmBtn.disabled = true;
-      confirmBtn.textContent = "Sende…";
+      confirmBtn.textContent = "Submitting…";
     }
 
     try {
@@ -9251,7 +9552,7 @@
         if (errEl) {
           errEl.classList.remove("hidden");
           errEl.textContent =
-            "DISARMED: TRADING_ENABLED=false — Confirm gesperrt.";
+            "DISARMED: TRADING_ENABLED=false — submission is locked.";
         }
         // Token was already cleared client-side; user must re-preview after arming
         return;
@@ -9283,20 +9584,20 @@
 
       if (data.sl_verified === false && data.sl_checked === false) {
         showToast(
-          "SL-Status UNBEKANNT — Order ist platziert. Bitte Position auf der " +
-            "Börse manuell prüfen! " + (data.sl_detail || ""),
+          "SL STATUS UNKNOWN — the order was placed. Check the position and stop " +
+            "on the exchange now. " + (data.sl_detail || ""),
           "err"
         );
       } else if (data.sl_verified === false) {
         showToast(
-          "KRITISCH: SL nicht verifiziert — " +
+          "CRITICAL: stop-loss was not verified — " +
             (data.sl_detail || "") +
-            (data.flatten ? " (Flatten versucht)" : ""),
+            (data.flatten ? " (emergency close attempted)" : ""),
           "err"
         );
       } else {
         showToast(
-          "Order platziert" +
+          "Order placed" +
             (data.external_oid ? " · " + data.external_oid : ""),
           "ok"
         );
@@ -9304,12 +9605,12 @@
       // Remember the entry candle + SL/TP so the zone starts at the fill and —
       // crucially in MANUAL mode where no exchange trigger exists — the SL/TP
       // fields are still drawn. Use the current live bar's open time.
-      const sm = state.previewSummary || {};
+      const sm = summary;
       const sym = sm.symbol;
       if (sym) {
         const key = String(sym).toUpperCase();
-        if (state.liveBar && state.liveBar.time) {
-          state.tradeEntryTimes[key] = state.liveBar.time; // legacy in-memory fallback
+        if (entryBarTime) {
+          state.tradeEntryTimes[key] = entryBarTime; // legacy in-memory fallback
         }
         // A3-01: write under the canonical key so every read site (position
         // zones, mini-tiles, the manual-SL alarm) can find it again.
@@ -9334,6 +9635,7 @@
       // confirmed): clear the disposable ticket inputs + un-stick Manual
       // mode now, never on the error/catch paths below.
       resetTicketAfterConfirm();
+      setConfirmSubmitting(false);
       closeConfirmModal();
       loadAccount();
       loadOpenOrders();
@@ -9347,14 +9649,13 @@
       if (errEl) {
         errEl.classList.remove("hidden");
         errEl.textContent =
-          "NETZWERKFEHLER beim Bestätigen — die Order ist möglicherweise " +
-          "bereits platziert. NICHT erneut previewen/bestätigen! Prüfe " +
-          "Positionen und Orders auf der Börse. (" +
+          "NETWORK ERROR while confirming — the order may already be placed. " +
+          "Do not submit it again. Check positions and orders on the exchange. (" +
           (err && err.message ? err.message : err) + ")";
       }
       showToast(
-        "⚠ Confirm-Antwort verloren — Order evtl. LIVE. Auf der Börse prüfen, " +
-          "NICHT erneut bestätigen.",
+        "⚠ Confirmation response lost — the order may be LIVE. Check the exchange " +
+          "and do not confirm again.",
         "err"
       );
       // Reconcile so the UI reflects any order the server actually placed.
@@ -9363,8 +9664,11 @@
       try { loadHistory(); } catch (_) {}
     } finally {
       state.orderBusy = false;
+      setConfirmSubmitting(false);
+      updateOrderButtonsEnabled();
+      updateTriggerModeUi();
       if (confirmBtn) {
-        confirmBtn.textContent = "Confirm LIVE";
+        confirmBtn.textContent = confirmActionLabel();
         confirmBtn.disabled = !state.previewToken;
       }
     }
@@ -9553,4 +9857,3 @@
     showOverview(); // start on the overview tab; also triggers the first mini refresh
   });
 })();
-

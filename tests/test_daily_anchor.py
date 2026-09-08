@@ -1,5 +1,7 @@
 """Daily regime anchor: compact block, snapshot passthrough, parallel fetch + cache."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.analysis import context as ctxmod
@@ -72,10 +74,19 @@ async def test_daily_fetch_is_cached_within_ttl():
 async def test_daily_cache_expires(monkeypatch):
     clear_daily_cache()
     client = _CountingClient()
-    t = [1000.0]
-    monkeypatch.setattr(ctxmod.time, "time", lambda: t[0])
+    wall = [1_000.0]
+    elapsed = [1_000.0]
+    monkeypatch.setattr(
+        ctxmod,
+        "time",
+        SimpleNamespace(
+            time=lambda: wall[0],
+            monotonic=lambda: elapsed[0],
+        ),
+    )
     await build_market_snapshot("BTC_C", "15m", "1H", client)
-    t[0] += ctxmod._DAILY_TTL_S + 1.0
+    wall[0] = 100.0
+    elapsed[0] += ctxmod._DAILY_TTL_S + 1.0
     await build_market_snapshot("BTC_C", "15m", "1H", client)
     assert client.kline_calls["1D"] == 2
 

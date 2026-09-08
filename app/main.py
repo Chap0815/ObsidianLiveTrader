@@ -3,6 +3,7 @@ import hashlib
 import html as _html
 import json
 import logging
+import math
 import os
 import re as _re
 import tempfile
@@ -53,6 +54,9 @@ from app.models import (
     CancelRequest,
     ClosePositionRequest,
     ConfirmRequest,
+    LLMKeyRequest,
+    LLMProbeRequest,
+    LLMProviderRequest,
     ModifySLRequest,
     OrderTicket,
     ReevaluateRequest,
@@ -60,7 +64,7 @@ from app.models import (
 from app.orders.protection import classify_protection
 from app.orders.service import OrderError, OrderService, estimate_same_side_risk_usdt
 from app.orders.tokens import PreviewStore
-from app.risk.sizing import suggest_vol
+from app.risk.sizing import adverse_market_entry, suggest_vol
 from app.security import (
     AUTH_COOKIE_NAME,
     _origin_matches_request,
@@ -141,6 +145,9 @@ log = logging.getLogger("app.main")
 # read endpoint with no cache at all, so a browser tab + a second tab/poll
 # landing within a few seconds fired the exchange twice for identical data.
 MINI_CACHE_TTL_S = 18.0
+MINI_MAX_SYMBOLS = 24
+# 24 maximal lange MEXC-Symbole (49 Zeichen) plus Trennkommas passen hinein.
+MINI_SYMBOLS_QUERY_MAX_LENGTH = MINI_MAX_SYMBOLS * 50
 # Simple size cap (mirrors ANALYZE_CACHE_MAX_ENTRIES below) so a long-running
 # process (many symbol-tuple/tf/limit combinations from the overview grid)
 # can't grow this dict unbounded — the oldest entry (by insertion order) is
@@ -154,6 +161,16 @@ MINI_CACHE_MAX_ENTRIES = 64
 # pass tf/htf straight through to INTERVAL_MAP.get(interval, interval), so an
 # unknown string went to the exchange verbatim instead of being rejected.
 VALID_MARKET_INTERVALS = frozenset(HL_INTERVAL_MAP) | frozenset(MEXC_INTERVAL_MAP)
+
+
+def _validate_market_intervals(*intervals: str) -> None:
+    """Reject unknown public-data intervals before any exchange fan-out."""
+    if any(interval not in VALID_MARKET_INTERVALS for interval in intervals):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid interval. Allowed: {sorted(VALID_MARKET_INTERVALS)}",
+        )
+
 
 # /api/market in-memory cache TTL + size cap — same (timestamp, payload)
 # shape + singleflight lock as /api/mini above. This endpoint had NO cache at
@@ -171,6 +188,27 @@ ANALYZE_CACHE_TTL_S = 120.0
 # verdict combinations) can't grow this dict unbounded — the oldest entry
 # (by insertion order) is dropped once the cache exceeds this many entries.
 ANALYZE_CACHE_MAX_ENTRIES = 256
+
+
+@asynccontextmanager
+async def _keyed_singleflight_lock(state, attr: str, key):
+    """Serialize one cache key while allowing independent keys to run together."""
+    locks = getattr(state, attr, None)
+    if locks is None:
+        locks = {}
+        setattr(state, attr, locks)
+    entry = locks.get(key)
+    if entry is None:
+        entry = [asyncio.Lock(), 0]
+        locks[key] = entry
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and locks.get(key) is entry:
+            del locks[key]
 
 # L2X-05: tf -> candle duration in seconds. floor(now / seconds) goes into the
 # analyze cache key so a candle CLOSE auto-invalidates the entry — a cached
@@ -479,19 +517,19 @@ async def lifespan(app: FastAPI):
     _hl_mainnet = s.exchange == "hyperliquid" and not s.hl_testnet
     if _hl_mainnet and s.trading_enabled and not s.mainnet_ack:
         raise RuntimeError(
-            "Mainnet + scharfes Trading erkannt (HL_TESTNET=false, "
-            "TRADING_ENABLED=true) — zur Bestätigung einmalig MAINNET_ACK=true "
-            "in die .env setzen. Empfohlen vorher: Trading disarmen "
-            "(TRADING_ENABLED=false), Agent-Key-Scope prüfen und mit einer "
-            "Micro-Probe testen, dann wieder armen. Siehe README, Abschnitt "
-            "„Wechsel auf Mainnet“."
+            "Mainnet with armed trading detected (HL_TESTNET=false, "
+            "TRADING_ENABLED=true). To confirm, set MAINNET_ACK=true once "
+            "in .env. Recommended first: disarm trading "
+            "(TRADING_ENABLED=false), verify the agent-key scope, run a "
+            "micro-probe, then arm again. See the README section "
+            "'Switching to mainnet'."
         )
     # Loud real-money startup notice: armed on mainnet (HL live) or any armed
     # MEXC (MEXC has no testnet). Mirrors the /api/health live_trading flag.
     if s.trading_enabled and not (s.exchange == "hyperliquid" and s.hl_testnet):
         log.warning(
-            "MAINNET · ECHTGELD AKTIV: scharfes Trading auf %s — Orders bewegen "
-            "echtes Kapital.",
+            "MAINNET · REAL FUNDS ACTIVE: armed trading on %s — orders move "
+            "real capital.",
             s.exchange,
         )
 
@@ -513,10 +551,8 @@ async def lifespan(app: FastAPI):
             "confirm/close trade_lock are NOT shared across processes — "
             "see the single-worker note on _detect_multi_worker_env() "
             "above). Running two live instances against the same data/ is "
-            "unsafe. "
-            "[Deutsch] Es läuft bereits eine andere Instanz dieser App mit "
-            "denselben Daten (%s) — bitte zuerst die andere Instanz "
-            "beenden, bevor eine zweite gestartet wird.",
+            "unsafe. Another instance of this app is already using the same "
+            "data (%s). Stop the other instance before starting a second one.",
             db.path.parent,
             db.path.parent,
         )
@@ -568,21 +604,21 @@ async def lifespan(app: FastAPI):
     # Singleflight lock for /api/news: concurrent cache-miss callers await
     # one in-flight refresh instead of each firing a full feed-fetch batch.
     app.state.news_lock = _asyncio.Lock()
-    # V3-03: /api/mini cache + its singleflight lock — fresh/empty on every
+    # V3-03: /api/mini cache + per-key singleflight — fresh/empty on every
     # process start, same as the other in-memory caches on this state object.
     app.state.mini_cache = {}
-    app.state.mini_lock = _asyncio.Lock()
-    # Audit finding A: /api/market cache + its singleflight lock — mirrors
+    app.state.mini_locks = {}
+    # Audit finding A: /api/market cache + per-key singleflight — mirrors
     # /api/mini above (fresh/empty on every process start).
     app.state.market_cache = {}
-    app.state.market_lock = _asyncio.Lock()
+    app.state.market_locks = {}
     # L2X-01: PER-KEY singleflight for /api/analyze. A single global lock would
     # serialize DIFFERENT coins (two tabs → ~2x latency at Grok p50 ~15s). This
     # dict maps a cache_key -> [asyncio.Lock, refcount]: identical in-flight
     # requests share one lock (→ exactly ONE LLM call, the round-1 guarantee),
     # while different keys run concurrently. Entries are deleted on idle
     # (refcount 0) so the dict can't leak one entry per coin forever
-    # (see analyze() below for the race-free scheme).
+    # (`_keyed_singleflight_lock` owns the shared race-free scheme).
     app.state.analyze_locks = {}
     multi_worker_warning = _detect_multi_worker_env()
     if multi_worker_warning:
@@ -596,10 +632,9 @@ async def lifespan(app: FastAPI):
         resolved = s.resolved_llm_provider
         if resolved != s.llm_provider:
             log.warning(
-                "LLM-FALLBACK AKTIV: LLM_PROVIDER=%s ist nicht einsatzbereit "
-                "(kein API-Key / nicht konfiguriert) — die KI-Analyse läuft "
-                "stattdessen auf '%s'. Trage den passenden API-Key in die .env "
-                "ein, um den gewünschten Provider (z.B. Sonnet) zu nutzen.",
+                "LLM FALLBACK ACTIVE: LLM_PROVIDER=%s is unavailable "
+                "(no API key or not configured), so AI analysis is using '%s'. "
+                "Add the matching API key to .env to use the requested provider.",
                 s.llm_provider,
                 resolved,
             )
@@ -718,8 +753,17 @@ def _order_service(request: Request) -> OrderService:
     if store is None:
         raise HTTPException(status_code=503, detail="Preview store not initialized")
     db = getattr(request.app.state, "db", None)
-    lock = getattr(request.app.state, "trade_lock", None)
+    lock = _app_trade_lock(request)
     return OrderService(client, s, store, db=db, trade_lock=lock)
+
+
+def _app_trade_lock(request: Request) -> asyncio.Lock:
+    """Return the single app-wide lock guarding every money/control mutation."""
+    lock = getattr(request.app.state, "trade_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.trade_lock = lock
+    return lock
 
 
 def _llm_settings(request: Request):
@@ -783,7 +827,7 @@ def _llm_status(request: Request) -> dict:
             {"id": "claude", "label": "Claude Opus", "configured": s.claude_ready},
             {"id": "xai", "label": "Grok", "configured": s.xai_ready},
             {"id": "openai", "label": "Codex", "configured": s.openai_ready},
-            {"id": "ollama", "label": "Ollama (lokal)", "configured": s.ollama_ready},
+            {"id": "ollama", "label": "Ollama (local)", "configured": s.ollama_ready},
         ],
     }
 
@@ -797,11 +841,11 @@ async def llm_get(request: Request, _: None = Depends(require_local_token)):
 @app.post("/api/llm")
 async def llm_set(
     request: Request,
-    body: dict,
+    body: LLMProviderRequest,
     _: None = Depends(require_local_token),
 ):
     """Hot-swap the KI provider for this session (env stays the default)."""
-    provider = str((body or {}).get("provider") or "").strip().lower()
+    provider = body.provider.strip().lower()
     aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
     provider = aliases.get(provider, provider)
     ready = {
@@ -869,9 +913,9 @@ def _setup_template_context() -> dict:
     from app.env_builder import DEFAULT_MODELS
 
     labels = {
-        "conservative": "Konservativ",
-        "balanced": "Ausgewogen",
-        "free": "Frei",
+        "conservative": "Conservative",
+        "balanced": "Balanced",
+        "free": "Unrestricted",
     }
 
     def _n(x) -> str:
@@ -882,15 +926,15 @@ def _setup_template_context() -> dict:
     for key in ("conservative", "balanced", "free"):
         p = RISK_PROFILES[key]
         rrr = float(p["min_rrr"])
-        rrr_txt = f"RRR {rrr} {'erzwungen' if p.get('strict_rrr') else 'als Warnung'}"
+        rrr_txt = f"RRR {rrr} {'enforced' if p.get('strict_rrr') else 'warning only'}"
         cap = float(p["max_notional_pct_of_equity"])
         cap_txt = (
-            "kein Equity-Cap" if cap == 0 else f"Notional-Cap {_n(cap / 100)}× Equity"
+            "no equity cap" if cap == 0 else f"notional cap {_n(cap / 100)}× equity"
         )
         desc = " · ".join(
             [
-                f"{_n(p['max_risk_pct'])}% Risiko",
-                f"Hebel ≤ {_n(p['max_leverage'])}",
+                f"{_n(p['max_risk_pct'])}% risk",
+                f"leverage ≤ {_n(p['max_leverage'])}",
                 rrr_txt,
                 cap_txt,
             ]
@@ -922,7 +966,7 @@ async def setup_save(request: Request, body: dict):
     if not _setup_needed():
         raise HTTPException(
             status_code=403,
-            detail="Setup bereits abgeschlossen (SETUP_COMPLETE) — gesperrt. KI-Keys über die authentifizierten Einstellungen ändern.",
+            detail="Setup is already complete (SETUP_COMPLETE) and locked. Change AI keys in the authenticated settings.",
         )
     try:
         answers = normalize_answers(body or {})
@@ -952,7 +996,7 @@ async def setup_save(request: Request, body: dict):
             Settings(_env_file=str(tmp))
         except Exception as e:
             tmp.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail=f"Konfiguration ungültig: {e}") from e
+            raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}") from e
         replace_with_retry(tmp, ENV_PATH)
     except HTTPException:
         raise
@@ -960,7 +1004,7 @@ async def setup_save(request: Request, body: dict):
         tmp.unlink(missing_ok=True)
         raise HTTPException(
             status_code=409,
-            detail=".env ist gerade durch ein anderes Programm gesperrt — bitte erneut versuchen.",
+            detail=".env is currently locked by another program. Please try again.",
         ) from e
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -985,19 +1029,19 @@ async def setup_save(request: Request, body: dict):
 
 
 @app.post("/api/setup/test-provider")
-async def setup_test_provider(request: Request, body: dict):
+async def setup_test_provider(request: Request, body: LLMProbeRequest):
     """Read-only KI-key ping during setup. Transient key, never persisted.
 
     SSRF-safe: cloud hosts are pinned in app.llm.probe; Ollama uses the
     server-side loopback-validated base URL.
     """
     if not _setup_needed():
-        raise HTTPException(status_code=403, detail="Setup abgeschlossen — gesperrt.")
+        raise HTTPException(status_code=403, detail="Setup is complete and locked.")
     from app.llm.probe import probe_provider
 
-    provider = str((body or {}).get("provider") or "").strip().lower()
-    api_key = str((body or {}).get("api_key") or "").strip()
-    model = str((body or {}).get("model") or "").strip()
+    provider = body.provider.strip().lower()
+    api_key = body.api_key.strip()
+    model = body.model.strip()
     return await probe_provider(
         provider,
         api_key=api_key,
@@ -1014,7 +1058,7 @@ _PROVIDER_LABELS = {
     "claude": "Claude Opus",
     "xai": "Grok",
     "openai": "Codex",
-    "ollama": "Ollama (lokal)",
+    "ollama": "Ollama (local)",
 }
 
 
@@ -1057,7 +1101,7 @@ async def settings_llm_get(
 
 @app.post("/api/settings/llm-key")
 async def settings_llm_key(
-    request: Request, body: dict, _: None = Depends(require_local_token)
+    request: Request, body: LLMKeyRequest, _: None = Depends(require_local_token)
 ) -> dict:
     """Append/update ONE provider's key + model. Whitelist-only, atomic.
 
@@ -1071,7 +1115,7 @@ async def settings_llm_key(
         patch_env_vars,
     )
 
-    provider = str((body or {}).get("provider") or "").strip().lower()
+    provider = body.provider.strip().lower()
     aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
     provider = aliases.get(provider, provider)
     if provider not in LLM_KEY_VARS:
@@ -1080,8 +1124,8 @@ async def settings_llm_key(
             detail="provider must be one of: claude, xai, openai, ollama",
         )
     key_var, model_var = LLM_KEY_VARS[provider]
-    api_key = str((body or {}).get("api_key") or "").strip()
-    model = str((body or {}).get("model") or "").strip()
+    api_key = body.api_key.strip()
+    model = body.model.strip()
 
     s = get_settings()
     current_model = {
@@ -1109,7 +1153,7 @@ async def settings_llm_key(
         except (PermissionError, OSError) as e:
             raise HTTPException(
                 status_code=409,
-                detail=".env ist gerade durch ein anderes Programm gesperrt — bitte erneut versuchen.",
+                detail=".env is currently locked by another program. Please try again.",
             ) from e
         get_settings.cache_clear()
 
@@ -1118,14 +1162,14 @@ async def settings_llm_key(
 
 @app.post("/api/settings/test-provider")
 async def settings_test_provider(
-    request: Request, body: dict, _: None = Depends(require_local_token)
+    request: Request, body: LLMProbeRequest, _: None = Depends(require_local_token)
 ) -> dict:
     """Authenticated read-only probe. If api_key omitted, use the STORED key
     (server-side; never returned)."""
     from app.env_builder import LLM_KEY_VARS
     from app.llm.probe import probe_provider
 
-    provider = str((body or {}).get("provider") or "").strip().lower()
+    provider = body.provider.strip().lower()
     aliases = {"anthropic": "claude", "grok": "xai", "codex": "openai", "local": "ollama"}
     provider = aliases.get(provider, provider)
     if provider not in LLM_KEY_VARS:
@@ -1133,8 +1177,8 @@ async def settings_test_provider(
             status_code=400,
             detail="provider must be one of: claude, xai, openai, ollama",
         )
-    api_key = str((body or {}).get("api_key") or "").strip()
-    model = str((body or {}).get("model") or "").strip()
+    api_key = body.api_key.strip()
+    model = body.model.strip()
     s = get_settings()
     if not api_key:
         api_key = {
@@ -1207,13 +1251,7 @@ async def market(
     loop can no longer fire a fresh klines+ticker+funding round-trip per call.
     """
     symbol = normalize_symbol(symbol)
-    if tf not in VALID_MARKET_INTERVALS or htf not in VALID_MARKET_INTERVALS:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Invalid interval. Allowed: {sorted(VALID_MARKET_INTERVALS)}"
-            ),
-        )
+    _validate_market_intervals(tf, htf)
     client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
@@ -1228,12 +1266,9 @@ async def market(
     if hit and _time.monotonic() - hit[0] < MARKET_CACHE_TTL_S:
         return hit[1]
 
-    lock = getattr(request.app.state, "market_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        request.app.state.market_lock = lock
-
-    async with lock:
+    async with _keyed_singleflight_lock(
+        request.app.state, "market_locks", cache_key
+    ):
         # Re-check: another caller may have already refreshed this exact key
         # while we were waiting for the lock (singleflight, mirrors /api/mini).
         hit = cache.get(cache_key)
@@ -1260,7 +1295,11 @@ async def market(
 @app.get("/api/mini")
 async def mini(
     request: Request,
-    symbols: str = Query("", description="Comma-separated coins for the overview grid"),
+    symbols: str = Query(
+        "",
+        max_length=MINI_SYMBOLS_QUERY_MAX_LENGTH,
+        description="Comma-separated coins for the overview grid",
+    ),
     tf: str = Query("15m", description="Kline interval"),
     limit: int = Query(96, ge=2, le=200, description="Candles per coin (~24h at 15m)"),
 ):
@@ -1275,6 +1314,7 @@ async def mini(
     shared by every concurrent caller for that exact (symbols, tf, limit) key
     instead of each firing its own exchange round-trip.
     """
+    _validate_market_intervals(tf)
     raw = [s for s in (symbols or "").split(",") if s.strip()]
     syms: list[str] = []
     invalid_errors: list[str] = []
@@ -1288,7 +1328,7 @@ async def mini(
             continue
         if n and n not in syms:
             syms.append(n)
-    syms = syms[:24]  # hard cap: overview never fans out unbounded
+    syms = syms[:MINI_MAX_SYMBOLS]  # hard cap: overview never fans out unbounded
     if not syms:
         return {"results": [], "errors": invalid_errors}
 
@@ -1301,12 +1341,7 @@ async def mini(
     if hit and _time.monotonic() - hit[0] < MINI_CACHE_TTL_S:
         return hit[1]
 
-    lock = getattr(request.app.state, "mini_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        request.app.state.mini_lock = lock
-
-    async with lock:
+    async with _keyed_singleflight_lock(request.app.state, "mini_locks", cache_key):
         # Re-check: another caller may have already refreshed this exact key
         # while we were waiting for the lock (singleflight, mirrors /api/news).
         hit = cache.get(cache_key)
@@ -1332,11 +1367,11 @@ async def mini(
             ]
             last = out[-1]["close"] if out else None
             first = out[0]["close"] if out else None
-            change = (
-                round((last - first) / first * 100.0, 2)
-                if last is not None and first not in (None, 0)
-                else None
-            )
+            change = None
+            if last is not None and first not in (None, 0):
+                calculated_change = (last - first) / first * 100.0
+                if math.isfinite(calculated_change):
+                    change = round(calculated_change, 2)
             return {"symbol": sym, "last_price": last, "change_pct": change, "candles": out}
 
         gathered = await asyncio.gather(
@@ -1765,6 +1800,7 @@ async def analyze(
     symbol = normalize_symbol(body.symbol or s.default_symbol)
     tf = body.tf or "15m"
     htf = body.htf or "1H"
+    _validate_market_intervals(tf, htf)
 
     # Analysis caching (LLM-credit saver): key includes the RESOLVED provider
     # (so hot-swapping the KI dropdown never serves a stale other-provider
@@ -1868,18 +1904,27 @@ async def analyze(
         atr_pct: float | None = None
         try:
             if atr and last_px:
-                atr_pct = float(atr) / float(last_px) * 100.0
+                calculated_atr_pct = float(atr) / float(last_px) * 100.0
+                if math.isfinite(calculated_atr_pct):
+                    atr_pct = calculated_atr_pct
         except (TypeError, ValueError, ZeroDivisionError):
             atr_pct = None
         try:
             if proposal.entry_price and last_px:
-                annotations["entry_vs_last_pct"] = round(
-                    (float(proposal.entry_price) - float(last_px)) / float(last_px) * 100.0, 3
+                entry_vs_last_pct = (
+                    (float(proposal.entry_price) - float(last_px))
+                    / float(last_px)
+                    * 100.0
                 )
+                if math.isfinite(entry_vs_last_pct):
+                    annotations["entry_vs_last_pct"] = round(entry_vs_last_pct, 3)
             if proposal.entry_price and proposal.stop_loss and atr:
-                annotations["sl_distance_atr"] = round(
-                    abs(float(proposal.entry_price) - float(proposal.stop_loss)) / float(atr), 2
+                sl_distance_atr = (
+                    abs(float(proposal.entry_price) - float(proposal.stop_loss))
+                    / float(atr)
                 )
+                if math.isfinite(sl_distance_atr):
+                    annotations["sl_distance_atr"] = round(sl_distance_atr, 2)
         except (TypeError, ValueError, ZeroDivisionError):
             pass
         proposal_dict = proposal.model_dump()
@@ -1903,6 +1948,7 @@ async def analyze(
 
         # Audit trail (Task 8) — soft-fail so analyze still returns on DB issues
         db: Database | None = getattr(request.app.state, "db", None)
+        proposal_id: int | None = None
         if db is not None:
             ctx_fingerprint = {
                 "symbol": symbol,
@@ -1913,7 +1959,6 @@ async def analyze(
             context_hash = hashlib.sha256(
                 json.dumps(ctx_fingerprint, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()[:16]
-            proposal_id: int | None = None
             try:
                 proposal_id = await db.insert_proposal(
                     symbol=symbol,
@@ -1988,6 +2033,7 @@ async def analyze(
             "symbol": symbol,
             "tf": tf,
             "htf": htf,
+            "proposal_id": proposal_id,
             "proposal": proposal_dict,
             "annotations": annotations,
             "last_price": market_api.get("last_price"),
@@ -2046,25 +2092,13 @@ async def analyze(
     #    provably unheld and unawaited. A late same-key request after the delete
     #    simply creates a fresh entry. The dict thus holds at most one entry per
     #    DISTINCT in-flight key and empties at quiescence (no per-coin leak).
-    locks = getattr(request.app.state, "analyze_locks", None)
-    if locks is None:
-        locks = {}
-        request.app.state.analyze_locks = locks
-    entry = locks.get(cache_key)
-    if entry is None:
-        entry = [asyncio.Lock(), 0]
-        locks[cache_key] = entry
-    entry[1] += 1
-    try:
-        async with entry[0]:
-            hit = _cache_lookup()
-            if hit is not None:
-                return hit
-            return await _run_analyze()
-    finally:
-        entry[1] -= 1
-        if entry[1] == 0 and locks.get(cache_key) is entry:
-            del locks[cache_key]
+    async with _keyed_singleflight_lock(
+        request.app.state, "analyze_locks", cache_key
+    ):
+        hit = _cache_lookup()
+        if hit is not None:
+            return hit
+        return await _run_analyze()
 
 
 def _extract_position_sl_tp(
@@ -2110,6 +2144,7 @@ async def reevaluate(
     symbol = normalize_symbol(body.symbol or s.default_symbol)
     tf = body.tf or "15m"
     htf = body.htf or "1H"
+    _validate_market_intervals(tf, htf)
 
     try:
         acct = await client.account_snapshot()
@@ -2154,8 +2189,10 @@ async def reevaluate(
     roe_pct: float | None = None
     try:
         if pnl is not None and im not in (None, 0):
-            roe_pct = round(float(pnl) / float(im) * 100.0, 2)
-    except (TypeError, ValueError, ZeroDivisionError):
+            calculated_roe = float(pnl) / float(im) * 100.0
+            if math.isfinite(calculated_roe):
+                roe_pct = round(calculated_roe, 2)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         roe_pct = None
 
     position_ctx = {
@@ -2176,9 +2213,23 @@ async def reevaluate(
         "stop_orders_known": stops_error is None,
     }
 
-    # Same market context builder as /api/analyze, plus the position on top.
+    # Same market context builder as /api/analyze. The response keeps the full
+    # local position for the UI, but the external LLM receives financial/account
+    # fields only after the explicit privacy opt-in.
     context = build_llm_context(market_api, acct, s)
-    context["position"] = position_ctx
+    if s.include_account_in_llm:
+        context["position"] = position_ctx
+    else:
+        context["position"] = {
+            "symbol": symbol,
+            "side": position.get("side"),
+            "entry_price": position.get("entry_price"),
+            "current_price": market_api.get("last_price"),
+            "stop_loss": current_sl,
+            "take_profit": current_tp,
+            "stop_orders_known": stops_error is None,
+            "account_fields_omitted": True,
+        }
 
     # Task 21 (O2-06): look up the ORIGINAL proposal this position was opened on
     # and thread its core fields into the context, so reevaluate checks CURRENT
@@ -2188,7 +2239,9 @@ async def reevaluate(
     db_re: Database | None = getattr(request.app.state, "db", None)
     if db_re is not None:
         try:
-            row = await db_re.latest_proposal_for_symbol(symbol)
+            row = await db_re.proposal_for_open_position(
+                symbol, str(position.get("side") or "").lower()
+            )
             thesis = build_original_thesis((row or {}).get("proposal"))
             if thesis is not None:
                 if row and row.get("created_at"):
@@ -2361,8 +2414,9 @@ async def orders_cancel(
     """Cancel open order by id via MEXC cancel endpoint."""
     svc = _order_service(request)
     oid = body.resolved_order_id()
+    symbol = normalize_symbol(body.symbol) if body.symbol else None
     try:
-        return await svc.cancel(order_id=oid, symbol=body.symbol)
+        return await svc.cancel(order_id=oid, symbol=symbol)
     except OrderError as e:
         raise HTTPException(
             status_code=400,
@@ -2496,61 +2550,60 @@ async def positions_arm(
     ):
         raise HTTPException(
             status_code=400,
-            detail="Auto-Management (BE/Trail) ist nur auf Hyperliquid verfuegbar.",
+            detail="Auto-management (BE/trailing) is only available on Hyperliquid.",
         )
 
-    # Position must be LIVE — can't arm what isn't open (spec §4 identity).
-    try:
-        snap = await client.account_snapshot()
-    except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    positions = (snap.get("positions") if isinstance(snap, dict) else None) or []
-    pos = next(
-        (
-            p
-            for p in positions
-            if isinstance(p, dict)
-            and p.get("symbol") == symbol
-            and p.get("side") == side
-        ),
-        None,
-    )
-    if pos is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No live {side} position for {symbol} to arm",
+    # Serialize the live-position check and the durable arm mutation with the
+    # same lock used by confirm, modify-SL and the kill-switch. Therefore a
+    # kill-switch that returns cannot be followed by a stale in-flight arm.
+    async with _app_trade_lock(request):
+        # Position must be LIVE — can't arm what isn't open (spec §4 identity).
+        try:
+            snap = await client.account_snapshot(fresh=True)
+        except ExchangeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        positions = (snap.get("positions") if isinstance(snap, dict) else None) or []
+        pos = next(
+            (
+                p
+                for p in positions
+                if isinstance(p, dict)
+                and p.get("symbol") == symbol
+                and p.get("side") == side
+            ),
+            None,
         )
-    try:
-        entry = float(pos.get("entry_price"))
-    except (TypeError, ValueError):
-        entry = 0.0
-    if entry <= 0:
-        raise HTTPException(
-            status_code=400, detail="Position has no usable entry price"
-        )
+        if pos is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No live {side} position for {symbol} to arm",
+            )
+        try:
+            entry = float(pos.get("entry_price"))
+        except (TypeError, ValueError):
+            entry = 0.0
+        if not math.isfinite(entry) or entry <= 0:
+            raise HTTPException(
+                status_code=400, detail="Position has no usable entry price"
+            )
 
-    now_ms = int(_time.time() * 1000)
-    # Freeze the baseline THEN write the arming. ensure_baseline never places an
-    # order — it only writes the mgmt record.
-    await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
-    await db.set_armed_rules(symbol, side, rules)
-    # Re-arming clears any sticky auto-BE halt (F2) so the "neu scharfschalten"
-    # recovery the halt alert advertises actually works: drop the in-memory
-    # attempt counter and the stale auto_be_error entry from the feed.
-    _attempts = getattr(request.app.state, "tm_be_attempts", None)
-    if isinstance(_attempts, dict):
-        _attempts.pop((symbol, side), None)
-    record = await db.get_open_position_mgmt(symbol, side)
-    if (
-        record
-        and isinstance(record.get("last_alert_state"), dict)
-        and "auto_be_error" in record["last_alert_state"]
-    ):
-        cleared = dict(record["last_alert_state"])
-        cleared.pop("auto_be_error", None)
-        await db.set_alert_state(symbol, side, cleared)
-        record["last_alert_state"] = cleared
-    return record or {}
+        now_ms = int(_time.time() * 1000)
+        await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
+        await db.set_armed_rules(symbol, side, rules)
+        _attempts = getattr(request.app.state, "tm_be_attempts", None)
+        if isinstance(_attempts, dict):
+            _attempts.pop((symbol, side), None)
+        record = await db.get_open_position_mgmt(symbol, side)
+        if (
+            record
+            and isinstance(record.get("last_alert_state"), dict)
+            and "auto_be_error" in record["last_alert_state"]
+        ):
+            cleared = dict(record["last_alert_state"])
+            cleared.pop("auto_be_error", None)
+            await db.set_alert_state(symbol, side, cleared)
+            record["last_alert_state"] = cleared
+        return record or {}
 
 
 @app.get("/api/positions/alerts")
@@ -2565,12 +2618,16 @@ async def positions_alerts(
     plus its armed_rules / be_done so the UI can reflect arming state."""
     db = getattr(request.app.state, "db", None)
     if db is None:
-        return {"alerts": []}
+        raise HTTPException(
+            status_code=503, detail="position management alerts unavailable"
+        )
     try:
         rows = await db.list_open_position_mgmt()
     except Exception:
         log.warning("positions/alerts: list_open_position_mgmt failed", exc_info=True)
-        return {"alerts": []}
+        raise HTTPException(
+            status_code=503, detail="position management alerts unavailable"
+        ) from None
     out = [
         {
             "symbol": r.get("symbol"),
@@ -2595,12 +2652,12 @@ async def positions_killswitch(
     db = getattr(request.app.state, "db", None)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
-    disarmed = await db.disarm_all()
-    # Also clear the in-memory auto-BE halt counters so a fresh arm after a
-    # kill-switch starts clean (F2).
-    _attempts = getattr(request.app.state, "tm_be_attempts", None)
-    if isinstance(_attempts, dict):
-        _attempts.clear()
+    async with _app_trade_lock(request):
+        disarmed = await db.disarm_all()
+        # Clear retry state under the same serialization boundary.
+        _attempts = getattr(request.app.state, "tm_be_attempts", None)
+        if isinstance(_attempts, dict):
+            _attempts.clear()
     return {"disarmed": disarmed}
 
 
@@ -2619,19 +2676,27 @@ async def orders_open(
         return {"orders": [], "stop_orders": [], "error": "Exchange client not initialized"}
     if symbol:
         symbol = normalize_symbol(symbol)
+    stops_task = asyncio.create_task(client.open_stop_orders(symbol))
     try:
         rows = await client.open_orders(symbol)
-    except ExchangeError as e:
-        return {"orders": [], "stop_orders": [], "error": str(e)}
+    except ExchangeError as exc:
+        stops_task.cancel()
+        await asyncio.gather(stops_task, return_exceptions=True)
+        return {"orders": [], "stop_orders": [], "error": str(exc)}
+    except BaseException:
+        stops_task.cancel()
+        await asyncio.gather(stops_task, return_exceptions=True)
+        raise
+
     stops_error: str | None = None
     try:
-        stops = await client.open_stop_orders(symbol)
-    except ExchangeError as e:
+        stops = await stops_task
+    except ExchangeError as exc:
         # Distinguish "no SL/TP" from "stop-order endpoint broken": an empty
         # list with stops_error=None means genuinely no triggers; a set
         # stops_error means the lookup failed and the UI must NOT show "no SL".
         stops = []
-        stops_error = str(e)
+        stops_error = str(exc)
     return {
         "orders": rows,
         "stop_orders": stops,
@@ -2651,14 +2716,22 @@ async def sizing_suggest(
     F-09: this must size CONSISTENTLY with the real gate the Preview/Confirm
     path enforces (app.risk.gates.validate_order) — otherwise a suggested
     size can be too large (or geometrically invalid) at the actual gate.
-    So the same inputs the gate uses are threaded through here: the RAW last
-    price as the market entry basis (R2-01 — the gate's entry_for_risk, no
-    slippage shift), the RISK_SLIPPAGE_PCT buffer on SL distance, directional
+    So the same inputs the gate uses are threaded through here: the adverse
+    fill allowed by MARKET_ENTRY_SLIPPAGE_PCT as the market entry basis, the
+    RISK_SLIPPAGE_PCT buffer on SL distance, directional
     SL geometry, existing same-side risk, available margin and the
     equity-relative notional cap. See suggest_vol() in app/risk/sizing.py for
     the shared clamp math.
     """
     s = get_settings()
+    if s.exchange == "hyperliquid" and ticket.order_type == "limit":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Hyperliquid limit entries are disabled because later/partial "
+                "fills cannot be guaranteed an attached stop"
+            ),
+        )
     client: MexcClient | None = _exchange_client(request)
     if client is None:
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
@@ -2673,15 +2746,12 @@ async def sizing_suggest(
 
     entry = float(ticket.entry or ticket.price or last or 0)
     if (ticket.order_type or "").lower() == "market" and last > 0:
-        # R2-01: use the RAW last price as the risk/entry basis — EXACTLY what
-        # validate_order (gate M-B) now does for a market order. The old
-        # market_entry_slippage_pct shift here was removed together with the
-        # gate's: applying it only in sizing made the suggestion systematically
-        # SMALLER than the gate would accept (up to ~33% under-size on a tight
-        # stop, where the shift inflates the entry→SL distance most). The
-        # remaining adverse-fill buffer is RISK_SLIPPAGE_PCT inside suggest_vol()
-        # (== the gate's risk_usdt buffer), so the two size the SAME number.
-        entry = last
+        try:
+            entry = adverse_market_entry(
+                last, side_l, s.market_entry_slippage_pct
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     stop = float(ticket.stop_loss or 0)
     if entry <= 0 or stop <= 0:
         raise HTTPException(status_code=400, detail="entry and stop_loss required")
@@ -2709,18 +2779,14 @@ async def sizing_suggest(
                     symbol=symbol,
                     side=side_l,
                     contract_size=contract.contract_size,
-                    strict=bool(getattr(s, "strict_aggregate_risk", False)),
-                    pos_risk_cap_pct=float(
-                        getattr(s, "aggregate_pos_risk_cap_pct", 2.0)
-                    ),
                 )
             except ValueError as e:
-                # Fail-closed (strict only): unknown same-side exposure must
-                # never be silently treated as 0 risk. In non-strict mode a
-                # conservative fallback + warning is used instead (R-01).
+                # Unknown same-side exposure is never silently treated as 0.
                 raise HTTPException(status_code=400, detail=str(e)) from e
-    if equity <= 0:
+    if not math.isfinite(equity) or equity <= 0:
         raise HTTPException(status_code=400, detail="equity unavailable for sizing")
+    if not math.isfinite(available):
+        raise HTTPException(status_code=400, detail="available margin unavailable for sizing")
 
     # Honor the client-requested risk %, but never let it exceed the gate's
     # max_risk_pct — the suggestion must never label a size as "X% risk"
@@ -2784,6 +2850,9 @@ async def ws_market(
     if origin is not None and not _origin_matches_request(origin, websocket):
         await websocket.close(code=1008)
         return
+    if tf not in VALID_MARKET_INTERVALS:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     s = get_settings()
     try:
@@ -2808,7 +2877,7 @@ async def ws_market(
             log.warning("ws_market HL proxy failed for %s: %s", symbol, e)
             try:
                 await websocket.send_json(
-                    {"type": "status", "status": "error", "error": "interner Fehler"}
+                    {"type": "status", "status": "error", "error": "Internal error"}
                 )
             except Exception:
                 pass
@@ -2842,7 +2911,7 @@ async def ws_market(
         log.warning("ws_market MEXC poll failed for %s: %s", symbol, e)
         try:
             await websocket.send_json(
-                {"type": "status", "status": "error", "error": "interner Fehler"}
+                {"type": "status", "status": "error", "error": "Internal error"}
             )
         except Exception:
             pass
@@ -2914,7 +2983,7 @@ async def _mexc_poll_send_loop(websocket: WebSocket, client, symbol: str) -> Non
             err_message = {
                 "type": "status",
                 "status": "error",
-                "error": "Ticker nicht erreichbar — neuer Versuch folgt",
+                "error": "Ticker unavailable — retrying",
             }
             delay = min(delay * 2, MEXC_POLL_MAX_DELAY_S)
         await websocket.send_json(mid_message if mid_message else err_message)
@@ -2987,6 +3056,7 @@ async def market_scan(
     body = body or {}
     tf = str(body.get("tf") or "15m")
     htf = str(body.get("htf") or "1H")
+    _validate_market_intervals(tf, htf)
 
     # Task 24: prefilter mode pulls a bigger overview (the momentum/flow universe
     # is ranked+floored from it); classic keeps the exact old top-N-by-turnover.
@@ -3061,7 +3131,7 @@ async def index(request: Request):
     # F-19: carry the local auth token in an HttpOnly, SameSite=Strict cookie
     # instead of the page DOM. Same-origin fetch/WebSocket send it
     # automatically; the X-Local-Token header stays a valid fallback. Secure
-    # is not required on plain-http 127.0.0.1.
+    # follows the request scheme so plain-http localhost remains usable.
     #
     # B-05 (audit, LOW): browser cookies are NOT port-scoped — this cookie is
     # sent by the browser to ANY server on 127.0.0.1, not just this app's
@@ -3084,6 +3154,7 @@ async def index(request: Request):
             token,
             httponly=True,
             samesite="strict",
+            secure=request.url.scheme.lower() == "https",
             path="/",
         )
     # F-20: strict CSP. The dashboard has no inline <script> (F-19 removed the

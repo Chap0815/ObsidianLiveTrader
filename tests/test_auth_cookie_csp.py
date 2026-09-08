@@ -42,9 +42,18 @@ def test_dashboard_sets_httponly_session_cookie(tokened_app):
     assert "httponly" in low, set_cookie
     assert "samesite=strict" in low, set_cookie
     assert "path=/" in low, set_cookie
+    assert "secure" not in low, set_cookie
     # The raw token must NOT be embedded in the HTML body any more.
     assert "LOCAL_API_TOKEN" not in r.text
     assert "test-token" not in r.text
+
+
+def test_dashboard_marks_auth_cookie_secure_over_https(tokened_app):
+    with TestClient(tokened_app, base_url="https://testserver") as tc:
+        r = tc.get("/")
+
+    assert r.status_code == 200, r.text
+    assert "secure" in r.headers.get("set-cookie", "").lower()
 
 
 def test_private_endpoint_accepts_cookie_only(tokened_app):

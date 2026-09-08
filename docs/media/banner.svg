@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+  <title id="title">Obsidian Live Trader</title>
+  <desc id="desc">Local futures cockpit. Charts, AI-assisted analysis and risk-gated execution.</desc>
+  <defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#171326"/><stop offset="1" stop-color="#0a0b11"/></linearGradient></defs>
+  <rect width="1200" height="240" rx="20" fill="url(#bg)"/>
+  <path d="M850 175 L900 135 L935 151 L980 82 L1015 108 L1070 53 L1145 68" fill="none" stroke="#42c799" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M850 193H1150M850 153H1150M850 113H1150M850 73H1150" stroke="#8b7cf6" opacity=".15"/>
+  <rect x="46" y="49" width="6" height="139" rx="3" fill="#8b7cf6"/>
+  <g font-family="Segoe UI,Arial,sans-serif" fill="#f2f0ff">
+    <text x="77" y="105" font-size="44" font-weight="700">OBSIDIAN LIVE TRADER</text>
+    <text x="79" y="149" font-size="22" fill="#b9b4d1">Charts. Analysis. Execution.</text>
+    <text x="79" y="183" font-size="16" fill="#8b839f">LOCAL FUTURES COCKPIT · HYPERLIQUID + MEXC</text>
+  </g>
+</svg>

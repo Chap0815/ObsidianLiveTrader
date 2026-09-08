@@ -57,6 +57,7 @@ def _contract() -> ContractMeta:
         max_leverage=125,
         min_leverage=1,
         api_allowed=True,
+        state=0,
     )
 
 

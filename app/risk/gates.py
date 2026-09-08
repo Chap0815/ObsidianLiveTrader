@@ -12,6 +12,7 @@ from typing import Any
 from app.config import Settings
 from app.models import ContractMeta, OrderTicket
 from app.risk.sizing import (
+    adverse_market_entry,
     calc_rrr,
     risk_usdt,
     round_down_to_unit,
@@ -74,6 +75,15 @@ def validate_order(
     errors: list[str] = []
     warnings: list[str] = []
 
+    existing_risk_f = 0.0
+    try:
+        candidate_existing_risk = float(existing_same_side_risk_usdt)
+        if not math.isfinite(candidate_existing_risk) or candidate_existing_risk < 0:
+            raise ValueError
+        existing_risk_f = candidate_existing_risk
+    except (TypeError, ValueError):
+        errors.append("existing same-side risk is invalid (must be finite and non-negative)")
+
     # ── Arming switch (preview + confirm) ──────────────────────────────
     if not settings.trading_enabled:
         msg = (
@@ -87,9 +97,41 @@ def validate_order(
         errors.append(
             f"Symbol {contract.symbol or ticket.symbol} has apiAllowed=false — API orders rejected"
         )
+    if settings.exchange == "mexc" and contract.state != 0:
+        errors.append(
+            f"Symbol {contract.symbol or ticket.symbol} has state={contract.state} "
+            "— new entries require an enabled MEXC contract (state=0)"
+        )
 
-    if contract.contract_size <= 0:
+    if not math.isfinite(float(contract.contract_size)):
+        errors.append("Invalid non-finite contract_size from exchange meta")
+    elif contract.contract_size <= 0:
         errors.append("Invalid contract_size from exchange meta")
+
+    for contract_field in (
+        "price_unit",
+        "vol_unit",
+        "min_vol",
+        "max_vol",
+        "min_notional",
+    ):
+        if not math.isfinite(float(getattr(contract, contract_field))):
+            errors.append(f"Invalid non-finite {contract_field} from exchange meta")
+
+    for positive_field in ("vol_unit", "min_vol", "max_vol"):
+        if float(getattr(contract, positive_field)) <= 0:
+            errors.append(f"Invalid {positive_field} from exchange meta")
+    for nonnegative_field in ("price_unit", "min_notional"):
+        if float(getattr(contract, nonnegative_field)) < 0:
+            errors.append(f"Invalid {nonnegative_field} from exchange meta")
+    if contract.max_vol > 0 and contract.min_vol > contract.max_vol:
+        errors.append("Invalid min_vol/max_vol bounds from exchange meta")
+    if (
+        contract.min_leverage < 1
+        or contract.max_leverage < 1
+        or contract.min_leverage > contract.max_leverage
+    ):
+        errors.append("Invalid leverage bounds from exchange meta")
 
     # ── Side / type / open_type ────────────────────────────────────────
     side = (ticket.side or "").lower()
@@ -99,6 +141,15 @@ def validate_order(
     order_type = (ticket.order_type or "").lower()
     if order_type not in ("market", "limit"):
         errors.append("order_type must be 'market' or 'limit'")
+
+    # A Hyperliquid limit can fill (or continue filling) after this synchronous
+    # request has returned. Without a durable fill watcher, that later exposure
+    # cannot be guaranteed an attached stop. Fail closed until it can.
+    if settings.exchange == "hyperliquid" and order_type == "limit":
+        errors.append(
+            "Hyperliquid limit entries are disabled: later/partial fills cannot "
+            "be guaranteed an attached stop. Use a market entry."
+        )
 
     # Manual SL/TP mode places NO exchange triggers (the trader manages exits),
     # so a missing take_profit is not a gate failure — the RRR check below warns
@@ -181,19 +232,18 @@ def validate_order(
     # ── Entry reference for risk ───────────────────────────────────────
     entry_for_risk: float | None = None
     if order_type == "market":
-        if last_price is not None and last_price > 0:
-            entry_for_risk = float(last_price)
-            # (M-B) The market_entry_slippage adverse-entry shift used to be
-            # applied here for risk/RRR. For a tight stop it inflated the
-            # entry→SL distance disproportionately (worst case ~2.5×), wrongly
-            # pushing legitimate scalps over MAX_RISK_PCT. Risk now uses the raw
-            # last price. Trade-off (deliberate): the remaining distance buffer is
-            # RISK_SLIPPAGE_PCT inside risk_usdt(), which is smaller than the old
-            # entry shift — so an adverse fill (up to market_entry_slippage_pct)
-            # can push the REALISED risk slightly over the computed MAX_RISK_PCT.
-            # This is bounded by the exchange-side slippage cap on the ACTUAL
-            # order (see exchange_factory / hyperliquid client), which limits how
-            # far the fill can move from last.
+        if (
+            last_price is not None
+            and math.isfinite(float(last_price))
+            and float(last_price) > 0
+            and side in ("long", "short")
+        ):
+            try:
+                entry_for_risk = adverse_market_entry(
+                    float(last_price), side, settings.market_entry_slippage_pct
+                )
+            except ValueError as exc:
+                errors.append(f"invalid market risk reference: {exc}")
         else:
             # Fail-closed: a MARKET order with no usable server-side reference
             # price (last_price None/<=0, e.g. a degraded ticker — service.py
@@ -249,8 +299,8 @@ def validate_order(
         # warning instead of silently skipping — the one-time token's TTL bounds
         # the exposure window, but the human should re-preview on a large move.
         warnings.append(
-            "Drift nicht prüfbar: Preview ohne Marktpreis erstellt — bei starker "
-            "Preisabweichung neu previewen"
+            "Price drift cannot be checked: preview was created without a market "
+            "price — create a new preview after a significant price move"
         )
 
     # ── SL required unless unprotected allowed ─────────────────────────
@@ -277,7 +327,7 @@ def validate_order(
         # stop with unbounded risk straight through the gate (ok=True, no
         # errors). Reject it here too so the gate fails CLOSED regardless.
         if not math.isfinite(sl_f):
-            errors.append("Stop-Loss ist keine gültige Zahl (NaN/Infinity)")
+            errors.append("Stop loss is not a valid number (NaN/Infinity)")
         if entry_for_risk is not None and side in ("long", "short"):
             if side == "long" and sl_f >= entry_for_risk:
                 errors.append("long stop_loss must be below entry")
@@ -290,6 +340,8 @@ def validate_order(
             # understating risk. The onto-/above-entry guard below still
             # stands as a second line of defense.
             sl_f = round_trigger_to_unit(sl_f, price_unit, side=side, kind="sl")
+            if not math.isfinite(sl_f) or sl_f <= 0:
+                errors.append("rounded stop_loss is invalid")
             # Tick rounding can flip a razor-thin stop onto the wrong side
             if entry_for_risk is not None and side in ("long", "short"):
                 if side == "long" and sl_f >= entry_for_risk:
@@ -313,7 +365,8 @@ def validate_order(
             rounded_tp = round_trigger_to_unit(rounded_tp, price_unit, side=side, kind="tp")
 
     # ── Equity fail-closed (G3 requires known equity) ──────────────────
-    if equity is None or float(equity) <= 0:
+    equity_f = float(equity) if equity is not None else 0.0
+    if not math.isfinite(equity_f) or equity_f <= 0:
         errors.append(
             "equity unknown/zero — fail-closed (MAX_RISK_PCT cannot be enforced)"
         )
@@ -329,43 +382,52 @@ def validate_order(
         and rounded_vol > 0
         and contract.contract_size > 0
     ):
-        risk_u = risk_usdt(
+        calculated_risk = risk_usdt(
             rounded_vol,
             contract.contract_size,
             entry_for_risk,
             sl_f,
             slippage_pct=settings.risk_slippage_pct,
         )
-        # Aggregate with existing same-side exposure on symbol
-        total_risk = risk_u + max(0.0, float(existing_same_side_risk_usdt or 0.0))
-        if float(equity) > 0:
-            risk_p = (total_risk / float(equity)) * 100.0
-            if existing_same_side_risk_usdt and existing_same_side_risk_usdt > 0:
-                warnings.append(
-                    f"includes existing same-side risk ~"
-                    f"{existing_same_side_risk_usdt:.4f} USDT "
-                    "(loss to each position's stop where known, else "
-                    "capped liquidation distance)"
-                )
-            # Surface any per-position fallback notes (e.g. missing liq price
-            # in non-strict mode) authored by estimate_same_side_risk_usdt.
-            if existing_same_side_warnings:
-                warnings.extend(existing_same_side_warnings)
-            # Defense-in-depth: config.py already rejects non-finite
-            # max_risk_pct, but guard here too so a NaN/Infinity that
-            # somehow slips through can't silently fail this gate open
-            # (risk_p > nan is always False).
-            if not math.isfinite(settings.max_risk_pct):
-                errors.append(
-                    "MAX_RISK_PCT is not a finite number — refusing to "
-                    "evaluate the risk gate (fail-closed)"
-                )
-            elif risk_p > settings.max_risk_pct + 1e-9:
-                errors.append(
-                    f"risk {risk_p:.4f}% of equity exceeds MAX_RISK_PCT="
-                    f"{settings.max_risk_pct} (incl. RISK_SLIPPAGE_PCT="
-                    f"{settings.risk_slippage_pct}% buffer; fees not fully modeled)"
-                )
+        if not math.isfinite(calculated_risk):
+            errors.append("calculated stop risk is not finite — fail-closed")
+        else:
+            risk_u = calculated_risk
+            # Aggregate with existing same-side exposure on symbol.
+            total_risk = risk_u + existing_risk_f
+            if not math.isfinite(total_risk):
+                errors.append("aggregate same-side risk is not finite — fail-closed")
+            elif math.isfinite(equity_f) and equity_f > 0:
+                calculated_risk_pct = (total_risk / equity_f) * 100.0
+                if not math.isfinite(calculated_risk_pct):
+                    errors.append("calculated risk percentage is not finite — fail-closed")
+                else:
+                    risk_p = calculated_risk_pct
+                    if existing_risk_f > 0:
+                        warnings.append(
+                            f"includes existing same-side risk ~"
+                            f"{existing_risk_f:.4f} USDT "
+                            "(loss to each position's stop where known, else "
+                            "full liquidation distance)"
+                        )
+                    # Preserve the estimator's stable warnings channel for callers.
+                    if existing_same_side_warnings:
+                        warnings.extend(existing_same_side_warnings)
+                    # Defense-in-depth: config.py already rejects non-finite
+                    # max_risk_pct, but guard here too so a NaN/Infinity that
+                    # somehow slips through can't silently fail this gate open
+                    # (risk_p > nan is always False).
+                    if not math.isfinite(settings.max_risk_pct):
+                        errors.append(
+                            "MAX_RISK_PCT is not a finite number — refusing to "
+                            "evaluate the risk gate (fail-closed)"
+                        )
+                    elif risk_p > settings.max_risk_pct + 1e-9:
+                        errors.append(
+                            f"risk {risk_p:.4f}% of equity exceeds MAX_RISK_PCT="
+                            f"{settings.max_risk_pct} (incl. RISK_SLIPPAGE_PCT="
+                            f"{settings.risk_slippage_pct}% buffer; fees not fully modeled)"
+                        )
 
     # ── G4 RRR ─────────────────────────────────────────────────────────
     rrr: float | None = None
@@ -378,7 +440,12 @@ def validate_order(
         and side in ("long", "short")
     ):
         try:
-            rrr = calc_rrr(side, entry_for_risk, sl_f, float(rounded_tp))
+            calculated_rrr = calc_rrr(
+                side, entry_for_risk, sl_f, float(rounded_tp)
+            )
+            if not math.isfinite(calculated_rrr):
+                raise ValueError("RRR is not finite")
+            rrr = calculated_rrr
             if rrr + 1e-12 < settings.min_rrr:
                 msg = f"RRR {rrr:.3f} < MIN_RRR={settings.min_rrr}"
                 if settings.strict_rrr:
@@ -397,57 +464,69 @@ def validate_order(
         rounded_tp is None or float(rounded_tp) <= 0
     ):
         warnings.append(
-            "MANUELL ohne TP: STRICT_RRR kann RRR nicht prüfen — kein Börsen-TP, "
-            "du verwaltest den Ausstieg selbst."
+            "MANUAL without TP: STRICT_RRR cannot check RRR — there is no "
+            "exchange-side TP, so you manage the exit yourself."
         )
 
     # ── Max notional ───────────────────────────────────────────────────
     notional = 0.0
     if entry_for_risk is not None and rounded_vol > 0 and contract.contract_size > 0:
-        notional = rounded_vol * contract.contract_size * entry_for_risk
-        # Fixed USDT cap is a soft WARNING (does not scale with the account, so
-        # it must not block "free size"). 0 = off. The real size guard is the
-        # equity-relative cap below + risk-% + available-margin gates.
-        if settings.max_notional_usdt > 0 and notional > settings.max_notional_usdt + 1e-9:
-            warnings.append(
-                f"Positionswert {notional:.2f} USDT über MAX_NOTIONAL_USDT="
-                f"{settings.max_notional_usdt} (Hinweis, kein Block)"
-            )
-        # HARD equity-relative fat-finger cap: notional <= equity × pct/100.
-        # Scales with the account and stays fail-closed to known equity. 0 = off.
-        pct_cap = float(getattr(settings, "max_notional_pct_of_equity", 0) or 0)
-        # Defense-in-depth: guard against a non-finite pct_cap, which would
-        # otherwise silently disable this equity-relative cap (any comparison
-        # against NaN is False; cap computed from Infinity would never bind).
-        if not math.isfinite(pct_cap):
-            errors.append(
-                "MAX_NOTIONAL_PCT_OF_EQUITY is not a finite number — "
-                "refusing to evaluate the equity-relative notional gate "
-                "(fail-closed)"
-            )
-        elif pct_cap > 0 and equity is not None and float(equity) > 0:
-            cap = float(equity) * pct_cap / 100.0
-            if notional > cap + 1e-9:
-                errors.append(
-                    f"notional {notional:.2f} USDT exceeds {pct_cap:.0f}% of equity "
-                    f"(cap {cap:.2f} USDT) — MAX_NOTIONAL_PCT_OF_EQUITY"
+        calculated_notional = rounded_vol * contract.contract_size * entry_for_risk
+        if not math.isfinite(calculated_notional):
+            errors.append("calculated notional is not finite — fail-closed")
+        else:
+            notional = calculated_notional
+            # Fixed USDT cap is a soft WARNING (does not scale with the account, so
+            # it must not block "free size"). 0 = off. The real size guard is the
+            # equity-relative cap below + risk-% + available-margin gates.
+            if (
+                settings.max_notional_usdt > 0
+                and notional > settings.max_notional_usdt + 1e-9
+            ):
+                warnings.append(
+                    f"Position value {notional:.2f} USDT exceeds MAX_NOTIONAL_USDT="
+                    f"{settings.max_notional_usdt} (warning only, not a block)"
                 )
-        min_notional = float(contract.min_notional or 0)
-        if min_notional > 0 and notional + 1e-9 < min_notional:
-            errors.append(
-                f"notional {notional:.4f} below exchange minimum "
-                f"{min_notional} — order would be rejected"
+            # HARD equity-relative fat-finger cap: notional <= equity × pct/100.
+            # Scales with the account and stays fail-closed to known equity. 0 = off.
+            pct_cap = float(
+                getattr(settings, "max_notional_pct_of_equity", 0) or 0
             )
+            # Defense-in-depth: guard against a non-finite pct_cap, which would
+            # otherwise silently disable this equity-relative cap (any comparison
+            # against NaN is False; cap computed from Infinity would never bind).
+            if not math.isfinite(pct_cap):
+                errors.append(
+                    "MAX_NOTIONAL_PCT_OF_EQUITY is not a finite number — "
+                    "refusing to evaluate the equity-relative notional gate "
+                    "(fail-closed)"
+                )
+            elif pct_cap > 0 and math.isfinite(equity_f) and equity_f > 0:
+                cap = equity_f * pct_cap / 100.0
+                if notional > cap + 1e-9:
+                    errors.append(
+                        f"notional {notional:.2f} USDT exceeds {pct_cap:.0f}% of equity "
+                        f"(cap {cap:.2f} USDT) — MAX_NOTIONAL_PCT_OF_EQUITY"
+                    )
+            min_notional = float(contract.min_notional or 0)
+            if min_notional > 0 and notional + 1e-9 < min_notional:
+                errors.append(
+                    f"notional {notional:.4f} below exchange minimum "
+                    f"{min_notional} — order would be rejected"
+                )
 
     # ── Available margin ───────────────────────────────────────────────
-    if available_usdt is not None and float(available_usdt) <= 0 and float(equity or 0) > 0:
+    available_f = float(available_usdt) if available_usdt is not None else None
+    if available_f is not None and not math.isfinite(available_f):
+        errors.append("available USDT is not finite — fail-closed")
+    elif available_f is not None and available_f <= 0 and equity_f > 0:
         errors.append("available USDT is 0 — cannot open (margin fully used)")
-    elif available_usdt is not None and notional > 0 and lev > 0:
+    elif available_f is not None and notional > 0 and lev > 0:
         est_im = notional / float(lev)
-        if float(available_usdt) + 1e-9 < est_im:
+        if available_f + 1e-9 < est_im:
             msg = (
                 f"estimated IM ~{est_im:.2f} exceeds available "
-                f"{float(available_usdt):.2f} USDT"
+                f"{available_f:.2f} USDT"
             )
             if getattr(settings, "strict_available_margin", True):
                 errors.append(msg + " (STRICT_AVAILABLE_MARGIN=true)")

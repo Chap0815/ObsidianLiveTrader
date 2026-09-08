@@ -10,6 +10,7 @@ a non-HL position never auto-BEs.
 """
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -78,20 +79,134 @@ def db_path(tmp_path):
     return str(tmp_path / "monitor.db")
 
 
-async def _seed_open(db, *, armed, rules=None):
+async def _seed_open(db, *, armed, rules=None, opened_at=NOW_MS):
     await db.upsert_position_mgmt(
         "BTC_USDT",
         "long",
         entry_snap=100.0,
         initial_sl_snap=98.0,
         r1=2.0,
-        opened_at=NOW_MS,
+        opened_at=opened_at,
         invalidation_price=None,
     )
     if armed:
         await db.set_armed_rules(
             "BTC_USDT", "long", rules if rules is not None else {"auto_be": True}
         )
+
+
+@pytest.mark.asyncio
+async def test_current_sl_ignores_explicitly_foreign_mexc_stop():
+    client = FakeClient(
+        [],
+        stops=[
+            {
+                "symbol": "ETH_USDT",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+            }
+        ],
+        is_hl=False,
+    )
+    client.exchange_id = "mexc"
+
+    assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
+        None,
+        True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalidation_uses_entry_proposal_not_latest_symbol_proposal():
+    db = SimpleNamespace(
+        proposal_for_open_position=AsyncMock(
+            return_value={"proposal": {"invalidation_price": 98.0}}
+        ),
+        latest_proposal_for_symbol=AsyncMock(
+            return_value={"proposal": {"invalidation_price": 105.0}}
+        ),
+    )
+
+    result = await monitor._best_effort_invalidation(
+        db,
+        "BTC_USDT",
+        "long",
+        observed_entry=100.0,
+        observed_open_sig=222,
+        observed_opened_at=2_000,
+        reopen_opened_at=2_000,
+    )
+
+    assert result == 98.0
+    db.proposal_for_open_position.assert_awaited_once_with(
+        "BTC_USDT",
+        "long",
+        observed_entry=100.0,
+        observed_open_sig=222,
+        observed_opened_at=2_000,
+        reopen_opened_at=2_000,
+    )
+    db.latest_proposal_for_symbol.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "invalidation"),
+    [
+        ("long", 100.0),
+        ("long", 105.0),
+        ("short", 100.0),
+        ("short", 95.0),
+        ("long", 0.0),
+        ("long", -1.0),
+        ("long", float("nan")),
+        ("long", float("inf")),
+    ],
+)
+async def test_invalidation_rejects_invalid_or_wrong_side_level(side, invalidation):
+    db = SimpleNamespace(
+        proposal_for_open_position=AsyncMock(
+            return_value={"proposal": {"invalidation_price": invalidation}}
+        )
+    )
+
+    result = await monitor._best_effort_invalidation(
+        db,
+        "BTC_USDT",
+        side,
+        observed_entry=100.0,
+        observed_opened_at=2_000,
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("side", "invalidation"), [("long", 98.0), ("short", 102.0)])
+async def test_invalidation_accepts_finite_loss_side_level(side, invalidation):
+    db = SimpleNamespace(
+        proposal_for_open_position=AsyncMock(
+            return_value={"proposal": {"invalidation_price": invalidation}}
+        )
+    )
+
+    result = await monitor._best_effort_invalidation(
+        db,
+        "BTC_USDT",
+        side,
+        observed_entry=100.0,
+        observed_opened_at=2_000,
+    )
+
+    assert result == invalidation
+
+
+@pytest.mark.parametrize(
+    "position_id",
+    [True, False, 0, -1, 1.5, "1.5", float("inf")],
+)
+def test_position_id_signature_rejects_non_positive_integer_ids(position_id):
+    assert monitor._position_id_signature({"position_id": position_id}) is None
 
 
 def _flat_candles(n=30, close=100.0, tr=1.0):
@@ -114,10 +229,13 @@ async def test_armed_hl_at_1r_moves_sl_to_be(monkeypatch, db_path):
     await _seed_open(db, armed=True)
     svc = _install_spy(monkeypatch)
     # entry 100, SL 98 -> r1=2 ; mark 102.5 -> +1.25R, above the +1R trigger.
-    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
+    client = FakeClient([_pos()], mark=102.5, is_hl=True)
+    client.account_snapshot = AsyncMock(wraps=client.account_snapshot)
+    app = _make_app(db, client)
 
     await monitor._run_one_cycle(app, NOW_MS)
 
+    client.account_snapshot.assert_awaited_once_with(fresh=True)
     svc.modify_stop_loss.assert_awaited_once()
     kwargs = svc.modify_stop_loss.await_args.kwargs
     assert kwargs["symbol"] == "BTC_USDT"
@@ -134,9 +252,24 @@ async def test_armed_hl_at_1r_moves_sl_to_be(monkeypatch, db_path):
 async def test_unarmed_only_alerts_no_modify(monkeypatch, db_path):
     db = Database(db_path)
     await db.init()
-    await _seed_open(db, armed=False)
-    # Thesis invalidation at 99 from the latest proposal; long mark 98.5 crosses.
-    await db.insert_proposal(symbol="BTC_USDT", proposal_json={"invalidation_price": 99.0})
+    opened_at = int(time.time() * 1000)
+    original_id = await db.insert_proposal(
+        symbol="BTC_USDT", proposal_json={"invalidation_price": 99.0}
+    )
+    await db.insert_order(
+        symbol="BTC_USDT",
+        side="long",
+        request_json={"_proposal_id": original_id},
+        response_json={"orderId": 1},
+        status="placed",
+        error=None,
+    )
+    await _seed_open(db, armed=False, opened_at=opened_at)
+    # A newer unrelated analysis must not replace the entry's thesis. At mark
+    # 98.5 the original invalidation (99) crosses, while the newer one (80) does not.
+    await db.insert_proposal(
+        symbol="BTC_USDT", proposal_json={"invalidation_price": 80.0}
+    )
     svc = _install_spy(monkeypatch)
     app = _make_app(db, FakeClient([_pos()], mark=98.5, is_hl=True))
 
@@ -242,6 +375,50 @@ async def test_transient_absence_does_not_disarm_before_grace(monkeypatch, db_pa
     # Reaching the grace threshold closes it.
     await monitor._run_one_cycle(app, NOW_MS)
     assert await db.get_open_position_mgmt("BTC_USDT", "long") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        None,
+        {},
+        {"positions": None},
+        {"positions": {}},
+        {"positions": [None]},
+        {"positions": [{}]},
+        {"positions": [{"symbol": True, "side": "long"}]},
+        {"positions": [{"symbol": "BTC_USDT", "side": "sideways"}]},
+    ],
+    ids=[
+        "not-object",
+        "missing",
+        "null",
+        "not-list",
+        "invalid-row",
+        "missing-identity",
+        "invalid-symbol",
+        "invalid-side",
+    ],
+)
+async def test_invalid_snapshot_never_proves_position_absence(
+    monkeypatch, db_path, snapshot
+):
+    """An unrecognized account shape is unknown, not evidence of a flat account."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    _install_spy(monkeypatch)
+    client = FakeClient([], is_hl=True)
+    client.account_snapshot = AsyncMock(return_value=snapshot)
+    app = _make_app(db, client)
+
+    for cycle in range(monitor._CLOSE_GRACE_CYCLES):
+        await monitor._run_one_cycle(app, NOW_MS + cycle * 20_000)
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row is not None
+    assert row["armed_rules"] == {"auto_be": True}
 
 
 @pytest.mark.asyncio
@@ -434,6 +611,30 @@ async def test_atr_cache_dedups_klines_within_cycle(monkeypatch, db_path):
     assert client.klines.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_atr_cache_ttl_uses_monotonic_time(monkeypatch):
+    app = SimpleNamespace(state=SimpleNamespace())
+    settings = SimpleNamespace(
+        tm_trail_atr_tf="15m",
+        tm_trail_atr_period=14,
+        tm_monitor_interval_s=20,
+    )
+    client = FakeClient([])
+    client.klines = AsyncMock(
+        side_effect=[_flat_candles(tr=1.0), _flat_candles(tr=2.0)]
+    )
+    ticks = iter([1_000.0, 1_021.0])
+    fake_time = SimpleNamespace(monotonic=lambda: next(ticks))
+    monkeypatch.setattr(monitor, "time", fake_time)
+
+    first = await monitor._atr_for(app, client, settings, "BTC_USDT", 1_000_000)
+    second = await monitor._atr_for(app, client, settings, "BTC_USDT", 100_000)
+
+    assert first == pytest.approx(1.0)
+    assert second == pytest.approx(2.0)
+    assert client.klines.await_count == 2
+
+
 # ── C2: modify_stop_loss SOFT-failure return must not latch a false be_done ───
 
 
@@ -489,6 +690,30 @@ async def test_verified_modify_latches_be(monkeypatch, db_path):
     assert row["be_done"] == 1  # latched on a CONFIRMED move
     assert "auto_be" in row["last_alert_state"]
     assert "auto_be_error" not in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_verified_be_with_latch_failure_does_not_repeat_mutation(
+    monkeypatch, db_path
+):
+    """A verified stop plus failed DB latch must halt, not send it every cycle."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    db.mark_be_done = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = _install_spy(
+        monkeypatch, result={"verified": True, "status": "modify_sl_ok"}
+    )
+    # The stop endpoint deliberately remains one cycle behind at the old SL.
+    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
+
+    await monitor._run_one_cycle(app, NOW_MS)
+    await monitor._run_one_cycle(app, NOW_MS + 20_000)
+
+    assert svc.modify_stop_loss.await_count == 1
+    assert app.state.tm_be_attempts[("BTC_USDT", "long")] == monitor._BE_MAX_ATTEMPTS
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"]["auto_be_error"]["halted"] is True
 
 
 @pytest.mark.asyncio

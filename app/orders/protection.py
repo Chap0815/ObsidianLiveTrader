@@ -22,6 +22,18 @@ position (F-12). The frontend keeps its own UI heuristic (app.js
 
 from __future__ import annotations
 
+import math
+
+
+def _positive_price(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
 
 def classify_order_label(label: str | None) -> str | None:
     """Classify an order purely by its type/kind label → 'sl' | 'tp' | None.
@@ -58,17 +70,15 @@ def classify_unlabeled_trigger(
     side_n = (side or "").strip().lower()
     if side_n not in ("long", "short"):
         return None
-    try:
-        entry = float(entry_price)
-    except (TypeError, ValueError):
+    trigger = _positive_price(trigger_price)
+    entry = _positive_price(entry_price)
+    if trigger is None or entry is None:
         return None
-    if entry <= 0:
-        return None
-    if trigger_price == entry:
+    if trigger == entry:
         return None
     if side_n == "long":
-        return "sl" if trigger_price < entry else "tp"
-    return "sl" if trigger_price > entry else "tp"
+        return "sl" if trigger < entry else "tp"
+    return "sl" if trigger > entry else "tp"
 
 
 def classify_protection(
@@ -94,28 +104,19 @@ def classify_protection(
     sl_candidates: list[float] = []
     tp: float | None = None
     for row in stops or []:
-        try:
-            sl_field = float(row.get("stopLossPrice"))
-        except (TypeError, ValueError):
-            sl_field = None
-        if sl_field and sl_field > 0:
+        sl_field = _positive_price(row.get("stopLossPrice"))
+        if sl_field is not None:
             sl_candidates.append(sl_field)
             continue
-        try:
-            tp_field = float(row.get("takeProfitPrice"))
-        except (TypeError, ValueError):
-            tp_field = None
-        if tp_field and tp_field > 0:
+        tp_field = _positive_price(row.get("takeProfitPrice"))
+        if tp_field is not None:
             tp = tp_field
             continue
         raw_trg = row.get("triggerPrice")
         if raw_trg is None:
             raw_trg = row.get("price")
-        try:
-            trg = float(raw_trg)
-        except (TypeError, ValueError):
-            trg = None
-        if not trg or trg <= 0:
+        trg = _positive_price(raw_trg)
+        if trg is None:
             continue
         kind = classify_order_label(row.get("orderType"))
         if kind == "tp":

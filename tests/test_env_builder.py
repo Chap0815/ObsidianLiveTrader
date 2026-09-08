@@ -77,9 +77,23 @@ def test_normalize_cloud_provider_needs_key():
 def test_normalize_port_and_host_bounds():
     with pytest.raises(ValueError):
         normalize_answers(_payload(port=80))
+    with pytest.raises(ValueError, match="PORT must be between"):
+        normalize_answers(_payload(port=0))
     with pytest.raises(ValueError):
         normalize_answers(_payload(host="10.0.0.5"))
     assert normalize_answers(_payload(port=9999))["port"] == 9999
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_normalize_rejects_boolean_port(value):
+    with pytest.raises(ValueError, match="PORT is not a number"):
+        normalize_answers(_payload(port=value))
+
+
+@pytest.mark.parametrize("value", [None, "", 8787.5])
+def test_normalize_rejects_explicit_non_integer_port(value):
+    with pytest.raises(ValueError, match="PORT is not a number"):
+        normalize_answers(_payload(port=value))
 
 
 def test_normalize_custom_risk_range_checked():
@@ -97,8 +111,53 @@ def test_normalize_custom_risk_range_checked():
     assert a["max_risk_pct"] == 2.0
 
 
+def test_normalize_rejects_fractional_max_leverage():
+    with pytest.raises(ValueError, match="MAX_LEVERAGE must be an integer"):
+        normalize_answers(
+            _payload(risk_profile="custom", max_leverage=10.9)
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_risk_pct",
+        "max_leverage",
+        "min_rrr",
+        "max_notional_pct_of_equity",
+        "max_notional_usdt",
+    ],
+)
+@pytest.mark.parametrize("value", [False, True])
+def test_normalize_rejects_boolean_risk_numbers(field, value):
+    payload = _payload(
+        risk_profile="custom",
+        max_risk_pct=2.0,
+        max_leverage=10,
+        min_rrr=2.0,
+        max_notional_pct_of_equity=1000,
+        max_notional_usdt=500,
+    )
+    payload[field] = value
+
+    with pytest.raises(ValueError, match="is not a number"):
+        normalize_answers(payload)
+
+
 def test_normalize_include_account_defaults_false():
     assert normalize_answers(_payload())["include_account_in_llm"] is False
+
+
+def test_normalize_include_account_requires_explicit_boolean():
+    assert (
+        normalize_answers(_payload(include_account_in_llm=True))[
+            "include_account_in_llm"
+        ]
+        is True
+    )
+    for invalid in ("false", "true", 0, 1, None, [], {}):
+        with pytest.raises(ValueError, match="Account-data.*boolean"):
+            normalize_answers(_payload(include_account_in_llm=invalid))
 
 
 # ── build_minimal_env ────────────────────────────────────────────────────────
@@ -195,6 +254,8 @@ def test_build_full_env_mexc_default_symbol(tmp_path, monkeypatch):
         )
     )
     assert "EXCHANGE=mexc" in content
+    assert "MEXC_BASE_URL=https://api.mexc.com" in content
+    assert "contract.mexc.com" not in content
     assert "DEFAULT_SYMBOL=BTC_USDT" in content
     p = tmp_path / ".env"
     p.write_text(content, encoding="utf-8")

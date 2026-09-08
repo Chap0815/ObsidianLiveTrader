@@ -7,6 +7,7 @@ columns), context_hash dedupe within a window, and the stats extensions
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -44,6 +45,28 @@ def _base_kwargs(**over):
 
 def _iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat()
+
+
+def test_nonfinite_historical_r_averages_degrade_to_null_json_safely():
+    raw = {
+        "total": 1,
+        "wins": 1,
+        "losses": 0,
+        "overall_sum_r": float("inf"),
+        "overall_sum_r_net": float("nan"),
+        "overall_net_sample": 1,
+        "by_confidence": {
+            "high": {"wins": 1, "losses": 0, "sum_r": float("-inf")}
+        },
+    }
+
+    response = build_stats_response(raw, min_sample=20)
+
+    assert response["overall"]["avg_realized_rrr"] is None
+    assert response["overall"]["avg_realized_rrr_net"] is None
+    assert response["by_confidence"]["high"]["avg_realized_rrr"] is None
+    # Mirrors Starlette's strict JSON rendering: no NaN/Infinity may escape.
+    json.dumps(response, allow_nan=False)
 
 
 # ── Migration on a pre-populated old DB ─────────────────────────────────

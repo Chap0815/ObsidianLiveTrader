@@ -16,12 +16,22 @@ TestClient). Hier fehlt nur der Cross-PORT-Fall.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import URL
 from starlette.websockets import WebSocketDisconnect
 
 from app.config import Settings
 from app.main import app
+from app.security import _origin_matches_request
+
+
+def test_secure_websocket_matches_https_origin_on_default_port():
+    request = SimpleNamespace(url=URL("wss://example.test/ws/market"))
+
+    assert _origin_matches_request("https://example.test", request) is True
 
 
 def test_ws_market_rejects_cross_port_origin_with_1008(monkeypatch):
@@ -40,6 +50,21 @@ def test_ws_market_rejects_cross_port_origin_with_1008(monkeypatch):
             with tc.websocket_connect(
                 "/ws/market?symbol=BTC",
                 headers={"origin": "http://testserver:9999"},
+            ):
+                pass
+    assert ei.value.code == 1008
+
+
+def test_ws_market_rejects_invalid_interval_with_1008(monkeypatch):
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    with TestClient(app) as tc:
+        with pytest.raises(WebSocketDisconnect) as ei:
+            with tc.websocket_connect(
+                "/ws/market?symbol=BTC&tf=invalid",
+                headers={"origin": "http://testserver"},
             ):
                 pass
     assert ei.value.code == 1008

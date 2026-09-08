@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import app
 from app.models import ContractMeta, Ticker
-from app.risk.sizing import suggest_vol
+from app.risk.sizing import adverse_market_entry, suggest_vol
 
 EQUITY = 10_000.0
 ENTRY = 100_000.0
@@ -94,13 +94,11 @@ def _post(
 
 
 def _risk_entry(max_risk_pct: float = 10.0) -> float:
-    """R2-01: the endpoint (and the real gate, M-B) use the RAW last price as
-    the market-order risk basis — NO market_entry_slippage_pct shift. The shift
-    used to be applied only in sizing, which under-sized the suggestion vs the
-    gate; removing it restores exact parity. The remaining adverse-fill buffer
-    is RISK_SLIPPAGE_PCT inside suggest_vol(), identical to the gate.
-    """
-    return ENTRY
+    """Endpoint and gate share the same adverse market-fill risk basis."""
+    settings = _settings(max_risk_pct)
+    return adverse_market_entry(
+        ENTRY, "long", settings.market_entry_slippage_pct
+    )
 
 
 def _expected_vol(
@@ -134,16 +132,8 @@ def _expected_vol(
     )
 
 
-def test_sizing_matches_gate_no_slippage_shift(monkeypatch):
-    """R2-01: the market-order sizing suggestion uses the RAW last price as its
-    risk/entry basis — EXACTLY what the real gate (validate_order, M-B) uses —
-    with NO market_entry_slippage_pct shift. Proves parity two ways:
-      1. body["entry"] == raw last (no shift), and body["vol"] == a raw-entry
-         suggest_vol() (the shifted result would be strictly smaller).
-      2. Feeding the SUGGESTED vol back through validate_order at the same raw
-         last price passes G3 and reports risk_pct == max_risk_pct (the gate
-         agrees the suggestion sizes to the full, unchanged budget).
-    """
+def test_sizing_matches_gate_adverse_slippage_entry(monkeypatch):
+    """Sizing and confirm gate use the identical worst-fill reference."""
     from app.models import OrderTicket
     from app.risk.gates import validate_order
 
@@ -154,30 +144,19 @@ def test_sizing_matches_gate_no_slippage_shift(monkeypatch):
     assert r.status_code == 200
     body = r.json()
 
-    # (1) No slippage shift: the entry basis IS the raw last price.
-    assert body["entry"] == ENTRY
+    shifted_entry = _risk_entry(max_risk)
+    assert body["entry"] == shifted_entry
 
-    # The size equals a suggest_vol() computed on the RAW entry (the fix) …
-    expected_raw = suggest_vol(
-        EQUITY, max_risk, CONTRACT_SIZE, ENTRY, STOP, VOL_UNIT, MIN_VOL,
-        side="long", slippage_pct=settings.risk_slippage_pct,
-        available_usdt=AVAILABLE, leverage=5,
-        max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
-    )
-    assert body["vol"] == expected_raw
-
-    # … and it is STRICTLY LARGER than the OLD, buggy slip-shifted suggestion
-    # (proving the under-sizing is gone, not merely renamed).
-    shifted_entry = ENTRY * (1.0 + settings.market_entry_slippage_pct / 100.0)
-    shifted_vol = suggest_vol(
+    expected_shifted = suggest_vol(
         EQUITY, max_risk, CONTRACT_SIZE, shifted_entry, STOP, VOL_UNIT, MIN_VOL,
         side="long", slippage_pct=settings.risk_slippage_pct,
         available_usdt=AVAILABLE, leverage=5,
         max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
     )
-    assert body["vol"] > shifted_vol
+    assert body["vol"] == expected_shifted
 
-    # (2) The gate, given the SUGGESTED vol at the SAME raw last, sizes to the
+    # The gate, given the suggested vol and same ticker, derives the same
+    # adverse entry and sizes to the
     # full budget and does NOT reject it — exact math parity.
     ticket = OrderTicket(
         symbol="BTC_USDT", side="long", order_type="market",
@@ -187,7 +166,7 @@ def test_sizing_matches_gate_no_slippage_shift(monkeypatch):
         ticket, _contract_meta(), EQUITY, settings, last_price=ENTRY,
         available_usdt=AVAILABLE,
     )
-    assert gate.entry_for_risk == ENTRY  # gate uses raw last too
+    assert gate.entry_for_risk == shifted_entry
     # Suggestion sizes to (approximately) the full max_risk_pct budget; never
     # over it. Floor-to-vol_unit rounding only ever leaves it at/just under.
     assert gate.risk_pct <= max_risk + 1e-9
@@ -325,11 +304,8 @@ def test_sizing_suggest_clamped_by_existing_same_side_risk(monkeypatch):
     assert new_risk + existing_risk_usdt <= EQUITY * 0.02 + 1e-6
 
 
-def test_sizing_suggest_missing_liq_non_strict_no_400(monkeypatch):
-    """R-01: a same-side position without liquidate_price must NOT hard-block
-    sizing when strict_aggregate_risk is off (the default). A conservative
-    fallback risk + a warning is used instead of a 400.
-    """
+def test_sizing_suggest_missing_liq_blocks(monkeypatch):
+    """Sizing cannot derive a safe aggregate budget from unknown exposure."""
     existing_position = {
         "symbol": "BTC_USDT",
         "side": "long",
@@ -339,31 +315,5 @@ def test_sizing_suggest_missing_liq_non_strict_no_400(monkeypatch):
     }
     mock = _mock_client(positions=[existing_position])
     r = _post(monkeypatch, {"risk_pct": 2.0}, max_risk_pct=10.0, mock=mock)
-    assert r.status_code == 200
-    body = r.json()
-    # Fallback exposure is applied (not silently 0) …
-    assert body["existing_same_side_risk_usdt"] > 0
-    # … and the user is warned about the fallback.
-    assert any("liquidate_price" in w for w in body.get("warnings", []))
-
-
-def test_sizing_suggest_missing_liq_strict_still_400(monkeypatch):
-    """R-01: with strict_aggregate_risk=True the fail-closed behaviour is kept
-    — a missing liquidate_price still yields a 400.
-    """
-    existing_position = {
-        "symbol": "BTC_USDT",
-        "side": "long",
-        "hold_vol": 2,
-        "entry_price": ENTRY,
-        "liquidate_price": None,
-    }
-    mock = _mock_client(positions=[existing_position])
-    r = _post(
-        monkeypatch,
-        {"risk_pct": 2.0},
-        max_risk_pct=10.0,
-        mock=mock,
-        settings_kwargs={"strict_aggregate_risk": True},
-    )
     assert r.status_code == 400
+    assert "liquidate_price" in r.json()["detail"]

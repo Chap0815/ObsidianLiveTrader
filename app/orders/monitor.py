@@ -154,12 +154,16 @@ def _position_id_signature(pos: Any) -> int | None:
     if not isinstance(pos, dict):
         return None
     pid = pos.get("position_id")
-    if pid in (None, ""):
+    if isinstance(pid, bool):
         return None
-    try:
-        return int(pid)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(pid, int):
+        return pid if pid > 0 else None
+    if isinstance(pid, str):
+        text = pid.strip()
+        if text.isdigit():
+            parsed = int(text)
+            return parsed if parsed > 0 else None
+    return None
 
 
 async def _hl_epoch_signature(
@@ -218,23 +222,50 @@ async def _open_signature(
     return _position_id_signature(pos)
 
 
-async def _best_effort_invalidation(db: Any, symbol: str) -> float | None:
-    """Thesis-invalidation price from the latest proposal for the symbol.
+async def _best_effort_invalidation(
+    db: Any,
+    symbol: str,
+    side: str,
+    *,
+    observed_entry: float | None = None,
+    observed_open_sig: int | None = None,
+    observed_opened_at: int | None = None,
+    reopen_opened_at: int | None = None,
+) -> float | None:
+    """Thesis-invalidation price from this position's explicit proposal.
 
-    Heuristic (spec §10): newest proposal for the symbol. Fail-safe — any miss
-    or decode error yields None (no alarm) rather than a wrong alarm/crash.
+    Fail-safe: a missing provenance link or decode error yields None (no alarm)
+    rather than borrowing an unrelated newer analysis for the same symbol.
     """
     try:
         if db is None:
             return None
-        prop = await db.latest_proposal_for_symbol(symbol)
+        prop = await db.proposal_for_open_position(
+            symbol,
+            side,
+            observed_entry=observed_entry,
+            observed_open_sig=observed_open_sig,
+            observed_opened_at=observed_opened_at,
+            reopen_opened_at=reopen_opened_at,
+        )
         if not prop:
             return None
         p = prop.get("proposal")
         if isinstance(p, dict):
             v = p.get("invalidation_price")
             if v not in (None, ""):
-                return float(v)
+                invalidation = float(v)
+                if not (math.isfinite(invalidation) and invalidation > 0):
+                    return None
+                if observed_entry is not None:
+                    entry = float(observed_entry)
+                    if not (math.isfinite(entry) and entry > 0):
+                        return None
+                    if side == "long" and invalidation >= entry:
+                        return None
+                    if side == "short" and invalidation <= entry:
+                        return None
+                return invalidation
     except Exception:
         pass
     return None
@@ -254,7 +285,24 @@ async def _current_sl(
     """
     try:
         stops = await client.open_stop_orders(symbol)
-        sl, _tp = classify_protection(stops, side=side, entry=entry)
+        # MEXC plan-order endpoints can return account-wide rows even when a
+        # symbol was requested.  Never let an explicitly foreign trigger drive
+        # this position's baseline or an automatic stop move.  Hyperliquid
+        # exposes bare coins (``BTC``), so only that adapter gets base matching;
+        # rows without a symbol retain the endpoint's requested-symbol scope.
+        want = symbol.upper()
+        is_hl = getattr(client, "exchange_id", "") == "hyperliquid"
+        matching_stops = []
+        for row in stops or []:
+            row_symbol = str(row.get("symbol") or "").upper()
+            if row_symbol and row_symbol != want:
+                if not (
+                    is_hl
+                    and row_symbol.split("_")[0] == want.split("_")[0]
+                ):
+                    continue
+            matching_stops.append(row)
+        sl, _tp = classify_protection(matching_stops, side=side, entry=entry)
         return sl, True
     except Exception:
         return None, False
@@ -299,13 +347,30 @@ async def ensure_baseline(
     # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
     # gate) — safe until a real stop exists.
     r1 = abs(entry - current_sl) if current_sl is not None else 0.0
-    opened_at = await _best_effort_opened_at(
-        client, db, symbol, side, now_ms, fills=fills
-    )
-    invalidation = await _best_effort_invalidation(db, symbol)
     # F2: stable exchange reopen-signature (HL trade-epoch fill / MEXC positionId;
     # None = inconclusive → no reset).
     open_sig = await _open_signature(client, pos, symbol, side, fills=fills)
+    is_hl = hasattr(client, "place_stop_order")
+    if is_hl and open_sig is not None:
+        # The HL signature is the validated Flat→Open fill timestamp and is more
+        # precise than the generic oldest-open-fill approximation.
+        opened_at = open_sig
+    else:
+        opened_at = await _best_effort_opened_at(
+            client, db, symbol, side, now_ms, fills=fills
+        )
+    reopen_opened_at = (
+        (open_sig if is_hl else now_ms) if open_sig is not None else None
+    )
+    invalidation = await _best_effort_invalidation(
+        db,
+        symbol,
+        side,
+        observed_entry=entry,
+        observed_open_sig=open_sig,
+        observed_opened_at=opened_at,
+        reopen_opened_at=reopen_opened_at,
+    )
 
     # Durable baseline. First sighting inserts; a later sighting refreshes in
     # place (arming/be_done/alert-state preserved), unless entry deviated beyond
@@ -320,6 +385,7 @@ async def ensure_baseline(
         opened_at=opened_at,
         invalidation_price=invalidation,
         open_sig=open_sig,
+        reopen_opened_at=reopen_opened_at,
     )
     # F1: heal a frozen r1==0 (position first seen without a bracket SL) now that
     # a real protective stop exists. Never overwrites an already-real r1, so the
@@ -468,8 +534,8 @@ async def _process_position(
                 alert_state["auto_be_unavailable"] = {
                     "active": True,
                     "message": (
-                        "Auto-Management (BE/Trail) ist nur auf Hyperliquid "
-                        "verfuegbar."
+                        "Auto-management (BE/trailing) is only available on "
+                        "Hyperliquid."
                     ),
                     "ts": now_ms,
                 }
@@ -486,9 +552,8 @@ async def _process_position(
                         "active": True,
                         "halted": True,
                         "message": (
-                            f"Auto-Management nach {_BE_MAX_ATTEMPTS} "
-                            "Fehlversuchen gestoppt — bitte pruefen / neu "
-                            "scharfschalten."
+                            f"Auto-management stopped after {_BE_MAX_ATTEMPTS} "
+                            "failed attempts — check it and arm it again."
                         ),
                         "ts": now_ms,
                     }
@@ -496,7 +561,12 @@ async def _process_position(
             else:
                 try:
                     result = await service.modify_stop_loss(
-                        symbol=symbol, side=side, new_sl=chosen.new_sl
+                        symbol=symbol,
+                        side=side,
+                        new_sl=chosen.new_sl,
+                        required_armed_rule=(
+                            "auto_be" if is_be_move else "auto_trail"
+                        ),
                     )
                 except Exception as e:  # noqa: BLE001 — must not abort the cycle
                     n = attempts.get(akey, 0) + 1
@@ -513,7 +583,7 @@ async def _process_position(
                         "active": True,
                         "halted": n >= _BE_MAX_ATTEMPTS,
                         "message": (
-                            f"Auto-Management fehlgeschlagen "
+                            f"Auto-management failed "
                             f"({n}/{_BE_MAX_ATTEMPTS}): {e}"
                         ),
                         "ts": now_ms,
@@ -535,30 +605,57 @@ async def _process_position(
                         isinstance(result, dict) and result.get("verified") is True
                     )
                     if verified:
-                        # Confirmed resting: clear the retry cap (both BE and
-                        # repeated trailing reset it) + a visible auto-action feed.
-                        attempts.pop(akey, None)
+                        latch_error: Exception | None = None
                         if be_eligible:
                             # Resulting stop is >= break-even → latch one-shot BE.
-                            await db.mark_be_done(symbol, side)
-                        if is_be_move:
-                            alert_state["auto_be"] = {
+                            try:
+                                await db.mark_be_done(symbol, side)
+                            except Exception as exc:  # noqa: BLE001 — stop is live
+                                latch_error = exc
+                        if latch_error is not None:
+                            # The mutation is already VERIFIED. If the local latch
+                            # fails while the stop read is stale, retrying could
+                            # place the same stop every cycle. Halt until re-arm.
+                            attempts[akey] = _BE_MAX_ATTEMPTS
+                            log.error(
+                                "auto-mgmt verified for %s %s but BE latch failed; "
+                                "automation halted: %s",
+                                symbol,
+                                side,
+                                latch_error,
+                            )
+                            alert_state["auto_be_error"] = {
                                 "active": True,
-                                "reason": chosen.reason,
-                                "new_sl": chosen.new_sl,
+                                "halted": True,
                                 "message": (
-                                    f"App hat SL auf BE gezogen ({chosen.reason})."
+                                    "SL move confirmed, but the local break-even "
+                                    "state could not be saved. Auto-management is "
+                                    "stopped until it is armed again."
                                 ),
                                 "ts": now_ms,
                             }
                         else:
-                            alert_state["auto_trail"] = {
-                                "active": True,
-                                "reason": chosen.reason,
-                                "new_sl": chosen.new_sl,
-                                "message": "App hat SL nachgezogen (Trail).",
-                                "ts": now_ms,
-                            }
+                            # Exchange and local state agree: clear the retry cap
+                            # and publish the successful action.
+                            attempts.pop(akey, None)
+                            if is_be_move:
+                                alert_state["auto_be"] = {
+                                    "active": True,
+                                    "reason": chosen.reason,
+                                    "new_sl": chosen.new_sl,
+                                    "message": (
+                                        f"App hat SL auf BE gezogen ({chosen.reason})."
+                                    ),
+                                    "ts": now_ms,
+                                }
+                            else:
+                                alert_state["auto_trail"] = {
+                                    "active": True,
+                                    "reason": chosen.reason,
+                                    "new_sl": chosen.new_sl,
+                                    "message": "App hat SL nachgezogen (Trail).",
+                                    "ts": now_ms,
+                                }
                         state_dirty = True
                     else:
                         # UNVERIFIED soft failure: new stop NOT confirmed, old stop
@@ -633,7 +730,7 @@ def _atr_cache(app: Any) -> dict:
 
 
 async def _atr_for(
-    app: Any, client: Any, settings: Any, symbol: str, now_ms: int
+    app: Any, client: Any, settings: Any, symbol: str, _now_ms: int
 ) -> float | None:
     """Latest Wilder-ATR for ``symbol`` on the trail TF — fail-safe + cached.
 
@@ -651,8 +748,9 @@ async def _atr_for(
         ttl_ms = max(1, int(settings.tm_monitor_interval_s)) * 1000
     except Exception:
         ttl_ms = 20_000
+    cache_now_ms = int(time.monotonic() * 1000)
     hit = cache.get(key)
-    if isinstance(hit, dict) and (now_ms - int(hit.get("ts", 0))) < ttl_ms:
+    if isinstance(hit, dict) and (cache_now_ms - int(hit.get("ts", 0))) < ttl_ms:
         return hit.get("atr")
 
     atr: float | None = None
@@ -664,7 +762,7 @@ async def _atr_for(
             atr = None  # never act on a non-finite / non-positive ATR
     except Exception:
         atr = None  # fail-safe: no ATR → no trail move this cycle
-    cache[key] = {"atr": atr, "ts": now_ms}
+    cache[key] = {"atr": atr, "ts": cache_now_ms}
     return atr
 
 
@@ -680,11 +778,21 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
         return
 
     try:
-        snap = await client.account_snapshot()
+        snap = await client.account_snapshot(fresh=True)
     except Exception:
         log.warning("trade monitor: account_snapshot failed", exc_info=True)
         return
-    positions = (snap.get("positions") if isinstance(snap, dict) else None) or []
+    positions = snap.get("positions") if isinstance(snap, dict) else None
+    if not isinstance(positions, list):
+        log.warning("trade monitor: invalid account_snapshot shape")
+        return
+    snapshot_complete = not any(
+        not isinstance(pos, dict)
+        or not isinstance(pos.get("symbol"), str)
+        or not pos["symbol"].strip()
+        or pos.get("side") not in ("long", "short")
+        for pos in positions
+    )
 
     # Build the shared-lock service ONCE per cycle (single seam for auto-BE
     # writes). Never fatal — if it can't be built, positions still evaluate for
@@ -724,6 +832,12 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
             # One bad position must never abort the sweep (spec §3.7).
             log.warning("trade monitor: position cycle failed", exc_info=True)
             continue
+
+    if not snapshot_complete:
+        # Valid rows were still processed independently above, but a partial
+        # snapshot cannot prove that any other managed position vanished.
+        log.warning("trade monitor: invalid position in account_snapshot")
+        return
 
     # Positions no longer live → close their mgmt record (frees the OPEN slot so
     # a later re-open starts a fresh baseline). Only after _CLOSE_GRACE_CYCLES

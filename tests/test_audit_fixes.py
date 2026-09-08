@@ -1,5 +1,7 @@
 ﻿"""Regression tests for deep-audit money-safety fixes."""
 
+import asyncio
+
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +13,7 @@ from app.orders.tokens import PreviewStore
 from app.risk.gates import validate_order
 from app.mexc.errors import MexcError
 from app.mexc.client import MexcClient, normalize_klines  # noqa: F401
+from app.hyperliquid.client import HyperliquidClient, _opt_f
 
 
 def _settings(**kwargs) -> Settings:
@@ -55,6 +58,7 @@ def _contract(**kwargs) -> ContractMeta:
         max_leverage=125,
         min_leverage=1,
         api_allowed=True,
+        state=0,
     )
     base.update(kwargs)
     return ContractMeta(**base)
@@ -81,6 +85,86 @@ def test_equity_zero_fail_closed():
     g = validate_order(_ticket(), _contract(), 0.0, _settings(), last_price=100_000.0)
     assert g.ok is False
     assert any("equity" in e.lower() for e in g.errors)
+
+
+@pytest.mark.asyncio
+async def test_mexc_adapter_rejects_nonfinite_account_balances():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    c.assets = AsyncMock(
+        return_value=[
+            {"currency": "USDT", "equity": "NaN", "availableBalance": "1000"}
+        ]
+    )
+    c.positions = AsyncMock(return_value=[])
+    with pytest.raises(MexcError, match="non-finite"):
+        await c.account_state(fresh=True)
+    await c.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["equity", "availableBalance"])
+async def test_mexc_adapter_rejects_boolean_account_balances(field):
+    row = {"currency": "USDT", "equity": "1000", "availableBalance": "900"}
+    row[field] = True
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    c.assets = AsyncMock(return_value=[row])
+    c.positions = AsyncMock(return_value=[])
+
+    with pytest.raises(MexcError, match="boolean"):
+        await c.account_state(fresh=True)
+
+    await c.aclose()
+
+
+def test_hyperliquid_adapter_rejects_nonfinite_account_balances():
+    with pytest.raises(ValueError, match="non-finite"):
+        HyperliquidClient._assets_from_state(
+            {
+                "marginSummary": {
+                    "accountValue": "NaN",
+                    "totalMarginUsed": "0",
+                },
+                "withdrawable": "1000",
+            }
+        )
+
+
+def test_hyperliquid_adapter_rejects_nonfinite_total_notional():
+    with pytest.raises(ValueError, match="non-finite"):
+        HyperliquidClient._assets_from_state(
+            {
+                "marginSummary": {
+                    "accountValue": "1000",
+                    "totalMarginUsed": "0",
+                    "totalNtlPos": "NaN",
+                },
+                "withdrawable": "1000",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "field", ["accountValue", "withdrawable", "totalMarginUsed", "totalNtlPos"]
+)
+def test_hyperliquid_adapter_rejects_boolean_account_balances(field):
+    state = {
+        "marginSummary": {
+            "accountValue": "1000",
+            "totalMarginUsed": "50",
+            "totalNtlPos": "500",
+        },
+        "withdrawable": "950",
+    }
+    target = state if field == "withdrawable" else state["marginSummary"]
+    target[field] = True
+
+    with pytest.raises(ValueError, match="boolean"):
+        HyperliquidClient._assets_from_state(state)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_hyperliquid_optional_float_drops_nonfinite(value):
+    assert _opt_f(value) is None
 
 
 def test_limit_entry_spoof_ignored_for_risk():
@@ -127,7 +211,7 @@ def test_manual_mode_without_tp_not_hard_blocked():
         last_price=100_000.0,
     )
     assert not any("take_profit required" in e.lower() for e in g.errors)
-    assert any("manuell ohne tp" in w.lower() for w in g.warnings)
+    assert any("manual without tp" in w.lower() for w in g.warnings)
     assert g.ok is True
 
 
@@ -273,6 +357,7 @@ def _happy_client(place_response, *, post_hold: float = 1.0):
     client.positions = AsyncMock(
         side_effect=[[], [], [], _filled_pos(post_hold), _filled_pos(post_hold)]
     )
+    client.open_orders = AsyncMock(return_value=[])
     client.open_stop_orders = AsyncMock(return_value=[])
     client.set_leverage = AsyncMock(return_value={})
     client.place_order = AsyncMock(return_value=place_response)
@@ -419,7 +504,7 @@ async def test_unfilled_resting_limit_not_flattened_or_cancelled():
     # No false SL-failure; instead an honest resting-limit warning. The exact
     # regression signatures are the English "SL not verified" warning and any
     # *_sl_unverified / *_flatten_sent status — all must be absent.
-    assert any("LIMIT RUHT" in w for w in out.get("warnings", []))
+    assert any("RESTING LIMIT" in w for w in out.get("warnings", []))
     assert not any("not verified" in w.lower() for w in out.get("warnings", []))
     assert "unverified" not in out["status"] and "flatten" not in out["status"]
 
@@ -502,7 +587,7 @@ async def test_mexc_resting_limit_not_cancelled():
     client.cancel_order.assert_not_awaited()
     client.close_position_market.assert_not_awaited()
     assert out["flatten"] is None
-    assert any("LIMIT RUHT" in w for w in out["warnings"])
+    assert any("RESTING LIMIT" in w for w in out["warnings"])
 
 
 @pytest.mark.asyncio
@@ -548,7 +633,7 @@ async def test_mexc_unconfirmable_fill_is_unknown_not_verified():
     assert out["sl_verified"] is False
     assert out["sl_checked"] is False
     assert out["status"] == "placed_sl_unknown"
-    assert any("UNBEKANNT" in w for w in out["warnings"])
+    assert any("UNKNOWN" in w for w in out["warnings"])
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
 
@@ -580,7 +665,7 @@ async def test_mexc_resting_limit_external_hold_bump_not_silently_verified():
     assert out["status"] == "placed_sl_unknown"
     # Loud warning stays (this fix produces UNBEKANNT, not LIMIT RUHT, because
     # the bump exceeds the resting eps and so is not classified as resting).
-    assert any("UNBEKANNT" in w for w in out["warnings"])
+    assert any("UNKNOWN" in w for w in out["warnings"])
     # Fail-safe: never flatten / close on an unverified, unattributed fill.
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
@@ -613,7 +698,7 @@ async def test_mexc_resting_limit_external_bump_not_verified():
     assert out["sl_verified"] is False
     assert out["sl_checked"] is False
     assert out["status"] == "placed_sl_unknown"
-    assert any("UNBEKANNT" in w for w in out["warnings"])
+    assert any("UNKNOWN" in w for w in out["warnings"])
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
 
@@ -640,7 +725,9 @@ async def test_mexc_fast_market_fill_retries_hold_read():
         ),
         PreviewStore(),
     )
-    prev = await svc.preview(_ticket(order_type="market", price=None))
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
     assert prev["ok"], prev.get("errors")
     out = await svc.confirm(prev["token"])
     assert out["sl_verified"] is True
@@ -665,11 +752,13 @@ async def test_mexc_market_still_unfilled_after_retries():
         ),
         PreviewStore(),
     )
-    prev = await svc.preview(_ticket(order_type="market", price=None))
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
     assert prev["ok"], prev.get("errors")
     out = await svc.confirm(prev["token"])
     assert out["status"] == "placed_unfilled_resting"
-    assert any("LIMIT RUHT" in w for w in out["warnings"])
+    assert any("RESTING LIMIT" in w for w in out["warnings"])
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
 
@@ -687,32 +776,15 @@ def _pos_without_liq():
 
 
 @pytest.mark.asyncio
-async def test_same_side_without_liq_price_blocks_preview_strict():
-    """R-01: with STRICT_AGGREGATE_RISK the missing liq price is fail-closed
-    (not risk=0) — preview is blocked exactly like before.
-    """
+async def test_same_side_without_liq_price_blocks_preview():
+    """Unknown existing exposure must block instead of using a guessed value."""
     client = _happy_client({"orderId": 1})
     client.positions = AsyncMock(return_value=_pos_without_liq())
-    svc = OrderService(client, _settings(strict_aggregate_risk=True), PreviewStore())
+    svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
     assert prev["ok"] is False
     assert prev["token"] is None
-    assert any("liquidate" in e.lower() or "aggregate" in e.lower() for e in prev["errors"])
-
-
-@pytest.mark.asyncio
-async def test_same_side_without_liq_price_warns_preview_non_strict():
-    """R-01: default (non-strict) no longer hard-blocks on a missing liq price
-    — a conservative fallback risk + a warning is used so add-on/second
-    positions are not falsely blocked.
-    """
-    client = _happy_client({"orderId": 1})
-    client.positions = AsyncMock(return_value=_pos_without_liq())
-    svc = OrderService(client, _settings(), PreviewStore())  # strict False by default
-    prev = await svc.preview(_ticket())
-    assert prev["ok"] is True, prev.get("errors")
-    assert any("liquidate_price" in w for w in prev["warnings"])
-    assert prev["summary"]["existing_same_side_risk_usdt"] > 0
+    assert any("liquidate_price" in error for error in prev["errors"])
 
 
 @pytest.mark.asyncio
@@ -847,6 +919,54 @@ async def test_sl_unverified_triggers_flatten():
 
 
 @pytest.mark.asyncio
+async def test_auto_flatten_timeout_recovers_exact_close_external_oid_once():
+    """An uncertain emergency-close response is looked up, never resent."""
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.positions = AsyncMock(
+        side_effect=[[], [], [], _filled_pos(1.0), _filled_pos(1.0), []]
+    )
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def recover(_symbol, recovery_oid):
+        assert recovery_oid.startswith("close:mlt-")
+        return {
+            "match": "history",
+            "externalOid": recovery_oid,
+            "order": {"state": 3},
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
+    assert out["flatten"]["match"] == "history"
+    assert any("recovered" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_timeout_mismatched_recovery_never_resends():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+    client.order_by_external_oid = AsyncMock(
+        return_value={"match": "history", "externalOid": "close:other"}
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
+    assert out["flatten"] == {"error": "timeout"}
+
+
+@pytest.mark.asyncio
 async def test_sl_unknown_when_stop_endpoint_down_does_not_flatten():
     """Regression: if the authoritative stop-order lookup FAILS (broken/renamed
     endpoint), the SL state is UNKNOWN, not MISSING. A position row without an
@@ -915,7 +1035,7 @@ async def test_price_match_against_preexisting_stop_is_unknown_not_verified():
     assert out["sl_verified"] is False
     assert out["sl_checked"] is False  # UNKNOWN, not a false "verified"
     assert out["status"] == "placed_sl_unknown"
-    assert any("UNBEKANNT" in w for w in out["warnings"])
+    assert any("UNKNOWN" in w for w in out["warnings"])
     # UNKNOWN never auto-flattens (fail-safe requires sl_checked=True to flatten)
     client.close_position_market.assert_not_awaited()
 
@@ -990,7 +1110,7 @@ async def test_manual_mode_scale_out_warns_ladder_not_placed():
     out = await svc.confirm(prev["token"])
     assert out["status"] == "placed_manual"
     assert "takeProfitPrice2" not in out["request"]
-    assert any("SCALE-OUT" in w and "IGNORIERT" in w for w in out["warnings"])
+    assert any("SCALE-OUT" in w and "IGNORED" in w for w in out["warnings"])
 
 
 @pytest.mark.asyncio
@@ -1113,6 +1233,24 @@ async def test_flatten_reported_zero_fill_cancels_resting_despite_bot_hold():
     assert out["flatten"] and out["flatten"].get("action") == "cancel_resting"
 
 
+@pytest.mark.asyncio
+async def test_auto_flatten_cancel_inner_error_is_not_reported_cancelled():
+    client = _happy_client({"orderId": 777, "dealVol": 0})
+    client.cancel_order = AsyncMock(
+        return_value=[{"orderId": 777, "errorCode": 3001, "errorMsg": "busy"}]
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.cancel_order.await_count == 1
+    assert out["flatten"]["cancelled"] == []
+    assert out["flatten"]["cancel_errors"]
+    assert any("could NOT be cancelled" in warning for warning in out["warnings"])
+
+
 # ── Fix 2: side-aware / directional tick rounding ───────────────────────────
 
 
@@ -1185,6 +1323,96 @@ def test_orders_open_no_stops_error_on_success(monkeypatch):
     body = r.json()
     assert body["stop_orders"] == []
     assert body["stops_error"] is None
+
+
+def test_orders_open_reads_orders_and_stops_concurrently(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    started: set[str] = set()
+    barrier = None
+
+    async def read(name):
+        nonlocal barrier
+        if barrier is None:
+            barrier = asyncio.Event()
+        started.add(name)
+        if len(started) == 2:
+            barrier.set()
+        await asyncio.wait_for(barrier.wait(), timeout=1.0)
+        return []
+
+    async def read_orders(symbol):
+        return await read("orders")
+
+    async def read_stops(symbol):
+        return await read("stops")
+
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(side_effect=read_orders)
+    mock.open_stop_orders = AsyncMock(side_effect=read_stops)
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200
+    assert started == {"orders", "stops"}
+
+
+def test_orders_open_preserves_primary_error_priority(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(side_effect=MexcError("orders failed"))
+    mock.open_stop_orders = AsyncMock(side_effect=MexcError("stops failed"))
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    body = response.json()
+    assert body["error"] == "orders failed"
+    assert body["orders"] == []
+    assert body["stop_orders"] == []
+
+
+def test_orders_open_cancels_stop_read_after_primary_failure(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    stop_started = None
+    stop_cancelled = False
+
+    async def fail_orders(symbol):
+        while stop_started is None:
+            await asyncio.sleep(0)
+        await stop_started.wait()
+        raise MexcError("orders failed")
+
+    async def slow_stops(symbol):
+        nonlocal stop_started, stop_cancelled
+        stop_started = asyncio.Event()
+        stop_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stop_cancelled = True
+
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(side_effect=fail_orders)
+    mock.open_stop_orders = AsyncMock(side_effect=slow_stops)
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.json()["error"] == "orders failed"
+    assert stop_cancelled is True
 
 
 # ── Fix 5: armed trading requires a non-empty LOCAL_API_TOKEN ────────────────
@@ -1269,11 +1497,11 @@ async def test_open_stop_orders_tries_fallback_paths():
         calls.append(path)
         if len(calls) == 1:
             raise MexcError("first path 404")
-        return [{"stopLossPrice": 99_000.0}]
+        return [{"stopLossPrice": 99_000.0, "state": 1}]
 
     c._request = fake_request  # type: ignore[assignment]
     out = await c.open_stop_orders("BTC_USDT")
-    assert out == [{"stopLossPrice": 99_000.0}]
+    assert out == [{"stopLossPrice": 99_000.0, "state": 1}]
     assert len(calls) == 2  # first failed, second succeeded
 
 
@@ -1401,7 +1629,8 @@ async def test_post_place_hold_failure_fails_closed_not_flat():
     assert out["flatten"]
     assert out["flatten"].get("action") == "skipped_post_hold_unknown"
     assert any(
-        "manuell" in w.lower() and "AUTO_FLATTEN" in w for w in out["warnings"]
+        "check the position" in w.lower() and "AUTO_FLATTEN" in w
+        for w in out["warnings"]
     )
 
 
@@ -1568,6 +1797,42 @@ async def test_close_full_fill_still_reports_ok():
 
 
 @pytest.mark.asyncio
+async def test_successful_close_survives_local_audit_failure():
+    """A completed exchange close must not turn into a retry-baiting DB error."""
+    client = _close_client(first_hold=_pos(5.0), reread=[])
+    db = MagicMock()
+    db.insert_order = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+
+    out = await svc.close_position(symbol="BTC_USDT", side="long")
+
+    assert out["ok"] is True
+    assert out["status"] == "closed"
+    assert any("audit log failed" in warning for warning in out["warnings"])
+    client.close_position_market.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_place_error_survives_local_audit_failure():
+    """The check-externalOid warning is authoritative even if SQLite is down."""
+    client = _happy_client({"orderId": 1})
+    client.place_order = AsyncMock(side_effect=MexcError("timeout"))
+    client.order_by_external_oid = AsyncMock(return_value={})
+    db = MagicMock()
+    db.insert_preview = AsyncMock()
+    db.mark_preview_used = AsyncMock()
+    db.insert_order = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = OrderService(client, _settings(), PreviewStore(), db=db)
+    preview = await svc.preview(_ticket())
+
+    with pytest.raises(OrderError, match="externalOid") as exc_info:
+        await svc.confirm(preview["token"])
+
+    assert "audit log failed" in str(exc_info.value)
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_close_reread_failure_is_uncertain_not_closed():
     """If the post-close reread itself fails, fail-safe: uncertain, never a
     false fully-closed."""
@@ -1639,30 +1904,96 @@ async def test_close_verify_retry_still_reports_genuine_partial():
 
 
 @pytest.mark.asyncio
-async def test_mexc_recovery_accepts_marked_match_without_oid_echo():
-    """O-05: a MEXC-client MATCH MARKER ("history"/"open"/"direct") is trusted
-    as recovery evidence even when the raw provider payload does NOT literally
-    echo our externalOid — the marker, not a substring, is the signal. Under the
-    old substring-only guard this recovered fill was discarded (→ hard error →
-    user re-previews → double position)."""
+async def test_mexc_recovery_rejects_marker_without_oid_echo():
+    """A marker without the adapter's exact externalOid is not identity proof."""
     client = _happy_client({"orderId": 1})
     client.exchange_id = "mexc"
+    client.positions = AsyncMock(side_effect=[[], [], [], []])
 
     async def _place(_body):
         raise MexcError("timeout connecting to upstream")
 
     client.place_order = AsyncMock(side_effect=_place)
-    # Marker present, but the raw payload does NOT contain our oid string.
     client.order_by_external_oid = AsyncMock(
         return_value={"match": "history", "order": {"orderId": 77, "state": 3}}
     )
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
-    out = await svc.confirm(prev["token"])
-    assert out["ok"] is True
-    assert "recovered_placed" in out["status"]
-    # Fail-closed integrity: exactly ONE place attempt, never a blind re-place.
+    with pytest.raises(OrderError, match="externalOid"):
+        await svc.confirm(prev["token"])
     assert client.place_order.await_count == 1
+
+
+def test_recovery_rejects_unknown_marker_even_with_exact_oid():
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(
+        {"match": "not-found", "externalOid": "mlt-1"}, "mlt-1"
+    )
+    assert not _recovery_is_match({"externalOid": "mlt-1"}, "mlt-1")
+
+
+def test_recovered_mexc_order_exposes_own_fill_to_service():
+    from app.orders.service import _extract_filled_vol
+
+    recovered = {
+        "match": "history",
+        "externalOid": "mlt-1",
+        "order": {"orderId": 7, "dealVol": "0.4", "state": 4},
+    }
+    assert _extract_filled_vol(recovered) == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"dealVol": -1},
+        {
+            "response": {
+                "data": {"statuses": [{"filled": {"totalSz": -1}}]}
+            }
+        },
+    ],
+)
+def test_negative_reported_fill_is_unknown_not_unfilled(response):
+    from app.orders.service import _extract_filled_vol
+
+    assert _extract_filled_vol(response) is None
+
+
+@pytest.mark.asyncio
+async def test_recovered_mexc_partial_fill_uses_order_fill_evidence():
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(side_effect=[[], [], _filled_pos(0.4)])
+
+    async def _place(_body):
+        raise MexcError("timeout")
+
+    async def _recover(_symbol, external_oid):
+        return {
+            "match": "history",
+            "externalOid": external_oid,
+            "order": {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "dealVol": "0.4",
+                "state": 4,
+            },
+        }
+
+    client.place_order = AsyncMock(side_effect=_place)
+    client.order_by_external_oid = AsyncMock(side_effect=_recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is True
+    assert "recovered_placed" in out["status"]
+    assert client.place_order.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
+    client.close_position_market.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1689,17 +2020,11 @@ async def test_mexc_recovery_no_match_still_fail_closed():
 
 
 @pytest.mark.asyncio
-async def test_mexc_recovery_uses_position_delta_signal():
-    """X2-03: on a timeout where the oid lookup can't confirm the order ({}),
-    a same-side hold that GREW by ≈the ordered size vs pre_hold is trusted as
-    "order probably live" → WARNING, no re-place, no hard error. This is the
-    signal that stops the user re-previewing into a double position when MEXC's
-    order index lags but the position already exists."""
+async def test_mexc_recovery_rejects_unowned_position_delta_signal():
+    """A same-side position increase without an exact oid match is not ours."""
     client = _happy_client({"orderId": 1})
     client.exchange_id = "mexc"
-    # pre_hold reads 0 (nothing yet; reused from the confirm-risk read — Finding
-    # 2); after the timeout the position shows the ordered size (rounded_vol≈1.0)
-    # → delta signal fires.
+    # A concurrent bot creates exactly the requested position delta.
     client.positions = AsyncMock(
         side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0), _filled_pos(1.0)]
     )
@@ -1708,16 +2033,14 @@ async def test_mexc_recovery_uses_position_delta_signal():
         raise MexcError("timeout connecting to upstream")
 
     client.place_order = AsyncMock(side_effect=_place)
-    # oid lookup cannot confirm (index-lag) → {}: only the delta may recover it.
+    # The exchange cannot associate that position with our externalOid.
     client.order_by_external_oid = AsyncMock(return_value={})
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
-    out = await svc.confirm(prev["token"])
-    assert out["ok"] is True
-    assert "recovered_placed" in out["status"]
-    # Fail-closed integrity: the delta signal must NEVER trigger a re-place.
+    with pytest.raises(OrderError, match="externalOid"):
+        await svc.confirm(prev["token"])
     assert client.place_order.await_count == 1
-    assert any("DO NOT re-preview" in w for w in out["warnings"])
+    assert client.order_by_external_oid.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1804,6 +2127,56 @@ async def test_place_order_empty_body_2xx_recovers_via_external_oid():
     assert out["ok"] is True
     assert "recovered_placed" in out["status"]
     assert any("DO NOT re-preview" in w for w in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_place_order_uncertain_json_shape_recovers_via_external_oid():
+    client = _happy_client({"orderId": 1})
+
+    async def _place(_body):
+        raise MexcError("uncertain order-create response shape")
+
+    client.place_order = AsyncMock(side_effect=_place)
+    async def _recover(_symbol, external_oid):
+        return {
+            "match": "history",
+            "externalOid": external_oid,
+            "order": {"orderId": 42, "state": 3},
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=_recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["ok"] is True
+    assert "recovered_placed" in out["status"]
+    assert client.place_order.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_place_order_recovery_rejects_oid_only_in_diagnostic_text():
+    client = _happy_client({"orderId": 1})
+
+    async def _place(_body):
+        raise MexcError("uncertain order-create response shape")
+
+    client.place_order = AsyncMock(side_effect=_place)
+
+    async def _diagnostic(_symbol, external_oid):
+        return {"message": f"{external_oid} not found"}
+
+    client.order_by_external_oid = AsyncMock(side_effect=_diagnostic)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    with pytest.raises(OrderError, match="externalOid"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
 
 
 # ── F-05: stale/ambiguous stop-order endpoint must yield UNKNOWN, not MISSING ─

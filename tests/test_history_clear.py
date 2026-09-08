@@ -78,6 +78,54 @@ async def test_repo_clear_history_does_not_touch_order_previews(db_path):
 
 
 @pytest.mark.asyncio
+async def test_insert_preview_prunes_expired_preview_rows(db_path):
+    """Short-lived preview payloads must not accumulate after their TTL."""
+    db = Database(db_path)
+    await db.init()
+
+    await db.insert_preview(
+        token_hash="expired",
+        payload_json={"symbol": "OLD_USDT"},
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+    await db.insert_preview(
+        token_hash="active",
+        payload_json={"symbol": "BTC_USDT"},
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+
+    async with db._connect() as conn:
+        cur = await conn.execute(
+            "SELECT token_hash FROM order_previews ORDER BY token_hash"
+        )
+        assert [row[0] for row in await cur.fetchall()] == ["active"]
+
+
+@pytest.mark.asyncio
+async def test_init_prunes_expired_preview_rows_after_restart(db_path):
+    """Startup must remove stale preview payloads even without another preview."""
+    db = Database(db_path)
+    await db.init()
+    async with db._connect() as conn:
+        await conn.execute(
+            """
+            INSERT INTO order_previews
+              (token_hash, payload_json, expires_at, used_at)
+            VALUES (?, ?, ?, NULL)
+            """,
+            ("expired", "{}", "2000-01-01T00:00:00+00:00"),
+        )
+        await conn.commit()
+
+    restarted = Database(db_path)
+    await restarted.init()
+
+    async with restarted._connect() as conn:
+        cur = await conn.execute("SELECT COUNT(*) FROM order_previews")
+        assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_repo_clear_history_empty_is_noop(db_path):
     db = Database(db_path)
     await db.init()

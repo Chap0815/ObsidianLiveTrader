@@ -16,7 +16,7 @@ import hmac
 import json
 import math
 import time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 import httpx
@@ -45,6 +45,11 @@ _INTERVAL_SECONDS: dict[str, int] = {
     "Hour4": 4 * 60 * 60,
     "Day1": 24 * 60 * 60,
 }
+
+# Account cards need contract sizes for correct position display, but these
+# public contract definitions do not need to be downloaded on every 30-second
+# account poll. Money-path contract checks intentionally do not use this cache.
+_ACCOUNT_CONTRACT_SIZE_TTL_S = 600.0
 
 
 def sign_payload(
@@ -108,15 +113,27 @@ def _fmt_price(v: Any, scale: int | None = None) -> str:
     contract's ``priceScale`` (or one derived from ``priceUnit``); when
     unknown, a conservative fixed fallback is used instead.
     """
-    if not math.isfinite(float(v)):
+    if isinstance(v, bool):
+        raise MexcError(f"Invalid price value: {v!r}")
+    try:
+        parsed = float(v)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MexcError(f"Invalid price value: {v!r}") from exc
+    if not math.isfinite(parsed):
         raise MexcError(f"Nicht-endlicher Preiswert: {v!r}")
-    d = Decimal(str(v))
+    try:
+        d = Decimal(str(v))
+    except InvalidOperation as exc:
+        raise MexcError(f"Invalid price value: {v!r}") from exc
     was_positive = d > 0
     decimals = scale if scale is not None else _DEFAULT_PRICE_DECIMALS
     if decimals < 0:
         decimals = 0
     quant = Decimal(1).scaleb(-decimals)
-    d = d.quantize(quant, rounding=ROUND_DOWN)
+    try:
+        d = d.quantize(quant, rounding=ROUND_DOWN)
+    except InvalidOperation as exc:
+        raise MexcError(f"Price value cannot be quantized: {v!r}") from exc
     # F-3 safety leine: a positive price/SL smaller than the quantization step
     # ROUND_DOWNs to 0 here. Shipping "0" for a stopLossPrice while the service
     # still believes body_had_sl=True is a SILENT stop-loss loss ("protected"
@@ -125,8 +142,8 @@ def _fmt_price(v: Any, scale: int | None = None) -> str:
     # price field, is never "positive" so it passes untouched).
     if was_positive and d <= 0:
         raise MexcError(
-            f"Preis {v!r} kollabiert bei Quantisierung (scale={decimals}) auf 0 "
-            "— harter Reject statt stillem SL-/Preis-Verlust auf der Wire"
+            f"Price {v!r} collapses to 0 at quantization scale {decimals}; "
+            "rejecting instead of silently losing the SL/price on the wire"
         )
     s = format(d, "f")
     if "." in s:
@@ -141,7 +158,10 @@ def _format_price_fields(body: dict[str, Any]) -> dict[str, Any]:
     out = dict(body)
     for key in _PRICE_FIELDS:
         if key in out and out[key] is not None:
-            out[key] = _fmt_price(out[key])
+            formatted = _fmt_price(out[key])
+            if Decimal(formatted) < 0:
+                raise MexcError(f"{key} must be >= 0")
+            out[key] = formatted
     return out
 
 
@@ -153,47 +173,94 @@ def _to_ms(ts: int | float) -> int:
 
 def normalize_klines(data: dict[str, Any]) -> list[Candle]:
     """Convert MEXC parallel-array kline payload to list[Candle]."""
-    times = data.get("time") or []
-    opens = data.get("open") or []
-    highs = data.get("high") or []
-    lows = data.get("low") or []
-    closes = data.get("close") or []
-    vols = data.get("vol") or []
-    amounts = data.get("amount") or []
+    names = ("time", "open", "high", "low", "close", "vol", "amount")
+    arrays = {name: data.get(name) for name in names}
+    if not all(isinstance(values, list) for values in arrays.values()):
+        raise MexcError("kline payload requires list arrays for all fields", raw=data)
+    times = arrays["time"]
+    opens = arrays["open"]
+    highs = arrays["high"]
+    lows = arrays["low"]
+    closes = arrays["close"]
+    vols = arrays["vol"]
+    amounts = arrays["amount"]
     n = len(times)
+    if any(len(arrays[name]) != n for name in names[1:]):
+        raise MexcError("kline payload arrays have different lengths", raw=data)
     candles: list[Candle] = []
     for i in range(n):
+        timestamp = _required_finite_float(times[i], "kline time")
+        open_px = _required_finite_float(opens[i], "kline open")
+        high_px = _required_finite_float(highs[i], "kline high")
+        low_px = _required_finite_float(lows[i], "kline low")
+        close_px = _required_finite_float(closes[i], "kline close")
+        volume = _required_finite_float(vols[i], "kline vol")
+        amount = _required_finite_float(amounts[i], "kline amount")
+        if timestamp <= 0 or min(open_px, high_px, low_px, close_px) <= 0:
+            raise MexcError("kline time and prices must be > 0")
+        if high_px < max(open_px, close_px) or low_px > min(open_px, close_px):
+            raise MexcError("kline OHLC geometry is invalid")
+        if volume < 0 or amount < 0:
+            raise MexcError("kline volume and amount must be >= 0")
         candles.append(
             Candle(
-                time=_to_ms(times[i]),
-                open=float(opens[i]) if i < len(opens) else 0.0,
-                high=float(highs[i]) if i < len(highs) else 0.0,
-                low=float(lows[i]) if i < len(lows) else 0.0,
-                close=float(closes[i]) if i < len(closes) else 0.0,
-                vol=float(vols[i]) if i < len(vols) else 0.0,
-                amount=float(amounts[i]) if i < len(amounts) else 0.0,
+                time=_to_ms(timestamp),
+                open=open_px,
+                high=high_px,
+                low=low_px,
+                close=close_px,
+                vol=volume,
+                amount=amount,
             )
         )
+    candles.sort(key=lambda candle: candle.time)
+    if any(a.time == b.time for a, b in zip(candles, candles[1:])):
+        raise MexcError("duplicate kline timestamp")
     return candles
 
 
 def parse_contract_meta(row: dict[str, Any]) -> ContractMeta:
-    return ContractMeta(
+    max_leverage = _required_int(row.get("maxLeverage"), "maxLeverage")
+    if "countryConfigContractMaxLeverage" in row:
+        country_max = _required_int(
+            row.get("countryConfigContractMaxLeverage"),
+            "countryConfigContractMaxLeverage",
+        )
+        if country_max < 0:
+            raise MexcError("countryConfigContractMaxLeverage must be >= 0")
+        if country_max > 0:
+            max_leverage = min(max_leverage, country_max)
+    meta = ContractMeta(
         symbol=str(row.get("symbol", "")),
-        contract_size=float(row.get("contractSize") or 0),
-        price_unit=float(row.get("priceUnit") or 0),
-        vol_unit=float(row.get("volUnit") or 0),
-        min_vol=float(row.get("minVol") or 0),
-        max_vol=float(row.get("maxVol") or 0),
-        max_leverage=int(row.get("maxLeverage") or 1),
-        min_leverage=int(row.get("minLeverage") or 1),
-        api_allowed=bool(row.get("apiAllowed", False)),
+        contract_size=_required_finite_float(
+            row.get("contractSize") or 0, "contractSize"
+        ),
+        price_unit=_required_finite_float(row.get("priceUnit") or 0, "priceUnit"),
+        vol_unit=_required_finite_float(row.get("volUnit") or 0, "volUnit"),
+        min_vol=_required_finite_float(row.get("minVol") or 0, "minVol"),
+        max_vol=_required_finite_float(row.get("maxVol") or 0, "maxVol"),
+        max_leverage=max_leverage,
+        min_leverage=_required_int(row.get("minLeverage"), "minLeverage"),
+        api_allowed=row.get("apiAllowed") is True,
         price_scale=row.get("priceScale"),
         vol_scale=row.get("volScale"),
         base_coin=row.get("baseCoin"),
         quote_coin=row.get("quoteCoin"),
-        state=row.get("state"),
+        state=_required_int(row.get("state"), "state"),
     )
+    positive = ("contract_size", "price_unit", "vol_unit", "min_vol", "max_vol")
+    for field_name in positive:
+        if getattr(meta, field_name) <= 0:
+            raise MexcError(f"{field_name} must be > 0")
+    if meta.min_vol > meta.max_vol:
+        raise MexcError("minVol exceeds maxVol")
+    if (
+        meta.min_leverage < 1
+        or meta.max_leverage < 1
+        or meta.min_leverage > meta.max_leverage
+    ):
+        raise MexcError("invalid leverage bounds")
+    return meta
 
 
 class MexcClient:
@@ -206,10 +273,8 @@ class MexcClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
-        # O-04: remembers which open_stop_orders candidate path last answered
-        # with a recognized schema, so the next call tries it first (fallback
-        # order is unchanged — this is purely an ordering hint).
-        self._stop_path_cache: str | None = None
+        self._account_contract_sizes_cache: tuple[float, dict[str, float]] | None = None
+        self._account_contract_sizes_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -235,7 +300,12 @@ class MexcClient:
             body_to_send: Any = json_body
             if isinstance(json_body, dict):
                 body_to_send = _format_price_fields(json_body)
-            content = json.dumps(body_to_send, separators=(",", ":"))
+            try:
+                content = json.dumps(
+                    body_to_send, separators=(",", ":"), allow_nan=False
+                )
+            except (TypeError, ValueError) as exc:
+                raise MexcError("request body is not valid finite JSON") from exc
             param_string = content
 
         if private:
@@ -249,7 +319,6 @@ class MexcClient:
                     "Signature": sign_payload(
                         self.api_key, self.api_secret, req_time, param_string
                     ),
-                    "Recv-Window": "10000",
                 }
             )
 
@@ -277,23 +346,23 @@ class MexcClient:
                 f"invalid JSON in 2xx response body: {e}",
                 raw={"status": r.status_code, "body": r.text[:300]},
             ) from e
-        if isinstance(data, dict) and data.get("success") is False:
-            raise MexcError(
-                str(data.get("message") or data.get("code") or "MEXC error"),
-                raw=data,
-            )
-        # F-2: MEXC can answer HTTP 200 with {"code": <nonzero>, "message": ...}
-        # and NO "success" field (gateway/maintenance/rate-limit variants). The
-        # success-only check above would pass such an error through as a result
-        # (fatal on place_order). Mirror _close_response_error's code guard, but
-        # ONLY as a FALLBACK when success is absent: an explicit success:true is
-        # authoritative (a legitimate answer that also carries a non-zero code
-        # must NOT be blocked in the money path), and success:false is already
-        # caught above. So gate on `success is None`. A missing code or the
-        # success codes (0/200) are legitimate answers and must not be rejected.
-        if isinstance(data, dict) and data.get("success") is None:
+        if isinstance(data, dict) and "success" in data:
+            success = data.get("success")
+            if success is False:
+                raise MexcError(
+                    str(data.get("message") or data.get("code") or "MEXC error"),
+                    raw=data,
+                )
+            if success is not True:
+                raise MexcError("invalid MEXC success marker", raw=data)
+        # The official common response uses code=0 for success. Validate a
+        # present code independently of the success marker: a contradictory
+        # success:true/code:<error> envelope must never authorize a mutation.
+        # Some endpoint-specific success responses omit code, so absence stays
+        # compatible; a present value must be the exact numeric/string zero.
+        if isinstance(data, dict) and "code" in data:
             code = data.get("code")
-            if code not in (None, 0, "0", 200, "200"):
+            if isinstance(code, bool) or code not in (0, "0"):
                 raise MexcError(
                     str(
                         data.get("message")
@@ -315,9 +384,57 @@ class MexcClient:
 
     async def contract_detail(
         self, symbol: str | None = None
-    ) -> dict[str, Any] | list[Any]:
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         params = {"symbol": symbol} if symbol else None
-        return await self._request("GET", "/api/v1/contract/detail", params=params)
+        data = await self._request("GET", "/api/v1/contract/detail", params=params)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and all(isinstance(row, dict) for row in data):
+            return data
+        raise MexcError("unrecognized contract-detail response shape", raw=data)
+
+    async def _account_contract_sizes(
+        self, required: set[str], *, fresh: bool = False
+    ) -> dict[str, float]:
+        """Return display-only contract sizes with TTL and cold-miss singleflight."""
+
+        def cached() -> dict[str, float] | None:
+            hit = self._account_contract_sizes_cache
+            if hit is None:
+                return None
+            created_at, sizes = hit
+            if time.monotonic() - created_at >= _ACCOUNT_CONTRACT_SIZE_TTL_S:
+                return None
+            if not required.issubset(sizes):
+                return None
+            return dict(sizes)
+
+        if not fresh and (hit := cached()) is not None:
+            return hit
+
+        async with self._account_contract_sizes_lock:
+            if not fresh and (hit := cached()) is not None:
+                return hit
+
+            detail = await self.contract_detail()
+            rows = detail if isinstance(detail, list) else [detail]
+            sizes: dict[str, float] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol") or "")
+                size = _opt_float(row.get("contractSize"))
+                if symbol and size is not None and size > 0:
+                    sizes[symbol] = size
+
+            missing = required - set(sizes)
+            if missing:
+                raise MexcError(
+                    "contract size unavailable for open position(s): "
+                    + ", ".join(sorted(missing))
+                )
+            self._account_contract_sizes_cache = (time.monotonic(), sizes)
+            return dict(sizes)
 
     async def list_symbols(self) -> list[str]:
         """All USDT-M perpetual symbols (for the UI symbol dropdown)."""
@@ -333,8 +450,14 @@ class MexcClient:
     async def market_overview(self, limit: int = 12) -> list[dict[str, Any]]:
         """Top USDT-perps by 24h turnover with funding/last (for the scanner)."""
         data = await self._request("GET", "/api/v1/contract/ticker")
+        if isinstance(data, dict):
+            source_rows = [data]
+        elif isinstance(data, list) and all(isinstance(row, dict) for row in data):
+            source_rows = data
+        else:
+            raise MexcError("unrecognized market-overview response shape", raw=data)
         rows: list[dict[str, Any]] = []
-        for r in data if isinstance(data, list) else [data]:
+        for r in source_rows:
             sym = str(r.get("symbol") or "")
             if not sym.endswith("_USDT"):
                 continue
@@ -343,14 +466,24 @@ class MexcClient:
             # OI LEVEL in contracts (MEXC exposes no OI-Δ, so this alone never
             # triggers the scanner oi_read and classic stays byte-for-byte).
             rfr = _opt_float(r.get("riseFallRate"))
+            volume24 = _opt_float(r.get("amount24"))
+            last = _opt_float(r.get("lastPrice"))
+            open_interest = _opt_float(r.get("holdVol"))
+            price_change_pct = rfr * 100.0 if rfr is not None else None
+            if price_change_pct is not None and not math.isfinite(price_change_pct):
+                price_change_pct = None
             rows.append(
                 {
                     "symbol": sym,
-                    "volume24": _f(r.get("amount24")),
-                    "funding": _f(r.get("fundingRate")),
-                    "last": _f(r.get("lastPrice")),
-                    "price_change_pct": (rfr * 100.0) if rfr is not None else None,
-                    "open_interest": _opt_float(r.get("holdVol")),
+                    "volume24": volume24 if volume24 is not None and volume24 >= 0 else 0.0,
+                    "funding": _opt_float(r.get("fundingRate")) or 0.0,
+                    "last": last if last is not None and last > 0 else None,
+                    "price_change_pct": price_change_pct,
+                    "open_interest": (
+                        open_interest
+                        if open_interest is not None and open_interest >= 0
+                        else None
+                    ),
                 }
             )
         rows.sort(key=lambda x: x["volume24"], reverse=True)
@@ -359,11 +492,16 @@ class MexcClient:
     async def contract_meta(self, symbol: str) -> ContractMeta:
         data = await self.contract_detail(symbol)
         if isinstance(data, list):
-            if not data:
+            row = next(
+                (item for item in data if str(item.get("symbol") or "") == symbol),
+                None,
+            )
+            if row is None:
                 raise MexcError(f"No contract detail for {symbol}")
-            row = data[0]
         else:
             row = data
+        if str(row.get("symbol") or "") != symbol:
+            raise MexcError(f"Contract symbol mismatch: wanted {symbol}")
         return parse_contract_meta(row)
 
     async def klines(
@@ -397,20 +535,34 @@ class MexcClient:
             "GET", "/api/v1/contract/ticker", params={"symbol": symbol}
         )
         if isinstance(data, list):
+            if not all(isinstance(item, dict) for item in data):
+                raise MexcError("ticker response contains a non-object row", raw=data)
             row = next((x for x in data if x.get("symbol") == symbol), None)
             if row is None:
                 raise MexcError(
                     f"Ticker for {symbol} not found (refusing other-symbol fallback)"
                 )
-        else:
-            row = data or {}
-            if row.get("symbol") and str(row.get("symbol")) != symbol:
+        elif isinstance(data, dict):
+            row = data
+            row_symbol = row.get("symbol")
+            if row_symbol is not None and not isinstance(row_symbol, str):
                 raise MexcError(
-                    f"Ticker symbol mismatch: wanted {symbol}, got {row.get('symbol')}"
+                    f"Ticker symbol is invalid: wanted {symbol}, got {row_symbol}"
                 )
+            if row_symbol and row_symbol != symbol:
+                raise MexcError(
+                    f"Ticker symbol mismatch: wanted {symbol}, got {row_symbol}"
+                )
+        else:
+            raise MexcError("unrecognized ticker response shape", raw=data)
+        last_price = _required_finite_float(
+            row.get("lastPrice") or 0, "ticker lastPrice"
+        )
+        if last_price <= 0:
+            raise MexcError("ticker lastPrice must be > 0")
         return Ticker(
             symbol=str(row.get("symbol") or symbol),
-            last_price=float(row.get("lastPrice") or 0),
+            last_price=last_price,
             bid1=_opt_float(row.get("bid1")),
             ask1=_opt_float(row.get("ask1")),
             fair_price=_opt_float(row.get("fairPrice")),
@@ -425,10 +577,21 @@ class MexcClient:
         data = await self._request(
             "GET", f"/api/v1/contract/funding_rate/{symbol}"
         )
-        row = data or {}
+        if not isinstance(data, dict):
+            raise MexcError("unrecognized funding-rate response shape", raw=data)
+        row = data
+        row_symbol = row.get("symbol")
+        if row_symbol is not None and not isinstance(row_symbol, str):
+            raise MexcError(
+                f"Funding symbol is invalid: wanted {symbol}, got {row_symbol}"
+            )
+        if row_symbol and row_symbol != symbol:
+            raise MexcError(
+                f"Funding symbol mismatch: wanted {symbol}, got {row_symbol}"
+            )
         return FundingRate(
             symbol=str(row.get("symbol") or symbol),
-            funding_rate=float(row.get("fundingRate") or 0),
+            funding_rate=_opt_float(row.get("fundingRate")) or 0.0,
             max_funding_rate=_opt_float(row.get("maxFundingRate")),
             min_funding_rate=_opt_float(row.get("minFundingRate")),
             collect_cycle=_opt_int(row.get("collectCycle")),
@@ -446,7 +609,11 @@ class MexcClient:
         data = await self._request(
             "GET", "/api/v1/private/account/assets", private=True
         )
-        return list(data or [])
+        if not isinstance(data, list):
+            raise MexcError("unrecognized account-assets response shape", raw=data)
+        if not all(isinstance(row, dict) for row in data):
+            raise MexcError("account-assets response contains a non-object row")
+        return data
 
     async def positions(
         self, symbol: str | None = None, *, fresh: bool = False
@@ -460,7 +627,45 @@ class MexcClient:
             params=params,
             private=True,
         )
-        return list(data or [])
+        if not isinstance(data, list):
+            raise MexcError("unrecognized open-positions response shape", raw=data)
+        rows = data
+        if symbol:
+            wanted_symbol = str(symbol).strip().upper()
+            scoped_rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    scoped_rows.append(row)
+                    continue
+                symbol_raw = row.get("symbol")
+                row_symbol = (
+                    symbol_raw.strip().upper()
+                    if isinstance(symbol_raw, str)
+                    else ""
+                )
+                if not row_symbol or row_symbol == wanted_symbol:
+                    scoped_rows.append(row)
+            rows = scoped_rows
+        for row in rows:
+            if not isinstance(row, dict):
+                raise MexcError("open positions contains a non-object row")
+            mapped = map_position(row)
+            hold = mapped.get("hold_vol")
+            entry = mapped.get("entry_price")
+            position_symbol = mapped.get("symbol")
+            if (
+                not isinstance(position_symbol, str)
+                or not position_symbol.strip()
+                or mapped.get("side") not in ("long", "short")
+            ):
+                raise MexcError("open position identity is invalid")
+            if mapped.get("open_type") not in ("isolated", "cross"):
+                raise MexcError("open position openType is invalid")
+            if hold is None or hold <= 0:
+                raise MexcError("open position holdVol is invalid")
+            if entry is None or entry <= 0:
+                raise MexcError("open position entry price is invalid")
+        return rows
 
     async def account_state(
         self, symbol: str | None = None, *, fresh: bool = False
@@ -485,31 +690,27 @@ class MexcClient:
             raise assets_raw
         if isinstance(positions_raw, BaseException):
             raise positions_raw
-        return list(assets_raw), list(positions_raw)
+        assets_list = list(assets_raw)
+        equity, available = usdt_balances(assets_list)
+        if not math.isfinite(equity) or not math.isfinite(available):
+            raise MexcError(
+                "account state contains non-finite equity/available balance"
+            )
+        return assets_list, list(positions_raw)
 
     async def account_snapshot(self, *, fresh: bool = False) -> dict[str, Any]:
         """Fetch assets + open positions and map to API account shape.
 
         Each position gets its OWN contract_size (F-10) — resolved from
         MEXC's contract metadata (one /contract/detail call covering all
-        symbols) rather than the active chart symbol's. If that lookup
-        fails or a symbol is missing from it, map_position safely defaults
-        that position's contract_size to 1.0.
+        symbols) rather than the active chart symbol's. Missing metadata is
+        unknown, not 1.0: fail so callers can retain the last good snapshot.
         """
-        assets_raw = await self.assets(fresh=fresh)
-        positions_raw = await self.positions(fresh=fresh)
+        assets_raw, positions_raw = await self.account_state(fresh=fresh)
         contract_sizes: dict[str, float] = {}
         if positions_raw:
-            try:
-                detail = await self.contract_detail()
-                rows = detail if isinstance(detail, list) else [detail]
-                for r in rows:
-                    sym = str(r.get("symbol") or "")
-                    if not sym:
-                        continue
-                    contract_sizes[sym] = float(r.get("contractSize") or 0) or 1.0
-            except MexcError:
-                pass  # per-position default (1.0) still applies below
+            required = {str(position.get("symbol") or "") for position in positions_raw}
+            contract_sizes = await self._account_contract_sizes(required, fresh=fresh)
         return map_account_snapshot(
             assets_raw, positions_raw, contract_sizes=contract_sizes
         )
@@ -527,9 +728,31 @@ class MexcClient:
         With open position: pass position_id (+ leverage).
         Without: symbol + openType + positionType + leverage.
         """
+        if isinstance(leverage, bool) or not isinstance(leverage, int) or leverage <= 0:
+            raise MexcError("leverage must be a positive integer")
+        if (
+            isinstance(open_type, bool)
+            or not isinstance(open_type, int)
+            or open_type not in (1, 2)
+        ):
+            raise MexcError("openType must be 1 (isolated) or 2 (cross)")
+        if position_id is not None:
+            if not _mexc_positive_order_id(position_id):
+                raise MexcError("positionId must be a positive numeric ID")
+        elif (
+            isinstance(position_type, bool)
+            or not isinstance(position_type, int)
+            or position_type not in (1, 2)
+        ):
+            raise MexcError("positionType must be 1 (long) or 2 (short)")
+        if position_id is None and (
+            not isinstance(symbol, str) or not symbol.strip()
+        ):
+            raise MexcError("symbol is required without positionId")
+
         body: dict[str, Any] = {"leverage": leverage}
         if position_id is not None:
-            body["positionId"] = position_id
+            body["positionId"] = int(position_id)
         else:
             body["symbol"] = symbol
             body["openType"] = open_type
@@ -541,7 +764,14 @@ class MexcClient:
             json_body=body,
             private=True,
         )
-        return data if isinstance(data, dict) else {"data": data}
+        # The official endpoint documents only the public response parameters
+        # (``success: true`` on success). A 2xx body whose data was null, a
+        # scalar, a list, or an arbitrary object is therefore not evidence that
+        # leverage actually changed. Confirm must fail closed here, before the
+        # entry order is sent.
+        if not isinstance(data, dict) or data.get("success") is not True:
+            raise MexcError("uncertain set-leverage response shape", raw=data)
+        return data
 
     async def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         """POST /api/v1/private/order/create (current official path).
@@ -552,13 +782,25 @@ class MexcClient:
         type: 1 limit, 5 market (see MEXC docs)
         openType: 1 isolated, 2 cross
         """
+        symbol = body.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise MexcError("order symbol must be a non-empty string")
         data = await self._request(
             "POST",
             "/api/v1/private/order/create",
             json_body=body,
             private=True,
         )
-        return data if isinstance(data, dict) else {"data": data}
+
+        if isinstance(data, dict):
+            for key in ("orderId", "order_id", "oid"):
+                if _mexc_positive_order_id(data.get(key)):
+                    return data
+        elif _mexc_positive_order_id(data):
+            # Normalize MEXC's documented scalar create response to the same
+            # shape consumed by cancellation and recovery code.
+            return {"orderId": data}
+        raise MexcError("uncertain order-create response shape", raw=data)
 
     async def cancel_order(
         self, body: dict[str, Any] | list[Any]
@@ -568,29 +810,103 @@ class MexcClient:
         Official body is often a list of order ids (max 50).
         Also accepts a dict wrapper if callers prefer that shape.
         """
-        return await self._request(
+        items = body if isinstance(body, list) else [body]
+        if not items:
+            raise MexcError("cancel request must not be empty")
+        requested: set[str] = set()
+        for item in items:
+            if isinstance(item, dict):
+                value = item.get("orderId")
+                if value is None:
+                    value = item.get("oid")
+            else:
+                value = item
+            if not _mexc_positive_order_id(value):
+                raise MexcError("cancel requires positive numeric order IDs")
+            requested.add(str(value))
+
+        data = await self._request(
             "POST",
             "/api/v1/private/order/cancel",
             json_body=body,
             private=True,
         )
+        if (
+            not isinstance(data, list)
+            or not data
+            or not all(isinstance(row, dict) for row in data)
+        ):
+            raise MexcError("uncertain cancel response shape", raw=data)
+        if any("orderId" not in row or "errorCode" not in row for row in data):
+            raise MexcError("cancel response row lacks orderId/errorCode", raw=data)
+        failed = next(
+            (
+                row
+                for row in data
+                if isinstance(row.get("errorCode"), bool)
+                or row.get("errorCode") not in (0, "0")
+            ),
+            None,
+        )
+        if failed is not None:
+            detail = failed.get("errorMsg") or failed.get("message") or "unknown"
+            raise MexcError(
+                f"cancel rejected: errorCode={failed.get('errorCode')} {detail}",
+                raw=data,
+            )
+
+        returned = {str(row["orderId"]) for row in data}
+        if not requested.issubset(returned):
+            raise MexcError("cancel response does not identify requested order(s)", raw=data)
+        return data
+
+    _OPEN_ORDERS_PAGE_SIZE = 100
+    _OPEN_ORDERS_MAX_PAGES = 5
 
     async def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """GET open orders — path per current MEXC futures docs."""
-        params: dict[str, Any] = {"page_num": 1, "page_size": 100}
-        if symbol:
-            params["symbol"] = symbol
-        data = await self._request(
-            "GET",
-            "/api/v1/private/order/list/open_orders",
-            params=params,
-            private=True,
-        )
-        if isinstance(data, dict) and "resultList" in data:
-            return list(data.get("resultList") or [])
-        if isinstance(data, list):
-            return data
-        return list(data or []) if data else []
+        """GET all open orders within the bounded MEXC paging window."""
+        rows: list[dict[str, Any]] = []
+        for page_num in range(1, self._OPEN_ORDERS_MAX_PAGES + 1):
+            params: dict[str, Any] = {
+                "page_num": page_num,
+                "page_size": self._OPEN_ORDERS_PAGE_SIZE,
+            }
+            if symbol:
+                params["symbol"] = symbol
+            data = await self._request(
+                "GET",
+                "/api/v1/private/order/list/open_orders",
+                params=params,
+                private=True,
+            )
+            if isinstance(data, dict) and isinstance(data.get("resultList"), list):
+                page_rows = data["resultList"]
+            elif isinstance(data, list):
+                page_rows = data
+            else:
+                raise MexcError("unrecognized open-orders response shape", raw=data)
+            if not all(isinstance(row, dict) for row in page_rows):
+                raise MexcError(
+                    "open-orders response contains a non-object row", raw=data
+                )
+            rows.extend(page_rows)
+            if len(page_rows) < self._OPEN_ORDERS_PAGE_SIZE:
+                if not symbol:
+                    return rows
+                wanted_symbol = str(symbol).strip().upper()
+                scoped_rows = []
+                for row in rows:
+                    symbol_raw = row.get("symbol")
+                    if symbol_raw is not None and not isinstance(symbol_raw, str):
+                        raise MexcError(
+                            "open-orders response contains an invalid symbol identity",
+                            raw=row,
+                        )
+                    row_symbol = (symbol_raw or "").strip().upper()
+                    if not row_symbol or row_symbol == wanted_symbol:
+                        scoped_rows.append(row)
+                return scoped_rows
+        raise MexcError("open-orders pagination exceeded safe page cap", raw=rows)
 
     # C3-01: page size / page cap for user_fills paging (mirrors the
     # history_orders pattern above — widen past a single page only as far as
@@ -610,8 +926,11 @@ class MexcClient:
         closed_pnl, oid, fee. Paged like history_orders (widen only as far
         as `limit` needs, capped at _FILLS_MAX_PAGES pages).
         """
-        page_size = min(max(int(limit), 1), self._FILLS_PAGE_SIZE)
+        requested_limit = max(int(limit), 1)
+        page_size = min(requested_limit, self._FILLS_PAGE_SIZE)
         raw_rows: list[Any] = []
+        out: list[dict[str, Any]] = []
+        wanted_symbol = str(symbol or "").strip().upper()
         for page_num in range(1, self._FILLS_MAX_PAGES + 1):
             params: dict[str, Any] = {"page_num": page_num, "page_size": page_size}
             if symbol:
@@ -622,45 +941,50 @@ class MexcClient:
                 params=params,
                 private=True,
             )
-            if isinstance(data, dict) and "resultList" in data:
-                page_rows = list(data.get("resultList") or [])
+            if isinstance(data, dict) and isinstance(data.get("resultList"), list):
+                page_rows = data["resultList"]
             elif isinstance(data, list):
                 page_rows = data
             else:
-                page_rows = [data] if data else []
+                raise MexcError("unrecognized user-fills response shape", raw=data)
             raw_rows.extend(page_rows)
-            if len(page_rows) < page_size or len(raw_rows) >= limit:
+            for row in page_rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    normalized = normalize_mexc_fill(row)
+                except (TypeError, ValueError):
+                    continue  # graceful degrade: skip, never fabricate a fill
+                if wanted_symbol and normalized["symbol"] != wanted_symbol:
+                    continue
+                out.append(normalized)
+            if len(out) >= requested_limit or len(page_rows) < page_size:
                 break
-
-        out: list[dict[str, Any]] = []
-        for row in raw_rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                out.append(normalize_mexc_fill(row))
-            except (TypeError, ValueError):
-                continue  # graceful degrade: skip, never fabricate a fill
+        else:
+            raise MexcError(
+                "user-fills pagination exceeded safe page cap", raw=raw_rows
+            )
         out.sort(key=lambda r: r["time"], reverse=True)
-        return out[: max(1, int(limit))]
+        return out[:requested_limit]
 
-    # Known MEXC futures stop/plan-order list paths across doc revisions.
-    # NEEDS LIVE VERIFICATION: tried in order, first that responds wins.
+    # Current official open TP/SL endpoint first. The only fallback is the
+    # official history endpoint constrained to unfinished rows; unfiltered
+    # history must never masquerade as live protection.
     _STOP_ORDER_PATHS = (
+        "/api/v1/private/stoporder/open_orders",
         "/api/v1/private/stoporder/list/orders",
-        "/api/v1/private/planorder/list/orders",
-        "/api/v1/private/stoporder/list/open_orders",
-        "/api/v1/private/stoporder/orders",
-        "/api/v1/private/planorder/orders",
     )
+    _STOP_ORDERS_PAGE_SIZE = 100
+    _STOP_ORDERS_MAX_PAGES = 5
 
     async def open_stop_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """GET open stop / plan orders.
 
-        The exact path varies by MEXC revision and is not guaranteed by a live
-        test here — try several known candidates and return the first that
-        answers with a RECOGNIZED order-list schema (a bare list, or a dict
-        containing "resultList" — an empty list/resultList is still trusted,
-        that's a genuine "no stop orders" answer).
+        Use the current official unpaged endpoint. If it is unavailable, the
+        official history endpoint is queried with ``is_finished=0`` and bounded
+        pagination. Return only a RECOGNIZED order-list schema (a bare list, or
+        a dict containing "resultList" — an empty list/resultList is still a
+        genuine "no stop orders" answer).
 
         A stale/deprecated endpoint that responds 2xx with an unrecognized
         shape (e.g. `{}` or `null` instead of erroring) is NOT proof of "no
@@ -669,35 +993,99 @@ class MexcClient:
         propagated (never a silent []) and the SL-verify path treats the check
         as UNKNOWN, never MISSING.
         """
-        params: dict[str, Any] = {"page_num": 1, "page_size": 100}
-        if symbol:
-            params["symbol"] = symbol
         last_err: MexcError | None = None
+        wanted_symbol = str(symbol or "").strip().upper()
 
-        # O-04: try the last-known-working path first (pure ordering hint —
-        # the fallback order over the remaining candidates is unchanged).
+        def _active(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            active = []
+            for row in rows:
+                state = _required_int(row.get("state"), "stop-order state")
+                if state not in (1, 2, 3, 4, 5):
+                    raise MexcError("stop-order state is outside the documented range")
+                if state == 1:
+                    active.append(row)
+            return active
+
+        def _scoped(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if not wanted_symbol:
+                return rows
+            scoped = []
+            for row in rows:
+                symbol_raw = row.get("symbol")
+                if symbol_raw is not None and not isinstance(symbol_raw, str):
+                    raise MexcError(
+                        "stop-order response contains an invalid symbol identity",
+                        raw=row,
+                    )
+                row_symbol = (symbol_raw or "").strip().upper()
+                if not row_symbol or row_symbol == wanted_symbol:
+                    scoped.append(row)
+            return scoped
+
         ordered_paths = list(self._STOP_ORDER_PATHS)
-        cached = self._stop_path_cache
-        if cached is not None and cached in ordered_paths:
-            ordered_paths.remove(cached)
-            ordered_paths.insert(0, cached)
 
         for path in ordered_paths:
+            is_current_open_endpoint = path == self._STOP_ORDER_PATHS[0]
+            params: dict[str, Any] = (
+                {}
+                if is_current_open_endpoint
+                else {
+                    "is_finished": 0,
+                    "page_num": 1,
+                    "page_size": self._STOP_ORDERS_PAGE_SIZE,
+                }
+            )
+            if symbol:
+                params["symbol"] = symbol
             try:
                 data = await self._request("GET", path, params=params, private=True)
             except MexcError as e:
                 last_err = e
                 continue
-            if isinstance(data, dict) and "resultList" in data:
-                self._stop_path_cache = path
-                return list(data.get("resultList") or [])
-            if isinstance(data, list):
-                self._stop_path_cache = path
-                return data
-            # Unrecognized schema — do not trust as "no stop orders"; the
-            # endpoint may be stale/deprecated. Keep trying other candidates.
-            last_err = MexcError(
-                f"unrecognized stop-order response shape from {path}", raw=data
+            if isinstance(data, dict) and isinstance(data.get("resultList"), list):
+                first_page = data["resultList"]
+            elif isinstance(data, list):
+                first_page = data
+            else:
+                last_err = MexcError(
+                    f"unrecognized stop-order response shape from {path}", raw=data
+                )
+                continue
+            if not all(isinstance(row, dict) for row in first_page):
+                last_err = MexcError(
+                    f"unrecognized stop-order response shape from {path}", raw=data
+                )
+                continue
+
+            # A recognized first page selects the authoritative candidate for
+            # this read. Any later failure must propagate: falling back to an
+            # empty response from a different endpoint would turn UNKNOWN into
+            # a false "no stop orders" result.
+            rows = list(first_page)
+            if is_current_open_endpoint or len(first_page) < self._STOP_ORDERS_PAGE_SIZE:
+                return _scoped(_active(rows))
+            for page_num in range(2, self._STOP_ORDERS_MAX_PAGES + 1):
+                params["page_num"] = page_num
+                data = await self._request("GET", path, params=params, private=True)
+                if isinstance(data, dict) and isinstance(
+                    data.get("resultList"), list
+                ):
+                    page_rows = data["resultList"]
+                elif isinstance(data, list):
+                    page_rows = data
+                else:
+                    raise MexcError(
+                        f"unrecognized stop-order response shape from {path}", raw=data
+                    )
+                if not all(isinstance(row, dict) for row in page_rows):
+                    raise MexcError(
+                        f"unrecognized stop-order response shape from {path}", raw=data
+                    )
+                rows.extend(page_rows)
+                if len(page_rows) < self._STOP_ORDERS_PAGE_SIZE:
+                    return _scoped(_active(rows))
+            raise MexcError(
+                f"stop-order pagination exceeded safe page cap for {path}", raw=rows
             )
         if last_err is not None:
             raise last_err
@@ -719,11 +1107,25 @@ class MexcClient:
         a transport timeout during a close can be recovered/looked-up
         unambiguously via ``order_by_external_oid`` instead of guessing.
         """
-        mexc_side = 4 if side == "long" else 2
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise MexcError("close symbol is required")
+        if (
+            isinstance(open_type, bool)
+            or not isinstance(open_type, int)
+            or open_type not in (1, 2)
+        ):
+            raise MexcError("openType must be 1 (isolated) or 2 (cross)")
+        close_side = str(side or "").strip().lower()
+        if close_side not in ("long", "short"):
+            raise MexcError(f"close side must be long/short, got {side!r}")
+        close_vol = _required_finite_float(vol, "close volume")
+        if close_vol <= 0:
+            raise MexcError("close volume must be > 0")
+        mexc_side = 4 if close_side == "long" else 2
         body = {
             "symbol": symbol,
             "price": 0,
-            "vol": vol,
+            "vol": close_vol,
             "side": mexc_side,
             "type": 5,
             "openType": open_type,
@@ -765,16 +1167,14 @@ class MexcClient:
                 )
             except MexcError:
                 break
-            if isinstance(data, dict) and "resultList" in data:
-                rows = data.get("resultList") or []
+            if isinstance(data, dict) and isinstance(data.get("resultList"), list):
+                rows = data["resultList"]
             elif isinstance(data, list):
                 rows = data
             else:
-                rows = [data] if data else []
+                break
             for r in rows:
-                if isinstance(r, dict) and str(
-                    r.get("externalOid") or r.get("external_oid") or ""
-                ) == str(external_oid):
+                if _mexc_recovery_identity_matches(r, symbol, external_oid):
                     return r
             if len(rows) < self._HISTORY_PAGE_SIZE:
                 break  # short page — no more data to page through
@@ -798,16 +1198,15 @@ class MexcClient:
         absent from BOTH lists during MEXC's index-lag window; a premature `{}`
         would send the caller to a hard error → re-preview → double position.
 
-        X2-04 STATE-FILTER: a match is only reported LIVE when its MEXC order
-        `state` is not terminal-dead — cancelled(4)/invalid(5) → `{}`, so a
-        cancelled order is never reported "recovered". Unknown/missing state is
-        NOT treated as dead (over-rejecting a genuine fill would reopen X2-03).
+        X2-04 STATE-FILTER: cancelled(4)/invalid(5) is terminal-dead only when
+        `dealVol` explicitly proves zero fill. A positive, missing or malformed
+        fill cannot be discarded because a partial position may already exist.
 
         Every live match is tagged with a marker so a later reconciliation step
         can tell WHERE the order was found:
             {"match": "direct"|"history"|"open", "externalOid": external_oid, "order": <raw>}
-        ("direct" = guessed direct-lookup endpoint — weaker, substring-based
-        evidence than the paged/field-filtered history list.)
+        ("direct" = guessed direct-lookup endpoint with an exact oid-field
+        match; history/open use the same exact field comparison.)
         No live match anywhere -> `{}` (fail-closed: never a fabricated match).
         """
         try:
@@ -819,11 +1218,10 @@ class MexcClient:
             )
         except MexcError:
             direct = None
-        # Fail-closed: only trust the direct answer if OUR oid actually appears
-        # in the raw payload — the wrapper below injects externalOid itself, so
-        # without this check a garbage/unrelated 2xx response would fabricate a
-        # "match" that the caller can no longer detect as bogus.
-        if direct and str(external_oid) in str(direct):
+        # Trust only an exact oid field, never a substring in unrelated
+        # diagnostic text. The wrapper below injects the oid, so a false match
+        # here would otherwise look like a recovered live order to the caller.
+        if _mexc_recovery_identity_matches(direct, symbol, external_oid):
             if _mexc_state_is_dead(direct):
                 return {}  # X2-04: cancelled/invalid — not live
             return {"match": "direct", "externalOid": external_oid, "order": direct}
@@ -846,9 +1244,7 @@ class MexcClient:
             except MexcError:
                 open_rows = []
             for r in open_rows:
-                if isinstance(r, dict) and str(
-                    r.get("externalOid") or r.get("external_oid") or ""
-                ) == str(external_oid):
+                if _mexc_recovery_identity_matches(r, symbol, external_oid):
                     if _mexc_state_is_dead(r):
                         return {}  # X2-04
                     return {"match": "open", "externalOid": external_oid, "order": r}
@@ -862,15 +1258,14 @@ class MexcClient:
 
 
 # MEXC futures order-state codes: 1=uninformed, 2=uncompleted, 3=completed,
-# 4=cancelled, 5=invalid. X2-04: a recovery match may only be reported LIVE for
-# the non-terminal-dead states. Only an EXPLICIT cancelled/invalid marker kills a
-# match — unknown/missing state is NOT dead (over-rejecting a genuine index-lag
-# fill would reopen X2-03: hard error → re-preview → double position).
+# 4=cancelled, 5=invalid. A terminal marker alone cannot prove zero fill:
+# `dealVol` must also be present, finite and zero. Otherwise the order may have
+# partially filled before cancellation and must continue through protection.
 _MEXC_DEAD_STATES = frozenset({"4", "5", "cancelled", "canceled", "invalid"})
 
 
 def _mexc_state_is_dead(row: Any) -> bool:
-    """True only if `row` carries an explicit MEXC cancelled(4)/invalid(5) state."""
+    """True only for an explicitly terminal MEXC order with a proven zero fill."""
     if not isinstance(row, dict):
         return False
     raw = row.get("state")
@@ -880,7 +1275,41 @@ def _mexc_state_is_dead(row: Any) -> bool:
         raw = row.get("order_state")
     if raw is None:
         return False
-    return str(raw).strip().lower() in _MEXC_DEAD_STATES
+    if str(raw).strip().lower() not in _MEXC_DEAD_STATES:
+        return False
+    deal_raw = row.get("dealVol")
+    if deal_raw is None:
+        deal_raw = row.get("deal_vol")
+    deal = _opt_float(deal_raw)
+    return deal is not None and 0 <= deal <= 1e-12
+
+
+def _mexc_positive_order_id(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        return value.isdigit() and int(value) > 0
+    return False
+
+
+def _mexc_recovery_identity_matches(
+    row: Any, symbol: str, external_oid: str
+) -> bool:
+    """Require a concrete order ID, exact externalOid and no symbol conflict."""
+    if not isinstance(row, dict):
+        return False
+    row_oid = row.get("externalOid") or row.get("external_oid")
+    if row_oid is None or str(row_oid) != str(external_oid):
+        return False
+    order_id = row.get("orderId")
+    if order_id is None:
+        order_id = row.get("order_id") or row.get("oid")
+    if not _mexc_positive_order_id(order_id):
+        return False
+    row_symbol = row.get("symbol")
+    return row_symbol is None or str(row_symbol).upper() == str(symbol).upper()
 
 
 def _opt_float(v: Any) -> float | None:
@@ -889,19 +1318,46 @@ def _opt_float(v: Any) -> float | None:
     im/marginRatio/funding fields. A bare `float(v)` raises ValueError on ""
     (or on garbage), which is not a MexcError and escapes the ExchangeError
     handlers upstream — degrade to None instead of crashing the poll cycle."""
-    if v is None or v == "":
+    if v is None or v == "" or isinstance(v, bool):
         return None
     try:
-        return float(v)
+        value = float(v)
     except (TypeError, ValueError):
         return None
+    return value if math.isfinite(value) else None
+
+
+def _required_finite_float(v: Any, field: str) -> float:
+    """Parse a required exchange number and keep failures in adapter semantics."""
+    if isinstance(v, bool):
+        raise MexcError(f"{field} is not numeric")
+    try:
+        value = float(v)
+    except (TypeError, ValueError) as exc:
+        raise MexcError(f"{field} is not numeric") from exc
+    if not math.isfinite(value):
+        raise MexcError(f"{field} is non-finite")
+    return value
+
+
+def _required_int(v: Any, field: str) -> int:
+    if v is None or v == "":
+        raise MexcError(f"{field} is not an integer")
+    raw = v
+    if isinstance(raw, bool):
+        raise MexcError(f"{field} is not an integer")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    raise MexcError(f"{field} is not an integer")
 
 
 def _opt_int(v: Any) -> int | None:
     """int(v) or None — same "" / garbage guard as `_opt_float`, for the raw
     int(...) timestamp/cycle fields (timestamp, collectCycle, nextSettleTime)
     that previously only checked `is not None`."""
-    if v is None or v == "":
+    if v is None or v == "" or isinstance(v, bool):
         return None
     try:
         return int(v)
@@ -924,14 +1380,17 @@ _MEXC_FILL_DIR = {
 
 
 def _first_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
-    """First present, non-null, numeric-parseable value across candidate
-    field names (MEXC doc revisions vary the exact key)."""
+    """First present finite numeric value across candidate field names."""
     for k in keys:
         if k in row and row[k] is not None:
+            if isinstance(row[k], bool):
+                continue
             try:
-                return float(row[k])
+                value = float(row[k])
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(value):
+                return value
     return None
 
 
@@ -945,23 +1404,39 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
     px = _first_float(row, ("price", "dealPrice", "avgPrice"))
     sz = _first_float(row, ("vol", "dealVol", "dealVolume"))
     t = _first_float(row, ("timestamp", "dealTime", "createTime", "time"))
-    if px is None or sz is None or t is None:
-        raise ValueError("MEXC deal row missing px/sz/time")
+    symbol_raw = row.get("symbol")
+    symbol = symbol_raw.strip() if isinstance(symbol_raw, str) else ""
+    if (
+        not symbol
+        or px is None
+        or px <= 0
+        or sz is None
+        or sz <= 0
+        or t is None
+        or t <= 0
+    ):
+        raise ValueError("MEXC deal row has invalid symbol/px/sz/time")
 
     side_i: int | None
-    try:
-        side_i = int(row.get("side"))
-    except (TypeError, ValueError):
+    if isinstance(row.get("side"), bool):
+        side_i = None
+    elif isinstance(row.get("side"), int):
+        side_i = row["side"]
+    elif isinstance(row.get("side"), str) and row["side"].isdigit():
+        side_i = int(row["side"])
+    else:
         side_i = None
     # MEXC side 1 (open long) / 2 (close short) both execute as a buy;
     # 3 (open short) / 4 (close long) both execute as a sell — mirrors
     # Hyperliquid's literal B/S trade-side semantics, not open/close intent.
-    side = "sell" if side_i in (3, 4) else "buy"
+    if side_i not in _MEXC_FILL_DIR:
+        raise ValueError("MEXC deal row has invalid side")
+    side = "buy" if side_i in (1, 2) else "sell"
 
     closed_pnl = _first_float(row, ("profit", "closedPnl", "realizedPnl"))
 
     return {
-        "symbol": str(row.get("symbol") or ""),
+        "symbol": symbol,
         "px": px,
         "sz": sz,
         "side": side,
@@ -970,20 +1445,15 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
         # ms -> defensiv durch _to_ms, damit ein Sekunden-Payload die Marker
         # nicht still auf 1970 setzt.
         "time": _to_ms(t),
-        "dir": _MEXC_FILL_DIR.get(side_i or -1, ""),
+        "dir": _MEXC_FILL_DIR[side_i],
         "closed_pnl": closed_pnl,
-        "oid": row.get("orderId"),
-        "fee": _first_float(row, ("fee",)) or 0.0,
+        "oid": None if isinstance(row.get("orderId"), bool) else row.get("orderId"),
+        "fee": (
+            0.0
+            if row.get("fee") in (None, "")
+            else _first_float(row, ("fee",))
+        ),
     }
-
-
-def _f(v: Any, default: float = 0.0) -> float:
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
 
 
 def usdt_balances(assets: list[dict[str, Any]]) -> tuple[float, float]:
@@ -991,11 +1461,19 @@ def usdt_balances(assets: list[dict[str, Any]]) -> tuple[float, float]:
     usdt: dict[str, Any] | None = None
     for row in assets:
         if str(row.get("currency") or "").upper() == "USDT":
+            if usdt is not None:
+                raise MexcError("multiple USDT account rows are ambiguous")
             usdt = row
-            break
     if usdt is None:
         return 0.0, 0.0
-    return _f(usdt.get("equity")), _f(usdt.get("availableBalance"))
+    equity_raw = usdt.get("equity")
+    available_raw = usdt.get("availableBalance")
+    if isinstance(equity_raw, bool) or isinstance(available_raw, bool):
+        raise MexcError("account balance contains a boolean numeric value")
+    return (
+        _required_finite_float(equity_raw, "account equity"),
+        _required_finite_float(available_raw, "account available balance"),
+    )
 
 
 def map_position(row: dict[str, Any], contract_size: float = 1.0) -> dict[str, Any]:
@@ -1010,17 +1488,17 @@ def map_position(row: dict[str, Any], contract_size: float = 1.0) -> dict[str, A
     is coin-denominated).
     """
     pt = row.get("positionType")
-    if pt == 1:
+    if not isinstance(pt, bool) and pt == 1:
         side = "long"
-    elif pt == 2:
+    elif not isinstance(pt, bool) and pt == 2:
         side = "short"
     else:
         side = str(pt) if pt is not None else None
 
     ot = row.get("openType")
-    if ot == 1:
+    if not isinstance(ot, bool) and ot == 1:
         open_type = "isolated"
-    elif ot == 2:
+    elif not isinstance(ot, bool) and ot == 2:
         open_type = "cross"
     else:
         open_type = ot
@@ -1028,23 +1506,36 @@ def map_position(row: dict[str, Any], contract_size: float = 1.0) -> dict[str, A
     entry = row.get("holdAvgPrice")
     if entry is None:
         entry = row.get("openAvgPrice")
+    leverage = _opt_float(row.get("leverage"))
+    if leverage is not None and leverage <= 0:
+        leverage = None
+    liquidation_price = _opt_float(row.get("liquidatePrice"))
+    if liquidation_price is not None and liquidation_price <= 0:
+        liquidation_price = None
+    initial_margin = _opt_float(row.get("im"))
+    if initial_margin is not None and initial_margin <= 0:
+        initial_margin = None
 
     return {
         "position_id": row.get("positionId"),
         "symbol": row.get("symbol"),
         "side": side,
         "position_type": pt,
-        "hold_vol": _f(row.get("holdVol")),
-        "entry_price": _f(entry),
-        "leverage": row.get("leverage"),
+        "hold_vol": _opt_float(row.get("holdVol")),
+        "entry_price": _opt_float(entry),
+        "leverage": leverage,
         "open_type": open_type,
-        "unrealized_pnl": _f(row.get("unRealizedPnl")),
-        "realised": _f(row.get("realised")),
-        "liquidate_price": _opt_float(row.get("liquidatePrice")),
-        "im": _opt_float(row.get("im")),
+        "unrealized_pnl": _opt_float(row.get("unRealizedPnl")),
+        "realised": _opt_float(row.get("realised")),
+        "liquidate_price": liquidation_price,
+        "im": initial_margin,
         "margin_ratio": _opt_float(row.get("marginRatio")),
         "state": row.get("state"),
-        "contract_size": float(contract_size) if contract_size else 1.0,
+        "contract_size": (
+            value
+            if (value := _opt_float(contract_size)) is not None and value > 0
+            else None
+        ),
     }
 
 

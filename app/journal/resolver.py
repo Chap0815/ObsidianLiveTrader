@@ -5,11 +5,10 @@ it only decides whether a proposal's tp1 or stop-loss would have been touched
 by subsequent price action, to measure the KI's raw call quality.
 
 SHADOW-FILL SIMPLIFICATION (documented so the stats are never misread as real
-PnL): the eval assumes the trade filled at EXACTLY entry_price at proposal time
-t0, regardless of whether price ever traded back to a limit entry. There are NO
-fees, funding, or slippage in realized_r, and only tp1 is tracked (not tp2/tp3,
-partial scale-outs, or SL-to-BE management). A +2R shadow win is gross, not net,
-and measures the level thesis — not achievable fills.
+PnL): market entries fill on the first post-t0 bar; limits fill only when a bar
+trades through entry_price. Every modeled fill uses EXACTLY entry_price.
+``realized_r`` is gross; ``realized_r_net`` subtracts a flat fee/slippage model.
+Funding, tp2/tp3, partial scale-outs and SL-to-BE management are not modeled.
 
 Intrabar ambiguity: when tp1 and sl fall inside the SAME candle we cannot know
 which was hit first, so we resolve PESSIMISTICALLY to LOSS (ambiguous=1). This
@@ -126,6 +125,15 @@ def geometry_ok(
         return False
     if entry_price is None or stop_loss is None or tp1 is None:
         return False
+    levels = (entry_price, stop_loss, tp1)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+        for value in levels
+    ):
+        return False
     if direction == "long":
         return tp1 > entry_price and stop_loss < entry_price
     return tp1 < entry_price and stop_loss > entry_price
@@ -228,14 +236,29 @@ def resolve_entry(
     all_candles = list(candles)
 
     t0_ms = _parse_iso_ms(created_at)
+    deadline_ms = t0_ms + int(max(0.0, float(window_s)) * 1000)
     reward = abs(tp1 - entry_price)
     risk = abs(entry_price - stop_loss)
     # geometry_ok guarantees risk > 0, but stay defensive.
     realized_win_r = (reward / risk) if risk > 0 else None
 
-    # Chronological scan of candles at/after t0.
+    # Never infer a terminal outcome when the fetched history does not reach
+    # the proposal time. A later TP/SL candle alone is not proof that an entry
+    # filled or survived unseen earlier candles.
+    candle_times = [_field(c, "time") for c in all_candles]
+    earliest = min(candle_times) if candle_times else None
+    covers_t0 = earliest is not None and earliest <= t0_ms
+    if not covers_t0:
+        return Outcome(status=PENDING)
+
+    # Scan only the contractual resolution window. Candles after the deadline
+    # must never retroactively turn an expired setup into a WIN or LOSS.
     ordered = sorted(
-        (c for c in all_candles if _field(c, "time") >= t0_ms),
+        (
+            c
+            for c in all_candles
+            if t0_ms <= _field(c, "time") < deadline_ms
+        ),
         key=lambda c: _field(c, "time"),
     )
 
@@ -284,13 +307,9 @@ def resolve_entry(
     # PENDING so the next cycle (with a wider/fresh fetch) gets another chance.
     elapsed = (now - _created_dt(created_at)).total_seconds()
     if elapsed >= window_s:
-        candle_times = [_field(c, "time") for c in all_candles]
-        earliest = min(candle_times) if candle_times else None
-        covers_t0 = earliest is not None and earliest <= t0_ms
-        if covers_t0:
-            # Entry never touched over a fully-covered, elapsed window -> the
-            # limit never filled. A filled-but-untouched-TP/SL entry -> EXPIRED.
-            return Outcome(status=NO_FILL if fill_index is None else EXPIRED)
+        # Entry never touched over a fully-covered, elapsed window -> the
+        # limit never filled. A filled-but-untouched-TP/SL entry -> EXPIRED.
+        return Outcome(status=NO_FILL if fill_index is None else EXPIRED)
     return Outcome(status=PENDING)
 
 
@@ -381,34 +400,39 @@ async def resolve_pending_once(
         stale_horizon_s = _stale_horizon_s(tf)
         for row in grp:
             try:
-                outcome = resolve_entry(
-                    direction=row.get("direction"),
-                    entry_price=row.get("entry_price"),
-                    stop_loss=row.get("stop_loss"),
-                    tp1=row.get("tp1"),
-                    created_at=row["created_at"],
-                    candles=candles,
-                    now=now,
-                    window_s=eff_window_s,
-                    # Lern-Loop fix: order_type ('market'|'limit') is now
-                    # persisted on the journal row (derived geometrically at
-                    # analyze time, see _journal_order_type in app/main.py) and
-                    # surfaced by pending_journal_entries. A 'market' entry fills
-                    # at t0/index 0 (a no-pullback momentum winner resolves WIN
-                    # instead of being dropped as NO_FILL); a 'limit' entry still
-                    # fills only when a candle straddles entry_price. Legacy rows
-                    # (NULL order_type) keep the conservative LIMIT modeling.
-                    order_type=row.get("order_type"),
-                )
+                try:
+                    _parse_iso_ms(row["created_at"])
+                except (TypeError, ValueError, OverflowError, OSError):
+                    # A corrupt/legacy t0 can never gain candle coverage. Leave
+                    # the measurement out of all outcome statistics instead of
+                    # retrying the same permanently unresolvable row forever.
+                    outcome = Outcome(status=SKIPPED)
+                else:
+                    outcome = resolve_entry(
+                        direction=row.get("direction"),
+                        entry_price=row.get("entry_price"),
+                        stop_loss=row.get("stop_loss"),
+                        tp1=row.get("tp1"),
+                        created_at=row["created_at"],
+                        candles=candles,
+                        now=now,
+                        window_s=eff_window_s,
+                        # Lern-Loop fix: order_type ('market'|'limit') is now
+                        # persisted on the journal row (derived geometrically at
+                        # analyze time, see _journal_order_type in app/main.py) and
+                        # surfaced by pending_journal_entries. A 'market' entry fills
+                        # at t0/index 0 (a no-pullback momentum winner resolves WIN
+                        # instead of being dropped as NO_FILL); a 'limit' entry still
+                        # fills only when a candle straddles entry_price. Legacy rows
+                        # (NULL order_type) keep the conservative LIMIT modeling.
+                        order_type=row.get("order_type"),
+                    )
                 # Defect E fix (b): a row this far stale can NEVER regain
                 # coverage back to t0 from a now-anchored, capped fetch -- the
                 # pure resolve_entry would (correctly, per its own contract)
-                # leave it PENDING forever. Force it to a terminal, non-WIN/
-                # LOSS status (reusing EXPIRED -- existing stats queries
-                # already filter on status IN ('WIN','LOSS') and a dedicated
-                # `expired` count, so this is excluded from win-rate/sum_r and
-                # surfaced honestly, not fabricated as a win or loss) so it
-                # exits the pending bucket and stops being re-fetched forever.
+                # leave it PENDING forever. Mark it SKIPPED (unresolvable) so it
+                # exits the work queue without pretending the unobserved setup
+                # was a fully covered, filled trade that merely expired.
                 if (
                     outcome.status == PENDING
                     and stale_horizon_s is not None
@@ -420,7 +444,7 @@ async def resolve_pending_once(
                     except Exception:
                         elapsed_row = 0.0
                     if elapsed_row > stale_horizon_s:
-                        outcome = Outcome(status=EXPIRED)
+                        outcome = Outcome(status=SKIPPED)
                 if outcome.status != PENDING:
                     await db.update_journal_outcome(
                         row["id"],

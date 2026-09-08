@@ -1,4 +1,4 @@
-# Local Futures Trader — PowerShell launcher (+ Setup-Assistent)
+# Local Futures Trader — PowerShell launcher (+ setup assistant)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -7,7 +7,12 @@ Write-Host "=== Local Futures Trader Launcher ===" -ForegroundColor Cyan
 
 $pyCmd = $null
 $pyArgs = @()
-if (Get-Command py -ErrorAction SilentlyContinue) {
+$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+  # Match start.bat: an existing project environment is self-sufficient and
+  # must not depend on a global Python still being present in PATH.
+  $pyCmd = $venvPython
+} elseif (Get-Command py -ErrorAction SilentlyContinue) {
   $pyCmd = "py"
   $pyArgs = @("-3")
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {

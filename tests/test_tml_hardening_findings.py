@@ -171,11 +171,11 @@ async def test_f1_heal_never_overwrites_a_real_r1(db_path):
 
 
 # ── FINDING 2: reset ONLY on a STABLE identity change, never on a rolling min ─
-async def _seed_f2(db):
+async def _seed_f2(db, *, opened_at=NOW_MS):
     await db.upsert_position_mgmt(
         "BTC_USDT", "long",
         entry_snap=100.0, initial_sl_snap=98.0, r1=2.0,
-        opened_at=NOW_MS, invalidation_price=None,
+        opened_at=opened_at, invalidation_price=None,
     )
     await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True, "auto_trail": True})
     await db.mark_be_done("BTC_USDT", "long")
@@ -186,7 +186,7 @@ async def _seed_f2(db):
 async def test_f2_hl_reopen_new_epoch_fill_resets(monkeypatch, db_path):
     db = Database(db_path)
     await db.init()
-    await _seed_f2(db)
+    await _seed_f2(db, opened_at=5000)
     _install_spy(monkeypatch)
     # Cycle A: epoch = newest Flat->Open fill @5000. mark 99 < entry so a reset
     # leaves high_water at entry (monotonic MAX can't re-inflate) → unambiguous.
@@ -203,6 +203,7 @@ async def test_f2_hl_reopen_new_epoch_fill_resets(monkeypatch, db_path):
     assert row["be_done"] == 0, "new trade-epoch fill must reset the BE latch"
     assert row["high_water"] == pytest.approx(100.0)
     assert row["armed_rules"] == {"auto_be": True, "auto_trail": True}
+    assert row["opened_at"] == 9000, "new trade epoch must reset the time-stop age"
 
 
 @pytest.mark.asyncio
@@ -254,7 +255,7 @@ async def test_f2_hl_add_on_fill_does_not_reset(monkeypatch, db_path):
 async def test_f2_mexc_position_id_change_resets(monkeypatch, db_path):
     db = Database(db_path)
     await db.init()
-    await _seed_f2(db)
+    await _seed_f2(db, opened_at=5000)
     _install_spy(monkeypatch)
     # Non-HL client (no place_stop_order) → signature = snapshot positionId.
     client = FakeClient([_pos(position_id=111)], mark=99.0, is_hl=False)
@@ -269,13 +270,14 @@ async def test_f2_mexc_position_id_change_resets(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 0, "a new MEXC positionId must reset the BE latch"
     assert row["high_water"] == pytest.approx(100.0)
+    assert row["opened_at"] == NOW_MS
 
 
 @pytest.mark.asyncio
 async def test_f2_mexc_stable_position_id_does_not_reset(monkeypatch, db_path):
     db = Database(db_path)
     await db.init()
-    await _seed_f2(db)
+    await _seed_f2(db, opened_at=5000)
     _install_spy(monkeypatch)
     client = FakeClient([_pos(position_id=111)], mark=99.0, is_hl=False)
     app = _make_app(db, client)
@@ -284,6 +286,7 @@ async def test_f2_mexc_stable_position_id_does_not_reset(monkeypatch, db_path):
     await monitor._run_one_cycle(app, NOW_MS)
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 1
+    assert row["opened_at"] == 5000
 
 
 # ── FINDING 3: minimum trail step (ATR fraction) suppresses micro-churn ───────

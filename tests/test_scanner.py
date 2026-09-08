@@ -33,6 +33,17 @@ def test_parse_scan_results_empty():
     assert parse_scan_results('{"results": []}') == []
 
 
+@pytest.mark.parametrize("bad_level", ["NaN", "Infinity", "-Infinity"])
+def test_parse_scan_results_coerces_nonfinite_key_level_to_none(bad_level):
+    text = (
+        '{"results":[{"symbol":"BTC","bias":"long","score":7,'
+        '"setup":"breakout","key_level":' + bad_level + "}]}"
+    )
+    out = parse_scan_results(text, {"BTC"})
+    assert len(out) == 1
+    assert out[0].key_level is None
+
+
 @pytest.mark.asyncio
 async def test_build_scan_contexts_survives_single_coin_failure():
     class FakeClient:
@@ -210,6 +221,8 @@ def test_scanner_prompt_carries_analyzer_non_negotiables():
     assert "RRR" in p
     assert "daily_stack" in p
     assert "score >= 5" in p  # L-02: floor decoupled from the against-daily cap (6)
+    assert "funding_extreme" in p and "funding_annualized" in p
+    assert "fundingExtreme" not in p and "fundingAnnualized" not in p
 
 
 def test_scanner_prompt_treats_against_daily_as_cap_not_reject():
@@ -353,6 +366,25 @@ def test_scanner_verdict_keeps_reason():
     assert "reason" not in out3
 
 
+def test_scanner_verdict_bounds_numeric_and_text_fields():
+    from app.llm.client import _sanitize_scanner_verdict
+
+    out = _sanitize_scanner_verdict(
+        {
+            "bias": "long",
+            "setup": "x" * 10_000,
+            "score": float("inf"),
+            "key_level": float("nan"),
+        }
+    )
+    assert out == {"bias": "long", "setup": "x" * 40}
+
+    booleans = _sanitize_scanner_verdict(
+        {"bias": "short", "score": True, "key_level": False}
+    )
+    assert booleans == {"bias": "short"}
+
+
 # --- S2-06: /api/scan must carry a scanned_at timestamp for staleness UI ---
 
 
@@ -410,6 +442,30 @@ def test_scan_response_has_scanned_at(monkeypatch):
     # distinct post-slice stage1_size (never larger than the universe).
     assert "universe_size" in data and "stage1_size" in data
     assert data["stage1_size"] <= data["universe_size"]
+
+
+def test_scan_rejects_invalid_interval_before_exchange_fanout(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import app
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    client = MagicMock()
+    client.market_overview = AsyncMock()
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        response = tc.post("/api/scan", json={"tf": "invalid", "htf": "1H"})
+
+    assert response.status_code == 422
+    client.market_overview.assert_not_awaited()
 
 
 def test_parse_scan_results_salvages_truncated_json():

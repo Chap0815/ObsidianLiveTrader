@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Ersteinrichtung — Obsidian Live Trader{% endblock %}
+{% block title %}First-time Setup — Obsidian Live Trader{% endblock %}
 
 {# S3-14: this page never touches the chart lib or the trading app bundle
    (store/utils/trade-math/api/app.js) — it's a standalone first-run form
@@ -10,9 +10,9 @@
 
 {% block body %}
   <div class="setup-banner" role="note">
-    <span class="arm-status" data-tip="Ersteinrichtung: Trading ist gesperrt, bis TRADING_ENABLED bewusst aktiviert wird.">
+    <span class="arm-status" data-tip="First-time setup: trading stays locked until you explicitly enable TRADING_ENABLED.">
       <span class="arm-dot" aria-hidden="true"></span>
-      <span class="arm-text">ERSTEINRICHTUNG · DISARMED</span>
+      <span class="arm-text">FIRST-TIME SETUP · DISARMED</span>
     </span>
   </div>
 
@@ -20,10 +20,10 @@
     <header class="setup-head">
       <span class="brand-mark" aria-hidden="true">◮</span>
       <div>
-        <h1>Obsidian Live Trader einrichten</h1>
+        <h1>Set up Obsidian Live Trader</h1>
         <p class="muted">
-          Ein paar Schritte, dann läuft alles. Deine Keys landen nur in der lokalen
-          <code>.env</code> auf diesem Rechner — nirgendwo sonst.
+          Complete these three short steps. Your keys are stored only in the local
+          <code>.env</code> file on this computer.
         </p>
       </div>
     </header>
@@ -32,45 +32,45 @@
 
       <!-- Schritt 1: Börse -->
       <section class="panel setup-section">
-        <div class="panel-head"><h2>1 · Börse</h2></div>
+        <div class="panel-head"><h2>1 · Exchange</h2></div>
         <div class="setup-body">
-          <div class="choice-grid" role="radiogroup" aria-label="Börse">
+          <div class="choice-grid" role="radiogroup" aria-label="Exchange">
             <label class="choice-card">
               <input type="radio" name="exchange" value="hl-testnet" checked />
               <span class="choice-title">Hyperliquid Testnet</span>
-              <span class="choice-desc">Empfohlen zum Start — Spielgeld, kein Risiko. Faucet auf app.hyperliquid-testnet.xyz.</span>
+              <span class="choice-desc">Recommended for your first run. Uses test funds; faucet available at app.hyperliquid-testnet.xyz.</span>
             </label>
             <label class="choice-card">
               <input type="radio" name="exchange" value="hl-mainnet" />
               <span class="choice-title">Hyperliquid Mainnet</span>
-              <span class="choice-desc">Echtes Geld. Nur wenn du den Flow schon kennst.</span>
+              <span class="choice-desc">Real funds. Use only after you have tested the full workflow.</span>
             </label>
             <label class="choice-card">
               <input type="radio" name="exchange" value="mexc" />
               <span class="choice-title">MEXC Futures</span>
-              <span class="choice-desc">USDT-M Perpetuals. API-Key nur mit Trade-Recht, ohne Withdraw.</span>
+              <span class="choice-desc">USDT-M perpetuals. Grant trading permission only; keep withdrawals disabled.</span>
             </label>
           </div>
 
           <div id="fields-hl" class="setup-fields">
             <label>
-              <span>Private Key (API/Agent-Wallet, beginnt mit 0x)</span>
+              <span>Private key (API/agent wallet, starts with 0x)</span>
               <span class="key-row">
                 <input type="password" id="hl-private-key" placeholder="0x…" spellcheck="false" />
-                <button type="button" class="btn-ghost key-eye" data-target="hl-private-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+                <button type="button" class="btn-ghost key-eye" data-target="hl-private-key" aria-label="Show or hide key">Show</button>
               </span>
               <small class="field-feedback" id="hl-private-key-fb" aria-live="polite"></small>
             </label>
             <label>
-              <span>Haupt-Wallet-Adresse <em class="label-note">nur bei Agent-Key nötig</em></span>
+              <span>Main wallet address <em class="label-note">usually required for agent keys</em></span>
               <input type="text" id="hl-account-address" placeholder="0x… (optional)" spellcheck="false" />
               <small class="field-feedback" id="hl-account-address-fb" aria-live="polite"></small>
             </label>
-            <p class="hint muted">Tipp: Lege in der Hyperliquid-UI unter „API" einen Agent-Key an — der kann handeln, aber nie abheben.</p>
+            <p class="hint muted">Tip: create an agent key under API in Hyperliquid. It can trade but cannot withdraw funds.</p>
           </div>
 
           <div id="fields-mainnet" class="setup-note setup-note-danger hidden">
-            <strong>Mainnet = echtes Geld.</strong> Zum Bestätigen tippe <code>MAINNET</code>:
+            <strong>Mainnet uses real funds.</strong> Type <code>MAINNET</code> to confirm:
             <label>
               <input type="text" id="mainnet-confirm" placeholder="MAINNET" spellcheck="false" autocomplete="off" />
             </label>
@@ -81,70 +81,70 @@
               <span>MEXC API Key</span>
               <span class="key-row">
                 <input type="password" id="mexc-api-key" spellcheck="false" />
-                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-key" aria-label="Show or hide key">Show</button>
               </span>
             </label>
             <label>
               <span>MEXC API Secret</span>
               <span class="key-row">
                 <input type="password" id="mexc-api-secret" spellcheck="false" />
-                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-secret" aria-label="Anzeigen/verbergen">Zeigen</button>
+                <button type="button" class="btn-ghost key-eye" data-target="mexc-api-secret" aria-label="Show or hide secret">Show</button>
               </span>
             </label>
-            <p class="hint muted">Im MEXC-Account: Trade erlauben, Withdraw/Transfer deaktivieren.</p>
+            <p class="hint muted">In MEXC, allow trading and disable withdrawals and transfers for this key.</p>
           </div>
         </div>
       </section>
 
       <!-- Schritt 2: KI -->
       <section class="panel setup-section">
-        <div class="panel-head"><h2>2 · KI-Analyse</h2></div>
+        <div class="panel-head"><h2>2 · AI Analysis</h2></div>
         <div class="setup-body">
           <label>
-            <span>Anbieter <em class="label-note">später im UI per Dropdown wechselbar</em></span>
+            <span>Provider <em class="label-note">you can switch it later from the dashboard</em></span>
             <select id="llm-provider">
               <option value="claude" selected>Claude Opus (Anthropic)</option>
               <option value="xai">Grok (xAI)</option>
               <option value="openai">Codex (OpenAI)</option>
-              <option value="ollama">Ollama — lokal, kein Key</option>
-              <option value="none">Ohne KI starten</option>
+              <option value="ollama">Ollama — local, no key required</option>
+              <option value="none">Start without AI</option>
             </select>
           </label>
           <label id="field-llm-key">
             <span id="llm-key-label">Anthropic API Key</span>
             <span class="key-row">
               <input type="password" id="llm-api-key" placeholder="sk-…" spellcheck="false" />
-              <button type="button" class="btn-ghost key-eye" data-target="llm-api-key" aria-label="Anzeigen/verbergen">Zeigen</button>
+              <button type="button" class="btn-ghost key-eye" data-target="llm-api-key" aria-label="Show or hide key">Show</button>
             </span>
           </label>
           <label id="field-llm-model">
-            <span>Modell</span>
+            <span>Model</span>
             <input type="text" id="llm-model" value="{{ default_models['claude'] }}" spellcheck="false" />
           </label>
           <div class="setup-row" id="field-llm-test">
-            <button type="button" id="btn-test-key" class="btn-ghost">Key testen</button>
+            <button type="button" id="btn-test-key" class="btn-ghost">Test connection</button>
             <span id="test-key-pill" class="pill hidden"></span>
           </div>
           <div id="fields-ollama" class="setup-fields hidden">
             <label>
-              <span>Ollama-Modell</span>
+              <span>Ollama model</span>
               <input type="text" id="ollama-model" value="{{ default_models['ollama'] }}" spellcheck="false" />
             </label>
-            <p class="hint muted">Voraussetzung: <code>ollama serve</code> läuft lokal (Port 11434).</p>
+            <p class="hint muted">Requirement: <code>ollama serve</code> must be running locally on port 11434.</p>
           </div>
           <label class="setup-check" id="field-include-account">
             <input type="checkbox" id="include-account" />
-            <span>Kontostand &amp; Positionen an die KI senden <em class="label-note">bessere Sizing-Vorschläge; bei Cloud-Anbietern verlassen diese Daten deinen Rechner — standardmäßig AUS</em></span>
+            <span>Send balance and positions to the AI <em class="label-note">may improve sizing suggestions; cloud providers receive this financial data. Off by default.</em></span>
           </label>
-          <p class="hint muted">Die KI schlägt nur vor — jede Order läuft durch die Risk-Gates und braucht dein Confirm.</p>
+          <p class="hint muted">AI output is advisory. Every order still passes the risk gates and requires your confirmation.</p>
         </div>
       </section>
 
       <!-- Schritt 3: Risiko -->
       <section class="panel setup-section">
-        <div class="panel-head"><h2>3 · Risiko-Profil</h2></div>
+        <div class="panel-head"><h2>3 · Risk Profile</h2></div>
         <div class="setup-body">
-          <div class="choice-grid" role="radiogroup" aria-label="Risiko-Profil">
+          <div class="choice-grid" role="radiogroup" aria-label="Risk profile">
             {# W3-09: Kartentexte serverseitig aus RISK_PROFILES generiert —
                nie wieder Drift zwischen angezeigtem und erzwungenem RRR/Cap. #}
             {% for card in risk_cards %}
@@ -156,36 +156,36 @@
             {% endfor %}
             <label class="choice-card">
               <input type="radio" name="risk_profile" value="custom" />
-              <span class="choice-title">Eigene Limits</span>
-              <span class="choice-desc">Alle Grenzen selbst setzen (fortgeschritten).</span>
+              <span class="choice-title">Custom limits</span>
+              <span class="choice-desc">Set every limit yourself (advanced).</span>
             </label>
           </div>
 
           <div id="fields-custom-risk" class="setup-grid hidden">
             <label>
-              <span>Max. Risiko pro Trade (% Equity)</span>
+              <span>Maximum risk per trade (% of equity)</span>
               <input type="number" id="risk-pct" value="1.0" min="0.1" max="50" step="0.1" />
             </label>
             <label>
-              <span>Max. Hebel</span>
+              <span>Maximum leverage</span>
               <input type="number" id="max-leverage" value="20" min="1" max="125" step="1" />
             </label>
             <label>
-              <span>Min. Chance/Risiko (RRR)</span>
+              <span>Minimum reward/risk ratio</span>
               <input type="number" id="min-rrr" value="2.0" min="1" max="10" step="0.1" />
             </label>
             <label>
-              <span>Harter Notional-Cap (% Equity) <em class="label-note">0 = aus</em></span>
+              <span>Hard notional cap (% of equity) <em class="label-note">0 = off</em></span>
               <input type="number" id="max-notional-pct" value="1000" min="0" max="100000" step="10" />
             </label>
             <label>
-              <span>Warnschwelle Ordergröße (USDT) <em class="label-note">kein harter Cap</em></span>
+              <span>Order size warning (USDT) <em class="label-note">not a hard cap</em></span>
               <input type="number" id="max-notional" value="500" min="0" step="10" />
             </label>
           </div>
           <p class="hint muted">
-            Presets werden serverseitig aus <code>RISK_PROFILE</code> erzwungen und sind
-            später in der <code>.env</code> änderbar.
+            The server enforces these presets through <code>RISK_PROFILE</code>.
+            You can change the setting later in <code>.env</code>.
           </p>
         </div>
       </section>
@@ -193,11 +193,11 @@
       <!-- Erweitert -->
       <section class="panel setup-section">
         <details>
-          <summary class="panel-head"><span class="panel-head-title">Erweitert (optional)</span></summary>
+          <summary class="panel-head"><span class="panel-head-title">Advanced (optional)</span></summary>
           <div class="setup-body">
             <div class="setup-grid">
               <label>
-                <span>Host <em class="label-note">nur loopback</em></span>
+                <span>Host <em class="label-note">loopback only</em></span>
                 <input type="text" id="host" value="127.0.0.1" spellcheck="false" />
               </label>
               <label>
@@ -206,23 +206,22 @@
               </label>
             </div>
             <p class="hint muted">
-              Ein hier geänderter Port greift erst beim nächsten Start (ein laufender
-              Server kann nicht neu binden). Bei Port-Konflikt beim Erst-Start:
-              <code>launch.py --port N</code>.
+              A changed port takes effect after the next restart. If the default port
+              is already in use on the first run, start with <code>launch.py --port N</code>.
             </p>
           </div>
         </details>
       </section>
 
       <div class="setup-note">
-        <strong>Sicherheit:</strong> Trading startet <strong>DISARMED</strong> — es kann
-        keine Order rausgehen, bis du bewusst <code>TRADING_ENABLED=true</code> in die
-        <code>.env</code> schreibst. Ein lokales API-Token wird automatisch generiert.
+        <strong>Safety:</strong> trading starts <strong>DISARMED</strong>. Orders remain
+        blocked until you explicitly set <code>TRADING_ENABLED=true</code> in
+        <code>.env</code>. A local API token is generated automatically.
       </div>
 
-      <button type="submit" id="btn-save" class="btn-submit">Konfiguration speichern &amp; starten</button>
+      <button type="submit" id="btn-save" class="btn-submit">Save configuration and open dashboard</button>
       <p id="setup-error" class="error-text hidden" role="alert"></p>
-      <p id="setup-ok" class="hint hidden">Gespeichert — Dashboard öffnet…</p>
+      <p id="setup-ok" class="hint hidden">Saved — opening the dashboard…</p>
     </form>
   </main>
 {% endblock %}
@@ -255,14 +254,14 @@
         $("fields-hl").classList.toggle("hidden", ex === "mexc");
         $("fields-mexc").classList.toggle("hidden", ex !== "mexc");
         $("fields-mainnet").classList.toggle("hidden", ex !== "hl-mainnet");
-        document.querySelectorAll('.choice-grid[aria-label="Börse"] .choice-card').forEach(function (c) {
+        document.querySelectorAll('.choice-grid[aria-label="Exchange"] .choice-card').forEach(function (c) {
           c.classList.toggle("active", c.querySelector("input").checked);
         });
       }
 
       function syncRisk() {
         $("fields-custom-risk").classList.toggle("hidden", currentRisk() !== "custom");
-        document.querySelectorAll('.choice-grid[aria-label="Risiko-Profil"] .choice-card').forEach(function (c) {
+        document.querySelectorAll('.choice-grid[aria-label="Risk profile"] .choice-card').forEach(function (c) {
           c.classList.toggle("active", c.querySelector("input").checked);
         });
       }
@@ -297,7 +296,7 @@
           if (!inp) return;
           var show = inp.type === "password";
           inp.type = show ? "text" : "password";
-          btn.textContent = show ? "Verbergen" : "Zeigen";
+          btn.textContent = show ? "Hide" : "Show";
         });
       });
 
@@ -313,8 +312,8 @@
           fb.style.color = ok ? "#3fae6b" : "#d9534f";
         });
       }
-      hexCheck("hl-private-key", "hl-private-key-fb", /^0x[0-9a-fA-F]{64}$/, "Erwartet: 0x + 64 Hex-Zeichen");
-      hexCheck("hl-account-address", "hl-account-address-fb", /^0x[0-9a-fA-F]{40}$/, "Erwartet: 0x + 40 Hex-Zeichen");
+      hexCheck("hl-private-key", "hl-private-key-fb", /^0x[0-9a-fA-F]{64}$/, "Expected: 0x followed by 64 hexadecimal characters");
+      hexCheck("hl-account-address", "hl-account-address-fb", /^0x[0-9a-fA-F]{40}$/, "Expected: 0x followed by 40 hexadecimal characters");
 
       function providerModel() {
         var p = $("llm-provider").value;
@@ -333,7 +332,7 @@
         var p = $("llm-provider").value;
         if (p === "none") return;
         var pill = $("test-key-pill");
-        showPill(pill, true, "teste…");
+        showPill(pill, true, "Testing…");
         try {
           var res = await fetch("/api/setup/test-provider", {
             method: "POST",
@@ -346,13 +345,13 @@
           });
           var data = await res.json().catch(function () { return {}; });
           if (!res.ok) {
-            showPill(pill, false, (data && data.detail) ? data.detail : "Fehler");
+            showPill(pill, false, (data && data.detail) ? data.detail : "Connection failed");
             return;
           }
           var ms = data.latency_ms != null ? " (" + data.latency_ms + " ms)" : "";
-          showPill(pill, !!data.ok, (data.detail || (data.ok ? "OK" : "Fehler")) + ms);
+          showPill(pill, !!data.ok, (data.detail || (data.ok ? "Connected" : "Connection failed")) + ms);
         } catch (err) {
-          showPill(pill, false, "Netzwerkfehler");
+          showPill(pill, false, "Network error");
         }
       });
 
@@ -393,21 +392,21 @@
         }
 
         if (ex !== "mexc" && !payload.hl_private_key) {
-          return fail("Hyperliquid Private Key fehlt.");
+          return fail("Enter a Hyperliquid private key.");
         }
         if (ex === "hl-mainnet" && payload.mainnet_confirm !== "MAINNET") {
-          return fail("Mainnet: Tippe MAINNET zum Bestätigen.");
+          return fail("Mainnet: type MAINNET to confirm real-funds mode.");
         }
         if (ex === "mexc" && (!payload.mexc_api_key || !payload.mexc_api_secret)) {
-          return fail("MEXC API Key und Secret werden benötigt.");
+          return fail("Enter both the MEXC API key and secret.");
         }
         if ((llm === "claude" || llm === "xai" || llm === "openai") && !payload.llm_api_key) {
-          return fail("API Key für den gewählten KI-Anbieter fehlt (oder wähle Ollama / Ohne KI).");
+          return fail("Enter an API key for the selected AI provider, or choose Ollama / Start without AI.");
         }
 
         var btn = $("btn-save");
         btn.disabled = true;
-        btn.textContent = "Speichere…";
+        btn.textContent = "Saving…";
         try {
           var res = await fetch("/api/setup", {
             method: "POST",
@@ -417,17 +416,17 @@
           var data = await res.json().catch(function () { return {}; });
           if (!res.ok) {
             var d = data && data.detail;
-            fail(typeof d === "string" ? d : JSON.stringify(d || "Speichern fehlgeschlagen"));
+            fail(typeof d === "string" ? d : JSON.stringify(d || "Could not save configuration"));
             btn.disabled = false;
-            btn.textContent = "Konfiguration speichern & starten";
+            btn.textContent = "Save configuration and open dashboard";
             return;
           }
           $("setup-ok").classList.remove("hidden");
           setTimeout(function () { window.location.href = "/"; }, 900);
         } catch (err) {
-          fail("Netzwerkfehler: " + (err && err.message ? err.message : err));
+          fail("Network error: " + (err && err.message ? err.message : err));
           btn.disabled = false;
-          btn.textContent = "Konfiguration speichern & starten";
+          btn.textContent = "Save configuration and open dashboard";
         }
       });
     })();

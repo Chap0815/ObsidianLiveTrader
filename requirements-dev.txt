@@ -1,4 +1,10 @@
 # Dev-only tooling — NOT installed at runtime.
 # Runtime dependencies live in requirements.lock; install those for the app.
 # For development/linting:  pip install -r requirements-dev.txt  then  ruff check .
+pytest==9.1.1
+pytest-asyncio==1.4.0
 ruff==0.15.22
+# Starlette TestClient backend; keeps the deprecated httpx fallback out of tests.
+httpx2==2.12.0
+# Optional offline UI regression runner: scripts/ui_smoke.py
+playwright==1.62.0

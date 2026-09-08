@@ -8,13 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MEXC_ALLOWED_HOSTS = frozenset(
-    {
-        "contract.mexc.com",
-        "api.mexc.com",
-        "futures.mexc.com",
-    }
-)
+MEXC_API_BASE_URL = "https://api.mexc.com"
+MEXC_ALLOWED_HOSTS = frozenset({"api.mexc.com"})
+MEXC_LEGACY_HOST = "contract.mexc.com"
 
 HL_ALLOWED_HOSTS = frozenset(
     {
@@ -42,7 +38,6 @@ RISK_PROFILES: dict[str, dict[str, object]] = {
         min_rrr=2.0,
         strict_rrr=True,
         strict_available_margin=True,
-        strict_aggregate_risk=True,
     ),
     # Default: freer size, moderate risk, RRR as warning only. Deliberately
     # does NOT set max_price_drift_pct — that field's own default (1.0) IS
@@ -88,7 +83,7 @@ class Settings(BaseSettings):
 
     mexc_api_key: str = ""
     mexc_api_secret: str = ""
-    mexc_base_url: str = "https://contract.mexc.com"
+    mexc_base_url: str = MEXC_API_BASE_URL
 
     # Hyperliquid (agent/API wallet private key 0x… — cannot withdraw)
     hl_private_key: str = ""
@@ -187,12 +182,6 @@ class Settings(BaseSettings):
     max_risk_pct: float = 5.0
     min_rrr: float = 1.5
     strict_rrr: bool = False
-    # R-07: aggregate (portfolio-wide) risk cap toggle + cap %. Off by default
-    # (balanced/free) so existing single-position gates keep behaving as
-    # before; conservative opts in. Consumed by the risk gates (Task 8), not
-    # this settings module — see aggregate_pos_risk_cap_pct_ok validator below.
-    strict_aggregate_risk: bool = False
-    aggregate_pos_risk_cap_pct: float = 2.0
     # Equity-relative position-size cap (hard): notional must stay under
     # equity × pct/100. 0 = off. Scales with the account (unlike a fixed USDT
     # cap) and stays fail-closed to known equity. Fat-finger guard, not a
@@ -307,6 +296,15 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("port")
+    @classmethod
+    def port_ok(cls, v: int) -> int:
+        if not (1024 <= int(v) <= 65_535):
+            raise ValueError(
+                f"PORT must be an integer in [1024, 65535] (got {v!r})"
+            )
+        return int(v)
+
     @field_validator("exchange")
     @classmethod
     def exchange_ok(cls, v: str) -> str:
@@ -386,11 +384,13 @@ class Settings(BaseSettings):
     def mexc_url_https_allowlist(cls, v: str) -> str:
         raw = (v or "").strip().rstrip("/")
         if not raw:
-            return "https://contract.mexc.com"
+            return MEXC_API_BASE_URL
         parsed = urlparse(raw)
         if parsed.scheme != "https":
             raise ValueError("MEXC_BASE_URL must use https://")
         host = (parsed.hostname or "").lower()
+        if host == MEXC_LEGACY_HOST:
+            return MEXC_API_BASE_URL
         if host not in MEXC_ALLOWED_HOSTS:
             raise ValueError(
                 f"MEXC_BASE_URL host {host!r} not in allowlist "
@@ -414,6 +414,26 @@ class Settings(BaseSettings):
                 f"{sorted(HL_ALLOWED_HOSTS)}"
             )
         return raw
+
+    @model_validator(mode="after")
+    def hl_network_matches_base_url(self) -> "Settings":
+        """Reject contradictory Hyperliquid network and endpoint settings."""
+        if not self.hl_base_url:
+            return self
+        host = (urlparse(self.hl_base_url).hostname or "").lower()
+        expected = (
+            "api.hyperliquid-testnet.xyz"
+            if self.hl_testnet
+            else "api.hyperliquid.xyz"
+        )
+        if host != expected:
+            network = "testnet" if self.hl_testnet else "mainnet"
+            raise ValueError(
+                f"HL_TESTNET selects {network}, but HL_BASE_URL points to "
+                f"{host!r}; expected {expected!r}. Refusing an ambiguous "
+                "Hyperliquid network configuration."
+            )
+        return self
 
     @field_validator("ollama_base_url")
     @classmethod
@@ -501,16 +521,6 @@ class Settings(BaseSettings):
         if not math.isfinite(v) or not (0 <= v <= 1000):
             raise ValueError(
                 f"MIN_RRR must be a finite number in [0, 1000] (got {v!r})"
-            )
-        return v
-
-    @field_validator("aggregate_pos_risk_cap_pct")
-    @classmethod
-    def aggregate_pos_risk_cap_pct_ok(cls, v: float) -> float:
-        if not math.isfinite(v) or not (0 < v <= 100):
-            raise ValueError(
-                "AGGREGATE_POS_RISK_CAP_PCT must be a finite number in "
-                f"(0, 100] (got {v!r})"
             )
         return v
 

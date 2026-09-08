@@ -1,5 +1,7 @@
 """Pure unit tests for technical indicators (no network)."""
 
+import math
+
 import pytest
 
 from app.analysis.indicators import (
@@ -149,6 +151,38 @@ def test_rvol_short_history_fallback():
     rvol, vol_trend = compute_rvol(candles)
     assert rvol == pytest.approx(1.0)
     assert vol_trend == "flat"
+
+
+def test_indicator_bundle_never_emits_nonfinite_derived_values():
+    candles = [
+        Candle(
+            time=i,
+            open=value,
+            high=value,
+            low=value,
+            close=value,
+            vol=value,
+        )
+        for i in range(61)
+        for value in [1e308 if i % 2 else 5e-324]
+    ]
+
+    bundle = indicator_bundle(candles)
+
+    def values(node):
+        if isinstance(node, dict):
+            for child in node.values():
+                yield from values(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from values(child)
+        else:
+            yield node
+
+    assert all(
+        not isinstance(value, float) or math.isfinite(value)
+        for value in values(bundle)
+    )
 
 
 # --- Task 16: intra-candle fix — bundle computes on CLOSED bars only ---------

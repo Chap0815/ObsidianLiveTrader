@@ -25,6 +25,209 @@ def _client(info: MagicMock) -> HyperliquidClient:
     return c
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_name", [True, 7, ["BTC"], {"coin": "BTC"}, "   "]
+)
+async def test_list_symbols_does_not_stringify_invalid_names(invalid_name):
+    info = MagicMock()
+    info.meta = MagicMock(
+        return_value={"universe": [{"name": "BTC"}, {"name": invalid_name}]}
+    )
+
+    assert await _client(info).list_symbols() == ["BTC"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_row", [{}, 7, None, "BTC"])
+async def test_list_symbols_skips_malformed_universe_rows(invalid_row):
+    info = MagicMock()
+    info.meta = MagicMock(
+        return_value={"universe": [{"name": "BTC"}, invalid_row]}
+    )
+
+    assert await _client(info).list_symbols() == ["BTC"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("universe", [{}, "bad", 7])
+async def test_list_symbols_rejects_malformed_universe_collection(universe):
+    info = MagicMock()
+    info.meta = MagicMock(return_value={"universe": universe})
+
+    with pytest.raises(HyperliquidError, match="metadata response"):
+        await _client(info).list_symbols()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, "bad", {"universe": "bad"}])
+async def test_malformed_metadata_is_not_cached_after_provider_recovers(malformed):
+    info = MagicMock()
+    info.meta = MagicMock(
+        side_effect=[malformed, {"universe": [{"name": "BTC"}]}]
+    )
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="metadata response"):
+        await client.list_symbols()
+
+    assert client._meta_cache is None
+    assert await client.list_symbols() == ["BTC"]
+    assert info.meta.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_metadata_cache_ttl_uses_monotonic_time(monkeypatch):
+    info = MagicMock()
+    info.meta = MagicMock(
+        side_effect=[
+            {"universe": [{"name": "BTC"}]},
+            {"universe": [{"name": "ETH"}]},
+        ]
+    )
+    client = _client(info)
+    fake_time = MagicMock()
+    fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
+    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 5_000.0])
+    monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
+
+    assert await client.list_symbols() == ["BTC"]
+    assert await client.list_symbols() == ["ETH"]
+    assert info.meta.call_count == 2
+
+
+def test_oi_history_sampling_uses_monotonic_time(monkeypatch):
+    client = _client(MagicMock())
+    fake_time = MagicMock()
+    fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
+    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 5_000.0])
+    monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
+
+    assert client._record_oi_and_change("BTC", 100.0) == (None, None)
+    change_1h, change_4h = client._record_oi_and_change("BTC", 200.0)
+
+    assert change_1h == 100.0
+    assert change_4h is None
+    assert client._oi_history["BTC"][-1][1] == 200.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mid", ["NaN", "Infinity"])
+async def test_ticker_rejects_nonfinite_mid_price(mid):
+    info = MagicMock()
+    info.all_mids = MagicMock(return_value={"BTC": mid})
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="Non-finite mid price"):
+        await client.ticker("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mid", [0, -1])
+async def test_ticker_rejects_nonpositive_mid_price(mid):
+    info = MagicMock()
+    info.all_mids = MagicMock(return_value={"BTC": mid})
+
+    with pytest.raises(HyperliquidError, match="mid price"):
+        await _client(info).ticker("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["o", "h", "l", "c", "v"])
+async def test_klines_reject_nonfinite_values(field):
+    row = {"t": 1_700_000_000_000, "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}
+    row[field] = "NaN"
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="Non-finite kline"):
+        await client.klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, None, ["not-a-candle"]])
+async def test_klines_reject_unrecognized_or_non_object_shapes(payload):
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=payload)
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="kline response"):
+        await client.klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("t", None),
+        ("t", 0),
+        ("o", None),
+        ("o", 0),
+        ("h", -1),
+        ("l", 0),
+        ("c", -1),
+        ("v", -1),
+    ],
+)
+async def test_klines_reject_missing_or_invalid_required_values(field, value):
+    row = {"t": 1_700_000_000_000, "o": 1, "h": 1, "l": 1, "c": 1, "v": 0}
+    row[field] = value
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="kline"):
+        await client.klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("h", 9), ("l", 11)])
+async def test_klines_reject_impossible_ohlc_geometry(field, value):
+    row = {"t": 1_700_000_000_000, "o": 10, "h": 11, "l": 9, "c": 10, "v": 1}
+    row[field] = value
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+
+    with pytest.raises(HyperliquidError, match="kline.*geometry"):
+        await _client(info).klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_normalize_provider_rows_to_chronological_order():
+    def row(timestamp, close):
+        return {"t": timestamp, "o": close, "h": close, "l": close, "c": close, "v": 1}
+
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(
+        return_value=[row(1_700_000_002_000, 12), row(1_700_000_001_000, 11)]
+    )
+
+    candles = await _client(info).klines("BTC", "15m")
+
+    assert [c.time for c in candles] == [1_700_000_001_000, 1_700_000_002_000]
+    assert candles[-1].close == 12
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_duplicate_timestamps():
+    def row(close):
+        return {
+            "t": 1_700_000_001_000,
+            "o": close,
+            "h": close,
+            "l": close,
+            "c": close,
+            "v": 1,
+        }
+
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row(11), row(12)])
+
+    with pytest.raises(HyperliquidError, match="duplicate kline timestamp"):
+        await _client(info).klines("BTC", "15m")
+
+
 # ── C-1: open_stop_orders must not silently fall back to a non-trigger endpoint ─
 
 
@@ -71,7 +274,160 @@ async def test_open_stop_orders_returns_triggers_on_recognized_list():
     out = await c.open_stop_orders("BTC")
     assert len(out) == 1
     assert out[0]["orderId"] == 5
-    assert out[0]["triggerPrice"] == "99000"
+    assert out[0]["triggerPrice"] == 99000.0
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_ignores_explicit_foreign_rows_before_validation():
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(
+        return_value=[
+            {
+                "coin": "BTC",
+                "oid": 5,
+                "isTrigger": True,
+                "orderType": "Stop Market",
+                "triggerPx": "99000",
+                "reduceOnly": True,
+            },
+            {
+                "coin": "ETH",
+                "oid": 6,
+                "isTrigger": "invalid",
+                "orderType": "Stop Market",
+                "triggerPx": "NaN",
+                "reduceOnly": "invalid",
+            },
+        ]
+    )
+
+    out = await _client(info).open_stop_orders("BTC")
+
+    assert [row["orderId"] for row in out] == [5]
+
+
+@pytest.mark.asyncio
+async def test_open_stop_orders_ignores_non_reduce_only_trigger():
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(
+        return_value=[
+            {
+                "coin": "BTC",
+                "oid": 5,
+                "isTrigger": True,
+                "orderType": "Stop Market",
+                "triggerPx": "99000",
+                "reduceOnly": False,
+            }
+        ]
+    )
+    c = _client(info)
+    assert await c.open_stop_orders("BTC") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"isTrigger": "false"},
+        {"reduceOnly": "true"},
+        {"triggerPx": "NaN"},
+        {"triggerPx": "Infinity"},
+        {"coin": ""},
+        {"coin": " "},
+        {"coin": True},
+        {"coin": 123},
+        {"oid": True},
+        {"oid": 0},
+    ],
+)
+async def test_open_stop_orders_rejects_malformed_protective_trigger(overrides):
+    row = {
+        "coin": "BTC",
+        "oid": 5,
+        "isTrigger": True,
+        "orderType": "Stop Market",
+        "triggerPx": "99000",
+        "reduceOnly": True,
+    }
+    row.update(overrides)
+    info = MagicMock()
+    info.frontend_open_orders = MagicMock(return_value=[row])
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="open_stop_orders"):
+        await c.open_stop_orders("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"coin": ""},
+        {"coin": " "},
+        {"coin": True},
+        {"coin": 123},
+        {"oid": None},
+        {"oid": True},
+        {"oid": 0},
+        {"side": "unknown"},
+        {"sz": "NaN"},
+        {"sz": "0"},
+        {"limitPx": "Infinity"},
+        {"limitPx": "0"},
+        {"reduceOnly": "false"},
+    ],
+)
+async def test_open_orders_rejects_malformed_rows(overrides):
+    row = {
+        "coin": "BTC",
+        "oid": 7,
+        "side": "B",
+        "sz": "0.01",
+        "limitPx": "60000",
+        "reduceOnly": False,
+    }
+    row.update(overrides)
+    info = MagicMock()
+    info.open_orders = MagicMock(return_value=[row])
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="open_orders"):
+        await c.open_orders("BTC")
+
+
+@pytest.mark.asyncio
+async def test_open_orders_normalizes_valid_row():
+    info = MagicMock()
+    info.open_orders = MagicMock(
+        return_value=[
+            {
+                "coin": "BTC",
+                "oid": 7,
+                "side": "B",
+                "sz": "0.01",
+                "limitPx": "60000",
+                "reduceOnly": False,
+            }
+        ]
+    )
+    c = _client(info)
+
+    row = (await c.open_orders("BTC"))[0]
+    assert row["orderId"] == 7
+    assert row["vol"] == 0.01
+    assert row["price"] == 60000.0
+    assert row["reduceOnly"] is False
+
+
+@pytest.mark.asyncio
+async def test_open_orders_rejects_unrecognized_response_shape():
+    info = MagicMock()
+    info.open_orders = MagicMock(return_value=None)
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="unrecognized shape"):
+        await c.open_orders("BTC")
 
 
 # ── SL-coverage: HL trigger rows must expose the closing size as `vol` (coins) ──
@@ -164,7 +520,15 @@ _DEGRADED_STATES = [
     [],
     {"foo": "bar"},
     {"marginSummary": {"accountValue": "1000"}},  # positions key missing
+    {"marginSummary": {"accountValue": "1000"}, "assetPositions": None},
     {"assetPositions": []},  # margin summary missing
+    {"marginSummary": {}, "assetPositions": []},
+    {"marginSummary": "invalid", "assetPositions": []},
+    {"marginSummary": {"accountValue": None}, "assetPositions": []},
+    {"marginSummary": {"accountValue": ""}, "assetPositions": []},
+    {"marginSummary": {"accountValue": True}, "assetPositions": []},
+    {"marginSummary": {"accountValue": "NaN"}, "assetPositions": []},
+    {"marginSummary": {"accountValue": "Infinity"}, "assetPositions": []},
 ]
 
 
@@ -199,6 +563,268 @@ async def test_assets_and_positions_ok_on_complete_state():
     assert await c.positions() == []
 
 
+def _state_with_open_position(**overrides):
+    position = {
+        "coin": "BTC",
+        "szi": "0.01",
+        "entryPx": "60000",
+        "unrealizedPnl": "5",
+        "liquidationPx": "45000",
+        "marginUsed": "60",
+        "leverage": {"value": 10, "type": "cross"},
+    }
+    position.update(overrides)
+    return {
+        "marginSummary": {
+            "accountValue": "1000",
+            "totalMarginUsed": "60",
+            "totalNtlPos": "600",
+        },
+        "withdrawable": "940",
+        "assetPositions": [{"position": position}],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("szi", None),
+        ("szi", "NaN"),
+        ("szi", "Infinity"),
+        ("entryPx", None),
+        ("entryPx", "NaN"),
+        ("entryPx", "0"),
+    ],
+)
+async def test_positions_reject_invalid_open_position_geometry(field, value):
+    state = _state_with_open_position(**{field: value})
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=state)
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="position"):
+        await c.positions(fresh=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", [None, "BTC"])
+@pytest.mark.parametrize("coin", ["", None, " ", True, 123])
+async def test_positions_reject_open_position_without_symbol(symbol, coin):
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_state_with_open_position(coin=coin))
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="position symbol"):
+        await c.positions(symbol, fresh=True)
+
+
+@pytest.mark.asyncio
+async def test_symbol_scoped_positions_ignore_explicit_foreign_invalid_row():
+    state = _state_with_open_position()
+    foreign = _state_with_open_position(coin="ETH", szi=None)["assetPositions"][0]
+    state["assetPositions"].append(foreign)
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=state)
+
+    rows = await _client(info).positions("BTC", fresh=True)
+
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "BTC"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "leverage",
+    [None, {}, {"type": "unknown", "value": 10}, {"type": True, "value": 10}, "isolated"],
+)
+async def test_positions_reject_missing_or_unknown_margin_mode(leverage):
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(leverage=leverage)
+    )
+
+    with pytest.raises(HyperliquidError, match="leverage type"):
+        await _client(info).positions(fresh=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, "NaN", "Infinity", 0, -1])
+async def test_positions_degrade_invalid_leverage_value_to_unknown(value):
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(
+            leverage={"type": "isolated", "value": value}
+        )
+    )
+
+    row = (await _client(info).positions(fresh=True))[0]
+
+    assert row["leverage"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("liquidation_price", [0, -1])
+async def test_positions_degrade_nonpositive_liquidation_price_to_unknown(
+    liquidation_price,
+):
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(liquidationPx=liquidation_price)
+    )
+
+    row = (await _client(info).positions(fresh=True))[0]
+
+    assert row["liquidatePrice"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("margin_used", [0, -1])
+async def test_positions_degrade_nonpositive_margin_used_to_unknown(margin_used):
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(marginUsed=margin_used)
+    )
+
+    row = (await _client(info).positions(fresh=True))[0]
+
+    assert row["im"] is None
+
+
+@pytest.mark.asyncio
+async def test_positions_drop_nonfinite_optional_finance_values():
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(
+            unrealizedPnl="NaN", liquidationPx="Infinity", marginUsed="-Infinity"
+        )
+    )
+    c = _client(info)
+
+    row = (await c.positions(fresh=True))[0]
+    assert row["unRealizedPnl"] is None
+    assert row["liquidatePrice"] is None
+    assert row["im"] is None
+
+
+@pytest.mark.asyncio
+async def test_positions_drop_boolean_optional_finance_values():
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value=_state_with_open_position(
+            unrealizedPnl=True, liquidationPx=True, marginUsed=True
+        )
+    )
+    c = _client(info)
+
+    row = (await c.positions(fresh=True))[0]
+    assert row["unRealizedPnl"] is None
+    assert row["liquidatePrice"] is None
+    assert row["im"] is None
+
+
+def _valid_fill(**overrides):
+    row = {
+        "coin": "BTC",
+        "px": "60000",
+        "sz": "0.01",
+        "side": "B",
+        "time": 1_700_000_000_000,
+        "dir": "Open Long",
+        "startPosition": "0",
+        "closedPnl": "0",
+        "fee": "0.1",
+        "oid": 42,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {}, "not-a-list"])
+async def test_user_fills_rejects_unrecognized_top_level_shape(payload):
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=payload)
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="user_fills.*unrecognized shape"):
+        await c.user_fills("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("coin", ""),
+        ("px", "NaN"),
+        ("px", "0"),
+        ("sz", "Infinity"),
+        ("sz", "0"),
+        ("side", "unknown"),
+        ("time", "NaN"),
+        ("time", 0),
+        ("time", True),
+    ],
+)
+async def test_user_fills_skips_invalid_required_fields(field, value):
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=[_valid_fill(**{field: value})])
+    c = _client(info)
+
+    assert await c.user_fills("BTC") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coin", [" ", True, 123])
+async def test_user_fills_unscoped_skips_invalid_coin_identity(coin):
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=[_valid_fill(coin=coin)])
+
+    assert await _client(info).user_fills() == []
+
+
+@pytest.mark.asyncio
+async def test_user_fills_drop_nonfinite_optional_values():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[
+            _valid_fill(
+                startPosition="NaN",
+                closedPnl="Infinity",
+                fee="-Infinity",
+            )
+        ]
+    )
+    c = _client(info)
+
+    row = (await c.user_fills("BTC"))[0]
+    assert row["start_position"] is None
+    assert row["closed_pnl"] is None
+    assert row["fee"] is None
+
+
+@pytest.mark.asyncio
+async def test_user_fills_drop_boolean_optional_values_and_oid():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[
+            _valid_fill(
+                startPosition=True,
+                closedPnl=True,
+                fee=True,
+                oid=True,
+            )
+        ]
+    )
+    c = _client(info)
+
+    row = (await c.user_fills("BTC"))[0]
+    assert row["start_position"] is None
+    assert row["closed_pnl"] is None
+    assert row["fee"] is None
+    assert row["oid"] is None
+
+
 # ── user_state short-TTL cache + 429 resilience (over-poll → 429 → 502 fix) ───
 
 
@@ -216,6 +842,28 @@ async def test_assets_and_positions_share_one_user_state_within_ttl():
 
 
 @pytest.mark.asyncio
+async def test_user_state_cache_ttl_uses_monotonic_time(monkeypatch):
+    newer_state = {
+        **_COMPLETE_STATE,
+        "marginSummary": {
+            **_COMPLETE_STATE["marginSummary"],
+            "accountValue": "2000",
+        },
+    }
+    info = MagicMock()
+    info.user_state = MagicMock(side_effect=[_COMPLETE_STATE, newer_state])
+    client = _client(info)
+    fake_time = MagicMock()
+    fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
+    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 5_000.0, 5_000.0])
+    monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
+
+    assert (await client.assets())[0]["equity"] == 1000.0
+    assert (await client.assets())[0]["equity"] == 2000.0
+    assert info.user_state.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_assets_positions_serve_stale_cache_on_429():
     """A warm cache older than the TTL but within the stale bound must be served
     when the refetch 429s — a transient rate-limit burst degrades to a slightly
@@ -226,7 +874,7 @@ async def test_assets_positions_serve_stale_cache_on_429():
     await c.assets()  # warm the cache (call_count == 1)
     # Age the cache past the TTL but within the stale bound, then 429 the refetch.
     ts, state, addr = c._user_state_cache
-    c._user_state_cache = (time.time() - 5.0, state, addr)
+    c._user_state_cache = (time.monotonic() - 5.0, state, addr)
     info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
     rows = await c.assets()
     assert rows[0]["equity"] == 1000.0  # stale equity served, no raise
@@ -255,7 +903,7 @@ async def test_assets_raises_when_cache_too_stale_on_error():
     c = _client(info)
     await c.assets()
     ts, state, addr = c._user_state_cache
-    c._user_state_cache = (time.time() - 30.0, state, addr)  # past MAX_STALE
+    c._user_state_cache = (time.monotonic() - 30.0, state, addr)  # past MAX_STALE
     info.user_state = MagicMock(side_effect=RuntimeError("429"))
     with pytest.raises(HyperliquidError):
         await c.assets()
@@ -432,7 +1080,11 @@ async def test_assets_fresh_fails_closed_on_429_despite_warm_cache(monkeypatch):
     c = _client(info)
     await c.assets()  # warm the cache
     ts, state, addr = c._user_state_cache
-    c._user_state_cache = (time.time() - 3.0, state, addr)  # aged past TTL, within 8s
+    c._user_state_cache = (
+        time.monotonic() - 3.0,
+        state,
+        addr,
+    )  # aged past TTL, within 8s
     info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
     # Contrast: a non-fresh read would serve the stale cache; fresh must fail closed.
     with pytest.raises(HyperliquidError):
@@ -490,7 +1142,14 @@ async def test_positions_fresh_bypasses_ttl_shortcircuit_and_fetches_live():
                           "totalNtlPos": "500"},
         "withdrawable": "1000",
         "assetPositions": [
-            {"position": {"coin": "BTC", "szi": "0.5", "entryPx": "100"}}
+            {
+                "position": {
+                    "coin": "BTC",
+                    "szi": "0.5",
+                    "entryPx": "100",
+                    "leverage": {"value": 5, "type": "isolated"},
+                }
+            }
         ],
     }
     info = MagicMock()
@@ -518,7 +1177,41 @@ async def test_assets_does_not_mislabel_notional_as_unrealized():
     assert row["notional_position"] == 500.0
 
 
+@pytest.mark.parametrize("withdrawable", [0, "0", None, "", -1])
+def test_assets_never_invents_available_balance_when_withdrawable_is_zero_or_missing(
+    withdrawable,
+):
+    row = HyperliquidClient._assets_from_state(
+        {
+            "marginSummary": {
+                "accountValue": "1000",
+                "totalMarginUsed": "50",
+                "totalNtlPos": "500",
+            },
+            "withdrawable": withdrawable,
+        }
+    )[0]
+
+    assert row["availableBalance"] == 0.0
+
+
 # ── O5: funding_rate reads from the ctx cache, no wasteful all_mids() ──────────
+
+
+def test_market_context_cache_ttl_uses_monotonic_time(monkeypatch):
+    first = ({"universe": [{"name": "BTC"}]}, [{"funding": "0.001"}])
+    second = ({"universe": [{"name": "BTC"}]}, [{"funding": "0.002"}])
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(side_effect=[first, second])
+    client = _client(info)
+    fake_time = MagicMock()
+    fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
+    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 1_003.0])
+    monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
+
+    assert client._meta_ctxs_sync() == first
+    assert client._meta_ctxs_sync() == second
+    assert info.meta_and_asset_ctxs.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -551,3 +1244,208 @@ async def test_funding_rate_falls_back_to_zero_when_ctx_missing_coin():
     fr = await c.funding_rate("BTC_USDT")
     assert fr.symbol == "BTC"
     assert fr.funding_rate == 0.0
+
+
+@pytest.mark.asyncio
+async def test_funding_rate_falls_back_to_zero_when_value_is_nonfinite():
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[{"universe": [{"name": "BTC"}]}, [{"funding": "NaN"}]]
+    )
+    client = _client(info)
+
+    result = await client.funding_rate("BTC_USDT")
+
+    assert result.funding_rate == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_name", [True, 7, ["BTC"], {"coin": "BTC"}])
+async def test_market_context_does_not_match_nonstring_market_identity(invalid_name):
+    requested = str(invalid_name).upper()
+    info = MagicMock()
+    info.all_mids = MagicMock(return_value={requested: "10"})
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [{"name": invalid_name}]},
+            [
+                {
+                    "funding": "0.001",
+                    "openInterest": "12",
+                    "premium": "0.01",
+                    "prevDayPx": "8",
+                }
+            ],
+        ]
+    )
+    client = _client(info)
+
+    ticker = await client.ticker(requested)
+    funding = await client.funding_rate(requested)
+    extras = await client.market_extras(requested)
+
+    assert ticker.funding_rate is None
+    assert funding.funding_rate == 0.0
+    assert extras["open_interest"] is None
+    assert extras["premium"] is None
+    assert extras["prev_day_px"] is None
+
+
+@pytest.mark.asyncio
+async def test_market_context_reads_skip_malformed_universe_rows():
+    info = MagicMock()
+    info.all_mids = MagicMock(return_value={"BTC": "10"})
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [7, {"name": "BTC"}]},
+            [
+                {"funding": "0.9"},
+                {
+                    "funding": "0.001",
+                    "openInterest": "12",
+                    "premium": "0.01",
+                    "prevDayPx": "8",
+                },
+            ],
+        ]
+    )
+    client = _client(info)
+
+    ticker = await client.ticker("BTC")
+    funding = await client.funding_rate("BTC")
+    extras = await client.market_extras("BTC")
+
+    assert ticker.funding_rate == 0.001
+    assert funding.funding_rate == 0.001
+    assert extras["open_interest"] == 12.0
+    assert extras["premium"] == 0.01
+    assert extras["prev_day_px"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_market_overview_sanitizes_invalid_ranking_fields():
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [{"name": "GOOD"}, {"name": "BAD"}]},
+            [
+                {
+                    "markPx": "10",
+                    "prevDayPx": "8",
+                    "dayNtlVlm": "1000",
+                    "funding": "0.001",
+                    "openInterest": "50",
+                },
+                {
+                    "markPx": "NaN",
+                    "prevDayPx": "Infinity",
+                    "dayNtlVlm": "-1",
+                    "funding": "NaN",
+                    "openInterest": "-2",
+                },
+            ],
+        ]
+    )
+
+    rows = await _client(info).market_overview()
+
+    assert rows[0]["symbol"] == "GOOD"
+    bad = rows[1]
+    assert bad["volume24"] == 0.0
+    assert bad["funding"] == 0.0
+    assert bad["last"] is None
+    assert bad["price_change_pct"] is None
+    assert bad["open_interest"] is None
+
+
+@pytest.mark.asyncio
+async def test_market_overview_degrades_overflowed_price_change_to_none():
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [{"name": "BTC"}]},
+            [
+                {
+                    "markPx": "1e308",
+                    "prevDayPx": "5e-324",
+                    "dayNtlVlm": "1000",
+                }
+            ],
+        ]
+    )
+
+    rows = await _client(info).market_overview()
+
+    assert rows[0]["price_change_pct"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_name", [True, 7, ["BTC"], {"coin": "BTC"}, "   "]
+)
+async def test_market_overview_does_not_stringify_invalid_names(invalid_name):
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [{"name": "BTC"}, {"name": invalid_name}]},
+            [{"markPx": "10"}, {"markPx": "20"}],
+        ]
+    )
+
+    rows = await _client(info).market_overview()
+
+    assert [row["symbol"] for row in rows] == ["BTC"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_row", [{}, 7, None, "BTC"])
+async def test_market_overview_skips_malformed_universe_rows(invalid_row):
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[
+            {"universe": [{"name": "BTC"}, invalid_row]},
+            [{"markPx": "10"}, {"markPx": "20"}],
+        ]
+    )
+
+    rows = await _client(info).market_overview()
+
+    assert [row["symbol"] for row in rows] == ["BTC"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_ctx", [None, 7, [], "bad"])
+async def test_market_overview_treats_malformed_context_as_missing(invalid_ctx):
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(
+        return_value=[{"universe": [{"name": "BTC"}]}, [invalid_ctx]]
+    )
+
+    row = (await _client(info).market_overview())[0]
+
+    assert row == {
+        "symbol": "BTC",
+        "volume24": 0.0,
+        "funding": 0.0,
+        "last": None,
+        "price_change_pct": None,
+        "open_interest": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"universe": [{"name": "BTC"}]}, "bad"],
+        [{"universe": "bad"}, []],
+        [{"universe": {}}, []],
+        [{"universe": []}, {}],
+    ],
+)
+async def test_market_overview_rejects_malformed_collection_shapes(payload):
+    info = MagicMock()
+    info.meta_and_asset_ctxs = MagicMock(return_value=payload)
+
+    with pytest.raises(HyperliquidError, match="market-overview response"):
+        await _client(info).market_overview()

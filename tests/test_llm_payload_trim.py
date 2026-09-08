@@ -11,7 +11,11 @@ None of this changes analysis quality — only fewer wasted input tokens.
 """
 
 from app.config import Settings
-from app.llm.client import build_llm_context, compact_tf_for_llm
+from app.llm.client import (
+    build_llm_context,
+    compact_daily_for_llm,
+    compact_tf_for_llm,
+)
 
 
 def _slice_with_candles():
@@ -43,6 +47,30 @@ def test_compact_tf_drops_amount_but_keeps_ohlcv():
         assert "amount" not in c  # dropped
         for k in ("time", "open", "high", "low", "close", "vol"):
             assert k in c  # OHLCV preserved
+
+
+def test_compact_reads_omit_overflowed_relative_percentages():
+    slice_dict = {
+        "tf": "15m",
+        "candles": [{"close": 1e308}],
+        "indicators": {
+            "as_of_close": 1e308,
+            "last": {
+                "ema20": 5e-324,
+                "ema50": 5e-324,
+                "ema200": 5e-324,
+                "vwap": 5e-324,
+            },
+        },
+        "structure": {},
+    }
+
+    tf_read = compact_tf_for_llm(slice_dict)["read"]
+    daily_read = compact_daily_for_llm(slice_dict)["read"]
+
+    assert "price_vs_ema20_pct" not in tf_read
+    assert "price_vs_vwap_pct" not in tf_read
+    assert "price_vs_ema20_pct" not in daily_read
 
 
 def _market_api():
@@ -107,6 +135,7 @@ def test_build_llm_context_funding_missing_is_graceful():
 
 def test_build_llm_context_recent_candles_have_no_amount():
     ctx = build_llm_context(_market_api(), {}, Settings(include_account_in_llm=False))
+    assert "note" not in ctx  # policy lives in the system prompt, not repeated per payload
     for tf in ("htf", "ltf"):
         for c in ctx[tf]["recent_candles"]:
             assert "amount" not in c

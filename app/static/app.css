@@ -21,12 +21,12 @@
   /* Obsidian Remake — refined volcanic glass. Monochrome base; colour = meaning.
      Deeper elevation steps, indigo-violet arrowhead as the ONLY interactive
      accent, green/red/amber reserved strictly for P&L / direction / warning. */
-  --bg: #08060d;              /* void — page ground */
-  --bg-panel: #100c18;        /* panels */
-  --bg-elevated: #191320;     /* inputs / raised */
-  --bg-inset: #0b0810;        /* wells / chart / segments */
-  --border: #292339;          /* panel edges */
-  --hairline: #1c1728;        /* subtle dividers */
+  --bg: #0b0b12;
+  --bg-panel: #12121d;
+  --bg-elevated: #1c1b2b;
+  --bg-inset: #0e0e17;
+  --border: #303044;
+  --hairline: #242435;
   --text: #eceaf4;
   --muted: #a5a1bc;
   --faint: #8983a6;           /* D3-04: was #6a6584 (~3.5:1 on --bg-panel) → ~5.4:1, WCAG-AA for small text */
@@ -75,9 +75,9 @@
   --live: #f5842a;
   --warn: #e5a93c;
 
-  --radius: 4px;
-  --radius-sm: 3px;
-  --radius-lg: 6px;
+  --radius: 8px;
+  --radius-sm: 4px;
+  --radius-lg: 12px;
   --radius-pill: 999px;
 
   /* ---- Type scale (Task 27 will migrate the ~43 ad-hoc sizes onto this;
@@ -116,14 +116,13 @@ body {
   padding: 0;
   min-height: 100%;
   /* subtle top vignette gives the obsidian ground depth without decoration */
-  background:
-    radial-gradient(130% 80% at 50% -12%, #130e1d 0%, var(--bg) 58%) fixed;
+  background: var(--bg);
   color: var(--text);
   /* Remake: the instrument speaks mono — the numbers ARE the typography.
      Hierarchy comes from weight/size/tracking, not from switching families.
      The one exception (humanist sans) is the KI-Analyse prose. */
-  font-family: var(--mono);
-  font-size: var(--fs-md);
+  font-family: var(--sans);
+  font-size: var(--fs-base);
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
@@ -690,9 +689,9 @@ select:focus {
    panel is stretched and the KI-analysis sits flush under the market context. */
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 2.2fr) minmax(400px, 0.85fr);
-  gap: var(--space-2h);
-  padding: var(--space-2h) var(--space-3) var(--space-4);
+  grid-template-columns: minmax(0, 1fr) 400px;
+  gap: var(--space-4);
+  padding: var(--space-4);
   align-items: start;
 }
 
@@ -703,7 +702,7 @@ select:focus {
   min-width: 0;
 }
 
-.chart-panel     { min-height: 52vh; }
+.chart-panel     { min-height: 0; }
 
 /* Below the chart: a 40/60 row — a stack of KI-analysis + history (left, 40%)
    beside the open-orders panel (right, 60%, made tall). */
@@ -738,6 +737,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   flex-direction: column;
   gap: var(--space-2h);
   align-self: start;
+  min-width: 0;
 }
 
 /* ── Tabbed data panel (Positionen · Offene Orders · Historie · Trades) ──
@@ -754,6 +754,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border-bottom: 1px solid var(--hairline);
   background: var(--bg-panel);
   overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: thin;
 }
 
 .data-tab {
@@ -762,11 +764,11 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--muted);
-  font-family: var(--mono);
-  font-size: var(--fs-xs);
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
   font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   padding: var(--space-2h) var(--space-3) var(--space-2);
   cursor: pointer;
   white-space: nowrap;
@@ -780,12 +782,16 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 .data-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .data-tab-actions {
-  margin-left: auto;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
   gap: var(--space-1h);
-  padding-left: 8px;
+  padding: var(--space-1h) var(--space-3);
+  border-bottom: 1px solid var(--hairline);
+  flex-shrink: 0;
 }
+.data-tab-actions:not(:has(.data-act:not(.hidden))) { display: none; }
 /* S3-08/09: no ".data-act.hidden{display:none}" here — the global
    .hidden{display:none!important} rule already covers it. */
 
@@ -932,6 +938,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-width: 0;
 }
 
 .panel-head {
@@ -941,28 +948,32 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  min-height: 48px;
 }
 
 .panel-head h2,
 .panel-head-title {
   margin: 0;
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: var(--fs-base);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  color: var(--faint);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  color: var(--text);
 }
 
 .panel-head h2::before,
 .panel-head-title::before {
-  content: "// ";
+  content: "";
   color: var(--accent);
   opacity: 0.7;
 }
 
 .panel-head-right {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   font-family: var(--mono);
@@ -1245,14 +1256,16 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 .chart-wrap {
   position: relative;
-  flex: 1;
-  min-height: 46vh;
+  /* Preserve viewport height instead of the canvas's intrinsic 340px. */
+  flex: 0 0 auto;
+  min-height: 0;
+  height: clamp(400px, 58vh, 820px);
   width: 100%;
 }
 
 .chart {
   flex: 1;
-  min-height: 46vh;
+  min-height: 0;
   width: 100%;
   height: 100%;
 }
@@ -1317,8 +1330,9 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 /* ── Statbar: instrument tiles under the chart ──────────── */
 .statbar {
   display: grid;
-  grid-template-columns: minmax(150px, 1.4fr) repeat(8, minmax(0, 1fr));
-  background: var(--bg-panel);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--hairline);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
@@ -1328,20 +1342,18 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   display: flex;
   flex-direction: column;
   gap: 3px;
-  padding: var(--space-2h) var(--space-3);
-  border-right: 1px solid var(--hairline);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-panel);
   min-width: 0;
 }
 
-.stat:last-child {
-  border-right: none;
-}
+.stat-contract { grid-column: span 2; }
 
 .stat-label {
   font-family: var(--mono);
   font-size: var(--fs-xs);
   font-weight: 600;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--faint);
   white-space: nowrap;
@@ -1349,22 +1361,22 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 
 .stat-value {
   font-family: var(--mono);
-  font-size: var(--fs-lg);
+  font-size: var(--fs-base);
   font-variant-numeric: tabular-nums;
   color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .stat-price {
   background: var(--bg-elevated);
+  justify-content: center;
 }
 
 .stat-price .stat-value {
-  font-size: var(--fs-2xl);
+  font-size: var(--fs-md);
   font-weight: 600;
-  line-height: 1.1;
+  line-height: 1.45;
 }
 
 .stat-price .stat-label {
@@ -2092,8 +2104,8 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   gap: var(--space-3); margin-bottom: 10px;
 }
 .overview-head h2 {
-  margin: 0; font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600;
-  letter-spacing: 0.16em; text-transform: uppercase; color: var(--faint);
+  margin: 4px 0 0; font-family: var(--sans); font-size: var(--fs-2xl); font-weight: 600;
+  letter-spacing: -0.02em; color: var(--text);
 }
 .watch-add { display: flex; gap: var(--space-1h); }
 .watch-add input {
@@ -2103,7 +2115,7 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
 }
 .overview-grid {
   display: grid; gap: var(--space-3);
-  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
 }
 .mini-tile {
   position: relative; background: var(--bg-panel); border: 1px solid var(--border);
@@ -2924,7 +2936,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .ticket-form .row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--space-2h);
 }
 
@@ -3522,9 +3534,9 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 .modal-card {
   position: relative;
   z-index: 1;
-  width: min(460px, 100%);
-  max-height: min(90vh, 680px);
-  overflow: auto;
+  width: min(580px, 100%);
+  max-height: min(92dvh, 820px);
+  overflow: hidden;
   background: var(--bg-panel);
   border: 1px solid var(--short);
   border-top: 3px solid var(--short);
@@ -3547,6 +3559,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
   gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--hairline);
+  flex-shrink: 0;
 }
 
 .modal-head h2 {
@@ -3567,6 +3580,9 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .modal-body {
   padding: var(--space-4);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .modal-body .warn-list {
@@ -3736,6 +3752,7 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 }
 
 .choice-card {
+  position: relative;
   display: block;
   padding: var(--space-2h) var(--space-3);
   border: 1px solid var(--border);
@@ -3764,6 +3781,10 @@ a.news-row:hover .news-row-title { color: var(--accent); }
 
 .choice-card input {
   position: absolute;
+  inset: 0 auto auto 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
   opacity: 0;
   pointer-events: none;
 }
@@ -3941,84 +3962,127 @@ label.setup-check > span {
   }
 }
 
-/* ── Responsive ─────────────────────────────────────────── */
-@media (max-width: 1280px) {
-  .layout {
-    grid-template-columns: minmax(0, 1.3fr) minmax(340px, 1fr);
-  }
+/* UI refinement: clear controls, readable data and bounded panel widths. */
+html { color-scheme: dark; }
+button, input, select { touch-action: manipulation; }
+input[type="password"] {
+  min-width: 0;
+  padding: var(--space-2) var(--space-2h);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+}
+.topbar { padding: 12px 16px; }
+.topbar-left, .topbar-right { gap: 12px; min-width: 0; }
+.brand-name { letter-spacing: 0.12em; color: var(--text); }
+.btn, .tf-btn, .type-btn, .btn-ai-lines, .llm-select { min-height: 34px; }
+.btn:disabled { cursor: not-allowed; }
+.panel-step { color: var(--muted); font-size: var(--fs-xs); }
+.layout-main, .left-split, .side-rail { gap: var(--space-4); }
+.irail { border-radius: 0; }
+.ir-cell { padding-top: 10px; padding-bottom: 10px; }
+#chart-meta { font-size: var(--fs-xs); color: var(--muted); }
+.size-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.size-mode-row .size-mode-seg { margin-left: 0; }
+.size-mode-btn, .sltp-mode-btn, .trigger-mode-btn { min-height: 30px; }
+.ticket-form label > span { font-family: var(--sans); letter-spacing: 0.03em; }
+.ticket-form input { min-width: 0; font-size: 16px; }
+.ticket-form .field-name { white-space: normal; flex-wrap: wrap; }
+.ticket-form.is-market #row-prices { display: none; }
+.ticket-form .hint { margin: 0; font-family: var(--sans); font-size: var(--fs-sm); line-height: 1.6; }
+.ticket-form .btn-submit { min-height: 46px; font-size: var(--fs-base); }
+.risk-label { letter-spacing: 0.02em; }
+.risk-val { overflow-wrap: anywhere; }
+.data-tab-actions .btn { font-size: var(--fs-sm); }
+.proposal-actions { margin-left: 0; }
+.proposal-panel > .panel-head { align-items: flex-start; }
+.proposal-actions .btn { min-height: 34px; }
+.analysis-empty { padding: 24px; max-width: none; }
+.empty-state-label { display: block; color: var(--accent); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; }
+.analysis-empty strong { display: block; margin-top: 8px; font-size: var(--fs-lg); color: var(--text); font-weight: 500; }
+.analysis-empty p { margin: 8px 0 0; max-width: 65ch; }
+.overview { padding: 20px 16px; }
+.overview-head { flex-wrap: wrap; margin: 24px 0 20px; }
+.watch-add { min-width: 0; max-width: 100%; }
+.watch-add input { min-width: 0; flex: 1; }
+.watch-add .btn { white-space: nowrap; }
+.acct-pulse { gap: 0; padding: 0; }
+.pulse-item { flex: 1 1 160px; padding: 16px 20px; border-right: 1px solid var(--hairline); }
+.pulse-item:last-child { border-right: 0; }
+.pulse-val { margin-top: 6px; }
+.mini-tile { min-width: 0; padding: 16px; }
+.mini-head { flex-wrap: wrap; padding-right: 16px; }
+.mini-sym { font-size: var(--fs-md); }
+.mini-price { font-size: var(--fs-sm); }
+.mini-remove { min-width: 28px; min-height: 28px; }
+.modal-actions { flex-shrink: 0; flex-wrap: wrap; border-top: 1px solid var(--hairline); background: var(--bg-panel); }
+.modal-head h2 { overflow-wrap: anywhere; }
+.modal-body { overflow-wrap: anywhere; }
+.modal[aria-busy="true"] .modal-card { border-color: var(--warn); }
+#ki-keys-modal .modal-card { border-color: var(--border); border-top-color: var(--accent); }
+#ki-keys-modal .modal-head h2 { color: var(--text); }
+.modal-card > .error-text { flex-shrink: 0; max-height: 25dvh; overflow: auto; }
 
-  .statbar {
-    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  }
-
-  .stat {
-    border-bottom: 1px solid var(--hairline);
-  }
-
-  .history-content {
-    grid-template-columns: 1fr 1fr;
-  }
+/* Split analysis/data only when both panels have enough working space. */
+@media (max-width: 1699px) {
+  .left-split { grid-template-columns: minmax(0, 1fr); }
+  .proposal-panel, .data-panel, body.has-position .proposal-panel { max-height: none; }
+  .history-content { grid-template-columns: 1fr 1fr; }
 }
 
-/* Below ~1100px the page collapses to a single readable column:
-   chart · KI-analysis · orders · history · ticket · positions. The 40/60
-   sub-row unwraps (display:contents) so its panels can be ordered inline. */
-@media (max-width: 1100px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
-
-  .left-split {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .left-split-col {
-    display: contents;
-  }
-
-  .proposal-panel { order: 1; max-height: none; }
-  .data-panel     { order: 2; max-height: none; }
-
-  .data-pane {
-    max-height: 360px;
-  }
-
-  /* S3-12: was its own @media (max-width: 1080px) block next to .irail —
-     folded into the shared 1100px breakpoint (20px earlier than before). */
+@media (max-width: 1200px) {
+  .layout { grid-template-columns: minmax(0, 1fr) 360px; }
+  .statbar { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .stat-contract { grid-column: auto; }
   .irail { flex-wrap: wrap; }
   .ir-position { margin-left: 0; width: 100%; border-top: 1px solid var(--hairline); }
 }
 
-@media (max-width: 820px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
+@media (max-width: 1000px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .side-rail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+  .chart-wrap { height: clamp(320px, 46vh, 480px); }
+  body.has-position .chart-panel { min-height: 0; }
+  .data-pane { max-height: 480px; }
+}
 
-  .proposal-panel,
-  .data-panel {
-    max-height: none;
-  }
-
-  .chart {
-    min-height: 320px;
-  }
-
-  .history-content {
-    grid-template-columns: 1fr;
-  }
-
-  .history-section {
-    border-right: none;
-    border-bottom: 1px solid var(--hairline);
-  }
-
-  .history-section:last-child {
-    border-bottom: none;
-  }
-
-  .brand {
-    display: none;
-  }
+@media (max-width: 700px) {
+  .layout, .overview { padding: 12px; }
+  .side-rail { display: flex; align-items: stretch; }
+  .statbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat:last-child { grid-column: 1 / -1; }
+  .history-content { grid-template-columns: minmax(0, 1fr); }
+  .history-section { border-right: 0; border-bottom: 1px solid var(--hairline); }
+  .history-section:last-child { border-bottom: 0; }
+  .topbar { gap: 10px; padding: 12px; }
+  .topbar-left, .topbar-right { width: 100%; gap: 8px; }
+  .brand { display: none; }
+  .symbol-picker { flex: 1 1 auto; }
+  .tf-group { order: 3; flex: 1 1 100%; }
+  .tf-btn { flex: 1; min-height: 38px; }
+  .health { flex-wrap: wrap; }
+  .equity { margin-left: auto; }
+  .arm-status, .health { font-size: var(--fs-xs); }
+  .ir-cell { padding: 8px 12px; }
+  .ir-position { min-width: 0; flex-wrap: wrap; }
+  .panel-head-right { width: 100%; }
+  #chart-meta { flex: 1 1 100%; }
+  .chart-panel .panel-head { gap: 6px; }
+  .proposal-actions { width: 100%; }
+  .proposal-actions .btn, .proposal-actions select { flex: 1 1 auto; }
+  .data-tabs { padding: 0 4px; }
+  .data-tab { min-height: 44px; padding: 10px; }
+  .data-tab-actions .btn { min-height: 38px; }
+  .analysis-empty { padding: 20px 16px; }
+  .watch-add { width: 100%; }
+  .pulse-item { flex-basis: 130px; padding: 12px; }
+  .modal { padding: 10px; }
+  .modal-card { max-height: calc(100dvh - 20px); }
+  .modal-head, .modal-body, .modal-actions { padding: 12px; }
+  .sum-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .modal-actions .btn { min-height: 42px; flex: 1 1 auto; }
+  .setup-grid { grid-template-columns: minmax(0, 1fr); }
 }
 

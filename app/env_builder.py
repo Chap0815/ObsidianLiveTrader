@@ -93,7 +93,7 @@ def sanitize_env_value(name: str, raw) -> str:
     """
     v = str(raw if raw is not None else "").strip()
     if any(ord(ch) < 32 or ch == "\x7f" for ch in v):
-        raise ValueError(f"{name} enthält ungültige Steuerzeichen")
+        raise ValueError(f"{name} contains invalid control characters")
     return v
 
 
@@ -110,54 +110,59 @@ def normalize_answers(payload: dict) -> dict:
 
     ex = str(p.get("exchange") or "hl-testnet").strip()
     if ex not in ("hl-testnet", "hl-mainnet", "mexc"):
-        raise ValueError("Ungültige Börsen-Auswahl")
+        raise ValueError("Invalid exchange selection")
     is_mexc = ex == "mexc"
 
     if ex == "hl-mainnet":
-        confirm = _san("Mainnet-Bestätigung", "mainnet_confirm")
+        confirm = _san("Mainnet confirmation", "mainnet_confirm")
         if confirm != "MAINNET":
             raise ValueError(
-                "Hyperliquid MAINNET erfordert die getippte Bestätigung 'MAINNET'"
+                "Hyperliquid MAINNET requires the typed confirmation 'MAINNET'"
             )
 
     hl_key = _san("Private Key", "hl_private_key")
-    hl_addr = _san("Wallet-Adresse", "hl_account_address")
+    hl_addr = _san("Wallet address", "hl_account_address")
     mexc_key = _san("MEXC API Key", "mexc_api_key")
     mexc_sec = _san("MEXC API Secret", "mexc_api_secret")
 
     if is_mexc:
         if not (mexc_key and mexc_sec):
-            raise ValueError("MEXC API Key und Secret werden benötigt")
+            raise ValueError("MEXC API key and secret are required")
     else:
         if not _HEX64.fullmatch(hl_key):
             raise ValueError(
-                "Hyperliquid Private Key muss 0x + 64 Hex-Zeichen sein "
-                "(API/Agent-Wallet-Key aus der Hyperliquid-UI)"
+                "Hyperliquid private key must be 0x followed by 64 hex characters "
+                "(API/agent-wallet key from the Hyperliquid UI)"
             )
         if hl_addr and not _HEX40.fullmatch(hl_addr):
-            raise ValueError("Wallet-Adresse muss 0x + 40 Hex-Zeichen sein")
+            raise ValueError("Wallet address must be 0x followed by 40 hex characters")
 
     llm = str(p.get("llm_provider") or "claude").strip().lower()
     if llm not in ("claude", "xai", "openai", "ollama", "none"):
-        raise ValueError("Ungültiger KI-Anbieter")
-    llm_key = _san("KI API Key", "llm_api_key")
+        raise ValueError("Invalid AI provider")
+    llm_key = _san("AI API key", "llm_api_key")
     if llm in ("claude", "xai", "openai") and not llm_key:
-        raise ValueError(f"API Key für {llm} fehlt")
-    model = _san("KI-Modell", "model")
+        raise ValueError(f"API key for {llm} is missing")
+    model = _san("AI model", "model")
 
-    include_account = bool(p.get("include_account_in_llm", False))
+    include_account = p.get("include_account_in_llm", False)
+    if not isinstance(include_account, bool):
+        raise ValueError("Account-data consent must be a boolean")
 
     risk_profile = str(p.get("risk_profile") or "balanced").strip().lower()
     if risk_profile not in ("conservative", "balanced", "free", "custom"):
-        raise ValueError("Ungültiges Risiko-Profil")
+        raise ValueError("Invalid risk profile")
 
     def _num(name: str, key: str, default: float, lo: float, hi: float) -> float:
+        raw_value = p.get(key, default)
+        if isinstance(raw_value, bool):
+            raise ValueError(f"{name} is not a number")
         try:
-            v = float(p.get(key, default))
+            v = float(raw_value)
         except (TypeError, ValueError):
-            raise ValueError(f"{name} ist keine Zahl") from None
+            raise ValueError(f"{name} is not a number") from None
         if not (lo <= v <= hi):
-            raise ValueError(f"{name} muss zwischen {lo} und {hi} liegen")
+            raise ValueError(f"{name} must be between {lo} and {hi}")
         return v
 
     answers: dict = {
@@ -176,9 +181,10 @@ def normalize_answers(payload: dict) -> dict:
 
     if risk_profile == "custom":
         answers["max_risk_pct"] = _num("MAX_RISK_PCT", "max_risk_pct", 1.0, 0.1, 50)
-        answers["max_leverage"] = int(
-            _num("MAX_LEVERAGE", "max_leverage", 20, 1, 125)
-        )
+        max_leverage = _num("MAX_LEVERAGE", "max_leverage", 20, 1, 125)
+        if not max_leverage.is_integer():
+            raise ValueError("MAX_LEVERAGE must be an integer")
+        answers["max_leverage"] = int(max_leverage)
         answers["min_rrr"] = _num("MIN_RRR", "min_rrr", 2.0, 1, 10)
         answers["max_notional_pct_of_equity"] = _num(
             "MAX_NOTIONAL_PCT_OF_EQUITY",
@@ -194,15 +200,20 @@ def normalize_answers(payload: dict) -> dict:
 
     host = _san("Host", "host") or "127.0.0.1"
     if host not in _LOOPBACK_HOSTS:
-        raise ValueError("HOST muss loopback sein (127.0.0.1 / localhost / ::1)")
+        raise ValueError("HOST must be loopback (127.0.0.1 / localhost / ::1)")
     answers["host"] = host
 
+    raw_port = p.get("port", 8787)
+    if isinstance(raw_port, bool) or (
+        isinstance(raw_port, float) and not raw_port.is_integer()
+    ):
+        raise ValueError("PORT is not a number")
     try:
-        port = int(p.get("port", 8787) or 8787)
-    except (TypeError, ValueError):
-        raise ValueError("PORT ist keine Zahl") from None
+        port = int(raw_port)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("PORT is not a number") from None
     if not (1024 <= port <= 65535):
-        raise ValueError("PORT muss zwischen 1024 und 65535 liegen")
+        raise ValueError("PORT must be between 1024 and 65535")
     answers["port"] = port
 
     return answers
@@ -273,7 +284,7 @@ def build_full_env(answers: dict) -> str:
         return DEFAULT_MODELS[prov]
 
     lines: list[str] = [
-        "# Generiert vom Setup-Assistenten — Werte jederzeit hier änderbar.",
+        "# Generated by the setup assistant — values can be changed here at any time.",
         "SETUP_COMPLETE=true",
         "HOST=127.0.0.1",
         f"PORT={a.get('port', 8787)}",
@@ -284,9 +295,9 @@ def build_full_env(answers: dict) -> str:
         f"HL_ACCOUNT_ADDRESS={a.get('hl_account_address', '')}",
         f"MEXC_API_KEY={a.get('mexc_api_key', '')}",
         f"MEXC_API_SECRET={a.get('mexc_api_secret', '')}",
-        "MEXC_BASE_URL=https://contract.mexc.com",
+        "MEXC_BASE_URL=https://api.mexc.com",
         "",
-        "# KI (Hot-Swap im UI möglich)",
+        "# AI (provider can be changed in the UI)",
         f"LLM_PROVIDER={provider_for_env}",
         f"ANTHROPIC_API_KEY={_key_for('claude')}",
         f"ANTHROPIC_MODEL={_model_for('claude')}",
@@ -298,7 +309,7 @@ def build_full_env(answers: dict) -> str:
         f"OLLAMA_MODEL={_model_for('ollama')}",
         f"INCLUDE_ACCOUNT_IN_LLM={'true' if a.get('include_account_in_llm') else 'false'}",
         "",
-        "# Risiko-Gates (serverseitig erzwungen)",
+        "# Risk gates (enforced server-side)",
     ]
 
     risk_profile = str(a.get("risk_profile") or "balanced").lower()
@@ -329,7 +340,7 @@ def build_full_env(answers: dict) -> str:
         "ALLOW_UNPROTECTED_ENTRY=false",
         "AUTO_FLATTEN_IF_SL_UNVERIFIED=true",
         "",
-        "# Sicherheit — Trading bleibt aus, bis DU es hier einschaltest",
+        "# Safety — trading stays off until YOU enable it here",
         "TRADING_ENABLED=false",
         f"LOCAL_API_TOKEN={token}",
         "REQUIRE_LOOPBACK_WHEN_ARMED=true",
@@ -378,20 +389,20 @@ def restrict_env_permissions(path: Path) -> None:
                 # swallowed silently — best-effort stays, but visibly.
                 if result.returncode != 0:
                     log.warning(
-                        "icacls-Haertung fuer %s fehlgeschlagen (rc=%s): %s",
+                        "Could not harden permissions for %s with icacls (rc=%s): %s",
                         p,
                         result.returncode,
                         (result.stderr or b"").decode("utf-8", "replace").strip(),
                     )
             else:
                 log.warning(
-                    "icacls-Haertung fuer %s uebersprungen: USERNAME/USERDOMAIN leer",
+                    "Skipped icacls hardening for %s: USERNAME/USERDOMAIN is empty",
                     p,
                 )
         else:
             os.chmod(p, 0o600)
     except Exception:
-        log.warning("Permission-Haertung fuer %s fehlgeschlagen", p, exc_info=True)
+        log.warning("Permission hardening failed for %s", p, exc_info=True)
 
 
 # ── Atomic patcher (post-setup key writes) ──────────────────────────────────
@@ -406,7 +417,7 @@ def patch_env_vars(
     clean: dict[str, str] = {}
     for k, v in (updates or {}).items():
         if k not in allowed:
-            raise ValueError(f"{k} ist nicht beschreibbar")
+            raise ValueError(f"{k} is not writable")
         clean[k] = sanitize_env_value(k, v)
 
     text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
@@ -422,7 +433,7 @@ def patch_env_vars(
             lines[i] = f"{key}={remaining.pop(key)}"
 
     if remaining:
-        footer = "# --- updated by settings (KI-Keys) ---"
+        footer = "# --- updated by settings (AI keys) ---"
         # trim a single trailing empty line for tidy append
         if lines and lines[-1] == "":
             lines.pop()

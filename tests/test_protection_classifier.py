@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.orders.protection import classify_protection
-from app.orders.service import OrderService
+from app.orders.service import OrderService, _sl_matches
 from app.orders.tokens import PreviewStore
 
 from tests.test_orders_flow import _settings
@@ -88,6 +88,28 @@ async def test_reevaluate_and_verify_agree():
     assert checked is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_symbol", [None, "ETH_USDT"])
+async def test_entry_sl_verify_requires_matching_stop_symbol(reported_symbol):
+    stop = {"orderType": "Stop", "triggerPrice": 95_000.0}
+    if reported_symbol is not None:
+        stop["symbol"] = reported_symbol
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(return_value=[stop])
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is True
+
+
 def test_classify_multiple_sl_long_picks_most_protective_highest():
     """C1: with MULTIPLE resting SL orders, classify_protection must report the
     MOST-protective one, never last-wins.
@@ -131,6 +153,69 @@ def test_classify_multiple_sl_explicit_field_most_protective():
     ]
     sl, _tp = classify_protection(stops, side="long", entry=120.0)
     assert sl == 118.0
+
+
+def test_classify_protection_ignores_nonfinite_prices():
+    stops = [
+        {"stopLossPrice": "NaN"},
+        {"takeProfitPrice": "Infinity"},
+        {"orderType": "Stop", "triggerPrice": "-Infinity"},
+        {"orderType": "Stop", "triggerPrice": 95.0},
+    ]
+    sl, tp = classify_protection(stops, side="long", entry=100.0)
+    assert sl == 95.0
+    assert tp is None
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"stopLossPrice": True},
+        {"takeProfitPrice": True},
+        {"orderType": "Stop", "triggerPrice": True},
+    ],
+)
+def test_classify_protection_ignores_boolean_prices(row):
+    sl, tp = classify_protection([row], side="long", entry=100.0)
+
+    assert sl is None
+    assert tp is None
+
+
+def test_unlabeled_trigger_rejects_nonfinite_entry():
+    sl, tp = classify_protection(
+        [{"triggerPrice": 95.0}], side="long", entry=float("nan")
+    )
+    assert sl is None
+    assert tp is None
+
+
+def test_unlabeled_trigger_rejects_boolean_entry():
+    sl, tp = classify_protection(
+        [{"triggerPrice": 95.0}], side="long", entry=True
+    )
+
+    assert sl is None
+    assert tp is None
+
+
+@pytest.mark.parametrize(
+    ("expected", "candidate"),
+    [
+        (95.0, "garbage"),
+        (95.0, "NaN"),
+        (95.0, "Infinity"),
+        (float("nan"), 95.0),
+        (float("inf"), 95.0),
+    ],
+)
+def test_sl_matcher_rejects_invalid_or_nonfinite_prices(expected, candidate):
+    assert _sl_matches(expected, candidate) is False
+
+
+@pytest.mark.parametrize(("expected", "candidate"), [(True, 1.0), (1.0, True)])
+def test_sl_matcher_rejects_boolean_prices(expected, candidate):
+    assert _sl_matches(expected, candidate) is False
 
 
 @pytest.mark.asyncio

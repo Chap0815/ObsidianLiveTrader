@@ -22,7 +22,7 @@
 function fmt(n, digits) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   const d = digits != null ? digits : 4;
-  return Number(n).toLocaleString("de-DE", {
+  return Number(n).toLocaleString("en-US", {
     maximumFractionDigits: d,
     minimumFractionDigits: 0,
   });
@@ -130,13 +130,13 @@ function relTime(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return "";
   const s = Math.max(0, (Date.now() - t) / 1000);
-  if (s < 60) return "gerade eben";
+  if (s < 60) return "just now";
   const m = Math.floor(s / 60);
-  if (m < 60) return "vor " + m + " Min";
+  if (m < 60) return m + " min ago";
   const h = Math.floor(m / 60);
-  if (h < 24) return "vor " + h + " Std";
+  if (h < 24) return h + " hr ago";
   const d = Math.floor(h / 24);
-  return "vor " + d + " Tag" + (d === 1 ? "" : "en");
+  return d + " day" + (d === 1 ? "" : "s") + " ago";
 }
 
 function numOrNull(el) {

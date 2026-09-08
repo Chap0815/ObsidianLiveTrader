@@ -1,0 +1,70 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Offline tests and publication checks
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      TRADING_ENABLED: "false"
+      HL_TESTNET: "true"
+      INCLUDE_ACCOUNT_IN_LLM: "false"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Check publication boundary
+        run: python scripts/check_publication.py
+      - name: Scan source and history for secrets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'gitleaks.zip'
+          $scanTool = Join-Path $env:RUNNER_TEMP 'gitleaks-tool'
+          Invoke-WebRequest 'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e') { throw 'Gitleaks checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $scanTool
+          & (Join-Path $scanTool 'gitleaks.exe') git . --redact=100 --no-banner --log-opts=--all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $scanTool 'gitleaks.exe') dir . --redact=100 --no-banner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install isolated dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --require-virtualenv -r requirements.lock -r requirements-dev.txt
+      - name: Lint Python
+        run: .\.venv\Scripts\ruff.exe check .
+      - name: Check JavaScript
+        run: |
+          node --check app/static/app.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check app/static/utils.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+      - name: Offline regression suite
+        run: .\.venv\Scripts\python.exe -m pytest tests/ -q
+      - name: Install browser
+        run: .\.venv\Scripts\python.exe -m playwright install chromium
+      - name: Offline responsive UI smoke
+        run: .\.venv\Scripts\python.exe scripts/ui_smoke.py

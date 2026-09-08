@@ -335,8 +335,8 @@ async def test_xai_empty_content_reports_finish_reason(monkeypatch, caplog):
             await _call_xai({"symbol": "BTC"}, _settings())
 
     message = str(exc_info.value)
-    assert "abgeschnitten" in message
-    assert "Token-Budget" in message
+    assert "truncated" in message
+    assert "token budget" in message
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("length" in r.getMessage() for r in warnings)
 
@@ -348,8 +348,8 @@ async def test_xai_empty_content_reports_finish_reason(monkeypatch, caplog):
         await _call_xai_reevaluate({"symbol": "BTC"}, _settings())
 
     message2 = str(exc_info2.value)
-    assert "abgeschnitten" in message2
-    assert "Token-Budget" in message2
+    assert "truncated" in message2
+    assert "token budget" in message2
 
 
 @pytest.mark.asyncio

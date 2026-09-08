@@ -156,6 +156,28 @@ def test_compute_simple_rrr_short():
     assert compute_simple_rrr(100.0, 110.0, 80.0, action="SELL") == pytest.approx(2.0)
 
 
+def test_compute_simple_rrr_overflow_cannot_escape_annotation():
+    entry = 1e-308
+    stop = 5e-324
+    target = 1e308
+
+    assert compute_simple_rrr(entry, stop, target, action="BUY") is None
+
+    proposal = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=entry,
+        stop_loss=stop,
+        tp1=target,
+        rrr=2.0,
+    )
+    annotated = annotate_proposal(proposal)
+
+    assert annotated.action == "STAY_OUT"
+    assert annotated.rrr is None
+
+
 def test_compute_simple_rrr_missing():
     assert compute_simple_rrr(None, 90.0, 120.0) is None
     assert compute_simple_rrr(100.0, None, 120.0) is None
@@ -423,6 +445,43 @@ def test_trade_proposal_accepts_finite_and_none():
     assert p.entry_price is None and p.stop_loss is None
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "conviction_score",
+        "entry_price",
+        "tp1",
+        "tp2",
+        "tp3",
+        "stop_loss",
+        "rrr",
+        "invalidation_price",
+    ],
+)
+def test_trade_proposal_rejects_boolean_numeric_fields(field):
+    data = dict(VALID_BUY)
+    data[field] = True
+
+    with pytest.raises(ValidationError):
+        TradeProposal.model_validate(data)
+
+
+def test_proposal_key_levels_drop_boolean_numbers():
+    from app.models import ProposalKeyLevels
+
+    levels = ProposalKeyLevels.model_validate(
+        {
+            "immediate_support": True,
+            "immediate_resistance": False,
+            "major_liquidity_pools": [True, 10.0, False],
+        }
+    )
+
+    assert levels.immediate_support is None
+    assert levels.immediate_resistance is None
+    assert levels.major_liquidity_pools == [10.0]
+
+
 def test_parse_content_to_proposal_maps_nan_to_llmerror():
     """The production contract: a NaN leg must degrade to a clean LlmError (HTTP
     502), NEVER a 500 or a fake-tradeable proposal."""
@@ -440,6 +499,16 @@ def test_reevaluate_proposal_rejects_nonfinite(field, bad):
 
     base = {"action": "HOLD", "new_sl": None, "new_tp": None}
     base[field] = bad
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(base)
+
+
+@pytest.mark.parametrize("field", ["new_sl", "new_tp", "partial_close_pct"])
+def test_reevaluate_proposal_rejects_boolean_numeric_fields(field):
+    from app.models import ReevaluateProposal
+
+    base = {"action": "HOLD", "new_sl": None, "new_tp": None}
+    base[field] = True
     with pytest.raises(ValidationError):
         ReevaluateProposal.model_validate(base)
 

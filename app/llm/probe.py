@@ -57,7 +57,7 @@ async def probe_provider(
 
     key = (api_key or "").strip()
     if not key:
-        return {"ok": False, "detail": "Kein API Key angegeben", "latency_ms": 0}
+        return {"ok": False, "detail": "No API key provided", "latency_ms": 0}
 
     url = _PINNED[prov]
     if prov == "claude":
@@ -69,14 +69,14 @@ async def probe_provider(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(url, headers=headers)
     except (httpx.HTTPError, OSError) as e:
-        return {"ok": False, "detail": f"nicht erreichbar: {e}", "latency_ms": _elapsed_ms(start)}
+        return {"ok": False, "detail": f"unavailable: {e}", "latency_ms": _elapsed_ms(start)}
 
     ms = _elapsed_ms(start)
     if resp.status_code == 200:
-        return {"ok": True, "detail": "Key gültig, Anbieter erreichbar", "latency_ms": ms}
+        return {"ok": True, "detail": "Key valid; provider reachable", "latency_ms": ms}
     if resp.status_code in (401, 403):
-        return {"ok": False, "detail": "Key ungültig", "latency_ms": ms}
-    return {"ok": False, "detail": f"Antwort {resp.status_code}", "latency_ms": ms}
+        return {"ok": False, "detail": "Invalid key", "latency_ms": ms}
+    return {"ok": False, "detail": f"Response {resp.status_code}", "latency_ms": ms}
 
 
 async def _probe_ollama(ollama_base_url: str, start: float) -> dict:
@@ -89,12 +89,12 @@ async def _probe_ollama(ollama_base_url: str, start: float) -> dict:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(url)
     except (httpx.HTTPError, OSError) as e:
-        return {"ok": False, "detail": f"nicht erreichbar: {e}", "latency_ms": _elapsed_ms(start)}
+        return {"ok": False, "detail": f"unavailable: {e}", "latency_ms": _elapsed_ms(start)}
     ms = _elapsed_ms(start)
     if resp.status_code == 200:
         try:
             n = len((resp.json() or {}).get("models") or [])
         except Exception:
             n = 0
-        return {"ok": True, "detail": f"{n} Modelle gefunden", "latency_ms": ms}
-    return {"ok": False, "detail": f"Antwort {resp.status_code}", "latency_ms": ms}
+        return {"ok": True, "detail": f"{n} models found", "latency_ms": ms}
+    return {"ok": False, "detail": f"Response {resp.status_code}", "latency_ms": ms}

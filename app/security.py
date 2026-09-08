@@ -71,16 +71,25 @@ def _is_loopback_origin(value: str) -> bool:
 
 def _origin_matches_request(value: str, request) -> bool:
     """True only if the Origin/Referer is the SAME ORIGIN as the server the
-    request actually hit — host AND port must match. A page on another
+    request actually hit — scheme, host AND port must match. A page on another
     localhost port (e.g. 127.0.0.1:9999) is a DIFFERENT origin in the browser's
     model and must be blocked for mutating /api/* calls; matching by hostname
     alone (the old check) let a cross-port drive-by through (audit CSRF-port)."""
-    o = urlparse(value)
-    o_host = (o.hostname or "").lower()
-    o_port = o.port or (443 if o.scheme == "https" else 80)
+    try:
+        o = urlparse(value)
+        origin_scheme = {"ws": "http", "wss": "https"}.get(
+            o.scheme.lower(), o.scheme.lower()
+        )
+        o_host = (o.hostname or "").lower()
+        o_port = o.port or (443 if origin_scheme == "https" else 80)
+    except (TypeError, ValueError):
+        return False
+    request_scheme = {"ws": "http", "wss": "https"}.get(
+        request.url.scheme.lower(), request.url.scheme.lower()
+    )
     req_host = (request.url.hostname or "").lower()
-    req_port = request.url.port or (443 if request.url.scheme == "https" else 80)
-    return o_host == req_host and o_port == req_port
+    req_port = request.url.port or (443 if request_scheme == "https" else 80)
+    return origin_scheme == request_scheme and o_host == req_host and o_port == req_port
 
 # MEXC: BTC_USDT | Hyperliquid: BTC or BTC_USDT (coin part used on HL)
 SYMBOL_RE_MEXC = re.compile(r"^[A-Z0-9]{2,32}_[A-Z0-9]{2,16}$")

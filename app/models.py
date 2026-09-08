@@ -1,7 +1,14 @@
 import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _reject_bool_numeric(v: Any) -> Any:
+    """Keep JSON booleans from being coerced to money-path numbers or IDs."""
+    if isinstance(v, bool):
+        raise ValueError("boolean is not a valid numeric value")
+    return v
 
 
 class Candle(BaseModel):
@@ -135,6 +142,18 @@ class ProposalKeyLevels(BaseModel):
     immediate_resistance: float | None = None
     major_liquidity_pools: list[float | str] = Field(default_factory=list)
 
+    @field_validator("immediate_support", "immediate_resistance", mode="before")
+    @classmethod
+    def _coerce_boolean_to_none(cls, v: Any) -> Any:
+        return None if isinstance(v, bool) else v
+
+    @field_validator("major_liquidity_pools", mode="before")
+    @classmethod
+    def _drop_boolean_pools(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            return [x for x in v if not isinstance(x, bool)]
+        return v
+
     @field_validator("immediate_support", "immediate_resistance")
     @classmethod
     def _coerce_nonfinite_to_none(cls, v: float | None) -> float | None:
@@ -211,6 +230,21 @@ class TradeProposal(BaseModel):
     pre_mortem: str | None = None
 
     @field_validator(
+        "conviction_score",
+        "entry_price",
+        "tp1",
+        "tp2",
+        "tp3",
+        "stop_loss",
+        "rrr",
+        "invalidation_price",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_numbers(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
+
+    @field_validator(
         "entry_price", "tp1", "tp2", "tp3", "stop_loss", "rrr", "invalidation_price"
     )
     @classmethod
@@ -267,6 +301,11 @@ class ReevaluateProposal(BaseModel):
     partial_close_pct: float | None = Field(None, ge=0, le=100)
     risk_notes: str = ""
 
+    @field_validator("new_sl", "new_tp", "partial_close_pct", mode="before")
+    @classmethod
+    def _reject_boolean_numbers(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
+
     @field_validator("new_sl", "new_tp", "partial_close_pct")
     @classmethod
     def _reject_nonfinite(cls, v: float | None) -> float | None:
@@ -296,7 +335,14 @@ TriggerMode = Literal["auto", "manual"]
 class OrderTicket(BaseModel):
     """Manual / applied order ticket. Never place without preview token + arming."""
 
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str
+    proposal_id: int | None = Field(
+        None,
+        ge=1,
+        description="Explicit source proposal applied to this ticket",
+    )
     side: OrderSide
     order_type: OrderType = "market"
     vol: float = Field(..., gt=0, description="Contract volume (not coin amount)")
@@ -330,6 +376,24 @@ class OrderTicket(BaseModel):
     )
 
     @field_validator(
+        "proposal_id",
+        "vol",
+        "leverage",
+        "price",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "tp2",
+        "tp1_share",
+        "open_type",
+        "risk_pct",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_numbers(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
+
+    @field_validator(
         "vol",
         "leverage",
         "price",
@@ -357,11 +421,20 @@ class OrderTicket(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
-    token: str
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(
+        ...,
+        min_length=43,
+        max_length=43,
+        pattern=r"^[A-Za-z0-9_-]{43}$",
+    )
 
 
 class ClosePositionRequest(BaseModel):
     """Market-close an open position (or part of it). Requires arming."""
+
+    model_config = ConfigDict(extra="forbid")
 
     symbol: str
     side: OrderSide
@@ -369,6 +442,11 @@ class ClosePositionRequest(BaseModel):
     fraction: float | None = Field(
         None, gt=0, le=1, description="Share of current hold to close (0<f<=1)"
     )
+
+    @field_validator("vol", "fraction", mode="before")
+    @classmethod
+    def _reject_boolean_numbers(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
 
     @field_validator("vol", "fraction")
     @classmethod
@@ -381,9 +459,22 @@ class ClosePositionRequest(BaseModel):
 
 
 class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_id: str | int | None = None
     orderId: str | int | None = None  # alias for MEXC-style clients
     symbol: str | None = None
+
+    @field_validator("order_id", "orderId", mode="before")
+    @classmethod
+    def _reject_boolean_order_ids(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
+
+    @model_validator(mode="after")
+    def _reject_two_order_id_fields(self):
+        if self.order_id is not None and self.orderId is not None:
+            raise ValueError("provide only one of order_id or orderId")
+        return self
 
     def resolved_order_id(self) -> str | int | None:
         return self.order_id if self.order_id is not None else self.orderId
@@ -392,9 +483,16 @@ class CancelRequest(BaseModel):
 class ModifySLRequest(BaseModel):
     """Move/replace the stop-loss of an OPEN position. Requires arming."""
 
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str
     side: OrderSide
     new_sl: float = Field(..., gt=0, description="New stop-loss price")
+
+    @field_validator("new_sl", mode="before")
+    @classmethod
+    def _reject_boolean_price(cls, v: Any) -> Any:
+        return _reject_bool_numeric(v)
 
     @field_validator("new_sl")
     @classmethod
@@ -416,7 +514,28 @@ class ArmRequest(BaseModel):
     the endpoint additionally whitelists the rule NAMES (v1: only `auto_be`).
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str
     side: OrderSide
     rules: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMProviderRequest(BaseModel):
+    """Strict provider selection without implied persistence options."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(..., min_length=1, max_length=32)
+
+
+class LLMProbeRequest(LLMProviderRequest):
+    """Bounded transient provider credentials/model for a read-only probe."""
+
+    api_key: str = Field("", max_length=8192)
+    model: str = Field("", max_length=256)
+
+
+class LLMKeyRequest(LLMProbeRequest):
+    """Bounded authenticated update for one provider key/model pair."""
 

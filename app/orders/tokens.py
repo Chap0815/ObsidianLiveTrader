@@ -5,6 +5,7 @@ SQLite may store a hash of the token for audit; the raw token is never logged.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import secrets
 import threading
@@ -47,14 +48,17 @@ class PreviewStore:
 
     def create(self, payload: dict[str, Any], ttl: int) -> str:
         token = secrets.token_urlsafe(32)
-        expires_at = time.time() + max(1, int(ttl))
+        stored_payload = copy.deepcopy(payload)
+        # TTL is elapsed time. A wall-clock correction must neither extend nor
+        # revive a confirm window, so keep this process-local deadline monotonic.
+        expires_at = time.monotonic() + max(1, int(ttl))
         with self._lock:
             self._purge_unlocked()
             # One open preview intent only — multi-tab cannot accumulate
             # confirmable tokens and double-place with different externalOids.
             self._items.clear()
             self._items[token] = {
-                "payload": payload,
+                "payload": stored_payload,
                 "expires_at": expires_at,
                 "used": False,
             }
@@ -70,7 +74,7 @@ class PreviewStore:
                 raise TokenError("preview token invalid or expired")
             if item["used"]:
                 raise TokenError("preview token already used")
-            if time.time() > float(item["expires_at"]):
+            if time.monotonic() >= float(item["expires_at"]):
                 del self._items[token]
                 raise TokenError("preview token expired")
             item["used"] = True
@@ -85,20 +89,25 @@ class PreviewStore:
             item = self._items.get(token)
             if item is None or item["used"]:
                 return None
-            if time.time() > float(item["expires_at"]):
+            if time.monotonic() >= float(item["expires_at"]):
                 return None
-            return item["payload"]
+            return copy.deepcopy(item["payload"])
 
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
 
+    def discard(self, token: str) -> None:
+        """Remove only this token; a newer single-slot token must survive."""
+        with self._lock:
+            self._items.pop(token, None)
+
     def _purge_unlocked(self) -> None:
-        now = time.time()
+        now = time.monotonic()
         dead = [
             t
             for t, it in self._items.items()
-            if it["used"] or now > float(it["expires_at"])
+            if it["used"] or now >= float(it["expires_at"])
         ]
         for t in dead:
             del self._items[t]

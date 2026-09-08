@@ -50,6 +50,7 @@ def _env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-claude")
     monkeypatch.setenv("MEXC_API_KEY", "k")
     monkeypatch.setenv("MEXC_API_SECRET", "s")
+    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "false")
     get_settings.cache_clear()
 
 
@@ -119,18 +120,95 @@ async def test_reevaluate_hold_result(monkeypatch):
         assert body["position"]["unrealized_pnl"] == 500.0
         assert body["position"]["stop_loss"] == 98_000.0
 
-        # ...and actually reached the LLM call (not just the HTTP response).
+        # ...while private financial fields do NOT reach the external LLM
+        # without the explicit INCLUDE_ACCOUNT_IN_LLM opt-in.
         pos_ctx = captured_context.get("position")
         assert pos_ctx is not None
         assert pos_ctx["entry_price"] == 100_000.0
         assert pos_ctx["side"] == "long"
-        assert pos_ctx["unrealized_pnl"] == 500.0
         assert pos_ctx["stop_loss"] == 98_000.0
-        assert pos_ctx["liquidate_price"] == 90_000.0
+        assert pos_ctx["account_fields_omitted"] is True
+        for private_key in (
+            "hold_vol",
+            "unrealized_pnl",
+            "roe_pct",
+            "liquidate_price",
+            "im",
+            "margin_ratio",
+        ):
+            assert private_key not in pos_ctx
         # Market snapshot context also present (same shape as /api/analyze).
         assert "htf" in captured_context
         assert "ltf" in captured_context
 
+    # Explicit opt-in restores the full financial position context.
+    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "true")
+    get_settings.cache_clear()
+    captured_context.clear()
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        with (
+            patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock())),
+            patch("app.main.snapshot_to_api_dict", return_value=_mock_snap()),
+            patch("app.main.reevaluate_with_llm", new=fake_reevaluate_with_llm),
+        ):
+            r = tc.post(
+                "/api/reevaluate",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+    assert r.status_code == 200, r.text
+    assert captured_context["position"]["unrealized_pnl"] == 500.0
+    assert captured_context["position"]["liquidate_price"] == 90_000.0
+
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_reevaluate_nonfinite_derived_roe_degrades_to_none(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "true")
+    get_settings.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    position = _mock_position()
+    position["unrealized_pnl"] = 1e308
+    position["im"] = 5e-324
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={
+            "equity_usdt": 1e308,
+            "available_usdt": 1e308,
+            "positions": [position],
+        }
+    )
+    client.open_stop_orders = AsyncMock(return_value=[])
+    result = ReevaluateProposal(
+        action="HOLD", confidence="low", reason="mocked", risk_notes=""
+    )
+    captured: dict = {}
+
+    async def fake_reevaluate(context, settings):
+        captured.update(context)
+        return result
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        with (
+            patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock())),
+            patch("app.main.snapshot_to_api_dict", return_value=_mock_snap()),
+            patch("app.main.reevaluate_with_llm", new=fake_reevaluate),
+        ):
+            response = tc.post(
+                "/api/reevaluate",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["position"]["roe_pct"] is None
+    assert captured["position"]["roe_pct"] is None
     get_settings.cache_clear()
 
 
@@ -156,6 +234,29 @@ def test_reevaluate_no_open_position_404(monkeypatch):
 
     assert r.status_code == 404, r.text
     assert "ETH_USDT" in r.json()["detail"]
+
+    get_settings.cache_clear()
+
+
+def test_reevaluate_rejects_invalid_interval_before_account_access(monkeypatch):
+    _env(monkeypatch)
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = MagicMock()
+    client.account_snapshot = AsyncMock()
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        response = tc.post(
+            "/api/reevaluate",
+            json={"symbol": "BTC_USDT", "tf": "invalid", "htf": "1H"},
+        )
+
+    assert response.status_code == 422
+    client.account_snapshot.assert_not_awaited()
 
     get_settings.cache_clear()
 

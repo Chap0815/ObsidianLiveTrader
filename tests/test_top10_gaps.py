@@ -9,8 +9,8 @@ sind hier bewusst NICHT dupliziert; der Verweis steht jeweils im Docstring:
   * Gap 5  (Singleflight analyze_lock/news_lock) →
            tests/test_analyze_cache.py::test_concurrent_identical_cache_miss_calls_llm_once
            und tests/test_api_news.py::test_concurrent_cache_miss_only_refreshes_once.
-  * Gap 6  (/api/sizing/suggest fail-closed strict=True → 400) →
-           tests/test_sizing_endpoint.py::test_sizing_suggest_missing_liq_strict_still_400.
+  * Gap 6  (/api/sizing/suggest missing-liq fail-closed → 400) →
+           tests/test_sizing_endpoint.py::test_sizing_suggest_missing_liq_blocks.
   * Gap 9  (Multi-Worker --workers-Footgun / File-Lock) →
            tests/test_multi_worker_guard.py::test_file_lock_detects_second_instance.
 
@@ -76,6 +76,7 @@ def _contract(**kwargs) -> ContractMeta:
         max_leverage=125,
         min_leverage=1,
         api_allowed=True,
+        state=0,
     )
     base.update(kwargs)
     return ContractMeta(**base)

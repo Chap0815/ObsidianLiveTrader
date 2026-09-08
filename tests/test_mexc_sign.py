@@ -1,9 +1,13 @@
+import pytest
+
 from app.mexc.client import (
     INTERVAL_MAP,
     normalize_klines,
+    parse_contract_meta,
     sign_payload,
     sorted_query,
 )
+from app.mexc.errors import MexcError
 
 
 def test_sign_get_stable():
@@ -67,3 +71,180 @@ def test_normalize_klines_seconds_to_ms():
     assert c.close == 33040.5
     assert c.vol == 67332.0
     assert c.amount == 222515.85925
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "close", "vol", "amount"])
+def test_normalize_klines_rejects_nonfinite_values(field):
+    raw = {
+        "time": [1609740600],
+        "open": [1.0],
+        "high": [1.0],
+        "low": [1.0],
+        "close": [1.0],
+        "vol": [1.0],
+        "amount": [1.0],
+    }
+    raw[field] = ["NaN"]
+
+    with pytest.raises(MexcError, match=f"kline {field} is non-finite"):
+        normalize_klines(raw)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda raw: raw.pop("amount"),
+        lambda raw: raw.update(open="not-an-array"),
+        lambda raw: raw.update(high=[]),
+    ],
+)
+def test_normalize_klines_rejects_missing_non_array_or_unequal_fields(mutation):
+    raw = {
+        "time": [1609740600],
+        "open": [1.0],
+        "high": [1.0],
+        "low": [1.0],
+        "close": [1.0],
+        "vol": [0.0],
+        "amount": [0.0],
+    }
+    mutation(raw)
+
+    with pytest.raises(MexcError, match="kline payload"):
+        normalize_klines(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("time", 0),
+        ("open", 0),
+        ("high", -1),
+        ("low", 0),
+        ("close", -1),
+        ("vol", -1),
+        ("amount", -1),
+    ],
+)
+def test_normalize_klines_rejects_invalid_required_ranges(field, value):
+    raw = {
+        "time": [1609740600],
+        "open": [1.0],
+        "high": [1.0],
+        "low": [1.0],
+        "close": [1.0],
+        "vol": [0.0],
+        "amount": [0.0],
+    }
+    raw[field] = [value]
+
+    with pytest.raises(MexcError, match="kline"):
+        normalize_klines(raw)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["contractSize", "priceUnit", "volUnit", "minVol", "maxVol"],
+)
+def test_contract_meta_rejects_nonfinite_filters(field):
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": 50,
+        "minLeverage": 1,
+        "state": 0,
+    }
+    row[field] = "NaN"
+
+    with pytest.raises(MexcError, match=f"{field} is non-finite"):
+        parse_contract_meta(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contractSize", 0),
+        ("priceUnit", -0.1),
+        ("volUnit", 0),
+        ("minVol", 0),
+        ("maxVol", -1),
+    ],
+)
+def test_contract_meta_rejects_invalid_positive_filters(field, value):
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": 50,
+        "minLeverage": 1,
+        "apiAllowed": True,
+        "state": 0,
+    }
+    row[field] = value
+
+    with pytest.raises(MexcError, match="must be > 0"):
+        parse_contract_meta(row)
+
+
+def test_contract_meta_treats_string_false_api_flag_as_disabled():
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": 50,
+        "minLeverage": 1,
+        "apiAllowed": "false",
+        "state": 0,
+    }
+
+    assert parse_contract_meta(row).api_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("min_leverage", "max_leverage"),
+    [(0, 50), (1, 0), (20, 10)],
+)
+def test_contract_meta_rejects_invalid_leverage_bounds(min_leverage, max_leverage):
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": max_leverage,
+        "minLeverage": min_leverage,
+        "apiAllowed": True,
+        "state": 0,
+    }
+
+    with pytest.raises(MexcError, match="leverage bounds"):
+        parse_contract_meta(row)
+
+
+def test_contract_meta_normalizes_invalid_leverage_type_to_mexc_error():
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": "garbage",
+        "minLeverage": 1,
+        "apiAllowed": True,
+        "state": 0,
+    }
+
+    with pytest.raises(MexcError, match="maxLeverage is not an integer"):
+        parse_contract_meta(row)

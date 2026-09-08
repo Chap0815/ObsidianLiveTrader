@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from app.db.repo import Database
@@ -329,3 +331,88 @@ async def test_non_reopen_cycle_preserves_alert_state(db_path):
     await db.upsert_position_mgmt(**_base_kwargs(entry_snap=100.0005, open_sig=1000))
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["last_alert_state"] == {"thesis": "fired"}  # preserved, NOT re-armed
+
+
+@pytest.mark.asyncio
+async def test_open_position_resolves_explicit_order_proposal_not_latest(db_path):
+    db = Database(db_path)
+    await db.init()
+    original_id = await db.insert_proposal(
+        symbol="BTC_USDT",
+        proposal_json={"action": "BUY", "thesis": "original"},
+    )
+    order_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    await db.insert_order(
+        symbol="BTC_USDT",
+        side="long",
+        request_json={"externalOid": "mlt-source", "_proposal_id": original_id},
+        response_json={"orderId": 1},
+        status="placed",
+        error=None,
+    )
+    await db.upsert_position_mgmt(**_base_kwargs(opened_at=order_ms))
+    await db.insert_proposal(
+        symbol="BTC_USDT",
+        proposal_json={"action": "SELL", "thesis": "unrelated newer analysis"},
+    )
+
+    resolved = await db.proposal_for_open_position("BTC_USDT", "long")
+    assert resolved is not None
+    assert resolved["id"] == original_id
+    assert resolved["proposal"]["thesis"] == "original"
+
+
+@pytest.mark.asyncio
+async def test_reopen_resolves_proposal_from_observed_trade_epoch(db_path):
+    db = Database(db_path)
+    await db.init()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    old_ms = now_ms - 120_000
+    old_id = await db.insert_proposal(
+        symbol="BTC_USDT", proposal_json={"thesis": "old"}
+    )
+    new_id = await db.insert_proposal(
+        symbol="BTC_USDT", proposal_json={"thesis": "new"}
+    )
+    old_order = await db.insert_order(
+        symbol="BTC_USDT",
+        side="long",
+        request_json={"_proposal_id": old_id},
+        response_json={"orderId": 1},
+        status="placed",
+        error=None,
+    )
+    new_order = await db.insert_order(
+        symbol="BTC_USDT",
+        side="long",
+        request_json={"_proposal_id": new_id},
+        response_json={"orderId": 2},
+        status="placed",
+        error=None,
+    )
+    async with db._acquire() as conn:
+        await conn.execute(
+            "UPDATE orders SET created_at = ? WHERE id = ?",
+            (datetime.fromtimestamp(old_ms / 1000, timezone.utc).isoformat(), old_order),
+        )
+        await conn.execute(
+            "UPDATE orders SET created_at = ? WHERE id = ?",
+            (datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(), new_order),
+        )
+        await conn.commit()
+    await db.upsert_position_mgmt(
+        **_base_kwargs(opened_at=old_ms, open_sig=111)
+    )
+
+    resolved = await db.proposal_for_open_position(
+        "BTC_USDT",
+        "long",
+        observed_entry=100.0,
+        observed_open_sig=222,
+        observed_opened_at=now_ms,
+        reopen_opened_at=now_ms,
+    )
+
+    assert resolved is not None
+    assert resolved["id"] == new_id
+    assert resolved["proposal"]["thesis"] == "new"

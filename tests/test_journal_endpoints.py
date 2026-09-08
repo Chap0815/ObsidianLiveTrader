@@ -38,7 +38,9 @@ def test_build_stats_empty_db_returns_zeros():
     assert r["overall"]["win_rate_ci95"] is None
     assert r["totals"]["stay_out_rate"] is None
     # standing shadow caveat always present
-    assert any("Shadow eval" in c for c in r["caveats"])
+    caveat = next(c for c in r["caveats"] if "Shadow eval" in c)
+    assert "limits only after price touch" in caveat
+    assert "net R uses a flat fee/slippage model" in caveat
 
 
 def test_build_stats_math_and_flags():

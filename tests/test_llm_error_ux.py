@@ -32,8 +32,8 @@ def test_categorize_401_is_invalid_key_message():
     account instead of fixing the key."""
     msg = _categorize_provider_http_error("Claude", 401, {"error": {"type": "auth"}})
     assert msg.startswith("⚠ Claude:")
-    assert "API-Key ungültig oder fehlt" in msg
-    assert "Credits erschöpft" not in msg
+    assert "API key is invalid or missing" in msg
+    assert "credits exhausted" not in msg
 
 
 def test_categorize_403_with_credit_keyword_is_credits_message():
@@ -43,7 +43,7 @@ def test_categorize_403_with_credit_keyword_is_credits_message():
         "xAI", 403, {"error": "insufficient quota for this request"}
     )
     assert msg.startswith("⚠ xAI:")
-    assert "Credits erschöpft oder Limit erreicht" in msg
+    assert "credits exhausted or limit reached" in msg
 
 
 def test_categorize_403_without_credit_keyword_is_generic():
@@ -53,14 +53,14 @@ def test_categorize_403_without_credit_keyword_is_generic():
     isn't the problem. It gets a generic access-denied message instead."""
     msg = _categorize_provider_http_error("xAI", 403, {"error": "forbidden"})
     assert msg.startswith("⚠ xAI:")
-    assert "Credits erschöpft" not in msg
-    assert "Zugriff verweigert" in msg
+    assert "credits exhausted" not in msg
+    assert "access denied" in msg
 
 
 def test_categorize_429_is_rate_limit_message():
     msg = _categorize_provider_http_error("Codex", 429, {"error": "slow down"})
     assert msg.startswith("⚠ Codex:")
-    assert "Rate-Limit" in msg
+    assert "rate limit" in msg
 
 
 def test_categorize_credit_keyword_in_body_without_401_403():
@@ -70,7 +70,7 @@ def test_categorize_credit_keyword_in_body_without_401_403():
         "Claude", 400, {"error": {"message": "Your spending limit was reached"}}
     )
     assert msg.startswith("⚠ Claude:")
-    assert "Credits erschöpft" in msg
+    assert "credits exhausted" in msg
 
 
 def test_categorize_rate_limit_keyword_in_body_without_429():
@@ -78,7 +78,7 @@ def test_categorize_rate_limit_keyword_in_body_without_429():
         "Ollama", 503, {"error": "rate limit exceeded, try later"}
     )
     assert msg.startswith("⚠ Ollama:")
-    assert "Rate-Limit" in msg
+    assert "rate limit" in msg
 
 
 def test_categorize_other_error_keeps_existing_message():
@@ -103,7 +103,7 @@ def test_categorize_used_all_credits_phrase_is_credits_message():
         "Claude", 400, {"error": {"message": "You have used all available credits"}}
     )
     assert msg.startswith("⚠ Claude:")
-    assert "Credits erschöpft" in msg
+    assert "credits exhausted" in msg
 
 
 def test_categorize_never_leaks_api_key():
@@ -172,7 +172,7 @@ async def test_call_claude_403_credits_raises_categorized_error(monkeypatch):
     with pytest.raises(LlmError) as ei:
         await _call_claude({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ Claude:")
-    assert "Credits erschöpft" in str(ei.value)
+    assert "credits exhausted" in str(ei.value)
 
 
 @pytest.mark.asyncio
@@ -185,8 +185,8 @@ async def test_call_claude_403_without_credit_keyword_is_generic(monkeypatch):
     with pytest.raises(LlmError) as ei:
         await _call_claude({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ Claude:")
-    assert "Credits erschöpft" not in str(ei.value)
-    assert "Zugriff verweigert" in str(ei.value)
+    assert "credits exhausted" not in str(ei.value)
+    assert "access denied" in str(ei.value)
 
 
 @pytest.mark.asyncio
@@ -196,7 +196,7 @@ async def test_call_xai_429_rate_limit_raises_categorized_error(monkeypatch):
     with pytest.raises(LlmError) as ei:
         await _call_xai({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ xAI:")
-    assert "Rate-Limit" in str(ei.value)
+    assert "rate limit" in str(ei.value)
 
 
 # --- L-09: single retry on transient provider failure -------------------
@@ -335,7 +335,7 @@ def test_analyze_endpoint_returns_credits_message_on_403(monkeypatch):
         assert r.status_code == 502, r.text
         detail = r.json()["detail"]
         assert detail.startswith("⚠ Claude:")
-        assert "Credits erschöpft" in detail
+        assert "credits exhausted" in detail
         # Never cached: a follow-up identical request must hit the LLM again.
         assert tc.app.state.analyze_cache == {}
 
@@ -375,6 +375,6 @@ def test_analyze_endpoint_returns_rate_limit_message_on_429(monkeypatch):
         assert r.status_code == 502, r.text
         detail = r.json()["detail"]
         assert detail.startswith("⚠ Claude:")
-        assert "Rate-Limit" in detail
+        assert "rate limit" in detail
 
     get_settings.cache_clear()

@@ -36,13 +36,13 @@ def _check_python_version(version_info: tuple | None = None) -> None:
     if tuple(vi[:2]) < (3, 11):
         found = f"{vi[0]}.{vi[1]}"
         msg = (
-            "FEHLER: Dieses Projekt benötigt Python 3.11 oder neuer "
-            f"(gefunden: Python {found}).\n"
-            "Bitte ein aktuelles Python installieren: "
+            "ERROR: This project requires Python 3.11 or newer "
+            f"(found Python {found}).\n"
+            "Install a current Python version: "
             "https://www.python.org/downloads/\n"
-            "Windows-Tipp: falls 'python' den Microsoft-Store öffnet, ist das "
-            "der Store-Stub — echtes Python 3.11+ separat installieren und "
-            "sicherstellen, dass 'py -3' bzw. 'python' danach darauf zeigt."
+            "Windows tip: if 'python' opens the Microsoft Store, it is only a "
+            "Store placeholder. Install Python 3.11+ separately and ensure "
+            "that 'py -3' or 'python' points to it."
         )
         print(msg)
         raise SystemExit(1)
@@ -94,7 +94,7 @@ def _run(
     r = subprocess.run(cmd, cwd=str(ROOT), env=env)
     if check and r.returncode != 0:
         if error_hint:
-            print(f"FEHLER: {error_hint} (Exit-Code {r.returncode})")
+            print(f"ERROR: {error_hint} (exit code {r.returncode})")
         raise SystemExit(r.returncode)
     return r.returncode
 
@@ -127,21 +127,21 @@ def ensure_venv(vpy: Path) -> Path:
             f"Refusing to use unexpected Python (not project .venv): {vpy}"
         )
 
-    print("Erzeuge Projekt-.venv (einmalig, isoliert von System-Python) …")
-    print(f"  System-Python nur für: python -m venv  →  {_system_python()}")
+    print("Creating the project .venv (one-time, isolated from system Python)…")
+    print(f"  System Python is used only for: python -m venv  →  {_system_python()}")
     # System interpreter is ONLY allowed for creating the venv module
     _run(
         [_system_python(), "-m", "venv", str(VENV_DIR)],
         error_hint=(
-            "venv-Erstellung fehlgeschlagen — prüfe Python-Installation und "
-            "Schreibrechte im Projektordner."
+            "Could not create .venv — check your Python installation and "
+            "write access to the project folder."
         ),
     )
     if not vpy.is_file():
         raise SystemExit(f"venv python missing after create: {vpy}")
     if not _is_project_venv(vpy):
         raise SystemExit(f"venv path check failed: {vpy}")
-    print(f"venv erstellt: {vpy}")
+    print(f"venv created: {vpy}")
     return vpy
 
 
@@ -171,7 +171,7 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         return
     if not _is_project_venv(vpy):
         raise SystemExit(
-            f"SICHERHEIT: pip nur im Projekt-.venv erlaubt, nicht: {vpy}"
+            f"SAFETY: pip is allowed only in the project .venv, not: {vpy}"
         )
 
     marker = VENV_DIR / ".deps_installed"
@@ -185,11 +185,11 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         print(f"Dependencies already installed in .venv (marker up to date: {req.name})")
         return
 
-    print(f"Installiere requirements ({req.name}) NUR in .venv (nicht global) …")
+    print(f"Installing requirements ({req.name}) in .venv only (not globally)…")
     env = _venv_env()
     pip_error_hint = (
-        "pip-Install fehlgeschlagen — prüfe Internetverbindung/Proxy; für "
-        "einen Offline-Retry ohne Install '--skip-install' verwenden."
+        "pip install failed — check your connection or proxy. For an offline "
+        "retry without installing, use '--skip-install'."
     )
     # Explicit: python.exe from .venv + -m pip + --require-virtualenv
     _run(
@@ -219,7 +219,7 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         error_hint=pip_error_hint,
     )
     marker.write_text(state, encoding="utf-8")
-    print("pip fertig — nur .venv betroffen.")
+    print("Dependencies are ready in the project .venv.")
 
 
 def run_with_venv(vpy: Path, script_rel: str, *args: str) -> int:
@@ -309,6 +309,21 @@ def read_exchange_banner() -> str:
     return "MEXC"
 
 
+def read_trading_banner() -> str:
+    """Return an honest, secret-free trading state for launcher output."""
+    env_path = ROOT / ".env"
+    if env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            if key.strip() == "TRADING_ENABLED":
+                armed = value.strip().lower() in ("1", "true", "yes", "on")
+                return "ARMED — order submission is enabled" if armed else "DISARMED (safe default)"
+    return "DISARMED (safe default)"
+
+
 def _port_in_use(host: str, port: int) -> bool:
     """W3-11: advisory pre-check — a closed/free port must never block a
     legitimate start. Only a clear 'something is listening' (connect
@@ -336,16 +351,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--setup-cli",
         dest="setup_cli",
         action="store_true",
-        help="Headless-Einrichtung im Terminal statt im Browser",
+        help="Run the terminal setup assistant instead of browser setup",
     )
-    p.add_argument("--skip-setup", action="store_true", help="Kein Bootstrap/Wizard")
+    p.add_argument("--skip-setup", action="store_true", help="Skip setup bootstrap")
     p.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Port für Bootstrap-.env (Default 8787). Bei belegtem Port beim "
-        "Erst-Start setzen; ein im /setup geänderter Port greift erst beim "
-        "nächsten Start (laufendes uvicorn kann nicht neu binden).",
+        help="Port for the bootstrap .env (default 8787). Set this on first "
+        "launch if the port is occupied; changes made in /setup apply on the "
+        "next launch because a running server cannot rebind.",
     )
     p.add_argument("--reload", action="store_true", help="uvicorn --reload (dev)")
     return p
@@ -360,8 +375,8 @@ def main() -> None:
     print("  Local Futures Trader — Launcher")
     print("=" * 56)
     print(f"  Project: {ROOT}")
-    print(f"  System-Python (nur venv-Create): {_system_python()}")
-    print(f"  Projekt-venv:                   {_venv_python()}")
+    print(f"  System Python (venv creation only): {_system_python()}")
+    print(f"  Project .venv:                    {_venv_python()}")
     print()
 
     # 1) venv first — all later steps use venv only
@@ -387,7 +402,9 @@ def main() -> None:
     print(f"Exchange: {read_exchange_banner()}")
     print(f"Server:   {url}")
     print(f"Python:   {vpy}  (venv only)")
-    print("Trading:  DISARMED until TRADING_ENABLED=true in .env")
+    print(f"Trading:  {read_trading_banner()}")
+    if setup_open:
+        print("Next:     complete the guided setup in your browser")
     print("Ctrl+C to stop.")
     print()
 
@@ -396,7 +413,7 @@ def main() -> None:
     # start.bat) und würde sonst einen englischen uvicorn-Bind-Traceback
     # sehen. Rein advisory: bei Unklarheit wird normal weitergestartet.
     if _port_in_use(host, port):
-        print(f"Läuft bereits auf Port {port} — Browser öffnen, kein zweiter Start nötig.")
+        print(f"Already running on port {port} — opening the browser; no second server needed.")
         print(f"  URL: {url}")
         if not args.no_browser:
             try:

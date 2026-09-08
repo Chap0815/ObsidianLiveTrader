@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any, Protocol
 
@@ -46,7 +47,7 @@ def _contract_public(meta: ContractMeta) -> dict[str, Any]:
 _FUNDING_EXTREME_THRESHOLD = 0.0001
 
 
-def _funding_annualized(rate: float, collect_cycle: int | None) -> float:
+def _funding_annualized(rate: float, collect_cycle: int | None) -> float | None:
     """Annualize a per-settlement funding rate.
 
     `collect_cycle` is the number of HOURS between funding settlements
@@ -58,7 +59,8 @@ def _funding_annualized(rate: float, collect_cycle: int | None) -> float:
     """
     cycle_hours = collect_cycle if collect_cycle and collect_cycle > 0 else 1
     periods_per_year = (24.0 * 365.0) / cycle_hours
-    return round(rate * periods_per_year, 6)
+    annualized = rate * periods_per_year
+    return round(annualized, 6) if math.isfinite(annualized) else None
 
 
 def _funding_extreme(rate: float) -> str:
@@ -183,7 +185,7 @@ async def _fetch_daily_candles(
     deep as the current request. A shallow scan fetch is therefore NEVER served
     to a deeper analysis request (which would leave EMA200/ema_stack "unknown")."""
     key = (symbol, daily)
-    now = time.time()
+    now = time.monotonic()
     hit = _daily_cache.get(key)
     if hit is not None and (now - hit[0]) < ttl and hit[2] >= limit_hint:
         return hit[1]
@@ -327,7 +329,7 @@ async def fetch_btc_regime(
     btc_price_vs_ema20_pct (1H stretch). Cached ~5 min and reused across all
     altcoin analyses. Returns None on any failure/empty data (block omitted)."""
     key = (htf, daily)
-    now = time.time()
+    now = time.monotonic()
     hit = _btc_regime_cache.get(key)
     if hit is not None and (now - hit[0]) < ttl:
         return hit[1]

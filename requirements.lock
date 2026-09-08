@@ -1,5 +1,5 @@
 # requirements.lock — exact, reproducible pin of the tested environment (F-18).
-# Generated from the project .venv with the full suite green (303 passed, 2026-07-12).
+# Validated with requirements-dev.txt (1892 passed, 2026-09-07).
 # requirements.txt keeps version RANGES for flexibility; this lockfile is the
 # byte-for-byte reproducible set. To reproduce exactly:
 #   .venv/Scripts/python.exe -m pip install --require-virtualenv -r requirements.lock
@@ -34,20 +34,14 @@ httptools==0.8.0
 httpx==0.28.1
 hyperliquid-python-sdk==0.24.0
 idna==3.18
-iniconfig==2.3.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 msgpack==1.2.1
-packaging==26.2
 parsimonious==0.10.0
-pluggy==1.6.0
 pycryptodome==3.23.0
 pydantic==2.13.4
 pydantic-settings==2.14.2
 pydantic_core==2.46.4
-Pygments==2.20.0
-pytest==9.1.1
-pytest-asyncio==1.4.0
 python-dotenv==1.2.2
 PyYAML==6.0.3
 regex==2026.6.28

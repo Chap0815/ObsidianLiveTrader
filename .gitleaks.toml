@@ -1,0 +1,25 @@
+title = "Obsidian publication secret checks"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Literal fail-closed error message, not a credential"
+condition = "AND"
+paths = ['''^app/security\.py$''']
+regexTarget = "match"
+regexes = ['''auth token required: TRADING_ENABLED''']
+
+[[allowlists]]
+description = "Synthetic key used by the no-readback API regression test"
+condition = "AND"
+paths = ['''^tests/test_settings_llm\.py$''']
+regexTarget = "match"
+regexes = ['''(?:api_key["']:\s*["']|XAI_API_KEY=)xai-secret-123["']''']
+
+[[allowlists]]
+description = "Historical empty token followed by a configuration variable name"
+condition = "AND"
+paths = ['''^\.env\.example$''']
+regexTarget = "match"
+regexes = ['''LOCAL_API_TOKEN=\s+STRICT_AVAILABLE_MARGIN''']

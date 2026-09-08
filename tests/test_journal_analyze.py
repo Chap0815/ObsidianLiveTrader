@@ -206,7 +206,7 @@ def test_analyze_recalibrates_display_but_never_blocks(tmp_path, monkeypatch):
         # (c) calibrated overlay downgraded + sizing suggestion shrunk.
         assert data["confidence_calibrated"] == "medium"
         assert data["size_factor"] == 0.5
-        assert data["calibration_note"] and "kalibriert: medium" in data["calibration_note"]
+        assert data["calibration_note"] and "calibrated: medium" in data["calibration_note"]
         assert data["position_sizing_note_calibrated"]
     get_settings.cache_clear()
 

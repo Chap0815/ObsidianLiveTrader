@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from typing import Any
 
 import websockets
@@ -82,6 +83,31 @@ def hl_ws_url(settings: Settings) -> str:
 def to_coin(symbol: str) -> str:
     s = (symbol or "").strip().upper().replace("-", "_")
     return s.split("_")[0] if s else "BTC"
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_float(value: Any) -> float | None:
+    parsed = _finite_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _timestamp_or_zero(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return parsed if parsed > 0 else 0
 
 
 async def _pump_client(client_ws: WebSocket) -> None:
@@ -312,7 +338,9 @@ async def _run_upstream_session(
     return forwarded_real_data
 
 
-def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
+def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
+    if not isinstance(msg, dict):
+        return None
     ch = msg.get("channel")
     data = msg.get("data")
 
@@ -322,21 +350,28 @@ def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
     if ch == "trades" and isinstance(data, list):
         trades = []
         for t in data:
-            if str(t.get("coin", "")).upper() not in ("", coin):
+            if not isinstance(t, dict):
+                continue
+            row_coin = t.get("coin", "")
+            if not isinstance(row_coin, str):
+                continue
+            if row_coin.upper() not in ("", coin):
                 # Wrong coin — skip it, do not forward as this coin's trade
                 # (F-21). Still accept if coin is missing.
                 continue
-            try:
-                trades.append(
-                    {
-                        "px": float(t["px"]),
-                        "sz": float(t.get("sz") or 0),
-                        "side": t.get("side"),
-                        "time": int(t.get("time") or 0),
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
+            px = _positive_float(t.get("px"))
+            size_raw = t.get("sz")
+            size = 0.0 if size_raw in (None, "") else _finite_float(size_raw)
+            if px is None or size is None or size < 0:
                 continue
+            trades.append(
+                {
+                    "px": px,
+                    "sz": size,
+                    "side": t.get("side"),
+                    "time": _timestamp_or_zero(t.get("time")),
+                }
+            )
         if not trades:
             return None
         last = trades[-1]
@@ -357,22 +392,39 @@ def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
         for c in candles:
             if not isinstance(c, dict):
                 continue
-            try:
-                # HL candle: t,T,o,h,l,c,v,s,i
-                out_bars.append(
-                    {
-                        "time_ms": int(c.get("t") or 0),
-                        "open": float(c["o"]),
-                        "high": float(c["h"]),
-                        "low": float(c["l"]),
-                        "close": float(c["c"]),
-                        "vol": float(c.get("v") or 0),
-                        "interval": c.get("i"),
-                        "coin": c.get("s") or coin,
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
+            row_coin_raw = c.get("s")
+            if row_coin_raw is not None and not isinstance(row_coin_raw, str):
                 continue
+            row_coin = (row_coin_raw or "").upper()
+            if row_coin and row_coin != coin:
+                continue
+            open_px = _positive_float(c.get("o"))
+            high_px = _positive_float(c.get("h"))
+            low_px = _positive_float(c.get("l"))
+            close_px = _positive_float(c.get("c"))
+            volume_raw = c.get("v")
+            volume = 0.0 if volume_raw in (None, "") else _finite_float(volume_raw)
+            if (
+                None in (open_px, high_px, low_px, close_px)
+                or volume is None
+                or volume < 0
+            ):
+                continue
+            if high_px < max(open_px, close_px) or low_px > min(open_px, close_px):
+                continue
+            # HL candle: t,T,o,h,l,c,v,s,i
+            out_bars.append(
+                {
+                    "time_ms": _timestamp_or_zero(c.get("t")),
+                    "open": open_px,
+                    "high": high_px,
+                    "low": low_px,
+                    "close": close_px,
+                    "vol": volume,
+                    "interval": c.get("i"),
+                    "coin": row_coin or coin,
+                }
+            )
         if not out_bars:
             return None
         bar = out_bars[-1]
@@ -385,11 +437,21 @@ def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
 
     if ch == "bbo" and isinstance(data, dict):
         # data: {"coin","time","bbo":[bid, ask]} where each is {"px","sz","n"}
+        row_coin_raw = data.get("coin")
+        if row_coin_raw is not None and not isinstance(row_coin_raw, str):
+            return None
+        row_coin = (row_coin_raw or "").upper()
+        if row_coin and row_coin != coin:
+            return None
         levels = data.get("bbo") or []
         try:
-            bid = float(levels[0]["px"]) if levels and levels[0] else None
-            ask = float(levels[1]["px"]) if len(levels) > 1 and levels[1] else None
-        except (KeyError, TypeError, ValueError, IndexError):
+            bid = _positive_float(levels[0].get("px")) if levels and levels[0] else None
+            ask = (
+                _positive_float(levels[1].get("px"))
+                if len(levels) > 1 and levels[1]
+                else None
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, IndexError):
             bid = ask = None
         mid = None
         if bid is not None and ask is not None:
@@ -398,25 +460,20 @@ def _normalize_hl(msg: dict[str, Any], *, coin: str) -> dict[str, Any] | None:
             mid = bid
         elif ask is not None:
             mid = ask
-        if mid is None:
+        if mid is None or not math.isfinite(mid) or mid <= 0:
             return None
         return {
             "type": "mid",
             "coin": coin,
             "px": mid,
-            "time": int(data.get("time") or 0),
+            "time": _timestamp_or_zero(data.get("time")),
         }
 
     if ch == "allMids" and isinstance(data, dict):
         mids = data.get("mids") or data
-        if coin in mids:
-            try:
-                return {
-                    "type": "mid",
-                    "coin": coin,
-                    "px": float(mids[coin]),
-                }
-            except (TypeError, ValueError):
-                return None
+        if isinstance(mids, dict) and coin in mids:
+            price = _positive_float(mids[coin])
+            if price is not None:
+                return {"type": "mid", "coin": coin, "px": price}
 
     return None

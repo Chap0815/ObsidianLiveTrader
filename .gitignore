@@ -35,6 +35,25 @@ docs/superpowers/HANDOFF-*.md
 docs/NACHT_AUDIT_LOG.md
 docs/NACHT_AUDIT_PROMPT.md
 docs/OPTIMIERUNG_PLAN.md
+docs/HARDENING_LOG.md
+docs/AUDIT*.md
+docs/superpowers/
 
 # Windows-Verknuepfungen (maschinenspezifische absolute Pfade) — via scripts/create-shortcut.ps1 erzeugen
 *.lnk
+
+# Local handoff and runtime artifacts
+NEW_SESSION_PROMPT.md
+PROJECT.md
+AGENDA.md
+*.log
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.bak
+*.bundle
+.coverage
+htmlcov/
+playwright-report/
+test-results/

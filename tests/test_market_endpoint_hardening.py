@@ -11,6 +11,7 @@ size-capped in-memory cache) plus a hard interval allowlist (422 on garbage).
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -106,3 +107,53 @@ def test_market_cache_size_is_capped():
                 assert r.status_code == 200, r.text
 
         assert len(client.app.state.market_cache) <= MARKET_CACHE_MAX_ENTRIES
+
+
+@pytest.mark.asyncio
+async def test_market_different_cache_keys_refresh_concurrently():
+    import asyncio
+
+    import httpx
+
+    inflight = 0
+    max_inflight = 0
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def build(symbol, tf, htf, client, limit_hint):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        if inflight == 2:
+            both_started.set()
+        try:
+            await release.wait()
+            return {"symbol": symbol}
+        finally:
+            inflight -= 1
+
+    app.state.exchange = MagicMock()
+    app.state.mexc = app.state.exchange
+    app.state.market_cache = {}
+    app.state.market_lock = asyncio.Lock()
+    app.state.market_locks = {}
+    transport = httpx.ASGITransport(app=app)
+
+    with (
+        patch("app.main.build_market_snapshot", new=build),
+        patch("app.main.snapshot_to_api_dict", side_effect=lambda snapshot: snapshot),
+    ):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            tasks = [
+                asyncio.create_task(client.get("/api/market/BTC_USDT")),
+                asyncio.create_task(client.get("/api/market/ETH_USDT")),
+            ]
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=1.0)
+            finally:
+                release.set()
+                responses = await asyncio.gather(*tasks)
+
+    assert all(response.status_code == 200 for response in responses)
+    assert max_inflight == 2
+    assert app.state.market_locks == {}

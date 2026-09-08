@@ -9,6 +9,8 @@ Conventions (documented for LLM/UI consumers):
 
 from __future__ import annotations
 
+import math
+
 from app.models import Candle
 
 
@@ -226,6 +228,19 @@ def indicator_bundle(candles: list[Candle]) -> dict:
     atr = compute_atr(closed, 14)
     rvol, vol_trend = compute_rvol(closed)
     as_of = closed[-1] if closed else None
+
+    def _finite_series(series: list[float | None]) -> list[float | None]:
+        return [v if v is None or math.isfinite(v) else None for v in series]
+
+    macd = {name: _finite_series(series) for name, series in macd.items()}
+    ema20 = _finite_series(ema20)
+    ema50 = _finite_series(ema50)
+    ema200 = _finite_series(ema200)
+    rsi = _finite_series(rsi)
+    vwap = _finite_series(vwap)
+    atr = _finite_series(atr)
+    if not math.isfinite(rvol):
+        rvol = 1.0
 
     def _last(series: list[float | None]) -> float | None:
         for v in reversed(series):

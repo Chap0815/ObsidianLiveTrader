@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Usage and installation questions
+    url: https://github.com/Chap0815/ObsidianLiveTrader/discussions
+    about: Ask for help without sharing private account data.
+  - name: Security vulnerability
+    url: https://github.com/Chap0815/ObsidianLiveTrader/security/advisories/new
+    about: Report vulnerabilities privately.

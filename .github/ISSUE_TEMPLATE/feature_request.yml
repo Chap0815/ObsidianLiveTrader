@@ -1,0 +1,16 @@
+name: Feature suggestion
+description: Describe a user need and the expected benefit.
+title: "[Suggestion]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behavior and alternatives
+    validations:
+      required: true

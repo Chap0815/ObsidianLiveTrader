@@ -126,7 +126,7 @@ def recalibrate(
     if not (conf_fires or regime_fires):
         # Nothing fired -> raw. Preserve the honest "too little data" note the
         # confidence group showed when it existed but was under-sampled.
-        note = f"zu wenig Daten (n={conf_n})" if 0 < conf_n < min_n else None
+        note = f"insufficient data (n={conf_n})" if 0 < conf_n < min_n else None
         return _raw(emitted_confidence, note)
 
     idx = _TIERS.index(emitted)
@@ -144,14 +144,14 @@ def recalibrate(
     parts: list[str] = []
     if conf_fires and conf_lo is not None:
         parts.append(
-            f"deine {emitted}-Setups insgesamt: "
-            f"{round(conf_lo * 100)} % WR (Wilson-LB, n={conf_n})"
+            f"your {emitted} setups overall: "
+            f"{round(conf_lo * 100)}% WR (Wilson LB, n={conf_n})"
         )
     if regime_fires and reg_lo is not None:
         parts.append(
-            f"Regime {regime_key}: {round(reg_lo * 100)} % WR (Wilson-LB, n={reg_n})"
+            f"Regime {regime_key}: {round(reg_lo * 100)}% WR (Wilson LB, n={reg_n})"
         )
-    note = f"KI: {emitted} · kalibriert: {calibrated} — " + " · ".join(parts)
+    note = f"AI: {emitted} · calibrated: {calibrated} — " + " · ".join(parts)
     return {
         "calibrated_confidence": calibrated,
         "size_factor": size_factor,

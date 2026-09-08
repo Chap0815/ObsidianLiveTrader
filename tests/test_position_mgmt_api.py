@@ -88,6 +88,10 @@ def test_arm_sets_rules_and_freezes_baseline(tmp_path, monkeypatch):
         assert body["r1"] == pytest.approx(2.0)
         assert body["initial_sl_snap"] == pytest.approx(98.0)
         assert body["be_done"] == 0
+        # Arming enables autonomous stop mutations and freezes the live
+        # baseline, so Hyperliquid's bounded-stale display cache must not be
+        # accepted here.
+        client.account_snapshot.assert_awaited_once_with(fresh=True)
         # It must NOT have placed/modified any order — only read paths allowed.
         called = {c[0] for c in client.method_calls}
         assert called <= {"account_snapshot", "open_stop_orders", "user_fills"}
@@ -156,6 +160,31 @@ def test_alerts_returns_set_alert_state(tmp_path, monkeypatch):
         assert row["side"] == "long"
         assert row["armed_rules"] == {"auto_be": True}
         assert row["alerts"]["thesis"]["active"] is True
+    get_settings.cache_clear()
+
+
+def test_alerts_db_failure_is_unavailable_not_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "alerts_error.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        original_db = tc.app.state.db
+        failing_db = MagicMock()
+        failing_db.list_open_position_mgmt = AsyncMock(
+            side_effect=RuntimeError("sqlite unavailable")
+        )
+        tc.app.state.db = failing_db
+        try:
+            r = tc.get("/api/positions/alerts")
+            tc.app.state.db = None
+            missing = tc.get("/api/positions/alerts")
+        finally:
+            tc.app.state.db = original_db
+
+        assert r.status_code == 503, r.text
+        assert "sqlite unavailable" not in r.text
+        assert missing.status_code == 503, missing.text
     get_settings.cache_clear()
 
 

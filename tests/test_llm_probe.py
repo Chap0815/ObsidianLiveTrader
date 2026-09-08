@@ -95,7 +95,7 @@ async def test_401_maps_to_invalid():
     _FakeClient.resp = _FakeResp(401)
     r = await probe_provider("openai", api_key="bad")
     assert r["ok"] is False
-    assert "ungültig" in r["detail"].lower()
+    assert "invalid" in r["detail"].lower()
 
 
 @pytest.mark.asyncio
@@ -120,4 +120,4 @@ async def test_network_error_maps_to_unreachable():
     _FakeClient.raise_exc = httpx.ConnectError("boom")
     r = await probe_provider("openai", api_key="k")
     assert r["ok"] is False
-    assert "erreichbar" in r["detail"].lower()
+    assert "unavailable" in r["detail"].lower()

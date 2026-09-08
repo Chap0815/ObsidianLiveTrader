@@ -1,8 +1,11 @@
 """Task 17: regime-label decoupling (M2-03), BTC regime anchor (K2-02),
 token-ballast removal (K2-05)."""
 
+from types import SimpleNamespace
+
 import pytest
 
+from app.analysis import context as ctxmod
 from app.analysis.context import (
     clear_btc_regime_cache,
     clear_daily_cache,
@@ -121,6 +124,31 @@ async def test_fetch_btc_regime_shape_and_cache():
     # second call within TTL is fully served from cache (no new upstream fetch)
     await fetch_btc_regime(client)
     assert client.calls == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_fetch_btc_regime_cache_ttl_uses_monotonic_time(monkeypatch):
+    clear_btc_regime_cache()
+    clear_daily_cache()
+    client = _BtcClient()
+    wall = [1_000.0]
+    elapsed = [1_000.0]
+    monkeypatch.setattr(
+        ctxmod,
+        "time",
+        SimpleNamespace(
+            time=lambda: wall[0],
+            monotonic=lambda: elapsed[0],
+        ),
+    )
+
+    await fetch_btc_regime(client)
+    calls_after_first = dict(client.calls)
+    wall[0] = 100.0
+    elapsed[0] += ctxmod._BTC_REGIME_TTL_S + 1.0
+    await fetch_btc_regime(client)
+
+    assert all(client.calls[key] > count for key, count in calls_after_first.items())
 
 
 @pytest.mark.asyncio
@@ -248,6 +276,24 @@ def test_context_no_remaining_budget_without_position():
     settings = Settings(include_account_in_llm=True, max_risk_pct=5.0)
     account = {"equity_usdt": 10_000.0, "available_usdt": 5_000.0, "positions": []}
     ctx = build_llm_context(_market(), account, settings)
+    assert "remaining_risk_budget_pct" not in ctx
+
+
+def test_context_omits_remaining_budget_when_one_side_risk_is_unknown():
+    settings = Settings(include_account_in_llm=True, max_risk_pct=5.0)
+    account = {
+        "equity_usdt": 10_000.0,
+        "available_usdt": 5_000.0,
+        "positions": [
+            _pos(side="long", stop_loss=None, liquidate_price=None),
+            _pos(side="short", hold_vol=20.0),
+        ],
+    }
+    mk = _market()
+    mk["contract"] = {"contractSize": 1.0, "maxLeverage": 25}
+
+    ctx = build_llm_context(mk, account, settings)
+
     assert "remaining_risk_budget_pct" not in ctx
 
 

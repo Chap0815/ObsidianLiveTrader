@@ -4,11 +4,8 @@ The env-content builder itself is covered by test_env_builder.py; this file
 covers the /setup + /api/setup wiring and the SETUP_COMPLETE marker.
 """
 
-import pytest
-
 from app.config import Settings
 from app.env_builder import build_full_env, normalize_answers
-from app.main import ENV_PATH
 
 
 def _payload(**kw):
@@ -53,24 +50,24 @@ def test_marker_transitions(tmp_path):
     assert Settings(_env_file=str(complete)).setup_complete is True
 
 
-@pytest.mark.skipif(
-    not ENV_PATH.exists(), reason="needs existing .env to test the lock"
-)
-def test_setup_locked_when_setup_complete():
+def test_setup_locked_when_setup_complete(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.config import get_settings
-    from app.main import _setup_needed, app
+    import app.main as main
 
-    # Only meaningful when the live .env is actually marked complete.
-    if _setup_needed():
-        pytest.skip("live .env is not SETUP_COMPLETE")
-    get_settings.cache_clear()
-    with TestClient(app) as c:
+    # Exercise the lock with a synthetic file, never a developer's real .env.
+    env = tmp_path / ".env"
+    original = "SETUP_COMPLETE=true\nTRADING_ENABLED=false\nHOST=127.0.0.1\n"
+    env.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(main, "ENV_PATH", env)
+    settings = Settings(_env_file=str(env))
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    with TestClient(main.app) as c:
         r = c.get("/setup", follow_redirects=False)
         assert r.status_code == 303  # locked → back to dashboard
         r2 = c.post("/api/setup", json=_payload())
         assert r2.status_code == 403  # cannot overwrite existing config
+    assert env.read_text(encoding="utf-8") == original
 
 
 # ── Finding 3: os.replace transient Windows lock -> 409, not opaque 500 ─────
@@ -97,6 +94,6 @@ def test_setup_save_permission_error_maps_to_409(tmp_path, monkeypatch):
         r = c.post("/api/setup", json=_payload())
 
     assert r.status_code == 409
-    assert "gesperrt" in r.json()["detail"]
+    assert "locked" in r.json()["detail"]
     assert not env.exists()  # fail-safe: never created
     assert list(tmp_path.glob(".env.*.tmp")) == []  # tmp cleaned up

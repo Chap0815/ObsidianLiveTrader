@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless Einrichtungsassistent (.env) — Fallback zum Browser-Setup.
+"""Headless setup assistant (.env) — fallback for browser setup.
 
 Teilt sich EINEN .env-Builder und dasselbe Fragen-Set mit dem Web-Setup
 (app.env_builder). Keine zweite Wahrheit mehr.
@@ -34,10 +34,10 @@ ENV_PATH = ROOT / ".env"
 def _banner() -> None:
     print()
     print("=" * 56)
-    print("  Local Futures Trader — Einrichtungsassistent (Terminal)")
+    print("  Local Futures Trader — Terminal Setup Assistant")
     print("=" * 56)
-    print("  Werte landen nur in lokaler .env (nicht online).")
-    print("  Trading bleibt DISARMED bis du TRADING_ENABLED=true setzt.")
+    print("  Values are stored only in the local .env file, never online.")
+    print("  Trading stays DISARMED until you set TRADING_ENABLED=true.")
     print()
 
 
@@ -46,18 +46,18 @@ def _ask(prompt: str, default: str = "", *, secret: bool = False) -> str:
     try:
         raw = getpass.getpass(f"{prompt}{hint}: ") if secret else input(f"{prompt}{hint}: ")
     except (EOFError, KeyboardInterrupt):
-        print("\nAbgebrochen.")
+        print("\nCancelled.")
         raise SystemExit(1)
     raw = (raw or "").strip()
     return raw if raw else default
 
 
 def _ask_yes(prompt: str, default: bool = False) -> bool:
-    d = "J/n" if default else "j/N"
+    d = "Y/n" if default else "y/N"
     raw = _ask(f"{prompt} ({d})", "")
     if not raw:
         return default
-    return raw.lower() in ("j", "ja", "y", "yes", "1", "true")
+    return raw.lower() in ("y", "yes", "1", "true")
 
 
 def collect_answers() -> dict:
@@ -66,68 +66,68 @@ def collect_answers() -> dict:
     payload: dict = {}
 
     # 1) Börse
-    print("1) Börse")
-    print("   [1] Hyperliquid TESTNET  (empfohlen zum Üben, Spielgeld)")
-    print("   [2] Hyperliquid MAINNET  (echtes Geld)")
-    print("   [3] MEXC Futures         (API-Key, echtes Geld)")
-    choice = _ask("Auswahl", "1")
+    print("1) Exchange")
+    print("   [1] Hyperliquid TESTNET  (recommended for practice; test funds)")
+    print("   [2] Hyperliquid MAINNET  (real funds)")
+    print("   [3] MEXC Futures         (API key; real funds)")
+    choice = _ask("Selection", "1")
     if choice == "3":
         payload["exchange"] = "mexc"
     elif choice == "2":
         payload["exchange"] = "hl-mainnet"
-        print("   MAINNET = echtes Geld. Zum Bestätigen 'MAINNET' tippen.")
-        payload["mainnet_confirm"] = _ask("Bestätigung")
+        print("   MAINNET uses real funds. Type 'MAINNET' to confirm.")
+        payload["mainnet_confirm"] = _ask("Confirmation")
     else:
         payload["exchange"] = "hl-testnet"
 
     if payload["exchange"] in ("hl-testnet", "hl-mainnet"):
         print()
-        print("2) Hyperliquid Keys (Agent/API-Wallet — kann NICHT withdrawen)")
+        print("2) Hyperliquid keys (agent/API wallet — cannot withdraw)")
         pk = _ask("HL_PRIVATE_KEY (0x… 64 Hex)", secret=True)
         if pk and not pk.startswith("0x"):
             pk = "0x" + pk
-        addr = _ask("HL_ACCOUNT_ADDRESS (Main-Wallet, oft nötig bei Agent-Key)")
+        addr = _ask("HL_ACCOUNT_ADDRESS (main wallet; often needed with an agent key)")
         if addr and not addr.startswith("0x"):
             addr = "0x" + addr
         payload["hl_private_key"] = pk
         payload["hl_account_address"] = addr
     else:
         print()
-        print("2) MEXC API Keys (Trade only, KEIN Withdraw)")
+        print("2) MEXC API keys (trade only; no withdrawals)")
         payload["mexc_api_key"] = _ask("MEXC_API_KEY", secret=True)
         payload["mexc_api_secret"] = _ask("MEXC_API_SECRET", secret=True)
 
     # 3) KI
     print()
-    print("3) KI-Anbieter")
-    print("   [1] Claude  [2] Grok (xAI)  [3] OpenAI/Codex  [4] Ollama (lokal)  [5] keiner")
+    print("3) AI provider")
+    print("   [1] Claude  [2] Grok (xAI)  [3] OpenAI/Codex  [4] Ollama (local)  [5] none")
     pmap = {"1": "claude", "2": "xai", "3": "openai", "4": "ollama", "5": "none"}
-    provider = pmap.get(_ask("Auswahl", "1"), "claude")
+    provider = pmap.get(_ask("Selection", "1"), "claude")
     payload["llm_provider"] = provider
     if provider in ("claude", "xai", "openai"):
-        payload["llm_api_key"] = _ask(f"API Key für {provider}", secret=True)
-        payload["model"] = _ask("Modell", DEFAULT_MODELS[provider])
+        payload["llm_api_key"] = _ask(f"API key for {provider}", secret=True)
+        payload["model"] = _ask("Model", DEFAULT_MODELS[provider])
     elif provider == "ollama":
-        payload["model"] = _ask("Ollama-Modell", DEFAULT_MODELS["ollama"])
+        payload["model"] = _ask("Ollama model", DEFAULT_MODELS["ollama"])
     payload["include_account_in_llm"] = _ask_yes(
-        "Account-Daten (Equity/Positionen) an die KI senden?", default=False
+        "Send account data (equity/positions) to the AI?", default=False
     )
 
     # 4) Risiko
     print()
-    print("4) Risiko-Profil")
+    print("4) Risk profile")
     print("   [1] conservative  [2] balanced  [3] free  [4] custom")
     rmap = {"1": "conservative", "2": "balanced", "3": "free", "4": "custom"}
-    rp = rmap.get(_ask("Auswahl", "1"), "conservative")
+    rp = rmap.get(_ask("Selection", "1"), "conservative")
     payload["risk_profile"] = rp
     if rp == "custom":
         payload["max_risk_pct"] = _ask("MAX_RISK_PCT (%)", "1.0")
         payload["max_leverage"] = _ask("MAX_LEVERAGE", "20")
         payload["min_rrr"] = _ask("MIN_RRR", "2.0")
         payload["max_notional_pct_of_equity"] = _ask(
-            "MAX_NOTIONAL_PCT_OF_EQUITY (harter Cap, % Equity; 0=aus)", "1000"
+            "MAX_NOTIONAL_PCT_OF_EQUITY (hard cap, % equity; 0=off)", "1000"
         )
-    payload["max_notional_usdt"] = _ask("MAX_NOTIONAL_USDT (Warnschwelle)", "500")
+    payload["max_notional_usdt"] = _ask("MAX_NOTIONAL_USDT (warning threshold)", "500")
 
     # 5) Erweitert
     print()
@@ -140,7 +140,7 @@ def _maybe_test_provider(payload: dict) -> None:
     provider = payload.get("llm_provider")
     if provider in (None, "none"):
         return
-    if not _ask_yes("KI-Key jetzt testen (read-only Ping)?", default=False):
+    if not _ask_yes("Test the AI key now (read-only ping)?", default=False):
         return
     try:
         import asyncio
@@ -155,10 +155,10 @@ def _maybe_test_provider(payload: dict) -> None:
                 ollama_base_url="http://127.0.0.1:11434/v1",
             )
         )
-        status = "OK" if result.get("ok") else "FEHLER"
+        status = "OK" if result.get("ok") else "ERROR"
         print(f"   [{status}] {result.get('detail')} ({result.get('latency_ms')} ms)")
     except Exception as e:  # pragma: no cover - best effort
-        print(f"   Test übersprungen: {e}")
+        print(f"   Test skipped: {e}")
 
 
 def _write_full_env(content: str) -> None:
@@ -178,34 +178,34 @@ def _write_full_env(content: str) -> None:
         tmp.unlink(missing_ok=True)
         raise
     restrict_env_permissions(ENV_PATH)  # belt-and-suspenders nach replace
-    print(f"\nGespeichert: {ENV_PATH}")
+    print(f"\nSaved: {ENV_PATH}")
 
 
 def run_wizard(*, force: bool = False) -> None:
     if ENV_PATH.exists() and not force:
-        print(f"{ENV_PATH} existiert bereits. Erneut mit --force.")
+        print(f"{ENV_PATH} already exists. Run again with --force to replace it.")
         return
 
     payload = collect_answers()
     try:
         answers = normalize_answers(payload)
     except ValueError as e:
-        print(f"\nUngültige Eingabe: {e}")
+        print(f"\nInvalid input: {e}")
         raise SystemExit(1) from e
 
     _maybe_test_provider(payload)
     content = build_full_env(answers)
-    if not _ask_yes("So speichern?", default=True):
-        print("Nicht gespeichert.")
+    if not _ask_yes("Save this configuration?", default=True):
+        print("Not saved.")
         raise SystemExit(0)
     _write_full_env(content)
-    print("Fertig. Start: py -3 scripts/launch.py")
-    print("Trading bleibt DISARMED bis du TRADING_ENABLED=true setzt.")
+    print("Done. Start with: start.bat")
+    print("Trading stays DISARMED until you set TRADING_ENABLED=true.")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Einrichtungsassistent (.env)")
-    p.add_argument("--force", action="store_true", help="Auch bei vorhandener .env")
+    p = argparse.ArgumentParser(description="Setup assistant (.env)")
+    p.add_argument("--force", action="store_true", help="Replace an existing .env")
     args = p.parse_args()
     run_wizard(force=args.force)
 

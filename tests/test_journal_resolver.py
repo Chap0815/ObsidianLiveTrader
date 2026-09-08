@@ -28,6 +28,11 @@ def _candle(offset_min, high, low):
     return {"time": T0_MS + offset_min * 60_000, "high": high, "low": low, "open": low, "close": high}
 
 
+def _covered(*candles):
+    """History reaching t0 without triggering either terminal level."""
+    return [_candle(0, 100.0, 100.0), *candles]
+
+
 def _long(**kw):
     base = dict(
         direction="long", entry_price=100.0, stop_loss=99.0, tp1=102.0,
@@ -47,7 +52,7 @@ def _short(**kw):
 
 
 def test_long_win():
-    o = _long(candles=[_candle(5, 100.5, 100.0), _candle(10, 102.5, 101.0)])
+    o = _long(candles=_covered(_candle(5, 100.5, 100.0), _candle(10, 102.5, 101.0)))
     assert o.status == WIN
     assert o.resolved_price == 102.0
     assert o.realized_r == pytest.approx(2.0)  # |102-100|/|100-99|
@@ -55,21 +60,21 @@ def test_long_win():
 
 
 def test_long_loss():
-    o = _long(candles=[_candle(5, 100.2, 98.5)])
+    o = _long(candles=_covered(_candle(5, 100.2, 98.5)))
     assert o.status == LOSS
     assert o.resolved_price == 99.0
     assert o.realized_r == -1.0
 
 
 def test_short_win():
-    o = _short(candles=[_candle(5, 100.0, 97.5)])
+    o = _short(candles=_covered(_candle(5, 100.0, 97.5)))
     assert o.status == WIN
     assert o.resolved_price == 98.0
     assert o.realized_r == pytest.approx(2.0)  # |98-100|/|100-101|
 
 
 def test_short_loss():
-    o = _short(candles=[_candle(5, 101.5, 99.0)])
+    o = _short(candles=_covered(_candle(5, 101.5, 99.0)))
     assert o.status == LOSS
     assert o.resolved_price == 101.0
     assert o.realized_r == -1.0
@@ -77,7 +82,7 @@ def test_short_loss():
 
 def test_both_hit_same_candle_is_loss_ambiguous():
     # long: candle spans both tp1 (102) and sl (99)
-    o = _long(candles=[_candle(5, 103.0, 98.0)])
+    o = _long(candles=_covered(_candle(5, 103.0, 98.0)))
     assert o.status == LOSS
     assert o.ambiguous is True
     assert o.resolved_price == 99.0
@@ -86,7 +91,7 @@ def test_both_hit_same_candle_is_loss_ambiguous():
 
 def test_first_terminal_candle_wins():
     # A losing candle first, then a winning one: LOSS must win.
-    o = _long(candles=[_candle(5, 100.1, 98.9), _candle(10, 103.0, 101.0)])
+    o = _long(candles=_covered(_candle(5, 100.1, 98.9), _candle(10, 103.0, 101.0)))
     assert o.status == LOSS
 
 
@@ -118,6 +123,16 @@ def test_incomplete_coverage_stays_pending_even_with_empty_candles():
     assert o.status == PENDING
 
 
+def test_terminal_touch_after_resolution_deadline_is_ignored():
+    o = _long(candles=_covered(_candle(24 * 60 + 5, 103.0, 100.0)))
+    assert o.status == EXPIRED
+
+
+def test_later_terminal_touch_without_t0_coverage_stays_pending():
+    o = _long(candles=[_candle(120, 103.0, 100.0)])
+    assert o.status == PENDING
+
+
 def test_full_coverage_expired_after_window():
     # Coverage reaches back to (before) t0 explicitly -> EXPIRED as before.
     pre = _candle(0, 100.5, 99.5)
@@ -145,6 +160,34 @@ def test_degenerate_short_geometry_skipped():
 def test_missing_levels_skipped():
     o = _long(tp1=None, candles=[_candle(5, 103.0, 101.0)])
     assert o.status == SKIPPED
+
+
+@pytest.mark.parametrize(
+    ("entry", "stop", "tp1"),
+    [
+        (float("nan"), 99.0, 102.0),
+        (float("inf"), 99.0, 102.0),
+        (100.0, float("-inf"), 102.0),
+        (100.0, 99.0, float("inf")),
+        (True, 0.0, 2.0),
+        (100.0, 0.0, 102.0),
+        (-100.0, -101.0, -98.0),
+    ],
+)
+def test_invalid_price_levels_are_skipped(entry, stop, tp1):
+    outcome = resolve_entry(
+        direction="long",
+        entry_price=entry,
+        stop_loss=stop,
+        tp1=tp1,
+        created_at=T0_ISO,
+        candles=_covered(_candle(5, 103.0, 98.0)),
+        now=NOW_FAR,
+        window_s=WINDOW,
+    )
+    assert outcome.status == SKIPPED
+    assert outcome.realized_r is None
+    assert outcome.realized_r_net is None
 
 
 # ── Task 19 / F2-02: entry-touch (NO_FILL) ───────────────────────────────────
@@ -180,7 +223,7 @@ def test_realized_r_net_subtracts_costs():
     # entry and tp1 (fills, then wins). cost_frac = 2*taker + slip = 0.003;
     # in R = 0.003 * entry/risk = 0.003 * 100/1 = 0.3 -> net = 2.0 - 0.3 = 1.7.
     o = _long(
-        candles=[_candle(5, 102.5, 99.5)],
+        candles=_covered(_candle(5, 102.5, 99.5)),
         taker_fee=0.001,
         slippage_frac=0.001,
     )

@@ -77,7 +77,8 @@ function apiFetch(url, opts) {
  * new request for the same resource aborts the previous in-flight one.
  *
  * MONEY-PATH GUARDRAIL: this registry is used ONLY for idempotent READ
- * resources ("market", "analyze"). Order submit / modify-sl / cancel go
+ * resources (market/analyze/fills/history/journal/calibration). Order submit /
+ * modify-sl / cancel go
  * through plain apiFetch() and are NEVER routed here, so the symbol-switch
  * abort logic can never abort a money request (aborting a modify-sl mid-flight
  * could leave a position transiently unprotected). Kept state-free — the

@@ -1,5 +1,6 @@
 """GET /api/account — balance + positions mapping."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,6 +60,27 @@ def test_usdt_balances_missing_usdt():
     assert available == 0.0
 
 
+def test_usdt_balances_rejects_duplicate_usdt_rows():
+    duplicate = {
+        "currency": "USDT",
+        "equity": 1_000_000.0,
+        "availableBalance": 1_000_000.0,
+    }
+
+    with pytest.raises(MexcError, match="multiple USDT account rows"):
+        usdt_balances([SAMPLE_ASSETS[0], duplicate])
+
+
+@pytest.mark.parametrize("field", ["equity", "availableBalance"])
+@pytest.mark.parametrize("value", [None, "", "not-a-number"])
+def test_usdt_balances_rejects_invalid_required_values(field, value):
+    row = dict(SAMPLE_ASSETS[0])
+    row[field] = value
+
+    with pytest.raises(MexcError, match="account (equity|available balance)"):
+        usdt_balances([row])
+
+
 def test_map_position_long_isolated():
     p = map_position(SAMPLE_POSITIONS[0])
     assert p["symbol"] == "BTC_USDT"
@@ -88,6 +110,29 @@ def test_map_position_short_cross():
     assert p["open_type"] == "cross"
     assert p["entry_price"] == 3000.0
     assert p["hold_vol"] == 3.0
+
+
+@pytest.mark.parametrize("leverage", [True, "NaN", "Infinity", 0, -1])
+def test_map_position_degrades_invalid_leverage_to_unknown(leverage):
+    row = dict(SAMPLE_POSITIONS[0], leverage=leverage)
+
+    assert map_position(row)["leverage"] is None
+
+
+@pytest.mark.parametrize("liquidation_price", [0, -1])
+def test_map_position_degrades_nonpositive_liquidation_price_to_unknown(
+    liquidation_price,
+):
+    row = dict(SAMPLE_POSITIONS[0], liquidatePrice=liquidation_price)
+
+    assert map_position(row)["liquidate_price"] is None
+
+
+@pytest.mark.parametrize("initial_margin", [0, -1])
+def test_map_position_degrades_nonpositive_initial_margin_to_unknown(initial_margin):
+    row = dict(SAMPLE_POSITIONS[0], im=initial_margin)
+
+    assert map_position(row)["im"] is None
 
 
 def test_map_position_default_contract_size_is_one():
@@ -194,9 +239,8 @@ async def test_mexc_account_snapshot_resolves_per_symbol_contract_size():
 
 
 @pytest.mark.asyncio
-async def test_mexc_account_snapshot_defaults_when_contract_detail_fails():
-    """If the contract-metadata lookup errors, positions still come back with
-    the safe 1.0 default instead of the whole /api/account call failing."""
+async def test_mexc_account_snapshot_fails_when_contract_detail_fails():
+    """Unknown MEXC contract size must not be presented as an invented 1.0."""
     c = MexcClient("https://contract.mexc.com", "k", "s")
 
     async def fake_request(method, path, *, params=None, private=False, **kw):
@@ -209,8 +253,159 @@ async def test_mexc_account_snapshot_defaults_when_contract_detail_fails():
         raise AssertionError(f"unexpected path {path}")
 
     c._request = fake_request  # type: ignore[assignment]
+    with pytest.raises(MexcError, match="contract detail unavailable"):
+        await c.account_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_fails_when_position_contract_size_is_missing():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            return SAMPLE_POSITIONS
+        if path == "/api/v1/contract/detail":
+            return [{"symbol": "ETH_USDT", "contractSize": 0.01}]
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    with pytest.raises(MexcError, match="BTC_USDT"):
+        await c.account_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_caches_contract_sizes_until_fresh_read():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    detail_calls = 0
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        nonlocal detail_calls
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            return SAMPLE_POSITIONS
+        if path == "/api/v1/contract/detail":
+            detail_calls += 1
+            return [{"symbol": "BTC_USDT", "contractSize": 0.0001}]
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    await c.account_snapshot()
+    await c.account_snapshot()
+    assert detail_calls == 1
+
+    await c.account_snapshot(fresh=True)
+    assert detail_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_refreshes_cache_for_new_position_symbol():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    position_calls = 0
+    detail_calls = 0
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        nonlocal position_calls, detail_calls
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            position_calls += 1
+            if position_calls == 1:
+                return SAMPLE_POSITIONS
+            return [
+                {
+                    "positionId": 2,
+                    "symbol": "ETH_USDT",
+                    "positionType": 1,
+                    "openType": 1,
+                    "holdVol": 2,
+                    "holdAvgPrice": 3000,
+                    "leverage": 5,
+                    "unRealizedPnl": 0.0,
+                }
+            ]
+        if path == "/api/v1/contract/detail":
+            detail_calls += 1
+            if detail_calls == 1:
+                return [{"symbol": "BTC_USDT", "contractSize": 0.0001}]
+            return [
+                {"symbol": "BTC_USDT", "contractSize": 0.0001},
+                {"symbol": "ETH_USDT", "contractSize": 0.01},
+            ]
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    await c.account_snapshot()
     snap = await c.account_snapshot()
-    assert snap["positions"][0]["contract_size"] == 1.0
+
+    assert detail_calls == 2
+    assert snap["positions"][0]["contract_size"] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_contract_size_cache_singleflights_parallel_misses():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    detail_calls = 0
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        nonlocal detail_calls
+        assert path == "/api/v1/contract/detail"
+        detail_calls += 1
+        started.set()
+        await release.wait()
+        return [{"symbol": "BTC_USDT", "contractSize": 0.0001}]
+
+    c._request = fake_request  # type: ignore[assignment]
+    first = asyncio.create_task(c._account_contract_sizes({"BTC_USDT"}))
+    await started.wait()
+    second = asyncio.create_task(c._account_contract_sizes({"BTC_USDT"}))
+    await asyncio.sleep(0)
+    release.set()
+
+    first_result, second_result = await asyncio.gather(first, second)
+    assert detail_calls == 1
+    assert first_result == second_result == {"BTC_USDT": 0.0001}
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_reads_assets_and_positions_concurrently():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    started: set[str] = set()
+    both_started = asyncio.Event()
+
+    async def fake_request(method, path, *, params=None, private=False, **kw):
+        started.add(path)
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+        if path == "/api/v1/private/account/assets":
+            return SAMPLE_ASSETS
+        if path == "/api/v1/private/position/open_positions":
+            return []
+        raise AssertionError(f"unexpected path {path}")
+
+    c._request = fake_request  # type: ignore[assignment]
+    snap = await asyncio.wait_for(c.account_snapshot(), timeout=1.0)
+
+    assert started == {
+        "/api/v1/private/account/assets",
+        "/api/v1/private/position/open_positions",
+    }
+    assert snap["positions"] == []
+
+
+@pytest.mark.asyncio
+async def test_mexc_account_snapshot_preserves_assets_error_priority():
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    c.assets = AsyncMock(side_effect=MexcError("assets failed"))
+    c.positions = AsyncMock(side_effect=MexcError("positions failed"))
+
+    with pytest.raises(MexcError, match="assets failed"):
+        await c.account_snapshot()
 
 
 def test_account_keys_not_configured(monkeypatch):

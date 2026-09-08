@@ -1,5 +1,7 @@
 """Authenticated post-setup KI-key management: no readback, whitelist, CSRF."""
 
+from unittest.mock import AsyncMock
+
 import app.main as main_mod
 
 
@@ -57,14 +59,11 @@ def test_llm_key_writes_via_whitelist_patch_and_never_echoes(tmp_path, monkeypat
     assert out.count("XAI_API_KEY=") == 1  # updated in place
 
 
-def test_llm_key_cannot_touch_trading_enabled(tmp_path, monkeypatch):
-    """Even a crafted body cannot flip a safety flag — provider is enum-gated and
-    the patcher is whitelist-only."""
+def test_llm_key_rejects_unknown_safety_field_before_write(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("SETUP_COMPLETE=true\nTRADING_ENABLED=false\n", encoding="utf-8")
     monkeypatch.setattr(main_mod, "ENV_PATH", env)
     with _client() as tc:
-        # extra keys in the body are ignored; only provider's whitelisted vars write
         r = tc.post(
             "/api/settings/llm-key",
             json={
@@ -74,8 +73,26 @@ def test_llm_key_cannot_touch_trading_enabled(tmp_path, monkeypatch):
                 "model": "gpt-5.1",
             },
         )
-    assert r.status_code == 200
-    assert "TRADING_ENABLED=false" in env.read_text(encoding="utf-8")
+    assert r.status_code == 422
+    assert env.read_text(encoding="utf-8") == (
+        "SETUP_COMPLETE=true\nTRADING_ENABLED=false\n"
+    )
+
+
+def test_llm_key_rejects_oversized_key_before_write(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    original = "SETUP_COMPLETE=true\nOPENAI_API_KEY=\n"
+    env.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(main_mod, "ENV_PATH", env)
+
+    with _client() as tc:
+        r = tc.post(
+            "/api/settings/llm-key",
+            json={"provider": "openai", "api_key": "x" * 8193},
+        )
+
+    assert r.status_code == 422
+    assert env.read_text(encoding="utf-8") == original
 
 
 def test_settings_csrf_cross_origin_blocked():
@@ -93,6 +110,71 @@ def test_test_provider_rejects_unknown():
     with _client() as tc:
         r = tc.post("/api/settings/test-provider", json={"provider": "bogus"})
     assert r.status_code == 400
+
+
+def test_llm_select_rejects_unknown_persistence_field(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(llm_provider="xai", xai_api_key="xai-test"),
+    )
+    with _client() as tc:
+        r = tc.post("/api/llm", json={"provider": "xai", "persist": True})
+
+    assert r.status_code == 422
+
+
+def test_settings_probe_rejects_oversized_key_before_provider(monkeypatch):
+    import app.llm.probe as probe_mod
+
+    probe = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(probe_mod, "probe_provider", probe)
+    with _client() as tc:
+        r = tc.post(
+            "/api/settings/test-provider",
+            json={"provider": "openai", "api_key": "x" * 8193},
+        )
+
+    assert r.status_code == 422
+    probe.assert_not_awaited()
+
+
+def test_setup_probe_rejects_unknown_field_before_provider(monkeypatch):
+    import app.llm.probe as probe_mod
+
+    probe = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(probe_mod, "probe_provider", probe)
+    monkeypatch.setattr(main_mod, "_setup_needed", lambda: True)
+    with _client() as tc:
+        r = tc.post(
+            "/api/setup/test-provider",
+            json={"provider": "openai", "api_key": "x", "save_key": True},
+        )
+
+    assert r.status_code == 422
+    probe.assert_not_awaited()
+
+
+def test_probe_request_forwards_valid_bounded_fields(monkeypatch):
+    import app.llm.probe as probe_mod
+
+    probe = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(probe_mod, "probe_provider", probe)
+    monkeypatch.setattr(main_mod, "_setup_needed", lambda: True)
+    with _client() as tc:
+        r = tc.post(
+            "/api/setup/test-provider",
+            json={"provider": "openai", "api_key": "test-key", "model": "gpt-test"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True}
+    probe.assert_awaited_once()
+    assert probe.await_args.args == ("openai",)
+    assert probe.await_args.kwargs["api_key"] == "test-key"
+    assert probe.await_args.kwargs["model"] == "gpt-test"
 
 
 # ── Finding 3: os.replace transient Windows lock -> 409, not opaque 500 ─────
@@ -121,5 +203,5 @@ def test_llm_key_permission_error_maps_to_409(tmp_path, monkeypatch):
             json={"provider": "xai", "api_key": "xai-secret", "model": "grok-4"},
         )
     assert r.status_code == 409
-    assert "gesperrt" in r.json()["detail"]
+    assert "locked" in r.json()["detail"]
     assert "XAI_API_KEY=xai-secret" not in env.read_text(encoding="utf-8")

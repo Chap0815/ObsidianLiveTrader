@@ -17,7 +17,7 @@ from itertools import zip_longest
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.analysis.context import (  # noqa: F401
     build_tf_slice,
@@ -71,8 +71,8 @@ Selection method per coin:
 2. Momentum: rsi14 and macd_hist tails must support the direction.
 3. Location: price must be NEAR an actionable level (support/resistance/swing),
    not in the middle of nowhere. Use read.price_vs_ema20_pct for stretch.
-4. Funding as tiebreaker: use fundingExtreme ("crowded_long"/"crowded_short"/
-   "neutral") and fundingAnnualized, not just the raw rate — crowded funding
+4. Funding as tiebreaker: use funding_extreme ("crowded_long"/"crowded_short"/
+   "neutral") and funding_annualized — crowded funding
    against the setup (e.g. crowded_long under a long idea = squeeze risk)
    lowers the score.
 5. Positioning (only when a coin carries oi_read): an OI read that CONFIRMS the
@@ -122,6 +122,16 @@ class ScanResult(BaseModel):
     setup: str = ""
     reason: str = ""
     key_level: float | None = None
+
+    @field_validator("key_level")
+    @classmethod
+    def _nonfinite_key_level_to_none(cls, value: float | None) -> float | None:
+        # LLM JSON is untrusted and Python's decoder accepts NaN/Infinity even
+        # though JSON does not. Preserve the useful scan row, but never expose
+        # or forward a non-standard numeric token.
+        if value is not None and not math.isfinite(value):
+            return None
+        return value
 
 
 def _salvage_result_objects(text: str) -> list[dict]:
@@ -338,7 +348,7 @@ async def build_scan_contexts(
         }
         # Crowdedness context for the funding tiebreaker (audit A9). L-08: the
         # RAW rate is intentionally omitted here -- the prompt only ever reads
-        # fundingExtreme/fundingAnnualized (see SCANNER_SYSTEM_PROMPT point 4),
+        # funding_extreme/funding_annualized (see SCANNER_SYSTEM_PROMPT point 4),
         # so shipping the raw number too was pure token ballast repeated across
         # every coin in the scan universe (up to scanner_universe_size).
         if isinstance(rate, (int, float)):
@@ -869,7 +879,7 @@ def _parse_scan_or_raise(
     except json.JSONDecodeError as e:
         preview = (text or "")[:200].replace("\n", " ")
         raise LlmError(
-            f"Scanner-Antwort ist kein JSON ({e}). Modell {model} lieferte: "
+            f"Scanner response is not valid JSON ({e}). Model {model} returned: "
             f"{preview!r}",
             raw=text,
         ) from e

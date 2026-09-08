@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -338,7 +339,8 @@ def compute_simple_rrr(
         reward = abs(t - e)
     if risk <= 0 or reward <= 0:
         return None
-    return round(reward / risk, 4)
+    rrr = reward / risk
+    return round(rrr, 4) if math.isfinite(rrr) else None
 
 
 _DIRECTIONAL = {"BUY", "STRONG_BUY", "SELL", "STRONG_SHORT"}
@@ -630,6 +632,14 @@ def _series_tail(series: Any, k: int = 12) -> list:
     return out
 
 
+def _relative_pct(value: Any, reference: Any) -> float | None:
+    try:
+        pct = (float(value) - float(reference)) / float(reference) * 100.0
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return round(pct, 3) if math.isfinite(pct) else None
+
+
 def _ema_stack_label(last: dict[str, Any], last_close: float | None) -> str:
     """bullish / bearish / mixed from EMA20/50/200 ordering + regime line.
 
@@ -714,17 +724,14 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
         "rvol": indicators.get("rvol"),
         "vol_trend": indicators.get("vol_trend"),
     }
-    try:
-        if last_close and last.get("ema20"):
-            read["price_vs_ema20_pct"] = round(
-                (last_close - last["ema20"]) / last["ema20"] * 100.0, 3
-            )
-        if last_close and last.get("vwap"):
-            read["price_vs_vwap_pct"] = round(
-                (last_close - last["vwap"]) / last["vwap"] * 100.0, 3
-            )
-    except (TypeError, ZeroDivisionError):
-        pass
+    if last_close and last.get("ema20"):
+        ema_pct = _relative_pct(last_close, last["ema20"])
+        if ema_pct is not None:
+            read["price_vs_ema20_pct"] = ema_pct
+    if last_close and last.get("vwap"):
+        vwap_pct = _relative_pct(last_close, last["vwap"])
+        if vwap_pct is not None:
+            read["price_vs_vwap_pct"] = vwap_pct
 
     # `indicators_last` (the full EMA/vwap/atr snapshot) is intentionally NOT
     # emitted: the prompt only ever reads `read.*`, `indicators_tail` and
@@ -772,13 +779,10 @@ def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
         "atr14": last.get("atr14"),
         "rvol": indicators.get("rvol"),
     }
-    try:
-        if last_close and last.get("ema20"):
-            read["price_vs_ema20_pct"] = round(
-                (last_close - last["ema20"]) / last["ema20"] * 100.0, 3
-            )
-    except (TypeError, ZeroDivisionError):
-        pass
+    if last_close and last.get("ema20"):
+        ema_pct = _relative_pct(last_close, last["ema20"])
+        if ema_pct is not None:
+            read["price_vs_ema20_pct"] = ema_pct
 
     swings = structure.get("swings") or {}
     return {
@@ -886,13 +890,25 @@ def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
         out["bias"] = bias.strip().lower()
     setup = raw.get("setup") or raw.get("setup_type")
     if isinstance(setup, str) and setup.strip():
-        out["setup"] = setup.strip()
+        # Scanner schema currently names short setup labels. Keep a modest
+        # allowance for provider variants, but never let a caller inflate the
+        # analyzer payload/cache key with arbitrary free text.
+        out["setup"] = setup.strip()[:40]
     kl = raw.get("key_level")
-    if isinstance(kl, (int, float)):
-        out["key_level"] = kl
+    if (
+        isinstance(kl, (int, float))
+        and not isinstance(kl, bool)
+        and math.isfinite(float(kl))
+    ):
+        out["key_level"] = float(kl)
     score = raw.get("score")
-    if isinstance(score, (int, float)):
-        out["score"] = score
+    if (
+        isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(float(score))
+        and 0 <= float(score) <= 10
+    ):
+        out["score"] = float(score)
     # S2-04: the screener's own rationale for the pick — without it the
     # analyzer re-derives blind and can't see WHY the coin was flagged.
     # Truncated to ~120 chars: it is LLM-origin free text, not a structured
@@ -926,7 +942,7 @@ def _remaining_risk_budget_pct(
     two sides is used (an add-on is same-side; we don't yet know which side the
     model will pick, so report the tightest). None when there is no open
     position on the symbol, equity is unknown, or it cannot be computed. Never
-    raises (uses the non-strict, fail-open estimator)."""
+    raises. Unknown exposure omits the advisory field entirely."""
     positions = account.get("positions") or []
     if not positions:
         return None
@@ -950,11 +966,9 @@ def _remaining_risk_budget_pct(
                 symbol=symbol,
                 side=side,
                 contract_size=csize,
-                strict=False,
-                pos_risk_cap_pct=float(getattr(settings, "aggregate_pos_risk_cap_pct", 2.0)),
             )
         except Exception:
-            risk = 0.0
+            return None
         if risk > 0:
             has_pos = True
             worst = max(worst, risk)
@@ -1022,12 +1036,6 @@ def build_llm_context(
         "contract": {"max_leverage": coin_max_lev}
         if isinstance(coin_max_lev, (int, float)) and coin_max_lev > 0
         else {},
-        "note": (
-            "Advisory only. Read daily (regime anchor), then htf (regime), then "
-            "ltf (timing). Human must apply and pass risk gates before any order. "
-            "Follow the system prompt's decision_policy for action vs STAY_OUT "
-            "and for SIZE TO CONVICTION sizing."
-        ),
     }
     if include_acct:
         ctx["account"] = {
@@ -1160,26 +1168,26 @@ def _categorize_provider_http_error(
     low = (body_text or "").lower()
     if status_code == 401:
         return (
-            f"⚠ {provider_label}: API-Key ungültig oder fehlt — "
-            "Key prüfen oder KI wechseln."
+            f"⚠ {provider_label}: API key is invalid or missing — "
+            "check the key or switch AI provider."
         )
     if status_code == 403:
         if any(k in low for k in _CREDIT_ERROR_KEYWORDS):
             return (
-                f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
-                "KI im Dropdown wechseln oder aufladen."
+                f"⚠ {provider_label}: credits exhausted or limit reached — "
+                "switch the AI provider in the dropdown or add credits."
             )
         return (
-            f"⚠ {provider_label}: Zugriff verweigert — "
-            "Key-Berechtigungen/Region prüfen."
+            f"⚠ {provider_label}: access denied — "
+            "check key permissions and region."
         )
     if any(k in low for k in _CREDIT_ERROR_KEYWORDS):
         return (
-            f"⚠ {provider_label}: Credits erschöpft oder Limit erreicht — "
-            "KI im Dropdown wechseln oder aufladen."
+            f"⚠ {provider_label}: credits exhausted or limit reached — "
+            "switch the AI provider in the dropdown or add credits."
         )
     if status_code == 429 or any(k in low for k in _RATE_LIMIT_KEYWORDS):
-        return f"⚠ {provider_label}: Rate-Limit — kurz warten oder KI wechseln."
+        return f"⚠ {provider_label}: rate limit reached — wait briefly or switch AI provider."
     return f"{provider_label} HTTP {status_code}: {detail}"
 
 
@@ -1591,7 +1599,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         )
         if not str(content or "").strip():
             raise LlmError(
-                "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
+                "xAI: response truncated — token budget exhausted "
                 f"(finish_reason=length, max_tokens={sent_body['max_tokens']})"
             )
 
@@ -1887,7 +1895,7 @@ async def _call_xai_reevaluate(
         )
         if not str(content or "").strip():
             raise LlmError(
-                "xAI: Antwort abgeschnitten — Token-Budget erschöpft "
+                "xAI: response truncated — token budget exhausted "
                 f"(finish_reason=length, max_tokens={sent_body['max_tokens']})"
             )
 

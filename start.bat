@@ -3,7 +3,8 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo === Local Futures Trader ===
-echo pip/Packages: NUR im Projekt-.venv  —  System-Python bleibt unangetastet
+echo Safe local startup: packages stay inside the project .venv
+echo First launch opens the guided browser setup automatically.
 echo.
 
 set "BOOTSTRAP="
@@ -27,7 +28,7 @@ where py >nul 2>&1
 if errorlevel 1 (
   where python >nul 2>&1
   if errorlevel 1 (
-    echo Python nicht gefunden. Bitte Python 3.11+ installieren: https://www.python.org/downloads/
+    echo Python was not found. Install Python 3.11+: https://www.python.org/downloads/
     pause
     exit /b 1
   ) else (
@@ -43,10 +44,10 @@ if errorlevel 1 (
     for /f "delims=" %%v in ('python --version 2^>^&1') do set "PYVER=%%v"
     echo !PYVER! | findstr /r /c:"^Python [0-9]" >nul
     if errorlevel 1 (
-      echo Python nicht gefunden ^(Microsoft-Store-Stub erkannt: "python" ist nur ein Platzhalter^).
-      echo Bitte Python 3.11+ von https://www.python.org/downloads/ installieren.
-      echo Tipp: In Windows unter "Einstellungen -^> Apps -^> App-Ausfuehrungsaliase"
-      echo den Store-Alias fuer python.exe/python3.exe deaktivieren.
+      echo Python was not found ^(the Microsoft Store placeholder was detected^).
+      echo Install Python 3.11+ from https://www.python.org/downloads/
+      echo Tip: Open Windows Settings -^> Apps -^> App execution aliases
+      echo and disable the Store aliases for python.exe/python3.exe.
       pause
       exit /b 1
     ) else (
@@ -71,9 +72,9 @@ if /I "%~1"=="setup" (
 set ERR=%ERRORLEVEL%
 if not %ERR%==0 (
   echo.
-  echo Launcher beendet mit Code %ERR%
-  echo Tipp: Meldung oben pruefen ^(Python-Version, venv, pip/Netzwerk^); bei
-  echo Netzwerkproblemen "start.bat --skip-install" fuer Offline-Retry.
+  echo The launcher stopped with exit code %ERR%.
+  echo Check the message above ^(Python version, .venv, pip, or network^).
+  echo For an offline retry, use: start.bat --skip-install
   pause
 )
 exit /b %ERR%

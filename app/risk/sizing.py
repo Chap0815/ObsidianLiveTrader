@@ -9,6 +9,26 @@ from __future__ import annotations
 import math
 
 
+def adverse_market_entry(last_price: float, side: str, slippage_pct: float) -> float:
+    """Return the worst fill allowed by the configured market slippage cap."""
+    last = float(last_price)
+    slip = float(slippage_pct) / 100.0
+    side_l = (side or "").strip().lower()
+    if not math.isfinite(last) or last <= 0:
+        raise ValueError("last_price must be a finite number > 0")
+    if not math.isfinite(slip) or slip < 0:
+        raise ValueError("slippage_pct must be a finite number >= 0")
+    if side_l == "long":
+        entry = last * (1.0 + slip)
+    elif side_l == "short":
+        entry = last * (1.0 - slip)
+    else:
+        raise ValueError("side must be long or short")
+    if not math.isfinite(entry) or entry <= 0:
+        raise ValueError("adverse market entry is not a finite positive price")
+    return entry
+
+
 def calc_rrr(side: str, entry: float, stop: float, tp: float) -> float:
     """Reward:risk. long: (tp-entry)/(entry-stop); short inverted.
 
@@ -95,6 +115,24 @@ def suggest_vol(
     Never inflates to min_vol when the risk budget cannot afford it — returns 0
     so the UI/API can show that no gate-safe size exists.
     """
+    numeric_inputs = (
+        equity,
+        risk_pct,
+        contract_size,
+        entry,
+        stop,
+        vol_unit,
+        min_vol,
+        existing_risk_usdt,
+        leverage,
+        max_notional_pct_of_equity,
+    )
+    if any(not math.isfinite(float(value or 0.0)) for value in numeric_inputs):
+        return 0.0
+    if available_usdt is not None and not math.isfinite(float(available_usdt)):
+        return 0.0
+    if float(existing_risk_usdt) < 0:
+        return 0.0
     if equity <= 0 or risk_pct <= 0 or contract_size <= 0:
         return 0.0
     distance = abs(float(entry) - float(stop))
@@ -110,11 +148,16 @@ def suggest_vol(
     if slippage_pct and slippage_pct > 0:
         distance = distance * (1.0 + float(slippage_pct) / 100.0)
 
-    budget = float(equity) * float(risk_pct) / 100.0 - max(0.0, float(existing_risk_usdt or 0.0))
-    if budget <= 0:
+    budget = float(equity) * float(risk_pct) / 100.0 - float(existing_risk_usdt)
+    if not math.isfinite(budget) or budget <= 0:
         return 0.0
 
-    raw = budget / (float(contract_size) * distance)
+    risk_per_vol = float(contract_size) * distance
+    if not math.isfinite(risk_per_vol) or risk_per_vol <= 0:
+        return 0.0
+    raw = budget / risk_per_vol
+    if not math.isfinite(raw) or raw <= 0:
+        return 0.0
 
     notional_per_vol = float(contract_size) * float(entry)
     if max_notional_pct_of_equity and max_notional_pct_of_equity > 0 and notional_per_vol > 0:
@@ -127,6 +170,8 @@ def suggest_vol(
         if leverage and float(leverage) > 0 and notional_per_vol > 0:
             raw = min(raw, (float(available_usdt) * float(leverage)) / notional_per_vol)
 
+    if float(vol_unit) > 0 and not math.isfinite(raw / float(vol_unit)):
+        return 0.0
     rounded = round_down_to_unit(raw, vol_unit)
     if rounded <= 0:
         return 0.0
@@ -141,8 +186,11 @@ def round_down_to_unit(value: float, unit: float) -> float:
         return float(value)
     v = float(value)
     u = float(unit)
+    step_count = v / u
+    if not math.isfinite(step_count):
+        return 0.0
     # Avoid float dust: floor(v/u + eps) * u
-    steps = math.floor(v / u + 1e-12)
+    steps = math.floor(step_count + 1e-12)
     if steps < 0:
         steps = 0
     return _clean_float(steps * u)
@@ -167,13 +215,16 @@ def round_to_unit(value: float, unit: float, direction: str = "nearest") -> floa
         return float(value)
     v = float(value)
     u = float(unit)
+    step_count = v / u
+    if not math.isfinite(step_count):
+        return 0.0
     d = (direction or "nearest").strip().lower()
     if d in ("down", "floor"):
-        steps = math.floor(v / u + 1e-12)
+        steps = math.floor(step_count + 1e-12)
     elif d in ("up", "ceil"):
-        steps = math.ceil(v / u - 1e-12)
+        steps = math.ceil(step_count - 1e-12)
     else:
-        steps = round(v / u)
+        steps = round(step_count)
     return _clean_float(steps * u)
 
 
@@ -210,5 +261,5 @@ def round_trigger_to_unit(
 def _clean_float(x: float) -> float:
     """Reduce binary float noise for display/API (e.g. 0.30000000004)."""
     if not math.isfinite(x):
-        return x
+        return 0.0
     return float(f"{x:.12g}")

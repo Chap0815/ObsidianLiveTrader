@@ -53,6 +53,94 @@ def _patched(analyze_mock, symbol="BTC_USDT"):
     )
 
 
+def test_analyze_rejects_invalid_interval_before_external_calls(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import app
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(
+            exchange="mexc",
+            mexc_api_key="k",
+            mexc_api_secret="s",
+            anthropic_api_key="test-claude",
+        ),
+    )
+    client = MagicMock()
+    snapshot = AsyncMock()
+    llm = AsyncMock()
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        with (
+            patch("app.main.build_market_snapshot", new=snapshot),
+            patch("app.main.analyze_with_llm", new=llm),
+        ):
+            response = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "invalid", "htf": "1H"},
+            )
+
+    assert response.status_code == 422
+    snapshot.assert_not_awaited()
+    llm.assert_not_awaited()
+
+
+def test_analyze_nonfinite_derived_annotations_are_omitted(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import app
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(
+            exchange="mexc",
+            mexc_api_key="k",
+            mexc_api_secret="s",
+            anthropic_api_key="test-claude",
+            include_account_in_llm=False,
+        ),
+    )
+    market = _mock_snap()
+    market["last_price"] = 5e-324
+    market["ltf"]["indicators"] = {"last": {"atr14": 5e-324}}
+    proposal = TradeProposal(
+        htf_trend="bullish",
+        ltf_trend="bullish",
+        action="BUY",
+        entry_price=1e308,
+        stop_loss=5e307,
+        rrr=2.0,
+        rationale="test proposal",
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = MagicMock()
+        tc.app.state.exchange = tc.app.state.mexc
+        tc.app.state.analyze_cache = {}
+        with (
+            patch(
+                "app.main.build_market_snapshot",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch("app.main.snapshot_to_api_dict", return_value=market),
+            patch("app.main.analyze_with_llm", new=AsyncMock(return_value=proposal)),
+            patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"}),
+        ):
+            response = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+
+    assert response.status_code == 200
+    annotations = response.json()["annotations"]
+    assert "entry_vs_last_pct" not in annotations
+    assert "sl_distance_atr" not in annotations
+
+
 def test_analyze_response_provider_model_and_fallback_flag(monkeypatch):
     """Task 37/U2-03: the analyze response must expose the RESOLVED
     provider/model actually used (not silently omitted), and the

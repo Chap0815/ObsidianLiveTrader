@@ -58,8 +58,8 @@ async def test_single_pass_resolves_win_and_loss(db_path):
     win_id = await _seed_long(db, symbol="BTC_USDT")
     loss_id = await _seed_long(db, symbol="ETH_USDT")
     client = FakeClient({
-        "BTC_USDT": [_candle(10, 102.5, 100.0)],   # hits tp1
-        "ETH_USDT": [_candle(10, 100.2, 98.5)],    # hits sl
+        "BTC_USDT": [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)],
+        "ETH_USDT": [_candle(0, 100.0, 100.0), _candle(10, 100.2, 98.5)],
     })
     now = T0 + timedelta(hours=1)
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
@@ -127,13 +127,12 @@ async def test_single_pass_sizes_fetch_to_reach_t0(db_path):
 
 
 @pytest.mark.asyncio
-async def test_far_stale_pending_row_forced_terminal_not_stuck_forever(db_path):
+async def test_far_stale_pending_row_becomes_skipped_not_false_expired(db_path):
     """Defect E regression: once a row's age exceeds the horizon a
     now-anchored, _MAX_LIMIT_HINT-capped kline fetch can ever reach back to
     (1000 bars * 900s for 15m = ~250h), the row must NOT stay PENDING
-    forever -- it must be forced to a terminal, non-WIN/LOSS status so it
-    stops rotting the P2 calibration sample and stops being re-fetched every
-    cycle indefinitely."""
+    forever -- it must become SKIPPED (unresolvable), not EXPIRED, because the
+    missing t0 history cannot prove that a filled setup merely timed out."""
     db = Database(db_path)
     await db.init()
     await _seed_long(db)
@@ -146,12 +145,27 @@ async def test_far_stale_pending_row_forced_terminal_not_stuck_forever(db_path):
     })
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
     rows = await db.recent_journal()
-    assert rows[0]["status"] != "PENDING"
-    assert rows[0]["status"] not in ("WIN", "LOSS")
+    assert rows[0]["status"] == "SKIPPED"
 
     stats = await db.journal_stats()
     assert stats["wins"] == 0
     assert stats["losses"] == 0
+    assert stats["expired"] == 0
+    assert stats["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_created_at_becomes_skipped_instead_of_pending_forever(db_path):
+    """A corrupt/legacy timestamp is not resolvable and must leave the queue."""
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db, created_at="not-a-timestamp")
+    client = FakeClient({"BTC_USDT": [_candle(0, 100.5, 99.5)]})
+
+    await resolve_pending_once(db, client, window_s=WINDOW, now=T0)
+
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "SKIPPED"
 
 
 @pytest.mark.asyncio
@@ -254,7 +268,9 @@ async def test_loop_can_be_cancelled_cleanly(db_path):
 
     app = FakeApp()
     app.state.db = db
-    app.state.mexc = FakeClient({"BTC_USDT": [_candle(10, 102.5, 100.0)]})
+    app.state.mexc = FakeClient(
+        {"BTC_USDT": [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)]}
+    )
 
     task = asyncio.create_task(run_resolver_loop(app))
     await asyncio.sleep(0.05)  # let one cycle run

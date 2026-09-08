@@ -7,6 +7,8 @@ per importlib aus dem Dateipfad statt `import scripts.launch`.
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,7 +35,7 @@ def launch():
     return _load_launch()
 
 
-def test_version_gate_rejects_below_3_11_with_german_message(launch, capsys):
+def test_version_gate_rejects_below_3_11_with_english_message(launch, capsys):
     with pytest.raises(SystemExit) as excinfo:
         launch._check_python_version((3, 9, 0))
     assert excinfo.value.code != 0
@@ -41,8 +43,8 @@ def test_version_gate_rejects_below_3_11_with_german_message(launch, capsys):
     combined = out.out + out.err
     assert "3.11" in combined
     assert "Python" in combined
-    # German-language, actionable message
-    assert "benötigt" in combined or "erforderlich" in combined
+    # English-language, actionable message
+    assert "requires" in combined
     assert "python.org" in combined.lower()
 
 
@@ -187,6 +189,17 @@ def test_setup_flag_parses_both_forms(launch):
     assert p.parse_args([]).setup_cli is False
 
 
+def test_trading_banner_reports_armed_state(launch, tmp_path, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text("TRADING_ENABLED=true\n", encoding="utf-8")
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_trading_banner_defaults_to_disarmed(launch, tmp_path, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    assert launch.read_trading_banner().startswith("DISARMED")
+
+
 def test_port_in_use_detects_listening_socket(launch):
     import socket
 
@@ -209,3 +222,37 @@ def test_port_in_use_false_when_port_free(launch):
     port = s.getsockname()[1]
     s.close()
     assert launch._port_in_use("127.0.0.1", port) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell launcher is Windows-only")
+def test_powershell_launcher_uses_existing_project_venv_without_python_on_path():
+    powershell = (
+        Path(os.environ["SystemRoot"])
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    env = os.environ.copy()
+    env["PATH"] = str(powershell.parent)
+
+    result = subprocess.run(
+        [
+            str(powershell),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(ROOT / "start.ps1"),
+            "--help",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "usage:" in result.stdout.lower()

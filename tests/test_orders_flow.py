@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.config import Settings, get_settings
-from app.models import ContractMeta, OrderTicket, Ticker
+from app.models import (
+    ArmRequest,
+    CancelRequest,
+    ConfirmRequest,
+    ContractMeta,
+    ModifySLRequest,
+    OrderTicket,
+    Ticker,
+)
 from app.orders.service import (
     OrderError,
     OrderService,
@@ -19,6 +28,7 @@ from app.orders.tokens import PreviewStore, TokenError
 
 def _settings(**kwargs) -> Settings:
     base = dict(
+        exchange="mexc",
         trading_enabled=True,
         max_leverage=20,
         max_risk_pct=1.0,
@@ -47,6 +57,7 @@ def _contract() -> ContractMeta:
         max_leverage=125,
         min_leverage=1,
         api_allowed=True,
+        state=0,
     )
 
 
@@ -160,6 +171,188 @@ async def test_low_rrr_strict_rejected_on_preview(client, store):
 
 
 @pytest.mark.asyncio
+async def test_preview_db_failure_discards_unpublished_token(client, store):
+    db = MagicMock()
+    db.insert_preview = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = OrderService(client, _settings(), store, db=db)
+
+    with pytest.raises(RuntimeError, match="sqlite unavailable"):
+        await svc.preview(_good_ticket())
+
+    assert store._items == {}
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preview_db_cancellation_discards_unpublished_token(client, store):
+    db = MagicMock()
+    db.insert_preview = AsyncMock(side_effect=asyncio.CancelledError)
+    svc = OrderService(client, _settings(), store, db=db)
+
+    with pytest.raises(asyncio.CancelledError):
+        await svc.preview(_good_ticket())
+
+    assert store._items == {}
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_proposal_provenance_is_validated_and_audited(tmp_path, client, store):
+    from app.db.repo import Database
+
+    db = Database(str(tmp_path / "proposal_order.db"))
+    await db.init()
+    proposal_id = await db.insert_proposal(
+        symbol="BTC_USDT", proposal_json={"action": "BUY", "thesis": "source"}
+    )
+    client.exchange_id = "mexc"
+    svc = OrderService(client, _settings(), store, db=db)
+    preview = await svc.preview(_good_ticket(proposal_id=proposal_id))
+    assert preview["ok"] is True
+    await svc.confirm(preview["token"])
+
+    orders = await db.recent_orders()
+    assert orders[0]["request"]["_proposal_id"] == proposal_id
+
+    wrong_id = await db.insert_proposal(
+        symbol="ETH_USDT", proposal_json={"action": "BUY"}
+    )
+    with pytest.raises(OrderError, match="does not match"):
+        await svc.preview(_good_ticket(proposal_id=wrong_id))
+
+
+@pytest.mark.asyncio
+async def test_confirm_rejects_nonfinite_equity_after_valid_preview(client, store):
+    valid = [
+        {"currency": "USDT", "equity": 10_000.0, "availableBalance": 9_000.0}
+    ]
+    invalid = [
+        {"currency": "USDT", "equity": "NaN", "availableBalance": 9_000.0}
+    ]
+    client.assets = AsyncMock(side_effect=[valid, invalid])
+    svc = OrderService(client, _settings(), store)
+    preview = await svc.preview(_good_ticket())
+    assert preview["ok"] is True
+    with pytest.raises(OrderError, match="equity unknown"):
+        await svc.confirm(preview["token"])
+    client.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_audit_mark_failure_consumes_before_exchange_read(client, store):
+    db = MagicMock()
+    db.insert_preview = AsyncMock()
+    db.mark_preview_used = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = OrderService(client, _settings(), store, db=db)
+    preview = await svc.preview(_good_ticket())
+
+    client.contract_meta.reset_mock()
+    client.ticker.reset_mock()
+    client.assets.reset_mock()
+    client.positions.reset_mock()
+    client.open_orders.reset_mock()
+
+    with pytest.raises(RuntimeError, match="sqlite unavailable"):
+        await svc.confirm(preview["token"])
+
+    with pytest.raises(TokenError):
+        store.consume(preview["token"])
+    client.contract_meta.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    client.assets.assert_not_awaited()
+    client.positions.assert_not_awaited()
+    client.open_orders.assert_not_awaited()
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_rejects_preview_without_bound_external_oid(client, store):
+    svc = OrderService(client, _settings(), store)
+    preview = await svc.preview(_good_ticket())
+    with store._lock:
+        del store._items[preview["token"]]["payload"]["external_oid"]
+
+    client.contract_meta.reset_mock()
+    client.ticker.reset_mock()
+    client.assets.reset_mock()
+    client.positions.reset_mock()
+    client.open_orders.reset_mock()
+
+    with pytest.raises(OrderError, match="externalOid|external_oid|payload"):
+        await svc.confirm(preview["token"])
+
+    client.contract_meta.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    client.assets.assert_not_awaited()
+    client.positions.assert_not_awaited()
+    client.open_orders.assert_not_awaited()
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_price",
+    [float("nan"), float("inf"), 0, -1, "not-a-price"],
+)
+async def test_confirm_rejects_invalid_preview_price_before_exchange_read(
+    client, store, bad_price
+):
+    svc = OrderService(client, _settings(), store)
+    preview = await svc.preview(_good_ticket())
+    with store._lock:
+        store._items[preview["token"]]["payload"]["last_price"] = bad_price
+
+    client.contract_meta.reset_mock()
+    client.ticker.reset_mock()
+    client.assets.reset_mock()
+    client.positions.reset_mock()
+    client.open_orders.reset_mock()
+
+    with pytest.raises(OrderError, match="last_price|market price|payload"):
+        await svc.confirm(preview["token"])
+
+    client.contract_meta.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    client.assets.assert_not_awaited()
+    client.positions.assert_not_awaited()
+    client.open_orders.assert_not_awaited()
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ticket_payload", [None, {"symbol": "BTC_USDT"}])
+async def test_confirm_maps_invalid_internal_ticket_before_exchange_read(
+    client, store, ticket_payload
+):
+    svc = OrderService(client, _settings(), store)
+    preview = await svc.preview(_good_ticket())
+    with store._lock:
+        payload = store._items[preview["token"]]["payload"]
+        if ticket_payload is None:
+            del payload["ticket"]
+        else:
+            payload["ticket"] = ticket_payload
+
+    client.contract_meta.reset_mock()
+    client.ticker.reset_mock()
+    client.assets.reset_mock()
+    client.positions.reset_mock()
+    client.open_orders.reset_mock()
+
+    with pytest.raises(OrderError, match="preview payload.*ticket"):
+        await svc.confirm(preview["token"])
+
+    with pytest.raises(TokenError):
+        store.consume(preview["token"])
+    client.contract_meta.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    client.assets.assert_not_awaited()
+    client.positions.assert_not_awaited()
+    client.open_orders.assert_not_awaited()
+    client.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unprotected_without_sl_rejected(client, store):
     svc = OrderService(
         client, _settings(allow_unprotected_entry=False), store
@@ -241,6 +434,32 @@ async def test_mexc_addon_confirm_forwards_position_id_to_set_leverage(client, s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("position_id", [True, False, 0, -1, 1.5, "1.5", "abc"])
+async def test_mexc_addon_rejects_invalid_position_id(client, store, position_id):
+    client.exchange_id = "mexc"
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    positions = [
+        {
+            "symbol": "BTC_USDT",
+            "positionType": 1,
+            "openType": 1,
+            "holdVol": 1.0,
+            "positionId": position_id,
+        }
+    ]
+
+    (hold, _open_type, checked), resolved_id = (
+        await svc._mexc_pre_hold_and_position_id(
+            "BTC_USDT", "long", positions=positions
+        )
+    )
+
+    assert checked is True
+    assert hold == pytest.approx(1.0)
+    assert resolved_id is None
+
+
+@pytest.mark.asyncio
 async def test_hl_confirm_leaves_set_leverage_position_id_none(client, store):
     """FINDING 1 guard: the positionId lookup is MEXC-only. A non-MEXC (HL)
     client must still be called with position_id=None (path unchanged)."""
@@ -253,6 +472,55 @@ async def test_hl_confirm_leaves_set_leverage_position_id_none(client, store):
     conf = await svc.confirm(prev["token"])
     assert conf["ok"] is True
     assert client.set_leverage.await_args.kwargs.get("position_id") is None
+
+
+@pytest.mark.asyncio
+async def test_hl_same_side_hold_matches_bare_coin_symbol(client, store):
+    client.exchange_id = "hyperliquid"
+    client.positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC",
+                "positionType": 1,
+                "openType": 1,
+                "holdVol": 0.25,
+                "holdAvgPrice": 100_000.0,
+            }
+        ]
+    )
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    hold, open_type, checked = await svc._same_side_hold_vol_ok(
+        "BTC_USDT", "long"
+    )
+
+    assert checked is True
+    assert hold == pytest.approx(0.25)
+    assert open_type == 1
+
+
+@pytest.mark.asyncio
+async def test_mexc_same_side_hold_keeps_quote_symbols_distinct(client, store):
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC_USDC",
+                "positionType": 1,
+                "openType": 1,
+                "holdVol": 0.25,
+                "holdAvgPrice": 100_000.0,
+            }
+        ]
+    )
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    hold, _open_type, checked = await svc._same_side_hold_vol_ok(
+        "BTC_USDT", "long"
+    )
+
+    assert checked is True
+    assert hold == 0.0
 
 
 @pytest.mark.asyncio
@@ -328,12 +596,270 @@ async def test_cancel_unknown_order_blocked(client, store):
     client.cancel_order.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_cancel_with_symbol_rejects_open_order_without_symbol(client, store):
+    client.exchange_id = "mexc"
+    client.open_orders = AsyncMock(return_value=[{"orderId": 12345}])
+    svc = OrderService(client, _settings(trading_enabled=False), store)
+
+    with pytest.raises(OrderError, match="not found"):
+        await svc.cancel(order_id=12345, symbol="BTC_USDT")
+
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order_id", [True, 0, -1, "abc", "1.5"])
+async def test_cancel_rejects_invalid_order_id_before_exchange_read(
+    client, store, order_id
+):
+    svc = OrderService(client, _settings(trading_enabled=False), store)
+
+    with pytest.raises(OrderError, match="positive numeric"):
+        await svc.cancel(order_id=order_id, symbol="BTC_USDT")
+
+    client.open_orders.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_hyperliquid_inner_status_error(client, store):
+    client.exchange_id = "hyperliquid"
+    client.open_orders = AsyncMock(
+        return_value=[{"oid": 12345, "symbol": "BTC"}]
+    )
+    client.cancel_order = AsyncMock(
+        return_value={
+            "status": "ok",
+            "response": {"data": {"statuses": [{"error": "order not found"}]}},
+        }
+    )
+    svc = OrderService(client, _settings(trading_enabled=False), store)
+    with pytest.raises(OrderError, match="order not found"):
+        await svc.cancel(order_id=12345, symbol="BTC_USDT")
+
+
+@pytest.mark.asyncio
+async def test_successful_cancel_survives_local_audit_failure(client, store):
+    client.open_orders = AsyncMock(
+        return_value=[{"orderId": 12345, "symbol": "BTC_USDT"}]
+    )
+    db = MagicMock()
+    db.insert_order = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    svc = OrderService(client, _settings(trading_enabled=False), store, db=db)
+
+    out = await svc.cancel(order_id=12345, symbol="BTC_USDT")
+
+    assert out["ok"] is True
+    assert any("audit log failed" in warning for warning in out["warnings"])
+    client.cancel_order.assert_awaited_once()
+
+
+def test_api_cancel_rejects_invalid_symbol_before_exchange_read(client):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client.open_orders = AsyncMock(return_value=[])
+    with TestClient(app) as tc:
+        app.state.mexc = client
+        app.state.exchange = client
+        response = tc.post(
+            "/api/orders/cancel",
+            json={"order_id": 12345, "symbol": "../invalid"},
+        )
+
+    assert response.status_code == 400
+    assert "Invalid symbol" in response.json()["detail"]
+    client.open_orders.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
+def test_api_cancel_normalizes_valid_symbol_before_exchange_read(client):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client.open_orders = AsyncMock(
+        return_value=[{"orderId": 12345, "symbol": "BTC_USDT"}]
+    )
+    with TestClient(app) as tc:
+        app.state.mexc = client
+        app.state.exchange = client
+        response = tc.post(
+            "/api/orders/cancel",
+            json={"order_id": 12345, "symbol": "btc-usdt"},
+        )
+
+    assert response.status_code == 200, response.text
+    client.open_orders.assert_awaited_once_with("BTC_USDT")
+    client.cancel_order.assert_awaited_once()
+
+
 def test_token_consume_once():
     store = PreviewStore()
     t = store.create({"a": 1}, ttl=30)
     assert store.consume(t)["a"] == 1
     with pytest.raises(TokenError):
         store.consume(t)
+
+
+def test_token_payload_isolated_from_creator_mutation():
+    store = PreviewStore()
+    payload = {"ticket": {"vol": 1.0}}
+    token = store.create(payload, ttl=30)
+
+    payload["ticket"]["vol"] = 99.0
+
+    assert store.consume(token)["ticket"]["vol"] == 1.0
+
+
+def test_token_payload_isolated_from_peek_mutation():
+    store = PreviewStore()
+    token = store.create({"ticket": {"vol": 1.0}}, ttl=30)
+
+    diagnostic = store.peek(token)
+    assert diagnostic is not None
+    diagnostic["ticket"]["vol"] = 99.0
+
+    assert store.consume(token)["ticket"]["vol"] == 1.0
+
+
+def test_discard_old_token_preserves_newer_single_slot_token():
+    store = PreviewStore()
+    old = store.create({"a": 1}, ttl=30)
+    new = store.create({"a": 2}, ttl=30)
+
+    store.discard(old)
+
+    assert store.consume(new) == {"a": 2}
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["x" * 42, "x" * 44, "!" * 43, "x" * 10_000],
+)
+def test_confirm_request_rejects_noncanonical_token(token):
+    with pytest.raises(ValueError):
+        ConfirmRequest(token=token)
+
+
+def test_confirm_request_accepts_generated_token():
+    store = PreviewStore()
+    token = store.create({}, ttl=60)
+    assert ConfirmRequest(token=token).token == token
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (ConfirmRequest, {"token": "x" * 43, "dry_run": True}),
+        (CancelRequest, {"order_id": 1, "dry_run": True}),
+        (
+            ModifySLRequest,
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "new_sl": 99_000,
+                "verify_only": True,
+            },
+        ),
+        (
+            ArmRequest,
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "rules": {},
+                "auto_be": True,
+            },
+        ),
+    ],
+)
+def test_mutating_request_models_reject_unknown_fields(model, payload):
+    with pytest.raises(ValueError):
+        model(**payload)
+
+
+def test_token_ttl_cannot_be_extended_by_wall_clock_rollback(monkeypatch):
+    """TTL is elapsed time; moving the system clock back must not revive it."""
+    import app.orders.tokens as token_module
+
+    wall_now = [1_000.0]
+    monotonic_now = [100.0]
+    monkeypatch.setattr(token_module.time, "time", lambda: wall_now[0])
+    monkeypatch.setattr(token_module.time, "monotonic", lambda: monotonic_now[0])
+
+    store = PreviewStore()
+    token = store.create({"a": 1}, ttl=10)
+    wall_now[0] = 1.0
+    monotonic_now[0] = 111.0
+
+    with pytest.raises(TokenError, match="expired|invalid"):
+        store.consume(token)
+
+
+def test_token_is_expired_at_exact_monotonic_deadline(monkeypatch):
+    """A TTL ends at its deadline; equality must not leave a confirm window."""
+    import app.orders.tokens as token_module
+
+    monotonic_now = [100.0]
+    monkeypatch.setattr(token_module.time, "monotonic", lambda: monotonic_now[0])
+
+    store = PreviewStore()
+    token = store.create({"a": 1}, ttl=10)
+    monotonic_now[0] = 110.0
+
+    assert store.peek(token) is None
+    with pytest.raises(TokenError, match="expired|invalid"):
+        store.consume(token)
+
+
+@pytest.mark.asyncio
+async def test_preview_blocks_existing_same_side_mexc_entry(client, store):
+    """A resting entry is future exposure and must not be ignored by the gate."""
+    client.exchange_id = "mexc"
+    client.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 77,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "vol": 5,
+                "dealVol": 0,
+            }
+        ]
+    )
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    out = await svc.preview(_good_ticket())
+
+    assert out["ok"] is False
+    assert out["token"] is None
+    assert any("pending" in error.lower() for error in out["errors"])
+
+
+@pytest.mark.asyncio
+async def test_confirm_rechecks_pending_mexc_entries_after_preview(client, store):
+    """An order appearing after Preview must block Confirm's fresh recheck."""
+    client.exchange_id = "mexc"
+    client.open_orders = AsyncMock(return_value=[])
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+    preview = await svc.preview(_good_ticket())
+    assert preview["ok"] is True
+
+    client.open_orders.return_value = [
+        {
+            "orderId": 78,
+            "symbol": "BTC_USDT",
+            "side": 1,
+            "vol": 5,
+            "dealVol": 0,
+        }
+    ]
+    with pytest.raises(OrderError, match="pending"):
+        await svc.confirm(preview["token"])
+
+    client.place_order.assert_not_called()
 
 
 # --- FastAPI route smoke (mocked client on app.state) ---
@@ -392,6 +918,26 @@ def test_api_preview_confirm_route(client, store, tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_api_confirm_rejects_noncanonical_token_before_service(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "invalid-token.db"))
+    get_settings.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as tc:
+        # If request validation did not stop the call, _order_service() would 503.
+        tc.app.state.exchange = None
+        tc.app.state.preview_store = None
+        response = tc.post("/api/orders/confirm", json={"token": "!" * 43})
+
+    assert response.status_code == 422, response.text
+    get_settings.cache_clear()
+
+
 # ── T2: preview token expiry + single-slot ──────────────────────────────────
 
 
@@ -425,100 +971,74 @@ def test_estimate_same_side_risk_aggregates_multiple():
         {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
          "entry_price": 100.0, "liquidate_price": 80.0},
         {"symbol": "BTC_USDT", "side": "short", "hold_vol": 5.0,
-         "entry_price": 100.0, "liquidate_price": 120.0},  # other side ignored
+         "entry_price": 100.0, "liquidate_price": 120.0},
         {"symbol": "ETH_USDT", "side": "long", "hold_vol": 9.0,
-         "entry_price": 100.0, "liquidate_price": 90.0},   # other symbol ignored
+         "entry_price": 100.0, "liquidate_price": 90.0},
     ]
-    # pos_risk_cap_pct high enough that the liq-distance cap never binds, so
-    # this stays a pure aggregation test.
     total, warnings = estimate_same_side_risk_usdt(
-        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-        strict=False, pos_risk_cap_pct=100.0,
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0
     )
-    # |100-90|*1*2 + |100-80|*1*1 = 20 + 20 = 40
     assert total == pytest.approx(40.0)
     assert warnings == []
-
-
-def test_estimate_same_side_risk_fail_closed_without_liq():
-    from app.orders.service import estimate_same_side_risk_usdt
-
-    positions = [
-        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
-         "entry_price": 100.0, "liquidate_price": None},
-    ]
-    with pytest.raises(ValueError):
-        estimate_same_side_risk_usdt(
-            positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-            strict=True, pos_risk_cap_pct=2.0,
-        )
-
-
-# ── T8 (R-01): SL-distance / cap / non-strict fallback ──────────────────────
 
 
 def test_aggregate_uses_sl_distance_when_present():
     from app.orders.service import estimate_same_side_risk_usdt
 
-    # SL is much nearer than liq → risk must come from SL distance, not liq.
     positions = [
         {"symbol": "BTC_USDT", "side": "long", "hold_vol": 2.0,
          "entry_price": 100.0, "liquidate_price": 90.0, "stop_loss": 95.0},
     ]
     total, warnings = estimate_same_side_risk_usdt(
-        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-        strict=False, pos_risk_cap_pct=100.0,
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0
     )
-    # |100-95|*1*2 = 10  (liq distance would have been |100-90|*1*2 = 20)
     assert total == pytest.approx(10.0)
     assert warnings == []
 
 
-def test_aggregate_caps_liq_distance():
+def test_aggregate_uses_full_liq_distance_without_stop():
     from app.orders.service import estimate_same_side_risk_usdt
 
-    # No SL, very wide liq distance → capped at entry * cap_pct/100.
     positions = [
         {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
          "entry_price": 100.0, "liquidate_price": 50.0},
     ]
     total, warnings = estimate_same_side_risk_usdt(
-        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-        strict=False, pos_risk_cap_pct=2.0,
+        positions, symbol="BTC_USDT", side="long", contract_size=1.0
     )
-    # min(|100-50|=50, 100*2/100=2) * 1 * 1 = 2
-    assert total == pytest.approx(2.0)
+    assert total == pytest.approx(50.0)
     assert warnings == []
 
 
-def test_missing_liq_non_strict_warns_not_raises():
+def test_missing_liq_always_blocks():
     from app.orders.service import estimate_same_side_risk_usdt
 
     positions = [
         {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
          "entry_price": 100.0, "liquidate_price": None},
     ]
-    total, warnings = estimate_same_side_risk_usdt(
-        positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-        strict=False, pos_risk_cap_pct=2.0,
-    )
-    # fallback = 100 * 2/100 * 1 * 1 = 2
-    assert total == pytest.approx(2.0)
-    assert len(warnings) == 1
-    assert "liquidate_price" in warnings[0]
-
-
-def test_missing_liq_strict_still_raises():
-    from app.orders.service import estimate_same_side_risk_usdt
-
-    positions = [
-        {"symbol": "BTC_USDT", "side": "long", "hold_vol": 1.0,
-         "entry_price": 100.0, "liquidate_price": None},
-    ]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="liquidate_price"):
         estimate_same_side_risk_usdt(
-            positions, symbol="BTC_USDT", side="long", contract_size=1.0,
-            strict=True, pos_risk_cap_pct=2.0,
+            positions, symbol="BTC_USDT", side="long", contract_size=1.0
+        )
+
+
+@pytest.mark.parametrize("field", ["hold_vol", "entry_price"])
+def test_existing_risk_rejects_nonfinite_position_geometry(field):
+    from app.orders.service import estimate_same_side_risk_usdt
+
+    position = {
+        "symbol": "BTC_USDT",
+        "side": "long",
+        "hold_vol": 1.0,
+        "entry_price": 100.0,
+        "liquidate_price": 80.0,
+    }
+    position[field] = float("nan")
+
+    with pytest.raises(ValueError, match=f"invalid {field}"):
+        estimate_same_side_risk_usdt(
+            [position], symbol="BTC_USDT", side="long", contract_size=1.0
         )
 
 
@@ -629,13 +1149,179 @@ async def test_modify_sl_verify_timeout_keeps_old(store):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reported_symbol", [None, "ETH_USDT"])
+async def test_modify_sl_verify_requires_matching_symbol(store, reported_symbol):
+    c = _modify_client()
+    old = {
+        "orderId": 111,
+        "symbol": "BTC_USDT",
+        "orderType": "Stop",
+        "triggerPrice": 98_000.0,
+    }
+    reported_new = {
+        "orderId": 555,
+        "orderType": "Stop",
+        "triggerPrice": 99_000.0,
+    }
+    if reported_symbol is not None:
+        reported_new["symbol"] = reported_symbol
+    c.open_stop_orders = AsyncMock(side_effect=[[old], [reported_new]])
+    svc = OrderService(c, _modify_settings(), store)
+
+    out = await svc.modify_stop_loss(
+        symbol="BTC_USDT", side="long", new_sl=99_000.0
+    )
+
+    assert out["verified"] is False
+    assert out["status"] == "modify_sl_unverified_old_kept"
+    c.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_does_not_cancel_symbol_less_existing_order(store):
+    c = _modify_client()
+    unknown_old = {
+        "orderId": 111,
+        "orderType": "Stop",
+        "triggerPrice": 98_000.0,
+    }
+    new = {
+        "orderId": 555,
+        "symbol": "BTC_USDT",
+        "orderType": "Stop",
+        "triggerPrice": 99_000.0,
+    }
+    c.open_stop_orders = AsyncMock(side_effect=[[unknown_old], [new]])
+    svc = OrderService(c, _modify_settings(), store)
+
+    out = await svc.modify_stop_loss(
+        symbol="BTC_USDT", side="long", new_sl=99_000.0
+    )
+
+    assert out["verified"] is True
+    assert out["cancelled_old"] == []
+    c.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_ignores_other_symbol_when_classifying_existing_sl(store):
+    c = _modify_client()
+    other_stop = {
+        "orderId": 111,
+        "symbol": "ETH_USDT",
+        "orderType": "Stop",
+        "triggerPrice": 101_000.0,
+    }
+    new = {
+        "orderId": 555,
+        "symbol": "BTC_USDT",
+        "orderType": "Stop",
+        "triggerPrice": 99_000.0,
+    }
+    c.open_stop_orders = AsyncMock(side_effect=[[other_stop], [new]])
+    svc = OrderService(c, _modify_settings(), store)
+
+    out = await svc.modify_stop_loss(
+        symbol="BTC_USDT", side="long", new_sl=99_000.0
+    )
+
+    assert out["ok"] is True
+    assert out["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_preserves_unclassified_same_symbol_trigger(store):
+    c = _modify_client()
+    unknown_trigger = {
+        "orderId": 111,
+        "symbol": "BTC_USDT",
+        "orderType": "plan",
+        "triggerPrice": 99_500.0,
+    }
+    new = {
+        "orderId": 555,
+        "symbol": "BTC_USDT",
+        "orderType": "Stop",
+        "triggerPrice": 99_000.0,
+    }
+    c.open_stop_orders = AsyncMock(side_effect=[[unknown_trigger], [new]])
+    svc = OrderService(c, _modify_settings(), store)
+
+    out = await svc.modify_stop_loss(
+        symbol="BTC_USDT", side="long", new_sl=99_000.0
+    )
+
+    assert out["verified"] is True
+    assert out["cancelled_old"] == []
+    c.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_modify_sl_cancel_old_failure_two_stops(store):
     c = _modify_client(cancel_order=AsyncMock(side_effect=RuntimeError("cancel 500")))
     svc = OrderService(c, _modify_settings(), store)
     out = await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
     assert out["status"] == "modify_sl_ok_old_cancel_failed"
     assert 111 in out["failed_cancel"]
-    assert any("ÜBER-geschützt" in w for w in out["warnings"])
+    assert any("OVER-protected" in w for w in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_inner_cancel_error_keeps_old_as_failed(store):
+    c = _modify_client(
+        cancel_order=AsyncMock(
+            return_value={
+                "status": "ok",
+                "response": {"data": {"statuses": [{"error": "not cancelled"}]}},
+            }
+        )
+    )
+    svc = OrderService(c, _modify_settings(), store)
+    out = await svc.modify_stop_loss(
+        symbol="BTC_USDT", side="long", new_sl=99_000.0
+    )
+    assert out["status"] == "modify_sl_ok_old_cancel_failed"
+    assert out["cancelled_old"] == []
+    assert out["failed_cancel"] == [111]
+
+
+@pytest.mark.asyncio
+async def test_autonomous_modify_rechecks_arm_state_after_lock(tmp_path, store):
+    """A disarm while the monitor waits on the lock cancels the stale move."""
+    from app.db.repo import Database
+
+    db = Database(str(tmp_path / "arm_recheck.db"))
+    await db.init()
+    await db.upsert_position_mgmt(
+        "BTC_USDT",
+        "long",
+        entry_snap=100_000.0,
+        initial_sl_snap=98_000.0,
+        r1=2_000.0,
+        opened_at=1_700_000_000_000,
+        invalidation_price=None,
+    )
+    await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True})
+
+    lock = asyncio.Lock()
+    await lock.acquire()
+    c = _modify_client()
+    svc = OrderService(c, _modify_settings(), store, db=db, trade_lock=lock)
+    pending = asyncio.create_task(
+        svc.modify_stop_loss(
+            symbol="BTC_USDT",
+            side="long",
+            new_sl=99_000.0,
+            required_armed_rule="auto_be",
+        )
+    )
+    await asyncio.sleep(0)
+    await db.disarm_all()
+    lock.release()
+
+    with pytest.raises(OrderError, match="no longer armed"):
+        await pending
+    c.place_stop_order.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -679,6 +1365,96 @@ async def test_modify_sl_geometry_long_rejected(store):
         await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=101_000.0)
     assert "BELOW mark" in str(ei.value)
     c.place_stop_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_sl", [float("nan"), float("inf"), float("-inf")])
+async def test_modify_sl_rejects_nonfinite_before_exchange_reads(store, new_sl):
+    c = _modify_client()
+    svc = OrderService(c, _modify_settings(), store)
+
+    with pytest.raises(OrderError, match="finite"):
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=new_sl)
+
+    c.positions.assert_not_awaited()
+    c.ticker.assert_not_awaited()
+    c.place_stop_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_blocks_when_finite_price_step_count_overflows(store):
+    contract = _contract()
+    contract.price_unit = 1e-308
+    c = _modify_client(
+        ticker=AsyncMock(
+            return_value=Ticker(symbol="BTC_USDT", last_price=1e101)
+        ),
+        contract_meta=AsyncMock(return_value=contract),
+    )
+    svc = OrderService(c, _modify_settings(), store)
+
+    with pytest.raises(OrderError, match="rounded SL is invalid"):
+        await svc.modify_stop_loss(
+            symbol="BTC_USDT", side="long", new_sl=1e100
+        )
+
+    c.open_stop_orders.assert_not_awaited()
+    c.place_stop_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_rejects_boolean_before_exchange_reads(store):
+    c = _modify_client()
+    svc = OrderService(c, _modify_settings(), store)
+
+    with pytest.raises(OrderError, match="numeric"):
+        await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=True)
+
+    c.positions.assert_not_awaited()
+    c.ticker.assert_not_awaited()
+    c.place_stop_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("fraction", float("nan")),
+        ("fraction", float("inf")),
+        ("fraction", -0.1),
+        ("fraction", 0.0),
+        ("fraction", 1.1),
+        ("fraction", True),
+        ("vol", float("nan")),
+        ("vol", float("inf")),
+        ("vol", -1.0),
+        ("vol", 0.0),
+        ("vol", True),
+    ],
+)
+async def test_close_rejects_invalid_explicit_amount_before_exchange_reads(
+    store, field, bad
+):
+    c = _modify_client()
+    svc = OrderService(c, _modify_settings(), store)
+
+    with pytest.raises(OrderError):
+        await svc.close_position(symbol="BTC_USDT", side="long", **{field: bad})
+
+    c.positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_ambiguous_vol_and_fraction_before_exchange_reads(store):
+    c = _modify_client()
+    svc = OrderService(c, _modify_settings(), store)
+
+    with pytest.raises(OrderError, match="either vol or fraction"):
+        await svc.close_position(
+            symbol="BTC_USDT", side="long", vol=0.01, fraction=0.5
+        )
+
+    c.positions.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -870,7 +1646,7 @@ async def test_modify_stop_loss_rejected_on_non_hyperliquid(store):
     svc = OrderService(c, _modify_settings(), store)
     with pytest.raises(OrderError) as ei:
         await svc.modify_stop_loss(symbol="BTC_USDT", side="long", new_sl=99_000.0)
-    assert "nur auf Hyperliquid" in str(ei.value)
+    assert "only available on Hyperliquid" in str(ei.value)
 
 
 # ── M1: partially-filled resting GTC limit → remainder unprotected + unwarned ─
@@ -901,7 +1677,7 @@ async def test_partial_limit_fill_warns_and_not_fully_sl_verified(client, store)
     assert conf["sl_fully_verified"] is False
     assert "partial" in conf["status"].lower()
     assert any(
-        "UNGESCHÜTZT" in w or "TEILFÜLLUNG" in w or "TEILGEFÜLLT" in w
+        "UNPROTECTED" in w or "PARTIAL FILL" in w or "PARTIALLY FILLED" in w
         for w in conf["warnings"]
     )
     # Must NOT flatten a partly-protected position (no fill-watcher, honest report).
@@ -990,6 +1766,42 @@ async def test_mexc_close_clamps_vol_to_live_hold(client, store):
 
 
 @pytest.mark.asyncio
+async def test_partial_close_blocks_when_contract_metadata_is_unknown(client, store):
+    from app.mexc.errors import MexcError
+
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(return_value=_pos(10.0))
+    client.contract_meta = AsyncMock(side_effect=MexcError("metadata unavailable"))
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    with pytest.raises(
+        OrderError, match="partial close blocked.*contract metadata unavailable"
+    ):
+        await svc.close_position(symbol="BTC_USDT", side="long", fraction=0.5)
+
+    client.close_position_market.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_close_remains_available_when_contract_metadata_is_unknown(
+    client, store
+):
+    from app.mexc.errors import MexcError
+
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(side_effect=[_pos(10.0), _pos(10.0), []])
+    client.contract_meta = AsyncMock(side_effect=MexcError("metadata unavailable"))
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    result = await svc.close_position(
+        symbol="BTC_USDT", side="long", fraction=1.0
+    )
+
+    assert result["ok"] is True
+    assert client.close_position_market.await_args.kwargs["vol"] == 10.0
+
+
+@pytest.mark.asyncio
 async def test_close_path_passes_external_oid(client, store):
     """X2-06: the manual-close call-site must pass a non-None external_oid so the
     O-08 close-cloid recovery (client stamps 'close:'+oid) is not dead code."""
@@ -998,6 +1810,47 @@ async def test_close_path_passes_external_oid(client, store):
     await svc.close_position(symbol="BTC_USDT", side="long", fraction=1.0)
     passed = client.close_position_market.await_args.kwargs.get("external_oid")
     assert passed  # truthy, non-None deterministic close oid
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_recovers_by_namespaced_external_oid(client, store):
+    from app.mexc.errors import MexcError
+
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(5.0), []])
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def _recover(_symbol, external_oid):
+        assert external_oid.startswith("close:mlt-close-")
+        return {"match": "history", "externalOid": external_oid, "order": {"state": 3}}
+
+    client.order_by_external_oid = AsyncMock(side_effect=_recover)
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    out = await svc.close_position(symbol="BTC_USDT", side="long", fraction=1.0)
+
+    assert out["ok"] is True
+    assert out["status"] == "closed"
+    assert any("recovered" in warning for warning in out["warnings"])
+    assert client.close_position_market.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_without_recovery_never_resends(client, store):
+    from app.mexc.errors import MexcError
+
+    client.exchange_id = "mexc"
+    client.positions = AsyncMock(side_effect=[_pos(5.0), _pos(5.0)])
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+    client.order_by_external_oid = AsyncMock(return_value={})
+    svc = OrderService(client, _settings(trading_enabled=True), store)
+
+    with pytest.raises(OrderError, match="close failed"):
+        await svc.close_position(symbol="BTC_USDT", side="long", fraction=1.0)
+
+    assert client.close_position_market.await_count == 1
+    assert client.order_by_external_oid.await_count == 1
 
 
 # ── Finding 2: modify-SL sizes the new reduce-only stop to the LIVE hold ──────

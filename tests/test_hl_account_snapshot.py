@@ -49,3 +49,12 @@ async def test_hl_account_snapshot_position_contract_size_is_one():
     p = snap["positions"][0]
     assert p["symbol"] == "BTC"
     assert p["contract_size"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_hl_fresh_account_snapshot_uses_one_consistent_user_state_read():
+    c = _client()
+
+    await c.account_snapshot(fresh=True)
+
+    assert c._info.user_state.call_count == 1

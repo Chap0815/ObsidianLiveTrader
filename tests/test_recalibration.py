@@ -31,8 +31,8 @@ def test_downgrade_on_weak_lower_bound_with_size_factor():
     assert out["calibrated_confidence"] == "medium"
     assert out["size_factor"] == 0.5
     assert out["size_factor"] < 1.0
-    assert "kalibriert: medium" in out["note"]
-    assert "46 % WR" in out["note"]
+    assert "calibrated: medium" in out["note"]
+    assert "46% WR" in out["note"]
     assert "n=40" in out["note"]
 
 
@@ -64,7 +64,7 @@ def test_raw_when_below_min_sample():
     )
     assert out["calibrated_confidence"] == "high"
     assert out["size_factor"] == 1.0
-    assert out["note"] == "zu wenig Daten (n=5)"
+    assert out["note"] == "insufficient data (n=5)"
 
 
 def test_never_upgrades_above_emitted_tier():
@@ -155,10 +155,10 @@ def test_regime_axis_alone_downgrades_and_cuts_size():
     assert out["calibrated_confidence"] == "medium"
     assert out["size_factor"] == 0.5
     assert "Regime btcDown/volHigh" in out["note"]
-    assert "30 % WR" in out["note"]
+    assert "30% WR" in out["note"]
     assert "n=30" in out["note"]
     # confidence-group clause must NOT appear (that axis did not fire)
-    assert "deine high-Setups" not in out["note"]
+    assert "your high setups" not in out["note"]
     assert "action" not in out
 
 
@@ -174,7 +174,7 @@ def test_confidence_axis_alone_unchanged_when_regime_strong():
     )
     assert out["calibrated_confidence"] == "medium"
     assert out["size_factor"] == 0.5
-    assert "deine high-Setups insgesamt: 46 % WR" in out["note"]
+    assert "your high setups overall: 46% WR" in out["note"]
     assert "Regime" not in out["note"]
 
 
@@ -192,7 +192,7 @@ def test_both_axes_weak_single_tier_step_and_min_size_floor():
     assert out["calibrated_confidence"] != "low"
     assert out["size_factor"] == 0.5
     assert out["size_factor"] >= 0.25
-    assert "deine high-Setups" in out["note"]
+    assert "your high setups" in out["note"]
     assert "Regime btcDown/volHigh" in out["note"]
 
 
@@ -253,4 +253,4 @@ def test_regime_axis_fires_even_when_confidence_group_undersampled():
     assert out["calibrated_confidence"] == "medium"
     assert out["size_factor"] == 0.5
     assert "Regime btcDown/volHigh" in out["note"]
-    assert "zu wenig Daten" not in out["note"]
+    assert "insufficient data" not in out["note"]

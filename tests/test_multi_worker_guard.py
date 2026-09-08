@@ -103,8 +103,9 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
     # Stale: a dead PID must be reclaimed, not block startup.
     stale_dir = tmp_path / "stale"
     stale_dir.mkdir()
-    (stale_dir / "instance.lock").write_text(str(_dead_pid()))
-    assert _pid_is_alive(_dead_pid()) is False
+    dead_pid = _dead_pid()
+    (stale_dir / "instance.lock").write_text(str(dead_pid))
+    assert _pid_is_alive(dead_pid) is False
     reclaimed = _acquire_instance_lock(stale_dir)
     assert reclaimed is not None
     reclaimed_pid, _reclaimed_start = _parse_lock_content(reclaimed.read_text())

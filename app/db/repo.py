@@ -30,6 +30,14 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
+async def _purge_expired_previews(conn: aiosqlite.Connection) -> None:
+    """Drop expired short-lived payloads; they never restore token authority."""
+    await conn.execute(
+        "DELETE FROM order_previews WHERE expires_at <= ?",
+        (_utc_now_iso(),),
+    )
+
+
 # Task 4 (trade-management-layer spec §4/§5): a position is treated as the
 # SAME open trade across upserts as long as entry_snap hasn't moved beyond a
 # small tolerance (mark noise / re-fetch jitter). Anything larger means the
@@ -205,6 +213,7 @@ class Database:
                 await conn.execute(
                     "ALTER TABLE position_management ADD COLUMN user_override_hw REAL"
                 )
+            await _purge_expired_previews(conn)
             await conn.commit()
 
     async def insert_proposal(
@@ -242,6 +251,7 @@ class Database:
     ) -> None:
         payload = _dumps(payload_json) or "{}"
         async with self._acquire() as conn:
+            await _purge_expired_previews(conn)
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO order_previews
@@ -316,10 +326,11 @@ class Database:
             return out
 
     async def latest_proposal_for_symbol(self, symbol: str) -> dict[str, Any] | None:
-        """Task 21 (O2-06): the most recent stored proposal for a symbol — the
-        ORIGINAL thesis the reevaluate path compares current structure against.
-        Returns None (never raises for a missing row) when there is no proposal;
-        the caller soft-fails so reevaluate is never broken by a lookup miss."""
+        """Return the most recent stored proposal for a symbol, if any.
+
+        This is not position provenance; money-adjacent consumers must use
+        ``proposal_for_open_position`` instead.
+        """
         async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
@@ -338,6 +349,125 @@ class Database:
             d = dict(r)
             d["proposal"] = _loads(d.pop("proposal_json"))
             return d
+
+    async def proposal_by_id(self, proposal_id: int) -> dict[str, Any] | None:
+        """Return one explicit proposal identity, or None when it is absent."""
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, symbol, proposal_json
+                FROM proposals WHERE id = ?
+                """,
+                (int(proposal_id),),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            out = dict(row)
+            out["proposal"] = _loads(out.pop("proposal_json"))
+            return out
+
+    async def proposal_for_open_position(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        observed_entry: float | None = None,
+        observed_open_sig: int | None = None,
+        observed_opened_at: int | None = None,
+        reopen_opened_at: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve only a proposal explicitly carried by this position's order.
+
+        The position-management row supplies the active trade epoch. Confirmed
+        order audit rows carry ``_proposal_id`` separately from the exchange
+        payload. The closest placed order within the bounded placement window
+        is used; unrelated newer analyses can never become the original thesis.
+
+        The optional observed values let the monitor resolve a newly detected
+        epoch before its baseline upsert. This prevents a same-entry reopen from
+        borrowing the previous trade's proposal for one evaluation cycle.
+        """
+        mgmt = await self.get_open_position_mgmt(symbol, side)
+
+        def _epoch(value: Any) -> int | None:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if parsed > 0 else None
+
+        opened_at = _epoch((mgmt or {}).get("opened_at"))
+        if mgmt is None:
+            opened_at = _epoch(observed_opened_at)
+        else:
+            try:
+                entry_changed = observed_entry is not None and _entry_deviated(
+                    float(mgmt.get("entry_snap")), float(observed_entry)
+                )
+                sig_changed = (
+                    observed_open_sig is not None
+                    and mgmt.get("open_sig") is not None
+                    and int(mgmt.get("open_sig")) != int(observed_open_sig)
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if entry_changed:
+                opened_at = _epoch(observed_opened_at)
+            elif sig_changed:
+                opened_at = _epoch(reopen_opened_at)
+        if opened_at is None:
+            return None
+
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, request_json
+                FROM orders
+                WHERE symbol = ? AND side = ?
+                  AND (status LIKE 'placed%' OR status LIKE 'recovered_placed%')
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (symbol, side),
+            )
+            best: tuple[int, int] | None = None
+            for row in await cur.fetchall():
+                request_data = _loads(row["request_json"])
+                if not isinstance(request_data, dict):
+                    continue
+                try:
+                    proposal_id = int(request_data.get("_proposal_id") or 0)
+                    order_ms = int(
+                        datetime.fromisoformat(str(row["created_at"])).timestamp()
+                        * 1000
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                distance = abs(order_ms - opened_at)
+                if proposal_id <= 0 or distance > 15 * 60 * 1000:
+                    continue
+                if best is None or distance < best[0]:
+                    best = (distance, proposal_id)
+            if best is None:
+                return None
+            cur = await conn.execute(
+                """
+                SELECT id, created_at, symbol, proposal_json
+                FROM proposals WHERE id = ? AND symbol = ?
+                """,
+                (best[1], symbol),
+            )
+            proposal = await cur.fetchone()
+            if proposal is None:
+                return None
+            out = dict(proposal)
+            out["proposal"] = _loads(out.pop("proposal_json"))
+            return out
 
     async def recent_orders(self, limit: int = 20) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
@@ -774,6 +904,7 @@ class Database:
         opened_at: int | None,
         invalidation_price: float | None,
         open_sig: int | None = None,
+        reopen_opened_at: int | None = None,
     ) -> int:
         """Insert the OPEN record for (symbol, side) or refresh the existing one.
 
@@ -814,9 +945,11 @@ class Database:
                 # hard-reset the volatile state (be_done latch, stale high-water,
                 # user override, one-shot advisory alarms) so the fresh position
                 # re-arms cleanly. The frozen
-                # risk baseline (entry_snap/initial_sl/r1/opened_at) and the user's
+                # price-risk baseline (entry_snap/initial_sl/r1) and the user's
                 # armed_rules are preserved (same-entry reopen keeps the same risk
-                # geometry + arming intent — mirrors reset_position_mgmt_baseline).
+                # geometry + arming intent). opened_at is refreshed only when the
+                # caller supplies evidence for the new epoch; otherwise it stays
+                # frozen like an ordinary re-sighting.
                 # NULL on either side (unavailable signature, or a legacy/first
                 # sighting) is inconclusive → never resets (best-effort, no misfire).
                 sig_changed = (
@@ -830,11 +963,17 @@ class Database:
                         UPDATE position_management
                         SET be_done = 0, high_water = entry_snap,
                             user_override_hw = NULL, last_alert_state = '{}',
-                            open_sig = ?,
+                            open_sig = ?, opened_at = COALESCE(?, opened_at),
                             invalidation_price = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (open_sig, invalidation_price, now, existing["id"]),
+                        (
+                            open_sig,
+                            reopen_opened_at,
+                            invalidation_price,
+                            now,
+                            existing["id"],
+                        ),
                     )
                     await conn.commit()
                     return int(existing["id"])

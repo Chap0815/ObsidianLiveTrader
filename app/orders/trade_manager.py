@@ -179,9 +179,8 @@ def evaluate_rules(
                 Alert(
                     "thesis",
                     (
-                        f"Thesis invalidiert: {side.upper()} @ mark {mark:g} "
-                        f"hat Invalidierungspreis {inval:g} gekreuzt "
-                        "— Position pruefen."
+                        f"Thesis invalidated: {side.upper()} @ mark {mark:g} "
+                        f"crossed invalidation price {inval:g} — check the position."
                     ),
                 )
             )
@@ -198,10 +197,10 @@ def evaluate_rules(
             Alert(
                 "time_stop",
                 (
-                    f"Time-Stop: {side.upper()} laeuft seit "
-                    f"{settings.tm_time_stop_hours:g}h und steht erst bei "
+                    f"Time stop: {side.upper()} has been open for "
+                    f"{settings.tm_time_stop_hours:g}h and is only at "
                     f"{unreal_r:+.2f}R (< {settings.tm_time_stop_min_r:g}R) "
-                    "— Position pruefen."
+                    "— check the position."
                 ),
             )
         )

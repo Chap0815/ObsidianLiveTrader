@@ -57,6 +57,247 @@ def test_trade_message_missing_coin_field_still_accepted():
     assert out["px"] == 60000.0
 
 
+@pytest.mark.parametrize("invalid_coin", [True, False, 77])
+def test_trade_rejects_nonstring_coin_matching_subscription_text(invalid_coin):
+    msg = {
+        "channel": "trades",
+        "data": [
+            {
+                "coin": invalid_coin,
+                "px": "60000.0",
+                "sz": "0.5",
+                "time": 1000,
+            }
+        ],
+    }
+
+    assert _normalize_hl(msg, coin=str(invalid_coin).upper()) is None
+
+
+@pytest.mark.parametrize("payload", [None, [], "valid-json-scalar", 7, True])
+def test_normalizer_ignores_non_object_json_frames(payload):
+    """A syntactically valid but non-object upstream frame is malformed data,
+    not a reason to tear down an otherwise healthy subscription."""
+    assert _normalize_hl(payload, coin="BTC") is None
+
+
+def test_trade_message_skips_non_object_rows():
+    msg = {
+        "channel": "trades",
+        "data": [
+            "malformed-row",
+            {"coin": "BTC", "px": "60000.0", "sz": "0.5", "side": "S", "time": 1000},
+        ],
+    }
+
+    out = _normalize_hl(msg, coin="BTC")
+
+    assert out is not None
+    assert out["px"] == 60000.0
+    assert len(out["trades"]) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"channel": "trades", "data": [{"px": True, "time": 1000}]},
+        {
+            "channel": "candle",
+            "data": {"t": 1000, "o": "1", "h": "NaN", "l": "1", "c": "1"},
+        },
+        {
+            "channel": "bbo",
+            "data": {"time": 1000, "bbo": [{"px": "-1"}, {"px": "-1"}]},
+        },
+        {"channel": "allMids", "data": {"mids": {"BTC": "0"}}},
+    ],
+)
+def test_normalizer_rejects_invalid_live_prices(payload):
+    assert _normalize_hl(payload, coin="BTC") is None
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        {
+            "channel": "candle",
+            "data": {
+                "t": 1000,
+                "o": "3000",
+                "h": "3010",
+                "l": "2990",
+                "c": "3005",
+                "s": "ETH",
+            },
+        },
+        {
+            "channel": "bbo",
+            "data": {
+                "coin": "ETH",
+                "time": 1000,
+                "bbo": [{"px": "3000"}, {"px": "3001"}],
+            },
+        },
+    ],
+)
+def test_price_message_wrong_coin_is_skipped(msg):
+    assert _normalize_hl(msg, coin="BTC") is None
+
+
+@pytest.mark.parametrize("invalid_coin", [False, 0, [], {}])
+def test_candle_rejects_falsy_nonstring_coin_identity(invalid_coin):
+    msg = {
+        "channel": "candle",
+        "data": {
+            "t": 1000,
+            "o": "60000",
+            "h": "60010",
+            "l": "59990",
+            "c": "60000",
+            "s": invalid_coin,
+        },
+    }
+
+    assert _normalize_hl(msg, coin="BTC") is None
+
+
+@pytest.mark.parametrize("invalid_coin", [False, 0, [], {}])
+def test_bbo_rejects_falsy_nonstring_coin_identity(invalid_coin):
+    msg = {
+        "channel": "bbo",
+        "data": {
+            "coin": invalid_coin,
+            "time": 1000,
+            "bbo": [{"px": "59999"}, {"px": "60001"}],
+        },
+    }
+
+    assert _normalize_hl(msg, coin="BTC") is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type", "expected_price"),
+    [
+        (
+            {
+                "channel": "trades",
+                "data": [{"coin": "BTC", "px": "60000", "sz": "0.1", "time": 1000}],
+            },
+            "trade",
+            60000.0,
+        ),
+        (
+            {
+                "channel": "candle",
+                "data": {
+                    "t": 1000,
+                    "o": "59990",
+                    "h": "60010",
+                    "l": "59980",
+                    "c": "60000",
+                    "v": "2",
+                    "s": "BTC",
+                },
+            },
+            "candle",
+            60000.0,
+        ),
+        (
+            {
+                "channel": "bbo",
+                "data": {
+                    "coin": "BTC",
+                    "time": 1000,
+                    "bbo": [{"px": "59999"}, {"px": "60001"}],
+                },
+            },
+            "mid",
+            60000.0,
+        ),
+        (
+            {"channel": "allMids", "data": {"mids": {"BTC": "60000"}}},
+            "mid",
+            60000.0,
+        ),
+    ],
+)
+def test_normalizer_keeps_valid_price_channels(payload, expected_type, expected_price):
+    out = _normalize_hl(payload, coin="BTC")
+
+    assert out is not None
+    assert out["type"] == expected_type
+    actual_price = out["bar"]["close"] if expected_type == "candle" else out["px"]
+    assert actual_price == expected_price
+
+
+def test_bbo_invalid_timestamp_keeps_valid_price_with_receive_time_fallback():
+    msg = {
+        "channel": "bbo",
+        "data": {
+            "coin": "BTC",
+            "time": "not-a-timestamp",
+            "bbo": [{"px": "59999"}, {"px": "60001"}],
+        },
+    }
+
+    out = _normalize_hl(msg, coin="BTC")
+
+    assert out is not None
+    assert out["px"] == 60000.0
+    assert out["time"] == 0
+
+
+def test_bbo_non_object_levels_are_ignored():
+    msg = {
+        "channel": "bbo",
+        "data": {"coin": "BTC", "time": 1000, "bbo": ["bad-bid", "bad-ask"]},
+    }
+
+    assert _normalize_hl(msg, coin="BTC") is None
+
+
+@pytest.mark.parametrize("channel", ["trades", "candle"])
+def test_negative_realtime_timestamp_uses_receive_time_fallback(channel):
+    if channel == "trades":
+        msg = {
+            "channel": channel,
+            "data": [{"coin": "BTC", "px": "60000", "sz": "0.1", "time": -1}],
+        }
+    else:
+        msg = {
+            "channel": channel,
+            "data": {
+                "t": -1,
+                "o": "59990",
+                "h": "60010",
+                "l": "59980",
+                "c": "60000",
+                "s": "BTC",
+            },
+        }
+
+    out = _normalize_hl(msg, coin="BTC")
+
+    assert out is not None
+    timestamp = out["bar"]["time_ms"] if channel == "candle" else out["time"]
+    assert timestamp == 0
+
+
+@pytest.mark.parametrize(("field", "value"), [("h", "59989"), ("l", "60001")])
+def test_realtime_candle_rejects_impossible_ohlc_geometry(field, value):
+    candle = {
+        "t": 1000,
+        "o": "59990",
+        "h": "60010",
+        "l": "59980",
+        "c": "60000",
+        "s": "BTC",
+    }
+    candle[field] = value
+
+    assert _normalize_hl({"channel": "candle", "data": candle}, coin="BTC") is None
+
+
 class _FakeClientWS:
     """Minimal stand-in for starlette WebSocket, driven by a scripted frame
     sequence: strings are delivered as-is via receive_text(), exceptions are

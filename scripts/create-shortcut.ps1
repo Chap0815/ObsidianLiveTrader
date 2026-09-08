@@ -13,8 +13,8 @@ $target = Join-Path $root 'start.bat'
 $icon   = Join-Path $root 'app\obsidian.ico'
 $name   = 'Obsidian Live Trader.lnk'
 
-if (-not (Test-Path $target)) { throw "start.bat nicht gefunden: $target" }
-if (-not (Test-Path $icon))   { throw "Icon nicht gefunden: $icon" }
+if (-not (Test-Path $target)) { throw "start.bat not found: $target" }
+if (-not (Test-Path $icon))   { throw "Icon not found: $icon" }
 
 $targets = @($root, [Environment]::GetFolderPath('Desktop'))
 $ws = New-Object -ComObject WScript.Shell
@@ -27,7 +27,7 @@ foreach ($dir in $targets) {
     $lnk.WindowStyle      = 1   # normales Fenster — Server-Konsole bleibt sichtbar
     $lnk.Description       = 'Obsidian Live Trader — Local Futures Cockpit'
     $lnk.Save()
-    Write-Host "Verknuepfung erstellt: $path"
+    Write-Host "Shortcut created: $path"
 }
 Write-Host ""
-Write-Host "Fertig. Doppelklick auf 'Obsidian Live Trader' startet den Server."
+Write-Host "Done. Double-click 'Obsidian Live Trader' to start the server."

@@ -13,6 +13,17 @@ def test_host_rejects_lan_bind():
         Settings(host="0.0.0.0")
 
 
+@pytest.mark.parametrize("port", [0, 80, 65_536])
+def test_settings_port_matches_setup_and_env_builder_bounds(port):
+    with pytest.raises(ValidationError):
+        Settings(port=port)
+
+
+@pytest.mark.parametrize("port", [1024, 8787, 65_535])
+def test_settings_port_accepts_documented_bounds(port):
+    assert Settings(port=port).port == port
+
+
 def test_mexc_url_must_https_allowlist():
     with pytest.raises(ValidationError):
         Settings(mexc_base_url="http://contract.mexc.com")
@@ -20,6 +31,41 @@ def test_mexc_url_must_https_allowlist():
         Settings(mexc_base_url="https://evil.example.com")
     s = Settings(mexc_base_url="https://contract.mexc.com")
     assert s.mexc_base_url.startswith("https://")
+
+
+def test_mexc_uses_current_api_host_and_migrates_legacy_default():
+    current = "https://api.mexc.com"
+    assert Settings(_env_file=None).mexc_base_url == current
+    assert Settings(_env_file=None, mexc_base_url="").mexc_base_url == current
+    assert (
+        Settings(
+            _env_file=None,
+            mexc_base_url="https://contract.mexc.com",
+        ).mexc_base_url
+        == current
+    )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, mexc_base_url="https://futures.mexc.com")
+
+
+def test_hyperliquid_network_flag_and_base_url_cannot_disagree():
+    with pytest.raises(ValidationError, match="ambiguous Hyperliquid network"):
+        Settings(
+            _env_file=None,
+            hl_testnet=True,
+            hl_base_url="https://api.hyperliquid.xyz",
+        )
+    with pytest.raises(ValidationError, match="ambiguous Hyperliquid network"):
+        Settings(
+            _env_file=None,
+            hl_testnet=False,
+            hl_base_url="https://api.hyperliquid-testnet.xyz",
+        )
+    assert Settings(
+        _env_file=None,
+        hl_testnet=True,
+        hl_base_url="https://api.hyperliquid-testnet.xyz",
+    ).hl_testnet is True
 
 
 def test_ollama_url_must_be_loopback():
@@ -228,8 +274,15 @@ def test_csrf_cross_origin_mutating_blocked(monkeypatch):
             json={},
             headers={"Origin": "https://evil.example.com"},
         )
+        malformed = tc.post(
+            "/api/scan",
+            json={},
+            headers={"Origin": "http://testserver:not-a-port"},
+        )
     assert r.status_code == 403
     assert "cross-origin" in r.json()["detail"].lower()
+    assert malformed.status_code == 403
+    assert "cross-origin" in malformed.json()["detail"].lower()
 
 
 def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
@@ -250,9 +303,15 @@ def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
         r3 = tc.post(
             "/api/scan", json={}, headers={"Origin": "http://testserver:9999"}
         )
+        # Same host and effective port, but a different scheme is still a
+        # different browser origin and must be blocked.
+        r4 = tc.post(
+            "/api/scan", json={}, headers={"Origin": "https://testserver:80"}
+        )
     assert r1.status_code != 403 or "cross-origin" not in r1.json().get("detail", "").lower()
     assert r2.status_code != 403 or "cross-origin" not in r2.json().get("detail", "").lower()
     assert r3.status_code == 403 and "cross-origin" in r3.json()["detail"].lower()
+    assert r4.status_code == 403 and "cross-origin" in r4.json()["detail"].lower()
 
 
 def test_resolved_llm_provider_falls_back_to_a_configured_one():

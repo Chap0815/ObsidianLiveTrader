@@ -3,6 +3,7 @@
 import pytest
 
 from app.analysis.context import (
+    _funding_annualized,
     build_market_snapshot,
     snapshot_to_api_dict,
 )
@@ -53,6 +54,11 @@ def test_snapshot_to_api_dict_includes_market_key():
     assert d["market"]["oi_change_pct_1h"] == 2.5
 
 
+def test_funding_annualization_overflow_degrades_to_none():
+    assert _funding_annualized(1e308, None) is None
+    assert _funding_annualized(0.0001, None) == 0.876
+
+
 def test_build_llm_context_exposes_market_block_without_prev_day_px():
     market = {
         "symbol": "BTC", "last_price": 100.0, "funding": {}, "contract": {},
@@ -96,6 +102,17 @@ def test_oi_change_1h_computed_4h_insufficient():
     ch1, ch4 = c._record_oi_and_change("BTC", 1100.0, now=t0 + 3600.0)
     assert ch1 == 10.0     # +10% over exactly 1h
     assert ch4 is None     # only 1h of history — not >= 50% of the 4h lookback
+
+
+def test_oi_change_overflow_degrades_to_none():
+    c = _hl_client()
+    t0 = 10_000.0
+    c._record_oi_and_change("BTC", 5e-324, now=t0)
+
+    ch1, ch4 = c._record_oi_and_change("BTC", 1e308, now=t0 + 3600.0)
+
+    assert ch1 is None
+    assert ch4 is None
 
 
 def test_oi_change_ignores_nonpositive_and_none_oi():

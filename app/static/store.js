@@ -67,6 +67,9 @@ var state = {
   priceLines: [],
   health: null,
   account: null,
+  _accountLoadPromise: null,
+  _accountLoadQueued: false,
+  _accountStaleWarned: false,
   proposal: null,
   analyzeBusy: false,
   previewToken: null,
@@ -79,6 +82,7 @@ var state = {
   _slOverlayOn: false, // C3-04b: overlay currently interactive (±4px hit zone)
   _slDragWired: false, // C3-04b: pointer/keys wired once (initChart runs once, belt+braces)
   historyClearBusy: false, // history reset in flight
+  _historySeq: 0, // latest-wins guard for overlapping history reads
   _cancelBusy: {}, // per-order cancel guards (F6/F7)
   llmLabel: "KI", // active provider label for the analyze spinner
   apiAllowed: null,
@@ -106,11 +110,16 @@ var state = {
   _symbolTabsFp: null, // last symbol-tab bar fingerprint
   _gridStructFp: null, // last overview-grid structure fingerprint
   proposalSymbol: null,
+  proposalId: null,
   proposalApplied: false,
+  ticketProposalId: null,
+  ticketProposalSymbol: null,
   proposalAt: null, // ms timestamp of the underlying analysis (U2-04 drift header)
   _proposalDriftTimer: null,
   showAiLines: true,
   openOrders: null,
+  _ordersLoadPromise: null,
+  _ordersLoadQueued: false,
   scanBusy: false,
   scanResults: null,
   showZones: true,
@@ -145,6 +154,7 @@ var state = {
   _tradesWired: false, // #trades-body delegated listener attached once
   journalStats: null,
   journalEntries: [],
+  _journalSeq: 0,
   // Task 40 (N3-17): active breakdown-row filter chip applied to the
   // journal Entries table, or null when no filter is active. Cleared
   // explicitly (clear button / re-clicking the active row) — never
@@ -153,6 +163,7 @@ var state = {
   journalFilter: null, // {field: "setup_confidence"|"action"|"provider", value: string}
   _journalWired: false, // #journal-body delegated listener attached once
   calibrationData: null, // last /api/journal/stats payload for the Kalibrierung tab
+  _calibrationSeq: 0,
   // A3-04: formerly dynamically-created top-level fields — enumerated
   // exhaustively (grep `\bstate\.<name>\s*=`) and pre-declared here so a
   // typo can no longer mint a silent new field once the state is sealed.
@@ -164,6 +175,8 @@ var state = {
   _chartResizeObserver: null, // ResizeObserver on the chart container
   _fillAggById: null, // Map: fill id -> aggregated fill (marker tooltips)
   _fillsSeq: 0, // fills fetch sequence guard (drop superseded responses)
+  _fillsStaleWarned: false, // one visible warning per fill-read outage
+  _symbolsStaleWarned: false, // one visible warning per degraded symbol-list phase
   _fundingCdTimer: null, // funding-countdown setInterval handle
   _lastSlRecon: 0, // ms ts of the last SL reconciliation (5s throttle)
   _markerTooltipEl: null, // hover tooltip DOM node (created once)
