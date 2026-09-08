@@ -14,7 +14,7 @@ this maintenance policy does not restrict rights independently granted by it.
 
 ## Maintainer workflow
 
-- Read `AGENTS.md` and inspect the current worktree before editing.
+- Read the operating and security documentation and inspect the worktree before editing.
 - Use small patches with evidence and relevant regression coverage.
 - Run the offline tests, Ruff, JavaScript syntax checks and publication check.
   UI changes also require `scripts/ui_smoke.py`.

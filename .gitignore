@@ -43,6 +43,7 @@ docs/superpowers/
 *.lnk
 
 # Local handoff and runtime artifacts
+[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
 NEW_SESSION_PROMPT.md
 PROJECT.md
 AGENDA.md

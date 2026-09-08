@@ -12,6 +12,7 @@ from scripts.check_publication import forbidden_path
     "../private.txt", "/private.txt", "private\\api.pem",
     "docs/HARDENING_LOG.md",
     "docs/AUDIT_2026-09-06.md", "docs/superpowers/plans/old.md", "PROJECT.md", "AGENDA.md",
+    "AGENTS.md", "agents.md", "app/AGENTS.md",
 ])
 def test_private_paths_are_blocked(path):
     assert forbidden_path(path)

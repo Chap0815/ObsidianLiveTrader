@@ -23,7 +23,7 @@ def forbidden_path(name: str) -> bool:
         return True
     leaf = parts[-1]
     return (
-        leaf in {"new_session_prompt.md", "project.md", "agenda.md"}
+        leaf in {"agents.md", "new_session_prompt.md", "project.md", "agenda.md"}
         or name.replace("\\", "/") == "docs/HARDENING_LOG.md"
         or (parts[0] == "docs" and leaf.startswith("audit") and leaf.endswith(".md"))
         or parts[:2] == ["docs", "superpowers"]
