@@ -362,11 +362,11 @@ def restrict_env_permissions(path: Path) -> None:
 
     ``.env`` holds exchange API secrets and the local auth token, so it must
     not be group-/world-readable. POSIX: ``chmod 0600`` (owner read/write
-    only). Windows has no POSIX mode bits, so ``icacls`` is used instead to
-    strip inherited ACEs and grant Full Control to only the current user.
+    only). Windows replaces the access ACL with a protected, current-user-only
+    grant, removing both inherited and explicit entries for other principals.
 
     Both branches are deliberately best-effort: any failure (unsupported
-    filesystem, no ``icacls`` on PATH, insufficient privilege to change ACLs,
+    filesystem, unavailable PowerShell, insufficient privilege to change ACLs,
     ...) is swallowed. The ``.env`` content has already been written
     correctly at this point — a permission-tightening failure must never be
     reported as (or turn into) a failed config write.
@@ -374,30 +374,31 @@ def restrict_env_permissions(path: Path) -> None:
     p = Path(path)
     try:
         if os.name == "nt":
-            user = os.environ.get("USERNAME", "")
-            domain = os.environ.get("USERDOMAIN", "")
-            account = f"{domain}\\{user}" if domain and user else user
-            if account:
-                result = subprocess.run(
-                    ["icacls", str(p), "/inheritance:r", "/grant:r", f"{account}:F"],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                # B3-03: a non-zero rc (e.g. a poisoned/empty USERNAME, no
-                # icacls on PATH, insufficient privilege) must never be
-                # swallowed silently — best-effort stays, but visibly.
-                if result.returncode != 0:
-                    log.warning(
-                        "Could not harden permissions for %s with icacls (rc=%s): %s",
-                        p,
-                        result.returncode,
-                        (result.stderr or b"").decode("utf-8", "replace").strip(),
-                    )
-            else:
+            # Never interpolate a filename into PowerShell code. Resolve the
+            # real process identity rather than trusting USERNAME/USERDOMAIN.
+            script = (
+                "$ErrorActionPreference = 'Stop'; "
+                "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
+                "$acl = New-Object System.Security.AccessControl.FileSecurity; "
+                "$acl.SetAccessRuleProtection($true, $false); "
+                "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule"
+                "($sid, 'FullControl', 'Allow'); "
+                "$acl.AddAccessRule($rule); "
+                "Set-Acl -LiteralPath $env:OBSIDIAN_ENV_ACL_PATH -AclObject $acl"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                env={**os.environ, "OBSIDIAN_ENV_ACL_PATH": str(p.resolve())},
+                capture_output=True,
+                timeout=10,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0:
                 log.warning(
-                    "Skipped icacls hardening for %s: USERNAME/USERDOMAIN is empty",
+                    "Could not harden permissions for %s (rc=%s)",
                     p,
+                    result.returncode,
                 )
         else:
             os.chmod(p, 0o600)
