@@ -393,10 +393,80 @@ def test_mainnet_with_ack_starts(monkeypatch):
     assert r.json()["live_trading"] is True
 
 
+def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_path, monkeypatch):
+    import os
+    import subprocess
+
+    from app.env_builder import restrict_env_permissions
+
+    if os.name != "nt":
+        pytest.skip("Windows ACL integration")
+    p = tmp_path / "synthetic [owner's] $value.env"
+    p.write_text("synthetic configuration\n", encoding="utf-8")
+    subprocess.run(
+        ["icacls", str(p), "/grant", "*S-1-1-0:F"],
+        capture_output=True, check=True, timeout=10,
+    )
+    # A forged display name must not change which actual identity receives access.
+    monkeypatch.setenv("USERNAME", "nonexistent-display-name")
+    monkeypatch.setenv("USERDOMAIN", "nonexistent-domain")
+    # Exercise the writer without autoloadable PowerShell modules, as on
+    # runners launched from another PowerShell version.
+    run = subprocess.run
+
+    def without_modules(args, **kwargs):
+        args = [*args]
+        args[-1] = "$PSModuleAutoLoadingPreference = 'None'; " + args[-1]
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", without_modules)
+    restrict_env_permissions(p)
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$acl = [System.IO.File]::GetAccessControl($env:TEST_ACL_PATH); "
+        "$rules = @($acl.GetAccessRules($true, $true, "
+        "[System.Security.Principal.SecurityIdentifier])); "
+        "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
+        "[Console]::WriteLine((@($rules.Count, $acl.AreAccessRulesProtected, "
+        "($rules.Count -eq 1 -and $rules[0].IdentityReference -eq $sid), "
+        "($rules[0].FileSystemRights -eq 'FullControl'), "
+        "($rules[0].AccessControlType -eq 'Allow')) -join ','))"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        env={**os.environ, "TEST_ACL_PATH": str(p)},
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1,True,True,True,True"
+    assert p.read_text(encoding="utf-8") == "synthetic configuration\n"
+
+
+def test_windows_env_acl_failure_is_reported_without_raw_output(tmp_path, monkeypatch, caplog):
+    import os
+    from types import SimpleNamespace
+
+    import app.env_builder as builder
+
+    if os.name != "nt":
+        pytest.skip("Windows ACL failure path")
+    p = tmp_path / "synthetic.env"
+    p.write_text("synthetic configuration\n", encoding="utf-8")
+    monkeypatch.setattr(
+        builder.subprocess, "run",
+        lambda *a, **kw: SimpleNamespace(returncode=1, stderr=b"untrusted-output"),
+    )
+    builder.restrict_env_permissions(p)
+    assert "Could not harden permissions" in caplog.text
+    assert "rc=1" in caplog.text
+    assert "untrusted-output" not in caplog.text
+    assert p.read_text(encoding="utf-8") == "synthetic configuration\n"
+
+
 def test_env_file_written_restrictive_perms(tmp_path):
     """B-08: .env carries exchange API secrets and the local auth token, so it
     must not be group-/world-readable after an atomic write. POSIX: chmod
-    0600 (owner-only). Windows has no POSIX mode bits; the icacls best-effort
+    0600 (owner-only). Windows has no POSIX mode bits; the ACL-hardening
     branch must actually tighten the ACL down to the current user (Full
     Control) with inherited ACEs stripped — not just avoid raising."""
     import os as _os
@@ -420,7 +490,7 @@ def test_env_file_written_restrictive_perms(tmp_path):
         assert user.lower() in low
         # Windows grants SYSTEM + BUILTIN\Administrators on new files by
         # default (inherited from the parent dir) — real evidence the
-        # hardening ran is that /inheritance:r stripped exactly those
+        # hardening ran is that the replacement ACL stripped those
         # inherited ACEs, leaving only the current user's grant.
         assert "nt authority\\system" not in low
         assert "builtin\\administrators" not in low
