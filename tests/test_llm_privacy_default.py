@@ -56,6 +56,19 @@ def test_llm_context_omits_account_by_default():
     assert "positions" not in ctx["account"]
 
 
+def test_llm_context_requires_literal_true_for_account_opt_in():
+    settings = Settings(_env_file=None, include_account_in_llm=False)
+    settings.include_account_in_llm = "false"  # type: ignore[assignment]
+
+    ctx = build_llm_context(MARKET, ACCOUNT, settings)
+
+    assert ctx["account"] == {
+        "omitted": True,
+        "reason": "INCLUDE_ACCOUNT_IN_LLM=false",
+    }
+    assert "remaining_risk_budget_pct" not in ctx
+
+
 def test_llm_context_includes_account_when_explicitly_enabled():
     """Setting INCLUDE_ACCOUNT_IN_LLM=true keeps full existing behavior —
     no functional change for users who opt in."""

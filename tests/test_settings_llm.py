@@ -59,6 +59,27 @@ def test_llm_key_writes_via_whitelist_patch_and_never_echoes(tmp_path, monkeypat
     assert out.count("XAI_API_KEY=") == 1  # updated in place
 
 
+def test_llm_key_update_replaces_analysis_cache(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(
+        "SETUP_COMPLETE=true\nXAI_API_KEY=old-key\nXAI_MODEL=grok-old\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_mod, "ENV_PATH", env)
+
+    with _client() as tc:
+        old_cache = {("BTC_USDT",): (0.0, {"proposal": "old-model"})}
+        tc.app.state.analyze_cache = old_cache
+        r = tc.post(
+            "/api/settings/llm-key",
+            json={"provider": "xai", "api_key": "new-key", "model": "grok-new"},
+        )
+
+        assert r.status_code == 200, r.text
+        assert tc.app.state.analyze_cache == {}
+        assert tc.app.state.analyze_cache is not old_cache
+
+
 def test_llm_key_rejects_unknown_safety_field_before_write(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("SETUP_COMPLETE=true\nTRADING_ENABLED=false\n", encoding="utf-8")
@@ -124,6 +145,76 @@ def test_llm_select_rejects_unknown_persistence_field(monkeypatch):
         r = tc.post("/api/llm", json={"provider": "xai", "persist": True})
 
     assert r.status_code == 422
+
+
+def test_llm_select_identifies_missing_model(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            llm_provider="xai",
+            xai_api_key="synthetic-xai-key",
+            xai_model=" \t ",
+        ),
+    )
+
+    with _client() as tc:
+        response = tc.post("/api/llm", json={"provider": "xai"})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"].lower()
+    assert "model" in detail
+    assert "api key" not in detail
+
+
+def test_llm_select_replaces_analysis_cache_when_provider_changes(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(
+            llm_provider="claude",
+            anthropic_api_key="claude-test",
+            xai_api_key="xai-test",
+        ),
+    )
+    with _client() as tc:
+        tc.app.state.llm_override = None
+        old_cache = {("BTC_USDT",): (0.0, {"provider": "claude"})}
+        tc.app.state.analyze_cache = old_cache
+
+        response = tc.post("/api/llm", json={"provider": "xai"})
+
+        assert response.status_code == 200, response.text
+        assert tc.app.state.llm_override == "xai"
+        assert tc.app.state.analyze_cache == {}
+        assert tc.app.state.analyze_cache is not old_cache
+
+
+def test_llm_status_does_not_report_deliberate_override_as_fallback(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(
+            llm_provider="claude",
+            anthropic_api_key="synthetic-claude-key",
+            xai_api_key="synthetic-xai-key",
+        ),
+    )
+    with _client() as tc:
+        tc.app.state.llm_override = "xai"
+        response = tc.get("/api/llm")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["provider"] == "xai"
+    assert response.json()["provider_configured"] == "claude"
+    assert response.json()["fallback_active"] is False
 
 
 def test_settings_probe_rejects_oversized_key_before_provider(monkeypatch):

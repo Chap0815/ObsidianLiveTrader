@@ -330,6 +330,50 @@ def test_analyze_cache_key_verdict_hit_when_identical(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (
+            {"bias": "long", "score": 7, "reason": "bounced off support"},
+            {"bias": "long", "score": 7, "reason": "momentum breakout"},
+        ),
+        ({"bias": "long"}, {"bias": "long", "score": 0}),
+    ],
+)
+def test_analyze_cache_key_distinguishes_scanner_context(monkeypatch, first, second):
+    """Different sanitized scanner input must not reuse an analysis generated
+    for a different rationale or for a verdict where score was absent."""
+    _env(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    analyze_mock = AsyncMock(return_value=_proposal())
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.analyze_cache = {}
+        p1, p2, p3, p4 = _patched(analyze_mock)
+        with p1, p2, p3, p4:
+            r1 = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H", "scanner_verdict": first},
+            )
+            r2 = tc.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H", "scanner_verdict": second},
+            )
+
+        assert r1.json()["cached"] is False
+        assert r2.json()["cached"] is False
+        assert analyze_mock.await_count == 2
+
+    get_settings.cache_clear()
+
+
 def test_analyze_cache_key_includes_resolved_provider(monkeypatch):
     """Switching the KI provider (hot-swap dropdown) must never serve a
     cached proposal generated for a DIFFERENT provider — the cache key has
@@ -562,6 +606,106 @@ async def test_same_key_still_singleflight(monkeypatch):
     assert cached_flags == [False, True]
     assert app.state.analyze_locks == {}  # entry deleted on idle
 
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_waiting_analysis_rejects_invalidated_generation_before_work(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.main as main
+    from app.models import AnalyzeRequest
+
+    _env(monkeypatch)
+    old_cache = {}
+    state = SimpleNamespace(
+        mexc=MagicMock(),
+        exchange=MagicMock(),
+        analyze_cache=old_cache,
+        analyze_locks={},
+        llm_override=None,
+    )
+    state.exchange = state.mexc
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    class InvalidatingWait:
+        async def __aenter__(self):
+            state.analyze_cache = {}
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    build = AsyncMock()
+    with (
+        patch("app.main._keyed_singleflight_lock", return_value=InvalidatingWait()),
+        patch("app.main.build_market_snapshot", new=build),
+    ):
+        with pytest.raises(main.HTTPException) as exc:
+            await main.analyze(
+                request,
+                AnalyzeRequest(symbol="BTC_USDT", tf="15m", htf="1H"),
+                None,
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == (
+        "Analysis configuration changed. Retry the request."
+    )
+    build.assert_not_awaited()
+    assert old_cache == {}
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_inflight_analysis_is_rejected_after_configuration_invalidation(monkeypatch):
+    """A settings hot-update must not return or cache an old-model result."""
+    import asyncio as _asyncio
+
+    import httpx
+
+    _env(monkeypatch)
+    from app.main import app
+
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def fake_analyze_with_llm(context, settings):
+        started.set()
+        await release.wait()
+        return _proposal()
+
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={"equity_usdt": 1000.0, "available_usdt": 900.0, "positions": []}
+    )
+    old_cache = {}
+    app.state.mexc = client
+    app.state.analyze_cache = old_cache
+    app.state.analyze_locks = {}
+
+    p1 = patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock()))
+    p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
+    p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
+    p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+
+    transport = httpx.ASGITransport(app=app)
+    body = {"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
+    with p1, p2, p3, p4:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            task = _asyncio.create_task(ac.post("/api/analyze", json=body))
+            await _asyncio.wait_for(started.wait(), timeout=2.0)
+            app.state.analyze_cache = {}
+            new_cache = app.state.analyze_cache
+            release.set()
+            response = await task
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "Analysis configuration changed. Retry the request."
+    )
+    assert old_cache == {}
+    assert app.state.analyze_cache is new_cache
+    assert new_cache == {}
     get_settings.cache_clear()
 
 

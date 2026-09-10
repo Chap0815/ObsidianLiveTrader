@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from typing import Any
 
 import websockets
@@ -34,6 +35,8 @@ HL_HEARTBEAT_INTERVAL = 30.0
 HL_IDLE_TIMEOUT = 45.0
 HL_BACKOFF_START = 1.0
 HL_BACKOFF_CAP = 10.0
+_MIN_REALTIME_TIMESTAMP_MS = 1_000_000_000_000
+_MAX_REALTIME_FUTURE_SKEW_MS = 5 * 60 * 1000
 
 # UI TF → HL candle interval
 TF_TO_HL = {
@@ -45,6 +48,13 @@ TF_TO_HL = {
     "1h": "1h",
     "4h": "4h",
     "1d": "1d",
+}
+_HL_INTERVAL_MS = {
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "1h": 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
 }
 
 
@@ -101,13 +111,20 @@ def _positive_float(value: Any) -> float | None:
 
 
 def _timestamp_or_zero(value: Any) -> int:
-    if isinstance(value, bool):
+    if value is None or value == "" or isinstance(value, bool):
         return 0
     try:
-        parsed = int(value or 0)
+        numeric = float(value)
     except (TypeError, ValueError, OverflowError):
         return 0
-    return parsed if parsed > 0 else 0
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return 0
+    parsed = int(numeric)
+    if parsed < _MIN_REALTIME_TIMESTAMP_MS:
+        return 0
+    if parsed > int(time.time() * 1000) + _MAX_REALTIME_FUTURE_SKEW_MS:
+        return 0
+    return parsed
 
 
 async def _pump_client(client_ws: WebSocket) -> None:
@@ -179,6 +196,10 @@ async def proxy_hyperliquid_market(
     # completes it raised WebSocketDisconnect, which we propagate to end.
     client_task = asyncio.create_task(_pump_client(client_ws))
     backoff = HL_BACKOFF_START
+    # Keep the newest forwarded event times across upstream reconnects. The
+    # browser chart survives those reconnects too, so resetting chronology per
+    # upstream connection would let a delayed first frame rewind live state.
+    timeline: dict[str, int] = {}
     try:
         while not client_task.done():
             try:
@@ -213,7 +234,12 @@ async def proxy_hyperliquid_market(
                     # — that still lets a single blip after a long healthy run
                     # reconnect fast, without inheriting a long delay.
                     healthy = await _run_upstream_session(
-                        client_ws, upstream, coin, client_task
+                        client_ws,
+                        upstream,
+                        coin,
+                        client_task,
+                        interval=interval,
+                        timeline=timeline,
                     )
                     backoff = _reset_backoff_after_session(
                         backoff, session_healthy=healthy
@@ -259,6 +285,9 @@ async def _run_upstream_session(
     upstream: Any,
     coin: str,
     client_task: asyncio.Task,
+    *,
+    interval: str,
+    timeline: dict[str, int] | None = None,
 ) -> bool:
     """Pump ONE upstream connection concurrently with the shared client pump.
 
@@ -278,6 +307,8 @@ async def _run_upstream_session(
     """
 
     forwarded_real_data = False
+    timeline = timeline if timeline is not None else {}
+    interval_ms = _HL_INTERVAL_MS[interval]
 
     async def pump_upstream() -> None:
         nonlocal forwarded_real_data
@@ -289,11 +320,44 @@ async def _run_upstream_session(
                 msg = json.loads(raw)
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
-            out = _normalize_hl(msg, coin=coin)
+            out = _normalize_hl(msg, coin=coin, interval=interval)
             if out is None:
                 # HL's app-ping reply ({"channel":"pong"}) and any other
                 # unhandled frame fall through here → not forwarded.
                 continue
+
+            # The browser uses one persistent live bar across frames and across
+            # our transparent upstream reconnects. Drop delayed events before
+            # they can move that bar (or its displayed price) backwards. Candle
+            # timestamps are bucket opens, so compare them by bucket against
+            # trades/BBOs and exactly only against earlier candles.
+            event_type = out.get("type")
+            event_time = 0
+            timeline_key = ""
+            if event_type == "candle":
+                event_time = out["bar"]["time_ms"]
+                timeline_key = "candle_time_ms"
+            elif event_type in ("trade", "mid"):
+                event_time = out.get("time", 0)
+                timeline_key = "tick_time_ms"
+            if event_time:
+                event_bucket = event_time // interval_ms
+                latest_bucket = timeline.get("market_bucket")
+                latest_type_time = timeline.get(timeline_key)
+                if (
+                    latest_bucket is not None
+                    and event_bucket < latest_bucket
+                    or latest_type_time is not None
+                    and event_time < latest_type_time
+                ):
+                    continue
+                timeline["market_bucket"] = max(
+                    event_bucket, latest_bucket if latest_bucket is not None else 0
+                )
+                timeline[timeline_key] = max(
+                    event_time,
+                    latest_type_time if latest_type_time is not None else 0,
+                )
             await client_ws.send_json(out)
             # A forwarded *data* frame proves the stream is genuinely alive.
             # The subscription ack ("subscribed") is only a control reply and
@@ -338,7 +402,9 @@ async def _run_upstream_session(
     return forwarded_real_data
 
 
-def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
+def _normalize_hl(
+    msg: Any, *, coin: str, interval: str | None = None
+) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         return None
     ch = msg.get("channel")
@@ -374,6 +440,10 @@ def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
             )
         if not trades:
             return None
+        # HL may batch trades without promising chronological input order. The
+        # browser consumes only the top-level price/time, so select it after a
+        # stable time sort; equal-millisecond trades retain venue order.
+        trades.sort(key=lambda item: item["time"])
         last = trades[-1]
         return {
             "type": "trade",
@@ -397,6 +467,9 @@ def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
                 continue
             row_coin = (row_coin_raw or "").upper()
             if row_coin and row_coin != coin:
+                continue
+            row_interval = c.get("i")
+            if interval is not None and row_interval != interval:
                 continue
             open_px = _positive_float(c.get("o"))
             high_px = _positive_float(c.get("h"))
@@ -427,6 +500,29 @@ def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
             )
         if not out_bars:
             return None
+        # A list frame is not guaranteed to arrive oldest-first, while the
+        # browser consumes ``bar`` as the current candle. Normalize order before
+        # choosing it so a trailing older row cannot rewind the live chart.
+        out_bars.sort(key=lambda item: item["time_ms"])
+
+        # Lightweight Charts buckets timestamps to the selected interval and
+        # requires one candle per bucket. Conflicting duplicates are ambiguous,
+        # so reject the frame instead of silently choosing whichever row happened
+        # to arrive last. Exact timestamp duplicates are still caught when the
+        # interval is unavailable to direct callers.
+        bucket_ms = _HL_INTERVAL_MS.get(interval or "")
+        seen_times: set[int] = set()
+        seen_buckets: set[int] = set()
+        for item in out_bars:
+            timestamp = item["time_ms"]
+            if timestamp in seen_times:
+                return None
+            seen_times.add(timestamp)
+            if bucket_ms is not None:
+                bucket = timestamp // bucket_ms
+                if bucket in seen_buckets:
+                    return None
+                seen_buckets.add(bucket)
         bar = out_bars[-1]
         return {
             "type": "candle",
@@ -455,6 +551,8 @@ def _normalize_hl(msg: Any, *, coin: str) -> dict[str, Any] | None:
             bid = ask = None
         mid = None
         if bid is not None and ask is not None:
+            if bid > ask:
+                return None
             mid = (bid + ask) / 2.0
         elif bid is not None:
             mid = bid

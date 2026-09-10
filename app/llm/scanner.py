@@ -115,6 +115,11 @@ Output ONLY valid JSON, no markdown, exactly this schema:
 """
 
 
+_SCANNER_SETUP_VALUES = frozenset(
+    {"pullback", "breakout", "range-fade", "reversal"}
+)
+
+
 class ScanResult(BaseModel):
     symbol: str
     bias: str = Field(pattern="^(long|short)$")
@@ -123,13 +128,38 @@ class ScanResult(BaseModel):
     reason: str = ""
     key_level: float | None = None
 
+    @field_validator("symbol")
+    @classmethod
+    def _normalize_symbol(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("symbol must not be blank")
+        return value
+
+    @field_validator("setup")
+    @classmethod
+    def _normalize_setup(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        return normalized if normalized in _SCANNER_SETUP_VALUES else ""
+
+    @field_validator("reason")
+    @classmethod
+    def _bound_reason(cls, value: str) -> str:
+        return " ".join(value.split()[:12])[:120]
+
+    @field_validator("key_level", mode="before")
+    @classmethod
+    def _boolean_key_level_to_none(cls, value: object) -> object:
+        # bool is a numeric subtype in Python/Pydantic, but never a price.
+        return None if isinstance(value, bool) else value
+
     @field_validator("key_level")
     @classmethod
-    def _nonfinite_key_level_to_none(cls, value: float | None) -> float | None:
+    def _invalid_key_level_to_none(cls, value: float | None) -> float | None:
         # LLM JSON is untrusted and Python's decoder accepts NaN/Infinity even
-        # though JSON does not. Preserve the useful scan row, but never expose
-        # or forward a non-standard numeric token.
-        if value is not None and not math.isfinite(value):
+        # though JSON does not. A price must also be positive. Preserve the
+        # useful scan row, but never expose or forward an invalid price.
+        if value is not None and (not math.isfinite(value) or value <= 0):
             return None
         return value
 
@@ -220,21 +250,32 @@ def parse_scan_results(
     `min_score` is a server-side ABSOLUTE floor (default 0 = keep everything the
     model returned): rows scoring below it are dropped so the scanner stops
     handing the deep analyzer marginal coins it will reject (audit B2)."""
-    rows: list[dict] = []
     try:
         data = json.loads(extract_json_object(text))
-        raw = data.get("results") if isinstance(data, dict) else data
-        rows = [r for r in (raw or []) if isinstance(r, dict)]
     except json.JSONDecodeError:
         rows = _salvage_result_objects(text)
         if not rows:
             raise  # truly unparseable — let the caller report it
 
-    allowed_upper = (
-        {s.upper() for s in allowed_symbols} if allowed_symbols is not None else None
+    else:
+        if isinstance(data, dict):
+            raw = data.get("results")
+        elif isinstance(data, list):
+            raw = data
+        else:
+            raw = None
+        if not isinstance(raw, list):
+            raise json.JSONDecodeError(
+                "scanner results must be a JSON array", text, 0
+            )
+        rows = [r for r in raw if isinstance(r, dict)]
+
+    allowed_by_upper = (
+        {s.upper(): s for s in allowed_symbols}
+        if allowed_symbols is not None
+        else None
     )
-    out: list[ScanResult] = []
-    seen: set[str] = set()
+    best: dict[str, ScanResult] = {}
     for row in rows:
         try:
             r = ScanResult.model_validate(row)
@@ -243,12 +284,14 @@ def parse_scan_results(
         if r.score < min_score:
             continue  # below the absolute quality bar — deep stage would reject
         key = r.symbol.upper()
-        if allowed_upper is not None and key not in allowed_upper:
-            continue  # hallucinated / out-of-scope symbol — never surfaced
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
+        if allowed_by_upper is not None:
+            if key not in allowed_by_upper:
+                continue  # hallucinated / out-of-scope symbol — never surfaced
+            # Return the exact server-provided symbol, not the LLM's casing.
+            r = r.model_copy(update={"symbol": allowed_by_upper[key]})
+        if key not in best or r.score > best[key].score:
+            best[key] = r
+    out = list(best.values())
     out.sort(key=lambda r: r.score, reverse=True)
     return out[:6]
 
@@ -335,11 +378,17 @@ async def build_scan_contexts(
         if not ltf_candles:
             errors.append(f"{sym}: no candles")
             return None
-        rate = row.get("funding")
+        rate = _num(row.get("funding"))
+        last_price = _num(row.get("last"))
+        if last_price is None or last_price <= 0:
+            last_price = _num(ltf_candles[-1].close)
+        volume24 = _num(row.get("volume24"))
+        if volume24 is not None and volume24 < 0:
+            volume24 = None
         ctx: dict[str, Any] = {
             "symbol": sym,
-            "last_price": row.get("last") or ltf_candles[-1].close,
-            "volume24_usd": row.get("volume24"),
+            "last_price": last_price,
+            "volume24_usd": volume24,
             # 1D regime anchor so a pick hard against the daily is scored down
             "daily_stack": _daily_stack(daily, daily_candles),
             # HTF first (regime before LTF timing)
@@ -351,7 +400,7 @@ async def build_scan_contexts(
         # funding_extreme/funding_annualized (see SCANNER_SYSTEM_PROMPT point 4),
         # so shipping the raw number too was pure token ballast repeated across
         # every coin in the scan universe (up to scanner_universe_size).
-        if isinstance(rate, (int, float)):
+        if rate is not None:
             ctx["funding_extreme"] = _funding_extreme(rate)
             ctx["funding_annualized"] = _funding_annualized(rate, None)
         # OI positioning read for the screener (audit I4). Only added when the
@@ -408,7 +457,10 @@ def _num(v: Any) -> float | None:
     """
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         return None
-    v = float(v)
+    try:
+        v = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
     return v if math.isfinite(v) else None
 
 
@@ -843,8 +895,12 @@ async def _call_scanner_llm(
     """Route one screener call to the configured provider. Returns (text, model).
 
     Cheap model first (token split), fall back to whatever is configured."""
-    if settings.claude_ready:
-        model = settings.scanner_model
+    scanner_model = (settings.scanner_model or "").strip()
+    claude_scanner_ready = bool(
+        (settings.anthropic_api_key or "").strip() and scanner_model
+    )
+    if claude_scanner_ready:
+        model = scanner_model
         text = await _anthropic_text(system, user, model, settings, provider_label="Claude")
     elif settings.xai_ready:
         model = settings.xai_model

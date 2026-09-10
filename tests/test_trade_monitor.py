@@ -96,6 +96,106 @@ async def _seed_open(db, *, armed, rules=None, opened_at=NOW_MS):
 
 
 @pytest.mark.asyncio
+async def test_opened_at_skips_malformed_fill_rows_without_losing_valid_time():
+    opened_at = NOW_MS - 5_000
+
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=["not-a-fill", {"dir": "Open Long", "time": opened_at}],
+    )
+
+    assert result == opened_at
+
+
+@pytest.mark.asyncio
+async def test_opened_at_rejects_boolean_fill_time():
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=[{"dir": "Open Long", "time": True}],
+    )
+
+    assert result == NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_opened_at_rejects_non_string_fill_direction():
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=[{"dir": {"open": "long"}, "time": NOW_MS - 5_000}],
+    )
+
+    assert result == NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_opened_at_requires_exact_open_fill_direction():
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=[{"dir": "Not Open Long", "time": NOW_MS - 5_000}],
+    )
+
+    assert result == NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_mexc_baseline_does_not_fetch_unlinked_fill_history(db_path):
+    db = Database(db_path)
+    await db.init()
+    client = FakeClient([], is_hl=False)
+    client.user_fills = AsyncMock(return_value=[])
+
+    await monitor.ensure_baseline(
+        db,
+        client,
+        "BTC_USDT",
+        "long",
+        100.0,
+        NOW_MS,
+        pos={**_pos(), "position_id": 42},
+        current_sl=98.0,
+    )
+
+    client.user_fills.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_baseline_ignores_unlinked_historical_fill_age(db_path):
+    db = Database(db_path)
+    await db.init()
+
+    await monitor.ensure_baseline(
+        db,
+        FakeClient([], is_hl=False),
+        "BTC_USDT",
+        "long",
+        100.0,
+        NOW_MS,
+        pos={**_pos(), "position_id": 42},
+        current_sl=98.0,
+        fills=[{"dir": "Open Long", "time": NOW_MS - 86_400_000}],
+    )
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["opened_at"] == NOW_MS
+
+
+@pytest.mark.asyncio
 async def test_current_sl_ignores_explicitly_foreign_mexc_stop():
     client = FakeClient(
         [],
@@ -113,6 +213,18 @@ async def test_current_sl_ignores_explicitly_foreign_mexc_stop():
     assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
         None,
         True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_stops", [None, {}, ""])
+async def test_current_sl_rejects_malformed_stop_collections(malformed_stops):
+    client = FakeClient([])
+    client.open_stop_orders = AsyncMock(return_value=malformed_stops)
+
+    assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
+        None,
+        False,
     )
 
 
@@ -203,10 +315,107 @@ async def test_invalidation_accepts_finite_loss_side_level(side, invalidation):
 
 @pytest.mark.parametrize(
     "position_id",
-    [True, False, 0, -1, 1.5, "1.5", float("inf")],
+    [True, False, 0, -1, 1.5, "1.5", float("inf"), "9" * 5000],
 )
 def test_position_id_signature_rejects_non_positive_integer_ids(position_id):
     assert monitor._position_id_signature({"position_id": position_id}) is None
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_ignores_malformed_fills():
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(), "BTC_USDT", "long", fills=object()
+        )
+        is None
+    )
+    fills = [
+        "not-a-fill",
+        {"dir": "Open Long", "start_position": 0, "time": "bad"},
+        {"dir": "Open Long", "start_position": 0, "time": 1_000},
+        {"dir": "Open Long", "start_position": 0, "time": 2_000},
+    ]
+
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(), "BTC_USDT", "long", fills=fills
+        )
+        == 2_000
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_fill",
+    [
+        {"dir": "Open Long", "start_position": False, "time": 2_000},
+        {"dir": "Open Long", "start_position": 0, "time": True},
+    ],
+)
+async def test_hl_epoch_signature_rejects_boolean_epoch_fields(bad_fill):
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(), "BTC_USDT", "long", fills=[bad_fill]
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_rejects_non_string_fill_direction():
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(),
+            "BTC_USDT",
+            "long",
+            fills=[
+                {
+                    "dir": {"open": "long"},
+                    "start_position": 0,
+                    "time": 2_000,
+                }
+            ],
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_requires_exact_open_fill_direction():
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(),
+            "BTC_USDT",
+            "long",
+            fills=[
+                {
+                    "dir": "Not Open Long",
+                    "start_position": 0,
+                    "time": 2_000,
+                }
+            ],
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_requires_exactly_flat_start_position():
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(),
+            "BTC_USDT",
+            "long",
+            fills=[
+                {
+                    "dir": "Open Long",
+                    "start_position": 1e-13,
+                    "time": 2_000,
+                }
+            ],
+        )
+        is None
+    )
 
 
 def _flat_candles(n=30, close=100.0, tr=1.0):
@@ -220,6 +429,21 @@ def _flat_candles(n=30, close=100.0, tr=1.0):
         SimpleNamespace(high=close + half, low=close - half, close=close)
         for _ in range(n)
     ]
+
+
+@pytest.mark.asyncio
+async def test_nonboolean_auto_trail_rule_skips_atr_and_money_path(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": "false"})
+    service = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=120.0, is_hl=True)
+    client.klines = AsyncMock(return_value=_flat_candles())
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    client.klines.assert_not_awaited()
+    service.modify_stop_loss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -246,6 +470,48 @@ async def test_armed_hl_at_1r_moves_sl_to_be(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 1
     assert "auto_be" in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_persisted_alert_state_does_not_block_auto_be(
+    monkeypatch, db_path
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    await db.set_alert_state("BTC_USDT", "long", "corrupt")
+    service = _install_spy(monkeypatch)
+
+    await monitor._run_one_cycle(
+        _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True)), NOW_MS
+    )
+
+    service.modify_stop_loss.assert_awaited_once()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"]["auto_be"]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_persisted_be_done_blocks_auto_stop_move(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    async with db._acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE position_management SET be_done = ''
+            WHERE symbol = ? AND side = ? AND status = 'OPEN'
+            """,
+            ("BTC_USDT", "long"),
+        )
+        await conn.commit()
+    service = _install_spy(monkeypatch)
+
+    await monitor._run_one_cycle(
+        _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True)), NOW_MS
+    )
+
+    service.modify_stop_loss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -298,20 +564,102 @@ async def test_disarmed_position_no_auto_action(monkeypatch, db_path):
 
 
 @pytest.mark.asyncio
-async def test_one_bad_position_does_not_abort_cycle(monkeypatch, db_path):
+async def test_unidentified_position_row_blocks_all_auto_actions(monkeypatch, db_path):
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True)
     svc = _install_spy(monkeypatch)
-    # A malformed (non-dict) position raises inside _process_position; the armed
-    # HL position that follows must still be processed.
+    # An unidentified row could be a malformed duplicate of the valid position.
+    # The whole snapshot is therefore unreliable for automatic money actions.
     app = _make_app(db, FakeClient(["not-a-dict", _pos()], mark=102.5, is_hl=True))
 
     await monitor._run_one_cycle(app, NOW_MS)
 
-    svc.modify_stop_loss.assert_awaited_once()
+    svc.modify_stop_loss.assert_not_awaited()
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
-    assert row["be_done"] == 1
+    assert row["be_done"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_entry", [float("nan"), float("inf"), float("-inf")])
+async def test_nonfinite_entry_is_rejected_before_position_reads(
+    monkeypatch, db_path, bad_entry
+):
+    db = Database(db_path)
+    await db.init()
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos(entry=bad_entry)], mark=102.5, is_hl=True)
+    client.open_stop_orders = AsyncMock(wraps=client.open_stop_orders)
+    client.ticker = AsyncMock(wraps=client.ticker)
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    client.open_stop_orders.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    svc.modify_stop_loss.assert_not_awaited()
+    assert await db.list_open_position_mgmt() == []
+
+
+@pytest.mark.asyncio
+async def test_boolean_entry_is_rejected_before_position_reads(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos(entry=True)], mark=2.0, stops=[{"triggerPrice": 0.5}])
+    client.open_stop_orders = AsyncMock(wraps=client.open_stop_orders)
+    client.ticker = AsyncMock(wraps=client.ticker)
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    client.open_stop_orders.assert_not_awaited()
+    client.ticker.assert_not_awaited()
+    svc.modify_stop_loss.assert_not_awaited()
+    assert await db.list_open_position_mgmt() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_mark", [float("nan"), float("inf"), float("-inf")])
+async def test_nonfinite_mark_is_rejected_without_state_or_order_change(
+    monkeypatch, db_path, bad_mark
+):
+    db = Database(db_path)
+    await db.init()
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=bad_mark, is_hl=True)
+    app = _make_app(db, client)
+
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_not_awaited()
+    assert await db.list_open_position_mgmt() == []
+
+
+@pytest.mark.asyncio
+async def test_boolean_mark_is_rejected_before_auto_stop_move(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(
+        "BTC_USDT",
+        "short",
+        entry_snap=100.0,
+        initial_sl_snap=102.0,
+        r1=2.0,
+        opened_at=NOW_MS,
+        invalidation_price=None,
+    )
+    await db.set_armed_rules("BTC_USDT", "short", {"auto_be": True})
+    svc = _install_spy(monkeypatch)
+    client = FakeClient(
+        [_pos(side="short")],
+        mark=True,
+        stops=[{"triggerPrice": 102.0, "orderType": "Stop"}],
+        is_hl=True,
+    )
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    svc.modify_stop_loss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -489,6 +837,9 @@ async def test_armed_trail_moves_sl_and_refires_no_latch(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 0  # trailing never latches be_done
     assert "auto_trail" in row["last_alert_state"]
+    assert row["last_alert_state"]["auto_trail"]["message"] == (
+        "App tightened the SL (trailing stop)."
+    )
     assert row["high_water"] == pytest.approx(110.0)
 
     # Second cycle, higher mark → hw 112 → trail 110: a fresh, tighter move.
@@ -496,6 +847,37 @@ async def test_armed_trail_moves_sl_and_refires_no_latch(monkeypatch, db_path):
     await monitor._run_one_cycle(app, NOW_MS + 20_000)
     assert svc.modify_stop_loss.await_count == 2
     assert svc.modify_stop_loss.await_args.kwargs["new_sl"] == pytest.approx(110.0)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_position_row_cannot_repeat_trail_move(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    position = _pos()
+    client = FakeClient([position, dict(position)], mark=110.0, is_hl=True)
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_conflicting_duplicate_position_rows_block_auto_move(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    position = _pos()
+    conflicting = dict(position, entry_price=101.0)
+    client = FakeClient([position, conflicting], mark=110.0, is_hl=True)
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    svc.modify_stop_loss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -623,7 +1005,7 @@ async def test_atr_cache_ttl_uses_monotonic_time(monkeypatch):
     client.klines = AsyncMock(
         side_effect=[_flat_candles(tr=1.0), _flat_candles(tr=2.0)]
     )
-    ticks = iter([1_000.0, 1_021.0])
+    ticks = iter([1_000.0, 1_000.0, 1_021.0, 1_021.0])
     fake_time = SimpleNamespace(monotonic=lambda: next(ticks))
     monkeypatch.setattr(monitor, "time", fake_time)
 
@@ -635,6 +1017,28 @@ async def test_atr_cache_ttl_uses_monotonic_time(monkeypatch):
     assert client.klines.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_atr_cache_ttl_starts_after_slow_refresh(monkeypatch):
+    app = SimpleNamespace(state=SimpleNamespace())
+    settings = SimpleNamespace(
+        tm_trail_atr_tf="15m",
+        tm_trail_atr_period=14,
+        tm_monitor_interval_s=20,
+    )
+    client = FakeClient([])
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+    ticks = iter([1_000.0, 1_021.0, 1_021.0, 1_021.0])
+    fake_time = SimpleNamespace(monotonic=lambda: next(ticks))
+    monkeypatch.setattr(monitor, "time", fake_time)
+
+    first = await monitor._atr_for(app, client, settings, "BTC_USDT", 1_000_000)
+    second = await monitor._atr_for(app, client, settings, "BTC_USDT", 1_000_000)
+
+    assert first == pytest.approx(1.0)
+    assert second == pytest.approx(1.0)
+    assert client.klines.await_count == 1
+
+
 # ── C2: modify_stop_loss SOFT-failure return must not latch a false be_done ───
 
 
@@ -643,7 +1047,7 @@ async def test_unverified_modify_does_not_latch_be(monkeypatch, db_path):
     """C2: a NON-exception but UNVERIFIED modify return
     (``verified=False`` / "modify_sl_unverified_old_kept") means the NEW stop is
     NOT confirmed resting and the OLD looser stop is still held. The monitor must
-    NOT latch be_done, must NOT write the "App hat SL auf BE gezogen" feed, must
+    NOT latch be_done, must NOT write the "App moved the SL" feed, must
     write an honest non-"done" feed, and auto-BE must stay ELIGIBLE next cycle
     (re-attempting) — counting toward the attempt cap so it can't hammer forever."""
     db = Database(db_path)
@@ -663,6 +1067,9 @@ async def test_unverified_modify_does_not_latch_be(monkeypatch, db_path):
     assert "auto_be" not in row["last_alert_state"]  # no false "moved" feed
     assert "auto_be_error" in row["last_alert_state"]  # honest error feed instead
     assert row["last_alert_state"]["auto_be_error"]["halted"] is False
+    message = row["last_alert_state"]["auto_be_error"]["message"]
+    assert "SL move not confirmed" in message
+    assert "NICHT bestaetigt" not in message
 
     # Still eligible next cycle → it re-attempts (auto-BE not stuck done).
     await monitor._run_one_cycle(app, NOW_MS + 20_000)
@@ -689,6 +1096,9 @@ async def test_verified_modify_latches_be(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 1  # latched on a CONFIRMED move
     assert "auto_be" in row["last_alert_state"]
+    assert "App moved the SL to break-even" in row["last_alert_state"]["auto_be"][
+        "message"
+    ]
     assert "auto_be_error" not in row["last_alert_state"]
 
 
@@ -719,7 +1129,7 @@ async def test_verified_be_with_latch_failure_does_not_repeat_mutation(
 @pytest.mark.asyncio
 async def test_unverified_trail_move_writes_no_done_feed(monkeypatch, db_path):
     """C2 for trailing: an unverified trail return must NOT write the
-    "App hat SL nachgezogen (Trail)" feed (a false "done") — honest error only."""
+    "App tightened the SL" feed (a false "done") — honest error only."""
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True, rules={"auto_trail": True})

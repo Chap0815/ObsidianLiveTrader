@@ -107,6 +107,31 @@ def test_fail_safe_on_empty_or_missing_stats():
         assert out["note"] is None
 
 
+def test_fail_safe_on_overflowed_stats_numbers():
+    cases = [
+        {"sample": float("inf"), "win_rate_ci95": [0.2, 0.4]},
+        {"sample": 40, "win_rate_lo": 10**400},
+    ]
+    for block in cases:
+        stats = {"by_confidence": {"high": block}}
+        out = recalibrate("high", None, None, stats, min_sample=20)
+        assert out["calibrated_confidence"] == "high"
+        assert out["size_factor"] == 1.0
+
+
+def test_fail_safe_on_impossible_wilson_lower_bound():
+    for bad_lower_bound in (-0.1, 1.1, float("nan"), float("inf"), float("-inf")):
+        out = recalibrate(
+            "high",
+            None,
+            None,
+            _stats("high", ci_lo=bad_lower_bound, ci_hi=0.99, sample=40),
+            min_sample=20,
+        )
+        assert out["calibrated_confidence"] == "high"
+        assert out["size_factor"] == 1.0
+
+
 def test_accepts_track_record_shape_win_rate_lo_and_n():
     # Tolerant of the compact track_record block shape (win_rate_lo + n).
     stats = {"by_confidence": {"high": {"n": 30, "win_rate_lo": 0.40}}}

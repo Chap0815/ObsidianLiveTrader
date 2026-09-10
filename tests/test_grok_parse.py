@@ -497,7 +497,7 @@ def test_parse_content_to_proposal_maps_nan_to_llmerror():
 def test_reevaluate_proposal_rejects_nonfinite(field, bad):
     from app.models import ReevaluateProposal
 
-    base = {"action": "HOLD", "new_sl": None, "new_tp": None}
+    base = {"action": "HOLD", "reason": "x", "new_sl": None, "new_tp": None}
     base[field] = bad
     with pytest.raises(ValidationError):
         ReevaluateProposal.model_validate(base)
@@ -507,10 +507,105 @@ def test_reevaluate_proposal_rejects_nonfinite(field, bad):
 def test_reevaluate_proposal_rejects_boolean_numeric_fields(field):
     from app.models import ReevaluateProposal
 
-    base = {"action": "HOLD", "new_sl": None, "new_tp": None}
+    base = {"action": "HOLD", "reason": "x", "new_sl": None, "new_tp": None}
     base[field] = True
     with pytest.raises(ValidationError):
         ReevaluateProposal.model_validate(base)
+
+
+@pytest.mark.parametrize("field", ["new_sl", "new_tp"])
+@pytest.mark.parametrize("bad", [0, -1.0])
+def test_reevaluate_proposal_rejects_nonpositive_price_levels(field, bad):
+    from app.models import ReevaluateProposal
+
+    base = {"action": "HOLD", "reason": "x", "new_sl": None, "new_tp": None}
+    base[field] = bad
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(base)
+
+
+def test_reevaluate_move_sl_requires_new_sl():
+    from app.models import ReevaluateProposal
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(
+            {"action": "MOVE_SL_BE", "reason": "x", "new_sl": None}
+        )
+    assert ReevaluateProposal(action="MOVE_SL_BE", reason="x", new_sl=100).new_sl == 100
+
+
+@pytest.mark.parametrize("partial_close_pct", [None, 0])
+def test_reevaluate_partial_close_requires_positive_share(partial_close_pct):
+    from app.models import ReevaluateProposal
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(
+            {
+                "action": "PARTIAL_CLOSE",
+                "reason": "x",
+                "partial_close_pct": partial_close_pct,
+            }
+        )
+    assert (
+        ReevaluateProposal(
+            action="PARTIAL_CLOSE", reason="x", partial_close_pct=25
+        ).partial_close_pct
+        == 25
+    )
+
+
+def test_reevaluate_partial_close_rejects_full_share():
+    from app.models import ReevaluateProposal
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal(action="PARTIAL_CLOSE", reason="x", partial_close_pct=100)
+    assert (
+        ReevaluateProposal(
+            action="PARTIAL_CLOSE", reason="x", partial_close_pct=99.9
+        ).partial_close_pct
+        == 99.9
+    )
+
+
+@pytest.mark.parametrize("action", ["HOLD", "MOVE_SL_BE", "CLOSE"])
+def test_reevaluate_non_partial_action_rejects_close_share(action):
+    from app.models import ReevaluateProposal
+
+    payload = {"action": action, "reason": "x", "partial_close_pct": 25}
+    if action == "MOVE_SL_BE":
+        payload["new_sl"] = 100
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate(payload)
+
+
+@pytest.mark.parametrize("field", ["new_sl", "new_tp"])
+def test_reevaluate_hold_rejects_level_changes(field):
+    from app.models import ReevaluateProposal
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate({"action": "HOLD", "reason": "x", field: 100})
+
+
+@pytest.mark.parametrize("field", ["new_sl", "new_tp"])
+def test_reevaluate_close_rejects_level_changes(field):
+    from app.models import ReevaluateProposal
+
+    with pytest.raises(ValidationError):
+        ReevaluateProposal.model_validate({"action": "CLOSE", "reason": "x", field: 100})
+
+
+@pytest.mark.parametrize("reason", [None, "   "])
+def test_reevaluate_requires_nonblank_reason(reason):
+    from app.models import ReevaluateProposal
+
+    payload = {"action": "HOLD", "confidence": "high"}
+    if reason is not None:
+        payload["reason"] = reason
+    proposal = ReevaluateProposal.model_validate(payload)
+
+    assert proposal.reason == "No rationale provided; verify manually."
+    assert proposal.confidence == "low"
 
 
 def _reeval(action="MOVE_SL_BE", **kw):
@@ -548,7 +643,7 @@ def test_reevaluation_wrong_side_tp_short_caps_confidence():
     from app.llm.client import annotate_reevaluation
 
     # short position: a valid new_tp is BELOW price; 106 (above) is wrong-side.
-    p = _reeval(action="HOLD", new_tp=106.0)
+    p = _reeval(action="PARTIAL_CLOSE", partial_close_pct=25, new_tp=106.0)
     out = annotate_reevaluation(p, _reeval_ctx(side="short", last_price=100.0))
     assert out.confidence == "low"
     assert out.risk_notes
@@ -561,6 +656,25 @@ def test_reevaluation_valid_geometry_unchanged():
     out = annotate_reevaluation(p, _reeval_ctx(side="long", last_price=100.0))
     assert out.confidence == "high"
     assert out.risk_notes == ""  # untouched
+
+
+@pytest.mark.parametrize(
+    ("side", "proposal"),
+    [
+        ("long", {"new_sl": 100.0}),
+        (
+            "short",
+            {"action": "PARTIAL_CLOSE", "partial_close_pct": 25, "new_tp": 100.0},
+        ),
+    ],
+)
+def test_reevaluation_level_at_market_caps_confidence(side, proposal):
+    from app.llm.client import annotate_reevaluation
+
+    out = annotate_reevaluation(_reeval(**proposal), _reeval_ctx(side=side))
+
+    assert out.confidence == "low"
+    assert out.risk_notes
 
 
 def test_parse_content_reevaluation_applies_plausibility_cap():

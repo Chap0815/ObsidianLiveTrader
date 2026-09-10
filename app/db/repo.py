@@ -70,9 +70,15 @@ def _loads(raw: str | None) -> Any:
 
 
 def _decode_position_mgmt_row(d: dict[str, Any]) -> dict[str, Any]:
-    """Decode the JSON TEXT columns (armed_rules / last_alert_state) to dicts."""
-    d["armed_rules"] = _loads(d.get("armed_rules")) or {}
-    d["last_alert_state"] = _loads(d.get("last_alert_state")) or {}
+    """Normalize persisted position-management control values."""
+    armed_rules = _loads(d.get("armed_rules"))
+    alert_state = _loads(d.get("last_alert_state"))
+    be_done = d.get("be_done")
+    d["armed_rules"] = armed_rules if isinstance(armed_rules, dict) else {}
+    d["last_alert_state"] = alert_state if isinstance(alert_state, dict) else {}
+    d["be_done"] = (
+        be_done if type(be_done) is int and be_done in (0, 1) else None
+    )
     return d
 
 
@@ -768,6 +774,8 @@ class Database:
                            SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) AS losses,
                            SUM(CASE WHEN status IN ('WIN','LOSS')
                                     THEN realized_r ELSE 0 END) AS sum_r,
+                           COUNT(CASE WHEN status IN ('WIN','LOSS')
+                                      THEN realized_r END) AS realized_r_sample,
                            -- F2-10: ambiguous resolved rows + a CLEAN win/loss
                            -- split (ambiguous excluded) so the endpoint can show
                            -- a win rate that isn't inflated by intrabar ties.
@@ -796,6 +804,7 @@ class Database:
                         "wins": int(r["wins"] or 0),
                         "losses": int(r["losses"] or 0),
                         "sum_r": float(r["sum_r"] or 0.0),
+                        "realized_r_sample": int(r["realized_r_sample"] or 0),
                         "ambiguous": int(r["ambiguous"] or 0),
                         "clean_wins": int(r["clean_wins"] or 0),
                         "clean_losses": int(r["clean_losses"] or 0),
@@ -803,15 +812,18 @@ class Database:
                     }
                 return out
 
-            # Overall sum of realized_r over resolved (WIN|LOSS) rows.
+            # Overall sum and non-NULL denominator for realized_r over resolved
+            # rows. Historical/corrupt rows without a gross R must not dilute
+            # the known average toward zero.
             sum_r = await conn.execute(
                 """
-                SELECT SUM(realized_r) FROM journal_entries
+                SELECT SUM(realized_r), COUNT(realized_r) FROM journal_entries
                 WHERE status IN ('WIN','LOSS')
                 """
             )
             sr = await sum_r.fetchone()
             overall_sum_r = float(sr[0]) if sr and sr[0] is not None else 0.0
+            overall_r_sample = int(sr[1]) if sr and sr[1] is not None else 0
 
             # F2-07: NET sum over resolved rows (Task 21's feedback uses net,
             # not gross). Pre-migration WIN/LOSS rows have NULL net -> SUM skips
@@ -839,6 +851,7 @@ class Database:
                 "wins": wins,
                 "losses": losses,
                 "overall_sum_r": overall_sum_r,
+                "overall_r_sample": overall_r_sample,
                 "overall_sum_r_net": overall_sum_r_net,
                 "overall_net_sample": overall_net_sample,
                 "by_confidence": await _groups("setup_confidence"),
@@ -1244,17 +1257,27 @@ class Database:
 
     async def disarm_all(self) -> int:
         """Kill-switch (spec §3.5): empty armed_rules on every OPEN row so no
-        auto-action fires again until the user re-arms. Returns the count of
-        rows affected (0 when nothing was armed/open)."""
+        auto-action fires again until the user re-arms. Returns how many rows
+        actually had at least one literally enabled rule."""
         async with self._acquire() as conn:
             cur = await conn.execute(
+                "SELECT armed_rules FROM position_management WHERE status = 'OPEN'"
+            )
+            rows = await cur.fetchall()
+            active_count = 0
+            for row in rows:
+                rules = _loads(row[0])
+                if isinstance(rules, dict) and any(
+                    value is True for value in rules.values()
+                ):
+                    active_count += 1
+            await conn.execute(
                 """
                 UPDATE position_management
                 SET armed_rules = '{}', updated_at = ?
-                WHERE status = 'OPEN'
+                WHERE status = 'OPEN' AND armed_rules <> '{}'
                 """,
                 (_now_ms(),),
             )
-            affected = cur.rowcount if cur.rowcount is not None else 0
             await conn.commit()
-            return max(0, affected)
+            return active_count

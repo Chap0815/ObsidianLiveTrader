@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import re
 from typing import Callable
 from urllib.parse import urlparse
@@ -69,6 +70,20 @@ def _is_loopback_origin(value: str) -> bool:
     return host in _LOOPBACK_HOSTS
 
 
+def _is_loopback_client(value: str) -> bool:
+    host = (value or "").strip().lower()
+    if host in {"localhost", "testclient"}:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
 def _origin_matches_request(value: str, request) -> bool:
     """True only if the Origin/Referer is the SAME ORIGIN as the server the
     request actually hit — scheme, host AND port must match. A page on another
@@ -82,13 +97,13 @@ def _origin_matches_request(value: str, request) -> bool:
         )
         o_host = (o.hostname or "").lower()
         o_port = o.port or (443 if origin_scheme == "https" else 80)
+        request_scheme = {"ws": "http", "wss": "https"}.get(
+            request.url.scheme.lower(), request.url.scheme.lower()
+        )
+        req_host = (request.url.hostname or "").lower()
+        req_port = request.url.port or (443 if request_scheme == "https" else 80)
     except (TypeError, ValueError):
         return False
-    request_scheme = {"ws": "http", "wss": "https"}.get(
-        request.url.scheme.lower(), request.url.scheme.lower()
-    )
-    req_host = (request.url.hostname or "").lower()
-    req_port = request.url.port or (443 if request_scheme == "https" else 80)
     return origin_scheme == request_scheme and o_host == req_host and o_port == req_port
 
 # MEXC: BTC_USDT | Hyperliquid: BTC or BTC_USDT (coin part used on HL)
@@ -187,12 +202,12 @@ async def loopback_or_token_middleware(request: Request, call_next: Callable):
         "/api/scan",
         "/api/fills",
         "/api/reevaluate",
+        "/api/positions",
     )
     if any(path.startswith(p) for p in private_prefixes):
         client = request.client.host if request.client else ""
-        loopbacks = {"127.0.0.1", "::1", "localhost", "testclient"}
         # Starlette TestClient uses "testclient"
-        if client and client not in loopbacks and not client.startswith("127."):
+        if not _is_loopback_client(client):
             s = get_settings()
             # Allow only if a matching credential is presented — header token
             # or the HttpOnly session cookie (F-19, additive).

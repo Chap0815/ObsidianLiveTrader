@@ -73,7 +73,7 @@ def _normalize_setup_confidence(data: dict) -> dict:
         cs = data.get("conviction_score")
         try:
             data["conviction_score"] = max(0, min(10, int(cs)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             data.pop("conviction_score", None)  # -> model default (None)
     return data
 
@@ -276,6 +276,12 @@ def annotate_reevaluation(
         # the target ABOVE; for a SHORT, inverted. new_sl and new_tp share the
         # same side rule keyed by their type.
         want_above = (label == "new_tp") == (side == "long")
+        if level == last_price:
+            wrong_side.append(
+                f"{label} {level:g} equals last_price {last_price:g} "
+                f"for a {side} position"
+            )
+            return
         is_above = level > last_price
         if is_above != want_above:
             wrong_side.append(
@@ -619,24 +625,43 @@ def annotate_proposal(
     return _apply_leverage_clamp(proposal, context)
 
 
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_float(value: Any) -> float | None:
+    parsed = _finite_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    parsed = _finite_float(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
 def _series_tail(series: Any, k: int = 12) -> list:
     """Last k values of an indicator series, rounded to keep tokens low."""
     if not isinstance(series, list):
         return []
     out = []
     for v in series[-k:]:
-        if isinstance(v, (int, float)):
-            out.append(round(float(v), 6))
-        else:
-            out.append(v)
+        numeric = _finite_float(v)
+        out.append(round(numeric, 6) if numeric is not None else None)
     return out
 
 
 def _relative_pct(value: Any, reference: Any) -> float | None:
-    try:
-        pct = (float(value) - float(reference)) / float(reference) * 100.0
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+    numeric_value = _positive_float(value)
+    numeric_reference = _positive_float(reference)
+    if numeric_value is None or numeric_reference is None:
         return None
+    pct = (numeric_value - numeric_reference) / numeric_reference * 100.0
     return round(pct, 3) if math.isfinite(pct) else None
 
 
@@ -652,17 +677,21 @@ def _ema_stack_label(last: dict[str, Any], last_close: float | None) -> str:
     EMA order alone would miss for many bars). Chosen over a separate
     `price_location` field to keep the change surgical and prompt-neutral.
     """
-    try:
-        e20, e50, e200 = last.get("ema20"), last.get("ema50"), last.get("ema200")
-        if e20 is None or e50 is None or e200 is None:
-            return "unknown"
-        if e20 > e50 > e200 and (last_close is None or last_close > e200):
-            return "bullish"
-        if e20 < e50 < e200 and (last_close is None or last_close < e200):
-            return "bearish"
-        return "mixed"
-    except TypeError:
+    e20, e50, e200 = (
+        _finite_float(last.get("ema20")),
+        _finite_float(last.get("ema50")),
+        _finite_float(last.get("ema200")),
+    )
+    if any(value is None or value <= 0 for value in (e20, e50, e200)):
         return "unknown"
+    close = None if last_close is None else _finite_float(last_close)
+    if last_close is not None and (close is None or close <= 0):
+        return "unknown"
+    if e20 > e50 > e200 and (close is None or close > e200):
+        return "bullish"
+    if e20 < e50 < e200 and (close is None or close < e200):
+        return "bearish"
+    return "mixed"
 
 
 def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> dict[str, Any]:
@@ -718,11 +747,14 @@ def compact_tf_for_llm(slice_dict: dict[str, Any], *, recent_bars: int = 30) -> 
         "atr14": _series_tail(indicators.get("atr14"), 6),
     }
 
+    vol_trend = indicators.get("vol_trend")
+    if vol_trend not in ("rising", "falling", "flat"):
+        vol_trend = None
     read = {
         "ema_stack": _ema_stack_label(last, last_close),
-        "atr14": last.get("atr14"),
-        "rvol": indicators.get("rvol"),
-        "vol_trend": indicators.get("vol_trend"),
+        "atr14": _positive_float(last.get("atr14")),
+        "rvol": _nonnegative_float(indicators.get("rvol")),
+        "vol_trend": vol_trend,
     }
     if last_close and last.get("ema20"):
         ema_pct = _relative_pct(last_close, last["ema20"])
@@ -776,8 +808,8 @@ def compact_daily_for_llm(slice_dict: dict[str, Any]) -> dict[str, Any]:
         # Daily ATR feeds the plausibility reference band so a legitimate deep
         # daily-anchored pullback entry/stop isn't auto-nuked to STAY_OUT when
         # it exceeds the small LTF/HTF ATR band (audit B3/I2).
-        "atr14": last.get("atr14"),
-        "rvol": indicators.get("rvol"),
+        "atr14": _positive_float(last.get("atr14")),
+        "rvol": _nonnegative_float(indicators.get("rvol")),
     }
     if last_close and last.get("ema20"):
         ema_pct = _relative_pct(last_close, last["ema20"])
@@ -879,6 +911,11 @@ def _oi_read_label(market: dict[str, Any], ltf_candles: list[Any] | None) -> str
     return table.get((price_dir, oi_dir))
 
 
+_SCANNER_SETUP_VALUES = frozenset(
+    {"pullback", "breakout", "range-fade", "reversal"}
+)
+
+
 def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
     """Keep only the fields the analyzer should confirm/refute, coerced to
     safe types. Returns None when nothing usable is present."""
@@ -890,32 +927,34 @@ def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
         out["bias"] = bias.strip().lower()
     setup = raw.get("setup") or raw.get("setup_type")
     if isinstance(setup, str) and setup.strip():
-        # Scanner schema currently names short setup labels. Keep a modest
-        # allowance for provider variants, but never let a caller inflate the
-        # analyzer payload/cache key with arbitrary free text.
-        out["setup"] = setup.strip()[:40]
+        normalized_setup = setup.strip().lower()
+        if normalized_setup in _SCANNER_SETUP_VALUES:
+            out["setup"] = normalized_setup
     kl = raw.get("key_level")
-    if (
-        isinstance(kl, (int, float))
-        and not isinstance(kl, bool)
-        and math.isfinite(float(kl))
-    ):
-        out["key_level"] = float(kl)
+    if isinstance(kl, (int, float)) and not isinstance(kl, bool):
+        try:
+            key_level = float(kl)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(key_level) and key_level > 0:
+                out["key_level"] = key_level
     score = raw.get("score")
-    if (
-        isinstance(score, (int, float))
-        and not isinstance(score, bool)
-        and math.isfinite(float(score))
-        and 0 <= float(score) <= 10
-    ):
-        out["score"] = float(score)
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        try:
+            numeric_score = float(score)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(numeric_score) and 0 <= numeric_score <= 10:
+                out["score"] = numeric_score
     # S2-04: the screener's own rationale for the pick — without it the
     # analyzer re-derives blind and can't see WHY the coin was flagged.
-    # Truncated to ~120 chars: it is LLM-origin free text, not a structured
-    # field, so it's a hint for the analyzer prompt, not a contract value.
+    # The scanner contract allows at most 12 words; retain the 120-character
+    # ceiling as a second bound for pathological single-token output.
     reason = raw.get("reason")
     if isinstance(reason, str) and reason.strip():
-        out["reason"] = reason.strip()[:120]
+        out["reason"] = " ".join(reason.split()[:12])[:120]
     return out or None
 
 
@@ -989,7 +1028,7 @@ def build_llm_context(
     account = account or {}
     # F-15 (privacy): default to false (opt-in) — a missing attribute must
     # fail closed toward NOT leaking account data, not toward sending it.
-    include_acct = bool(getattr(settings, "include_account_in_llm", False))
+    include_acct = getattr(settings, "include_account_in_llm", False) is True
     src_market = market_api.get("market") or {}
     daily_c = compact_daily_for_llm(market_api.get("daily") or {})
     htf_c = compact_tf_for_llm(market_api.get("htf") or {})
@@ -1089,18 +1128,36 @@ def build_original_thesis(proposal: dict[str, Any] | None) -> dict[str, Any] | N
     """
     if not isinstance(proposal, dict) or not proposal:
         return None
-    action = str(proposal.get("action") or "").upper()
-    if action == "STAY_OUT" or proposal.get("entry_price") is None:
+
+    def positive_price(value: Any) -> float | None:
+        return _positive_float(value)
+
+    def bounded_text(value: Any, limit: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text[:limit] if text else None
+
+    action = proposal.get("action")
+    entry_price = positive_price(proposal.get("entry_price"))
+    if action not in _DIRECTIONAL or entry_price is None:
         return None
-    return {
-        "action": proposal.get("action"),
-        "setup_confidence": proposal.get("setup_confidence"),
-        "chart_pattern": proposal.get("chart_pattern"),
-        "entry_price": proposal.get("entry_price"),
-        "stop_loss": proposal.get("stop_loss"),
-        "tp1": proposal.get("tp1"),
-        "rationale": proposal.get("rationale"),
-    }
+
+    thesis: dict[str, Any] = {"action": action, "entry_price": entry_price}
+    confidence = proposal.get("setup_confidence")
+    if confidence in ("low", "medium", "high"):
+        thesis["setup_confidence"] = confidence
+    chart_pattern = bounded_text(proposal.get("chart_pattern"), 80)
+    if chart_pattern is not None:
+        thesis["chart_pattern"] = chart_pattern
+    for field in ("stop_loss", "tp1"):
+        price = positive_price(proposal.get(field))
+        if price is not None:
+            thesis[field] = price
+    rationale = bounded_text(proposal.get("rationale"), 1000)
+    if rationale is not None:
+        thesis["rationale"] = rationale
+    return thesis
 
 
 class LlmError(Exception):

@@ -40,6 +40,7 @@ def test_regime_tag_deterministic_buckets(daily_stack, atr_pct, expected):
         ({"btc_daily_stack": "bullish"}, "oops"),    # wrong type
         ({"btc_daily_stack": "bullish"}, -1.0),      # nonsensical negative ATR%
         ({"btc_daily_stack": "bullish"}, float("nan")),  # NaN guard
+        ({"btc_daily_stack": "bullish"}, 10**400),   # float conversion overflow
         ("not-a-dict", 1.0),                          # wrong type entirely
     ],
 )

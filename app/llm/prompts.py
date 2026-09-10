@@ -501,7 +501,7 @@ METHOD — work through these steps in order:
      break-even.
    - PARTIAL_CLOSE: thesis is still plausible but momentum is fading, a target/structure
      level was reached, or risk should be trimmed without fully exiting. Set
-     partial_close_pct (0-100) for how much of the current position to close now, and
+     partial_close_pct (>0 and <100) for how much of the current position to close now, and
      optionally new_sl/new_tp for the remainder.
    - CLOSE: thesis is invalidated (structure broken against the position, momentum
      firmly reversed against position.side) or, when liquidate_price is present, price

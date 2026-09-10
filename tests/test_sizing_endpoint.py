@@ -4,8 +4,11 @@ endpoint always sized for max_risk_pct (10%) while the UI labeled the
 suggestion "2% risk".
 """
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -130,6 +133,133 @@ def _expected_vol(
         leverage=leverage,
         max_notional_pct_of_equity=settings.max_notional_pct_of_equity,
     )
+
+
+def test_sizing_suggest_rejects_overflowed_ticker_before_account_read(monkeypatch):
+    mock = _mock_client()
+    mock.ticker = AsyncMock(return_value=MagicMock(last_price=10**400))
+
+    r = _post(monkeypatch, {}, mock=mock)
+
+    assert r.status_code == 502
+    assert "ticker price" in r.text.lower()
+    mock.account_snapshot.assert_not_awaited()
+
+
+def test_sizing_suggest_rejects_boolean_ticker_before_account_read(monkeypatch):
+    mock = _mock_client()
+    mock.ticker = AsyncMock(return_value=MagicMock(last_price=True))
+
+    r = _post(monkeypatch, {}, mock=mock)
+
+    assert r.status_code == 502
+    assert "ticker price" in r.text.lower()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sizing_suggest_hot_swap_rejects_old_account_snapshot(monkeypatch):
+    import app.main as main
+    from app.models import OrderTicket
+
+    monkeypatch.setattr(main, "get_settings", lambda: _settings(10.0))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_snapshot(*, fresh):
+        started.set()
+        await release.wait()
+        return {
+            "equity_usdt": EQUITY,
+            "available_usdt": AVAILABLE,
+            "positions": [],
+        }
+
+    old_client = SimpleNamespace(
+        contract_meta=AsyncMock(return_value=_contract_meta()),
+        ticker=AsyncMock(return_value=Ticker(symbol="BTC_USDT", last_price=ENTRY)),
+        account_snapshot=old_snapshot,
+    )
+    new_client = object()
+    state = SimpleNamespace(mexc=old_client, exchange=old_client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    ticket = OrderTicket(
+        symbol="BTC_USDT",
+        side="long",
+        vol=1,
+        stop_loss=STOP,
+    )
+
+    task = asyncio.create_task(main.sizing_suggest(request, ticket, None))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    state.mexc = new_client
+    state.exchange = new_client
+    release.set()
+    with pytest.raises(main.HTTPException) as exc:
+        await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Exchange changed while loading data. Retry the request."
+
+
+def test_sizing_suggest_rejects_overflowed_account_numbers(monkeypatch):
+    for field, expected_detail in (
+        ("equity_usdt", "equity unavailable"),
+        ("available_usdt", "available margin unavailable"),
+    ):
+        mock = _mock_client()
+        snapshot = dict(mock.account_snapshot.return_value)
+        snapshot[field] = 10**400
+        mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+        r = _post(monkeypatch, {}, mock=mock)
+
+        assert r.status_code == 400
+        assert expected_detail in r.text.lower()
+
+
+def test_sizing_suggest_rejects_boolean_account_numbers(monkeypatch):
+    for field, expected_detail in (
+        ("equity_usdt", "equity unavailable"),
+        ("available_usdt", "available margin unavailable"),
+    ):
+        mock = _mock_client()
+        snapshot = dict(mock.account_snapshot.return_value)
+        snapshot[field] = True
+        mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+        r = _post(monkeypatch, {}, mock=mock)
+
+        assert r.status_code == 400
+        assert expected_detail in r.text.lower()
+
+
+def test_sizing_suggest_does_not_treat_missing_positions_as_flat(monkeypatch):
+    for bad_positions in (None, {}):
+        mock = _mock_client()
+        snapshot = dict(mock.account_snapshot.return_value)
+        if bad_positions is None:
+            snapshot.pop("positions")
+        else:
+            snapshot["positions"] = bad_positions
+        mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+        r = _post(monkeypatch, {}, mock=mock)
+
+        assert r.status_code == 400
+        assert "position data" in r.text.lower()
+
+
+def test_sizing_suggest_rejects_malformed_position_row(monkeypatch):
+    mock = _mock_client()
+    snapshot = dict(mock.account_snapshot.return_value)
+    snapshot["positions"] = [None]
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    r = _post(monkeypatch, {}, mock=mock)
+
+    assert r.status_code == 400
+    assert "position row" in r.text.lower()
 
 
 def test_sizing_matches_gate_adverse_slippage_entry(monkeypatch):

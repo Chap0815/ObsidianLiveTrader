@@ -216,6 +216,7 @@ def resolve_entry(
     order_type: str | None = None,
     taker_fee: float = _DEFAULT_TAKER_FEE,
     slippage_frac: float = _DEFAULT_SLIPPAGE_FRAC,
+    candle_interval_s: float | None = None,
 ) -> Outcome:
     """Decide a shadow outcome for one journal entry. Pure, no I/O.
 
@@ -227,6 +228,8 @@ def resolve_entry(
     """
     if not geometry_ok(direction, entry_price, stop_loss, tp1):
         return Outcome(status=SKIPPED)
+    if order_type is not None and order_type not in ("market", "limit"):
+        return Outcome(status=SKIPPED)
 
     assert direction is not None and entry_price is not None
     assert stop_loss is not None and tp1 is not None
@@ -234,6 +237,11 @@ def resolve_entry(
     # Materialize once: `candles` may be a one-shot generator, and we need to
     # scan it twice below (touch-scan, then coverage check).
     all_candles = list(candles)
+    now_dt = _created_dt(now)
+    now_ms = int(now_dt.timestamp() * 1000)
+    observed_candles = [
+        candle for candle in all_candles if _field(candle, "time") <= now_ms
+    ]
 
     t0_ms = _parse_iso_ms(created_at)
     deadline_ms = t0_ms + int(max(0.0, float(window_s)) * 1000)
@@ -245,22 +253,52 @@ def resolve_entry(
     # Never infer a terminal outcome when the fetched history does not reach
     # the proposal time. A later TP/SL candle alone is not proof that an entry
     # filled or survived unseen earlier candles.
-    candle_times = [_field(c, "time") for c in all_candles]
+    candle_times = [_field(c, "time") for c in observed_candles]
     earliest = min(candle_times) if candle_times else None
+    latest = max(candle_times) if candle_times else None
     covers_t0 = earliest is not None and earliest <= t0_ms
     if not covers_t0:
         return Outcome(status=PENDING)
+
+    interval_ms: int | None = None
+    coverage_end_ms = latest
+    if candle_interval_s is not None:
+        try:
+            interval_value = float(candle_interval_s)
+        except (TypeError, ValueError, OverflowError):
+            return Outcome(status=PENDING)
+        if (
+            isinstance(candle_interval_s, bool)
+            or not math.isfinite(interval_value)
+            or interval_value <= 0
+        ):
+            return Outcome(status=PENDING)
+        interval_ms = int(interval_value * 1000)
+        covering_starts = [value for value in candle_times if value <= t0_ms]
+        coverage_end_ms = max(covering_starts) + interval_ms
+        if coverage_end_ms <= t0_ms:
+            return Outcome(status=PENDING)
 
     # Scan only the contractual resolution window. Candles after the deadline
     # must never retroactively turn an expired setup into a WIN or LOSS.
     ordered = sorted(
         (
             c
-            for c in all_candles
+            for c in observed_candles
             if t0_ms <= _field(c, "time") < deadline_ms
         ),
         key=lambda c: _field(c, "time"),
     )
+    if interval_ms is not None:
+        contiguous: list[Any] = []
+        assert coverage_end_ms is not None
+        for candle in ordered:
+            candle_time = _field(candle, "time")
+            if candle_time > coverage_end_ms:
+                break
+            contiguous.append(candle)
+            coverage_end_ms = max(coverage_end_ms, candle_time + interval_ms)
+        ordered = contiguous
 
     # F2-02: find the fill bar; only scan TP/SL from there. Intrabar ambiguity
     # extends to the fill bar itself (entry + SL in the same candle -> LOSS).
@@ -299,14 +337,14 @@ def resolve_entry(
                 )
 
     # No terminal candle found. Expiring / NO_FILL is only safe once (a) the
-    # window has genuinely elapsed AND (b) the fetched candle history actually
-    # reaches back to t0 -- otherwise a real fill / WIN / LOSS could be hiding
-    # before our earliest fetched candle, and reporting a terminal state would
-    # silently discard it. Coverage-less/incomplete data (resolver was down
-    # longer than the fetch window, or an empty/delisted payload) always stays
-    # PENDING so the next cycle (with a wider/fresh fetch) gets another chance.
-    elapsed = (now - _created_dt(created_at)).total_seconds()
-    if elapsed >= window_s:
+    # window has genuinely elapsed AND (b) the fetched candle history spans the
+    # entire window from t0 through its deadline. Otherwise a real fill / WIN /
+    # LOSS could be hiding before our earliest or after our latest candle, and
+    # reporting a terminal state would silently discard it. Coverage-less or
+    # incomplete data always stays PENDING so a later cycle gets another chance.
+    elapsed = (now_dt - _created_dt(created_at)).total_seconds()
+    covers_deadline = coverage_end_ms is not None and coverage_end_ms >= deadline_ms
+    if elapsed >= window_s and covers_deadline:
         # Entry never touched over a fully-covered, elapsed window -> the
         # limit never filled. A filled-but-untouched-TP/SL entry -> EXPIRED.
         return Outcome(status=NO_FILL if fill_index is None else EXPIRED)
@@ -426,6 +464,7 @@ async def resolve_pending_once(
                         # fills only when a candle straddles entry_price. Legacy rows
                         # (NULL order_type) keep the conservative LIMIT modeling.
                         order_type=row.get("order_type"),
+                        candle_interval_s=_TF_SECONDS.get(tf),
                     )
                 # Defect E fix (b): a row this far stale can NEVER regain
                 # coverage back to t0 from a now-anchored, capped fetch -- the

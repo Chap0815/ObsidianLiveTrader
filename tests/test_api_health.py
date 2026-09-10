@@ -61,6 +61,21 @@ def test_health_live_trading_true_when_armed_mexc(monkeypatch):
     assert r.json()["live_trading"] is True
 
 
+def test_health_does_not_report_provider_alias_as_fallback(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: _settings(llm_provider="grok", xai_api_key="synthetic-xai-key"),
+    )
+    with TestClient(app) as client:
+        client.app.state.llm_override = None
+        body = client.get("/api/health").json()
+
+    assert body["llm_provider"] == "xai"
+    assert body["llm_provider_configured"] == "grok"
+    assert body["llm_fallback_active"] is False
+
+
 def _settings(**kwargs):
     from app.config import Settings
 

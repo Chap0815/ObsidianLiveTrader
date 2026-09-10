@@ -22,6 +22,7 @@ build_scan_contexts-Partial steckt in tests/test_scanner.py), 8, 10.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -166,6 +167,7 @@ async def test_lifespan_shutdown_cancels_resolver_and_closes_client(
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "trader.db"))
     monkeypatch.setenv("TRADING_ENABLED", "false")
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    monkeypatch.setenv("JOURNAL_ENABLED", "true")
     get_settings.cache_clear()
 
     aclose_called = {"v": False}
@@ -213,6 +215,7 @@ async def test_lifespan_shutdown_survives_resolver_error(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "trader.db"))
     monkeypatch.setenv("TRADING_ENABLED", "false")
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    monkeypatch.setenv("JOURNAL_ENABLED", "true")
     get_settings.cache_clear()
 
     aclose_called = {"v": False}
@@ -236,6 +239,188 @@ async def test_lifespan_shutdown_survives_resolver_error(tmp_path, monkeypatch):
         await asyncio.sleep(0.02)
     assert aclose_called["v"] is True
     get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_startup_failure_closes_created_client(tmp_path, monkeypatch):
+    """A client created before a DB startup failure must not leak."""
+    from fastapi import FastAPI
+
+    import app.main as main_module
+
+    state = {"client_closed": False, "db_closed": False, "lock_released": False}
+
+    class _FakeClient:
+        async def aclose(self):
+            state["client_closed"] = True
+
+    class _FailingDb:
+        def __init__(self, path):
+            self.path = path
+
+        async def init(self):
+            raise RuntimeError("db init failed")
+
+        async def open(self):
+            raise AssertionError("open must not follow failed init")
+
+        async def close(self):
+            state["db_closed"] = True
+
+    settings = SimpleNamespace(
+        exchange="mexc",
+        hl_testnet=True,
+        trading_enabled=False,
+        mainnet_ack=False,
+        database_path=tmp_path / "trader.db",
+    )
+    lock_path = tmp_path / "instance.lock"
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "create_exchange_client", lambda _s: _FakeClient())
+    monkeypatch.setattr(main_module, "Database", _FailingDb)
+    monkeypatch.setattr(main_module, "_acquire_instance_lock", lambda _path: lock_path)
+    monkeypatch.setattr(
+        main_module,
+        "_release_instance_lock",
+        lambda _path: state.__setitem__("lock_released", True),
+    )
+
+    with pytest.raises(RuntimeError, match="db init failed"):
+        async with main_module.lifespan(FastAPI()):
+            pass
+
+    assert state == {
+        "client_closed": True,
+        "db_closed": True,
+        "lock_released": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lifespan_client_close_error_still_releases_db_and_lock(
+    tmp_path, monkeypatch
+):
+    """One cleanup failure must not skip the remaining owned resources."""
+    from fastapi import FastAPI
+
+    import app.main as main_module
+
+    state = {"client_closed": False, "db_closed": False, "lock_released": False}
+
+    class _FailingClient:
+        async def aclose(self):
+            state["client_closed"] = True
+            raise RuntimeError("client close failed")
+
+    class _FakeDb:
+        def __init__(self, path):
+            self.path = path
+
+        async def init(self):
+            pass
+
+        async def open(self):
+            pass
+
+        async def close(self):
+            state["db_closed"] = True
+
+    settings = SimpleNamespace(
+        exchange="mexc",
+        hl_testnet=True,
+        trading_enabled=False,
+        mainnet_ack=False,
+        database_path=tmp_path / "trader.db",
+        resolved_llm_provider="none",
+        llm_provider="none",
+        journal_enabled=False,
+        tm_enabled=False,
+    )
+    lock_path = tmp_path / "instance.lock"
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        main_module, "create_exchange_client", lambda _s: _FailingClient()
+    )
+    monkeypatch.setattr(main_module, "Database", _FakeDb)
+    monkeypatch.setattr(main_module, "_acquire_instance_lock", lambda _path: lock_path)
+    monkeypatch.setattr(
+        main_module,
+        "_release_instance_lock",
+        lambda _path: state.__setitem__("lock_released", True),
+    )
+
+    with pytest.raises(RuntimeError, match="client close failed"):
+        async with main_module.lifespan(FastAPI()):
+            pass
+
+    assert state == {
+        "client_closed": True,
+        "db_closed": True,
+        "lock_released": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_closes_hot_applied_exchange_client(
+    tmp_path, monkeypatch
+):
+    """Shutdown must close the current app-state client, not the startup client."""
+    from fastapi import FastAPI
+
+    import app.main as main_module
+
+    class _FakeClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+
+    class _FakeDb:
+        def __init__(self, path):
+            self.path = path
+
+        async def init(self):
+            pass
+
+        async def open(self):
+            pass
+
+        async def close(self):
+            pass
+
+    settings = SimpleNamespace(
+        exchange="mexc",
+        hl_testnet=True,
+        trading_enabled=False,
+        mainnet_ack=False,
+        database_path=tmp_path / "trader.db",
+        resolved_llm_provider="none",
+        llm_provider="none",
+        journal_enabled=False,
+        tm_enabled=False,
+    )
+    original = _FakeClient()
+    replacement = _FakeClient()
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "create_exchange_client", lambda _s: original)
+    monkeypatch.setattr(main_module, "Database", _FakeDb)
+    monkeypatch.setattr(
+        main_module,
+        "_acquire_instance_lock",
+        lambda _path: tmp_path / "instance.lock",
+    )
+
+    test_app = FastAPI()
+    async with main_module.lifespan(test_app):
+        # Mirror setup_save's hot-apply: publish the replacement, then close old.
+        test_app.state.mexc = replacement
+        test_app.state.exchange = replacement
+        test_app.state._owned_exchange_client = replacement
+        await original.aclose()
+
+    assert original.close_calls == 1
+    assert replacement.close_calls == 1
 
 
 # ── Gap 4: /ws/market Origin-Reject (Code 1008) ─────────────────────────────

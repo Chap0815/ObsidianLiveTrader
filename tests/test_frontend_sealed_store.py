@@ -64,3 +64,116 @@ def test_every_state_write_is_declared_in_sealed_store():
 def test_chart_price_precision_is_declared():
     """Direct regression for the specific field that caused the outage."""
     assert "_chartPricePrecision" in _declared_state_keys()
+
+
+def test_reevaluate_frontend_keys_requests_by_symbol_and_side():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert 'reevalResultHtml(p.symbol, sideVal)' in src
+    assert 'actionEl.getAttribute("data-side")' in src
+    assert 'side: sideKey' in src
+
+
+def test_cached_reevaluation_is_scoped_to_current_position_snapshot():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "function _reevalPositionFingerprint(sym, side)" in src
+    assert "p.position_id" in src
+    assert "p.entry_price" in src
+    assert "p.hold_vol" in src
+    assert "entry.reviewFingerprint !== currentFingerprint" in src
+
+
+def test_late_reevaluation_result_is_discarded_after_position_change():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "const reviewFingerprint = _reevalReviewFingerprint" in src
+    assert "function cacheReevalResult(value)" in src
+    assert "currentFingerprint !== reviewFingerprint" in src
+
+
+def test_cached_reevaluation_is_scoped_to_timeframes():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "function _reevalReviewFingerprint(sym, side)" in src
+    assert "String(state.tf" in src
+    assert "String(state.htf" in src
+    assert "entry.reviewFingerprint !== currentFingerprint" in src
+
+
+def test_cached_reevaluation_is_scoped_to_selected_provider():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert 'const providerSelect = $("llm-select")' in src
+    assert "providerSelect.value" in src
+    assert "currentFingerprint !== reviewFingerprint" in src
+
+
+def test_visible_ai_status_and_chart_copy_is_english():
+    app_src = (_STATIC / "app.js").read_text(encoding="utf-8")
+    store_src = (_STATIC / "store.js").read_text(encoding="utf-8")
+    base_src = (_STATIC.parent / "templates" / "base.html").read_text(
+        encoding="utf-8"
+    )
+
+    for untranslated in (
+        '"KI Entry"',
+        '"KI SL -1R"',
+        '"KI TP1"',
+        '"KI TP2"',
+        '"KI TP3"',
+        '"Bewerte…"',
+        "KI bewertet Position…",
+        '"Analysiere…"',
+        '"KI") + " analysiert…"',
+    ):
+        assert untranslated not in app_src
+    for untranslated_rail_label in (
+        ">Unrealisiert<",
+        ">Schutz<",
+        ">Liq-Distanz<",
+        "SL-Bereich",
+        "TP-Bereich",
+    ):
+        assert untranslated_rail_label not in app_src
+    for english_copy in (
+        '"AI Entry"',
+        '"AI SL -1R"',
+        '"AI TP1"',
+        '"AI TP2"',
+        '"AI TP3"',
+        '"Reviewing…"',
+        "AI is reviewing the position…",
+        '"Analyzing…"',
+        '"AI") + " is analyzing…"',
+        'providerId || "AI"',
+    ):
+        assert english_copy in app_src
+    for english_rail_label in (
+        ">Unrealized PnL<",
+        ">Protection<",
+        ">Liq. distance<",
+        "SL zone",
+        "TP zone",
+    ):
+        assert english_rail_label in app_src
+    assert 'llmLabel: "AI"' in store_src
+    assert "store.js?v={{ asset_version|default('r29') }}" in base_src
+    assert "trade-math.js?v={{ asset_version|default('r36') }}" in base_src
+    assert "app.js?v={{ asset_version|default('r44') }}" in base_src
+
+
+def test_calibration_table_headers_are_english():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "<th>Win rate</th>" in src
+    assert "<th>Avg gross R</th>" in src
+    assert "<th>Win-Rate</th>" not in src
+    assert "<th>Ø R brutto</th>" not in src
+
+
+def test_trade_history_net_header_is_english():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "<th>Net</th>" in src
+    assert "<th>Netto</th>" not in src

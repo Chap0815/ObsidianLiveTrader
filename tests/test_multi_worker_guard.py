@@ -1,8 +1,6 @@
 """F-16 (deployment/concurrency): the in-process preview-token store and
-trade_lock require a single uvicorn worker. This app has no way to see a
-bare `uvicorn ... --workers N` CLI flag, but it CAN detect common
-multi-worker env vars some process managers set and warn loudly instead of
-silently corrupting preview tokens / the confirm/close lock across workers.
+trade_lock require a single uvicorn worker. Common multi-worker environment
+settings and the runtime instance lock both fail startup closed.
 """
 
 from app.main import _detect_multi_worker_env
@@ -43,6 +41,31 @@ def test_never_raises_and_defaults_to_real_os_environ(monkeypatch):
     assert _detect_multi_worker_env() is not None
 
 
+def test_declared_multi_worker_lifespan_fails_before_resource_setup(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+    from app.config import get_settings
+
+    create_client = main.create_exchange_client
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        main,
+        "create_exchange_client",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("exchange client must not be constructed")
+        ),
+    )
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="SINGLE-WORKER REQUIRED"):
+            with TestClient(main.app):
+                pass
+    finally:
+        get_settings.cache_clear()
+        monkeypatch.setattr(main, "create_exchange_client", create_client)
+
+
 # ── Q-02: exclusive file/PID lock on data/ (runtime detection, independent of
 # the env-var heuristic above — catches a bare `--workers N` / `gunicorn -w
 # N` launch that sets none of those vars). ─────────────────────────────────
@@ -60,6 +83,7 @@ from app.main import (
     _pid_is_alive,
     _process_start_time,
     _release_instance_lock,
+    _windows_open_failure_may_be_live,
 )
 
 
@@ -68,6 +92,35 @@ def _dead_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait(timeout=10)
     return proc.pid
+
+
+def test_oversized_lock_pid_is_inconclusive_instead_of_crashing(tmp_path):
+    oversized_pid = 10**100
+    assert _pid_is_alive(oversized_pid) is True
+    assert _process_start_time(oversized_pid) is None
+
+    data_dir = tmp_path / "oversized_pid"
+    data_dir.mkdir()
+    lock_path = data_dir / "instance.lock"
+    original = f"{oversized_pid}:1"
+    lock_path.write_text(original)
+
+    assert _acquire_instance_lock(data_dir) is None
+    assert lock_path.read_text() == original
+
+
+@pytest.mark.parametrize(
+    ("error_code", "may_be_live"),
+    [
+        (5, True),  # ERROR_ACCESS_DENIED: the process can exist but be protected
+        (8, True),  # unrelated resource failure is likewise inconclusive
+        (87, False),  # ERROR_INVALID_PARAMETER: invalid/nonexistent PID
+    ],
+)
+def test_windows_open_failure_only_proves_dead_for_invalid_pid(
+    error_code, may_be_live
+):
+    assert _windows_open_failure_may_be_live(error_code) is may_be_live
 
 
 def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
@@ -121,10 +174,9 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
     assert foreign_lock.exists()
 
     # Integration (lifespan): a second instance whose startup lock is busy
-    # (a live foreign PID already holds it) logs a loud WARNING; when this
-    # instance is ARMED (TRADING_ENABLED=true) it must abort startup
-    # entirely instead of quietly running two copies of the in-process
-    # preview_store/trade_lock state — an unarmed instance only warns.
+    # (a live foreign PID already holds it) logs a loud WARNING and aborts
+    # startup even while entry trading is disarmed: close/cancel/SL remain real
+    # safety actions and still require the one process-global trade lock.
     from app.config import get_settings
     from fastapi.testclient import TestClient
     from app.main import app
@@ -134,12 +186,13 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
     (data_dir / "instance.lock").write_text(str(other_live_pid))
     monkeypatch.setenv("DATABASE_PATH", str(data_dir / "trader.db"))
 
-    # Unarmed: warns, still starts.
+    # Unarmed still fails closed.
     monkeypatch.setenv("TRADING_ENABLED", "false")
     get_settings.cache_clear()
     with caplog.at_level(logging.WARNING, logger="app.main"):
-        with TestClient(app):
-            pass
+        with pytest.raises(RuntimeError, match="Refusing to start"):
+            with TestClient(app):
+                pass
     assert any("MULTI-INSTANCE DETECTED" in r.message for r in caplog.records)
 
     # Armed: fail-closed abort.
@@ -160,6 +213,35 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
 # look permanently busy and block every future ARMED start (a false-positive
 # DoS). Storing + comparing the process START TIME lets a reclaim tell a
 # genuinely-busy PID apart from a reused one.
+
+
+def test_instance_lock_does_not_reclaim_empty_publication_window(tmp_path):
+    """An existing empty path may belong to an O_EXCL winner that has not yet
+    written its PID. It must remain busy instead of being unlinked underneath
+    that live owner."""
+    data_dir = tmp_path / "publishing"
+    data_dir.mkdir()
+    lock_path = data_dir / "instance.lock"
+    lock_path.write_text("")
+
+    assert _acquire_instance_lock(data_dir) is None
+    assert lock_path.exists()
+    assert lock_path.read_text() == ""
+
+
+def test_instance_lock_second_acquire_in_same_process_is_busy(tmp_path):
+    """Two app lifespans in one process still represent two live instances."""
+    data_dir = tmp_path / "same_process"
+    data_dir.mkdir()
+    lock_path = _acquire_instance_lock(data_dir)
+    assert lock_path is not None
+    original = lock_path.read_text()
+
+    try:
+        assert _acquire_instance_lock(data_dir) is None
+        assert lock_path.read_text() == original
+    finally:
+        _release_instance_lock(lock_path)
 
 
 def test_stale_pid_reuse_reclaimed_via_start_time_mismatch(tmp_path):
@@ -197,3 +279,9 @@ def test_stale_pid_reuse_reclaimed_via_start_time_mismatch(tmp_path):
     old_format_dir.mkdir()
     (old_format_dir / "instance.lock").write_text(str(other_live_pid))
     assert _acquire_instance_lock(old_format_dir) is None
+
+    # Non-finite metadata is likewise inconclusive, never proof of PID reuse.
+    nonfinite_dir = tmp_path / "nonfinite_start_busy"
+    nonfinite_dir.mkdir()
+    (nonfinite_dir / "instance.lock").write_text(f"{other_live_pid}:nan")
+    assert _acquire_instance_lock(nonfinite_dir) is None

@@ -1,5 +1,6 @@
 """Daily regime anchor: compact block, snapshot passthrough, parallel fetch + cache."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +72,65 @@ async def test_daily_fetch_is_cached_within_ttl():
 
 
 @pytest.mark.asyncio
+async def test_daily_cache_is_scoped_to_client():
+    from app.analysis.context import _fetch_daily_candles
+
+    clear_daily_cache()
+    first = _CountingClient()
+    second = _CountingClient()
+
+    await _fetch_daily_candles(first, "BTC_SCOPE", "1D", 60)
+    await _fetch_daily_candles(second, "BTC_SCOPE", "1D", 60)
+
+    assert first.kline_calls.get("1D", 0) == 1
+    assert second.kline_calls.get("1D", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_daily_cache_misses_share_one_fetch():
+    from app.analysis.context import _fetch_daily_candles
+
+    clear_daily_cache()
+
+    class _BlockingClient(_CountingClient):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            self.kline_calls[interval] = self.kline_calls.get(interval, 0) + 1
+            self.started.set()
+            await self.release.wait()
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 86_400) * 1000,
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.5,
+                    vol=5.0,
+                )
+                for i in range(limit_hint)
+            ]
+
+    client = _BlockingClient()
+    first = asyncio.create_task(
+        _fetch_daily_candles(client, "BTC_SINGLEFLIGHT", "1D", 60)
+    )
+    await client.started.wait()
+    second = asyncio.create_task(
+        _fetch_daily_candles(client, "BTC_SINGLEFLIGHT", "1D", 60)
+    )
+    asyncio.get_running_loop().call_soon(client.release.set)
+
+    await asyncio.gather(first, second)
+
+    assert client.kline_calls["1D"] == 1
+    assert ctxmod._daily_cache_locks == {}
+
+
+@pytest.mark.asyncio
 async def test_daily_cache_expires(monkeypatch):
     clear_daily_cache()
     client = _CountingClient()
@@ -89,6 +149,33 @@ async def test_daily_cache_expires(monkeypatch):
     elapsed[0] += ctxmod._DAILY_TTL_S + 1.0
     await build_market_snapshot("BTC_C", "15m", "1H", client)
     assert client.kline_calls["1D"] == 2
+
+
+@pytest.mark.asyncio
+async def test_daily_cache_ttl_starts_after_successful_fetch(monkeypatch):
+    from app.analysis.context import _fetch_daily_candles
+
+    clear_daily_cache()
+    elapsed = [1_000.0]
+    monkeypatch.setattr(
+        ctxmod,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed[0]),
+    )
+
+    class _AdvancingClient(_CountingClient):
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            candles = await super().klines(
+                symbol, interval, limit_hint=limit_hint, paced=paced
+            )
+            elapsed[0] += 11.0
+            return candles
+
+    client = _AdvancingClient()
+    await _fetch_daily_candles(client, "BTC_TTL", "1D", 60, ttl=10.0)
+    await _fetch_daily_candles(client, "BTC_TTL", "1D", 60, ttl=10.0)
+
+    assert client.kline_calls["1D"] == 1
 
 
 class _DailyRaisingClient(_CountingClient):
@@ -111,6 +198,7 @@ async def test_daily_fetch_error_yields_none_daily():
     d = snapshot_to_api_dict(snap)
     assert d["daily"] is None
     assert d["htf"] is not None and d["ltf"] is not None
+    assert ctxmod._daily_cache_locks == {}
 
 
 class _DepthClient:

@@ -39,6 +39,12 @@ def test_sanitize_rejects_control_chars():
     assert sanitize_env_value("X", None) == ""
 
 
+def test_sanitize_rejects_values_that_dotenv_would_reinterpret():
+    for value in ("alpha # truncated", "${OBSIDIAN_SYNTHETIC_VAR}", "'quoted'"):
+        with pytest.raises(ValueError, match="dotenv syntax"):
+            sanitize_env_value("X", value)
+
+
 # ── normalize ────────────────────────────────────────────────────────────────
 def test_normalize_rejects_bad_hl_key():
     with pytest.raises(ValueError):
@@ -47,6 +53,12 @@ def test_normalize_rejects_bad_hl_key():
         normalize_answers(_payload(hl_private_key="kein-hex"))
     with pytest.raises(ValueError):
         normalize_answers(_payload(hl_private_key="0xabc"))
+    with pytest.raises(ValueError, match="valid secp256k1"):
+        normalize_answers(_payload(hl_private_key="0x" + "0" * 64))
+    with pytest.raises(ValueError, match="valid secp256k1"):
+        normalize_answers(
+            _payload(hl_private_key="0x" + "f" * 64)
+        )
 
 
 def test_normalize_mainnet_requires_typed_confirm():
@@ -144,6 +156,33 @@ def test_normalize_rejects_boolean_risk_numbers(field, value):
         normalize_answers(payload)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_risk_pct",
+        "max_leverage",
+        "min_rrr",
+        "max_notional_pct_of_equity",
+        "max_notional_usdt",
+    ],
+)
+def test_normalize_rejects_overflowed_risk_numbers(field):
+    payload = _payload(
+        risk_profile="custom",
+        max_risk_pct=2.0,
+        max_leverage=10,
+        min_rrr=2.0,
+        max_notional_pct_of_equity=1000,
+        max_notional_usdt=500,
+    )
+    # Large enough to overflow float(), but still below Python's default JSON
+    # integer digit limit, so the web setup endpoint can actually receive it.
+    payload[field] = 10 ** 1_000
+
+    with pytest.raises(ValueError, match="is not a number"):
+        normalize_answers(payload)
+
+
 def test_normalize_include_account_defaults_false():
     assert normalize_answers(_payload())["include_account_in_llm"] is False
 
@@ -182,6 +221,15 @@ def test_build_minimal_env_safe_and_parses(tmp_path, monkeypatch):
 def test_build_minimal_env_rejects_bad_port_falls_back():
     assert "PORT=8787" in build_minimal_env(port=80)
     assert "PORT=8787" in build_minimal_env(port="nope")  # type: ignore[arg-type]
+
+
+def test_build_minimal_env_rejects_unsafe_explicit_token():
+    for token in (
+        "synthetic\nTRADING_ENABLED=true",
+        "${OBSIDIAN_SYNTHETIC_TOKEN}",
+    ):
+        with pytest.raises(ValueError):
+            build_minimal_env(token=token)
 
 
 # ── build_full_env ───────────────────────────────────────────────────────────
@@ -284,6 +332,144 @@ def test_patch_env_updates_in_place_and_preserves(tmp_path):
     assert out.count("XAI_API_KEY=") == 1  # updated in place, not appended
 
 
+def test_patch_env_replaces_and_deduplicates_all_active_key_definitions(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text(
+        "XAI_API_KEY=old-first\n# keep this\nXAI_API_KEY=old-effective\n",
+        encoding="utf-8",
+    )
+
+    patch_env_vars(
+        p,
+        {"XAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("XAI_API_KEY=") == 1
+    assert "XAI_API_KEY=replacement" in out
+    assert "old-first" not in out and "old-effective" not in out
+    assert "# keep this" in out
+
+
+def test_patch_env_replaces_export_prefixed_key_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("export OPENAI_API_KEY=old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"OPENAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("OPENAI_API_KEY=") == 1
+    assert "OPENAI_API_KEY=replacement" in out
+    assert "old-value" not in out
+
+
+def test_patch_env_replaces_bom_prefixed_first_key_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("\ufeffXAI_API_KEY=old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"XAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("XAI_API_KEY=") == 1
+    assert "XAI_API_KEY=replacement" in out
+    assert "old-value" not in out
+
+
+def test_patch_env_replaces_tab_export_key_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("export\tOPENAI_API_KEY=old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"OPENAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("OPENAI_API_KEY=") == 1
+    assert "OPENAI_API_KEY=replacement" in out
+    assert "old-value" not in out
+
+
+def test_patch_env_replaces_case_insensitive_key_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("xai_api_key=old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"XAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("XAI_API_KEY=") == 1
+    assert "XAI_API_KEY=replacement" in out
+    assert "old-value" not in out
+
+
+def test_patch_env_replaces_single_quoted_key_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("'OPENAI_API_KEY'=old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"OPENAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("OPENAI_API_KEY=") == 1
+    assert "OPENAI_API_KEY=replacement" in out
+    assert "old-value" not in out
+
+
+def test_patch_env_replaces_legacy_claude_alias_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text("CLAUDE_API_KEY=legacy-old-value\n", encoding="utf-8")
+
+    patch_env_vars(
+        p,
+        {"ANTHROPIC_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert "CLAUDE_API_KEY=" not in out
+    assert out.count("ANTHROPIC_API_KEY=") == 1
+    assert "ANTHROPIC_API_KEY=replacement" in out
+    assert "legacy-old-value" not in out
+
+
+def test_patch_env_replaces_multiline_value_without_leaving_old_secret(tmp_path):
+    p = tmp_path / ".env"
+    p.write_text(
+        'OPENAI_API_KEY="old-first-line\nold-second-line"\nTRADING_ENABLED=false\n',
+        encoding="utf-8",
+    )
+
+    patch_env_vars(
+        p,
+        {"OPENAI_API_KEY": "replacement"},
+        allowed=set(SETTINGS_LLM_WRITABLE),
+    )
+
+    out = p.read_text(encoding="utf-8")
+    assert out.count("OPENAI_API_KEY=") == 1
+    assert "OPENAI_API_KEY=replacement" in out
+    assert "old-first-line" not in out
+    assert "old-second-line" not in out
+    assert "TRADING_ENABLED=false" in out
+
+
 def test_patch_env_appends_under_footer_when_missing(tmp_path):
     p = tmp_path / ".env"
     p.write_text("TRADING_ENABLED=false\n", encoding="utf-8")
@@ -308,6 +494,22 @@ def test_patch_env_rejects_control_char_value(tmp_path):
         patch_env_vars(
             p, {"XAI_API_KEY": "x\nTRADING_ENABLED=true"}, allowed=set(SETTINGS_LLM_WRITABLE)
         )
+
+
+def test_patch_env_rejects_malformed_existing_binding_without_rewriting(tmp_path):
+    p = tmp_path / ".env"
+    original = 'OPENAI_API_KEY="synthetic-unterminated\nTRADING_ENABLED=false\n'
+    p.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid dotenv syntax"):
+        patch_env_vars(
+            p,
+            {"OPENAI_API_KEY": "replacement"},
+            allowed=set(SETTINGS_LLM_WRITABLE),
+        )
+
+    assert p.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".env.*.tmp")) == []
 
 
 def test_default_models_have_all_providers():

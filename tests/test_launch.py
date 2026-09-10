@@ -170,6 +170,39 @@ def test_ensure_deps_marker_tracks_actual_file_used_switch_reinstalls(
     assert req_arg.endswith("requirements.lock")
 
 
+def test_ensure_deps_marker_detects_content_change_with_same_mtime(
+    launch, tmp_path, monkeypatch
+):
+    root = tmp_path
+    venv_dir = root / ".venv"
+    venv_dir.mkdir()
+    req = root / "requirements.lock"
+    req.write_text("fastapi==0.139.0\n", encoding="utf-8")
+    original_stat = req.stat()
+    marker = venv_dir / ".deps_installed"
+
+    monkeypatch.setattr(launch, "ROOT", root)
+    monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
+    monkeypatch.setattr(launch, "_is_project_venv", lambda p: True)
+    monkeypatch.setattr(launch, "_venv_env", lambda: {})
+    marker.write_text(launch._deps_marker_state(req), encoding="utf-8")
+
+    req.write_text("fastapi==0.138.0\n", encoding="utf-8")
+    os.utime(req, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *, check=True, env=None, error_hint=None):
+        calls.append([str(c) for c in cmd])
+        return 0
+
+    monkeypatch.setattr(launch, "_run", fake_run)
+
+    launch.ensure_deps(venv_dir / "Scripts" / "python.exe", skip=False)
+
+    assert len(calls) == 2
+    assert marker.read_text(encoding="utf-8") == launch._deps_marker_state(req)
+
+
 def test_setup_flag_explicit_alias_not_prefix_abbreviation(launch):
     """--setup must be a real, explicit alias for --setup-cli (W3-10) — not
     just an argparse prefix-abbreviation match."""
@@ -189,6 +222,48 @@ def test_setup_flag_parses_both_forms(launch):
     assert p.parse_args([]).setup_cli is False
 
 
+@pytest.mark.parametrize("value", ["0", "1023", "65536", "99999", "9" * 5000])
+def test_port_flag_rejects_out_of_range_values(launch, value):
+    with pytest.raises(SystemExit):
+        launch._build_arg_parser().parse_args(["--port", value])
+
+
+@pytest.mark.parametrize("value", ["1024", "8787", "65535"])
+def test_port_flag_accepts_configured_range(launch, value):
+    args = launch._build_arg_parser().parse_args(["--port", value])
+    assert args.port == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "not-a-port", "9000.1", "9e3", "0", "1023", "65536", "9" * 5000],
+)
+def test_read_port_host_rejects_invalid_explicit_port(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"HOST=127.0.0.1\nPORT={value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="PORT must be an integer from 1024 to 65535"):
+        launch.read_port_host()
+
+
+@pytest.mark.parametrize("value", ["+9000", "9_000", "9000.0"])
+def test_read_port_host_matches_settings_integer_forms(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"HOST=127.0.0.1\nPORT={value}\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_port_host() == ("127.0.0.1", 9000)
+
+
 def test_trading_banner_reports_armed_state(launch, tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "ROOT", tmp_path)
     (tmp_path / ".env").write_text("TRADING_ENABLED=true\n", encoding="utf-8")
@@ -198,6 +273,224 @@ def test_trading_banner_reports_armed_state(launch, tmp_path, monkeypatch):
 def test_trading_banner_defaults_to_disarmed(launch, tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "ROOT", tmp_path)
     assert launch.read_trading_banner().startswith("DISARMED")
+
+
+@pytest.mark.parametrize("value", ["", "enabled", "2"])
+def test_trading_banner_marks_invalid_explicit_values_unknown(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"TRADING_ENABLED={value}\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_trading_banner() == "UNKNOWN — invalid TRADING_ENABLED value"
+
+
+@pytest.mark.parametrize("value", ["y", "t"])
+def test_setup_complete_matches_short_true_literals(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"SETUP_COMPLETE={value}\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_setup_complete() is True
+
+
+@pytest.mark.parametrize("value", ["", "completed", "2"])
+def test_setup_complete_rejects_invalid_explicit_values(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"SETUP_COMPLETE={value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="SETUP_COMPLETE must be a valid boolean"):
+        launch.read_setup_complete()
+
+
+@pytest.mark.parametrize("value", ["y", "t"])
+def test_trading_banner_never_hides_short_true_literals(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"TRADING_ENABLED={value}\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_readers_support_export_prefixed_assignments(
+    launch, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "export SETUP_COMPLETE=true\n"
+        "export HOST=::1\n"
+        "export PORT=9000\n"
+        "export EXCHANGE=hyperliquid\n"
+        "export HL_TESTNET=false\n"
+        "export TRADING_ENABLED=true\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_setup_complete() is True
+    assert launch.read_port_host() == ("::1", 9000)
+    assert launch.read_exchange_banner() == "Hyperliquid MAINNET"
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_reader_supports_tab_after_export(launch, tmp_path, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "export\tTRADING_ENABLED=true\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_reader_matches_case_insensitive_settings_keys(
+    launch, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "setup_complete=true\n"
+        "Host=::1\n"
+        "port=9000\n"
+        "Exchange=HL\n"
+        "hl_TestNet=false\n"
+        "trading_enabled=true\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_setup_complete() is True
+    assert launch.read_port_host() == ("::1", 9000)
+    assert launch.read_exchange_banner() == "Hyperliquid MAINNET"
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_reader_does_not_hide_first_key_after_utf8_bom(
+    launch, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "\ufeffTRADING_ENABLED=true\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+@pytest.mark.parametrize("value", ["", "0.0.0.0", "LOCALHOST"])
+def test_read_port_host_rejects_invalid_explicit_host(
+    launch, tmp_path, monkeypatch, value
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"HOST={value}\nPORT=8787\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="HOST must be 127.0.0.1, localhost, or ::1"):
+        launch.read_port_host()
+
+
+def test_launcher_readers_use_last_duplicate_assignment(launch, tmp_path, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "SETUP_COMPLETE=false\nSETUP_COMPLETE=true\n"
+        "HOST=127.0.0.1\nHOST=::1\n"
+        "PORT=8787\nPORT=9000\n"
+        "EXCHANGE=mexc\nEXCHANGE=hyperliquid\n"
+        "HL_TESTNET=true\nHL_TESTNET=false\n"
+        "TRADING_ENABLED=false\nTRADING_ENABLED=true\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_setup_complete() is True
+    assert launch.read_port_host() == ("::1", 9000)
+    assert launch.read_exchange_banner() == "Hyperliquid MAINNET"
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_readers_match_quoted_commented_dotenv_scalars(
+    launch, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        'SETUP_COMPLETE="true" # completed\n'
+        "HOST='::1'\n"
+        'PORT="9000" # local port\n'
+        "EXCHANGE='hyperliquid'\n"
+        'HL_TESTNET="false" # selected network\n'
+        "TRADING_ENABLED='true' # explicit opt-in\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_setup_complete() is True
+    assert launch.read_port_host() == ("::1", 9000)
+    assert launch.read_exchange_banner() == "Hyperliquid MAINNET"
+    assert launch.read_trading_banner().startswith("ARMED")
+
+
+def test_launcher_env_reader_does_not_retain_secret_fields(launch, tmp_path, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=synthetic-key-material\nTRADING_ENABLED=false\n",
+        encoding="utf-8",
+    )
+
+    assert launch._read_env_assignments() == {"TRADING_ENABLED": "false"}
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("", "Hyperliquid TESTNET"),
+        ("EXCHANGE=HL\n", "Hyperliquid TESTNET"),
+        ("EXCHANGE=Hyperliquid\n", "Hyperliquid TESTNET"),
+        ("EXCHANGE=\n", "exchange=?"),
+        ("EXCHANGE=unknown\n", "exchange=?"),
+    ],
+)
+def test_exchange_banner_matches_settings_exchange_semantics(
+    launch, tmp_path, monkeypatch, content, expected
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(content, encoding="utf-8")
+
+    assert launch.read_exchange_banner() == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("yes", "Hyperliquid TESTNET"),
+        ("t", "Hyperliquid TESTNET"),
+        ("0", "Hyperliquid MAINNET"),
+        ("n", "Hyperliquid MAINNET"),
+        ("invalid", "Hyperliquid network=?"),
+    ],
+)
+def test_exchange_banner_does_not_mislabel_hyperliquid_network(
+    launch, tmp_path, monkeypatch, value, expected
+):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        f"EXCHANGE=hyperliquid\nHL_TESTNET={value}\n",
+        encoding="utf-8",
+    )
+
+    assert launch.read_exchange_banner() == expected
 
 
 def test_port_in_use_detects_listening_socket(launch):
@@ -222,6 +515,38 @@ def test_port_in_use_false_when_port_free(launch):
     port = s.getsockname()[1]
     s.close()
     assert launch._port_in_use("127.0.0.1", port) is False
+
+
+def test_port_in_use_uses_address_family_aware_connection(launch, monkeypatch):
+    calls = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_create_connection(address, timeout):
+        calls.append((address, timeout))
+        return FakeConnection()
+
+    monkeypatch.setattr(launch.socket, "create_connection", fake_create_connection)
+
+    assert launch._port_in_use("::1", 8787) is True
+    assert calls == [(('::1', 8787), 0.5)]
+
+
+@pytest.mark.parametrize(
+    ("host", "path", "expected"),
+    [
+        ("127.0.0.1", "/setup", "http://127.0.0.1:8787/setup"),
+        ("localhost", "", "http://localhost:8787"),
+        ("::1", "/setup", "http://[::1]:8787/setup"),
+    ],
+)
+def test_local_url_matches_bound_loopback_host(launch, host, path, expected):
+    assert launch._local_url(host, 8787, path) == expected
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell launcher is Windows-only")

@@ -34,6 +34,12 @@ def test_secure_websocket_matches_https_origin_on_default_port():
     assert _origin_matches_request("https://example.test", request) is True
 
 
+def test_origin_check_rejects_invalid_request_port_without_raising():
+    request = SimpleNamespace(url=URL("http://localhost:notaport/api/orders/preview"))
+
+    assert _origin_matches_request("http://localhost", request) is False
+
+
 def test_ws_market_rejects_cross_port_origin_with_1008(monkeypatch):
     """Gleicher Host, ANDERER Port als der tatsaechliche Request (TestClient
     bedient unter "testserver", Default-Port) -> muss wie ein fremder Origin

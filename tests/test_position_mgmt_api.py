@@ -68,6 +68,20 @@ async def _seed_open(db_path, symbol, *, armed=False, alert_state=None):
         await db.set_alert_state(symbol, "long", alert_state)
 
 
+async def _set_raw_management_controls(db_path, *, armed_rules, be_done):
+    db = Database(db_path)
+    async with db._acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE position_management
+            SET armed_rules = ?, be_done = ?
+            WHERE symbol = 'BTC_USDT' AND side = 'long' AND status = 'OPEN'
+            """,
+            (armed_rules, be_done),
+        )
+        await conn.commit()
+
+
 def test_arm_sets_rules_and_freezes_baseline(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_ok.db"))
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
@@ -95,6 +109,38 @@ def test_arm_sets_rules_and_freezes_baseline(tmp_path, monkeypatch):
         # It must NOT have placed/modified any order — only read paths allowed.
         called = {c[0] for c in client.method_calls}
         assert called <= {"account_snapshot", "open_stop_orders", "user_fills"}
+    get_settings.cache_clear()
+
+
+def test_disarm_all_rules_succeeds_without_exchange_read(tmp_path, monkeypatch):
+    """Turning automation off is local control and must survive an exchange outage."""
+    db_path = str(tmp_path / "disarm_offline.db")
+    monkeypatch.setenv("DATABASE_PATH", db_path)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    _run(_seed_open(db_path, "BTC_USDT", armed=True))
+
+    with TestClient(app) as tc:
+        client = _mock_client([])
+        client.account_snapshot = AsyncMock(side_effect=RuntimeError("exchange down"))
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        response = tc.post(
+            "/api/positions/arm",
+            json={
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "rules": {"auto_be": False, "auto_trail": False},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["armed_rules"] == {}
+        client.account_snapshot.assert_not_awaited()
+        client.open_stop_orders.assert_not_awaited()
+
+    row = _run(Database(db_path).get_open_position_mgmt("BTC_USDT", "long"))
+    assert row["armed_rules"] == {}
     get_settings.cache_clear()
 
 
@@ -136,6 +182,106 @@ def test_arm_non_live_position_rejected(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_arm_duplicate_live_position_rejected_before_baseline_write(tmp_path, monkeypatch):
+    """Ambiguous exchange identity must not freeze an arbitrary auto-rule baseline."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_duplicate.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos(entry=100.0), _pos(entry=110.0)])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 409, r.text
+        assert "multiple live" in r.text.lower()
+        client.open_stop_orders.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+def test_arm_overflowed_entry_rejected_before_baseline_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_overflowed_entry.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos(entry=10**400)])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 400, r.text
+        assert "usable entry price" in r.text
+        client.open_stop_orders.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("bad_hold", [None, 0, -1, True, "bad", 10**400])
+def test_arm_rejects_invalid_live_position_size_before_baseline_read(
+    tmp_path, monkeypatch, bad_hold
+):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_invalid_hold.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos() | {"hold_vol": bad_hold}])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 502, r.text
+        assert "account position data" in r.text.lower()
+        client.open_stop_orders.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+def test_arm_missing_position_collection_is_upstream_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_missing_positions.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        client = _mock_client([])
+        client.account_snapshot = AsyncMock(return_value={})
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 502, r.text
+        assert "account position data" in r.text.lower()
+        client.open_stop_orders.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+def test_arm_unidentified_position_row_blocks_valid_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_invalid_position_row.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos(), {}])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        r = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert r.status_code == 502, r.text
+        assert "account position data" in r.text.lower()
+        client.open_stop_orders.assert_not_awaited()
+    get_settings.cache_clear()
+
+
 def test_alerts_returns_set_alert_state(tmp_path, monkeypatch):
     db_path = str(tmp_path / "alerts.db")
     monkeypatch.setenv("DATABASE_PATH", db_path)
@@ -160,6 +306,30 @@ def test_alerts_returns_set_alert_state(tmp_path, monkeypatch):
         assert row["side"] == "long"
         assert row["armed_rules"] == {"auto_be": True}
         assert row["alerts"]["thesis"]["active"] is True
+    get_settings.cache_clear()
+
+
+def test_alerts_fail_closed_for_malformed_persisted_controls(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "alerts_malformed_controls.db")
+    monkeypatch.setenv("DATABASE_PATH", db_path)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    _run(_seed_open(db_path, "BTC_USDT"))
+    _run(
+        _set_raw_management_controls(
+            db_path,
+            armed_rules='{"auto_be":"false","auto_trail":1,"unknown":true}',
+            be_done="",
+        )
+    )
+
+    with TestClient(app) as tc:
+        r = tc.get("/api/positions/alerts")
+        assert r.status_code == 200, r.text
+        row = r.json()["alerts"][0]
+
+    assert row["armed_rules"] == {"auto_be": False, "auto_trail": False}
+    assert row["be_done"] is None
     get_settings.cache_clear()
 
 

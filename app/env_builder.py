@@ -22,7 +22,12 @@ import secrets
 import subprocess
 import tempfile
 import time
+from io import StringIO
 from pathlib import Path
+
+from dotenv.parser import parse_stream
+
+from app.config import is_valid_hl_private_key
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +87,7 @@ SETTINGS_LLM_WRITABLE: frozenset[str] = frozenset(
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _HEX64 = re.compile(r"0x[0-9a-fA-F]{64}")
 _HEX40 = re.compile(r"0x[0-9a-fA-F]{40}")
+_ENV_UPDATE_KEY_ALIASES = {"CLAUDE_API_KEY": "ANTHROPIC_API_KEY"}
 
 
 # ── Value sanitation (injection guard — reuse everywhere) ───────────────────
@@ -94,6 +100,8 @@ def sanitize_env_value(name: str, raw) -> str:
     v = str(raw if raw is not None else "").strip()
     if any(ord(ch) < 32 or ch == "\x7f" for ch in v):
         raise ValueError(f"{name} contains invalid control characters")
+    if v.startswith(("'", '"')) or "${" in v or re.search(r"\s#", v):
+        raise ValueError(f"{name} contains dotenv syntax that would change its value")
     return v
 
 
@@ -134,6 +142,8 @@ def normalize_answers(payload: dict) -> dict:
                 "Hyperliquid private key must be 0x followed by 64 hex characters "
                 "(API/agent-wallet key from the Hyperliquid UI)"
             )
+        if not is_valid_hl_private_key(hl_key):
+            raise ValueError("Hyperliquid private key must be a valid secp256k1 key")
         if hl_addr and not _HEX40.fullmatch(hl_addr):
             raise ValueError("Wallet address must be 0x followed by 40 hex characters")
 
@@ -159,7 +169,7 @@ def normalize_answers(payload: dict) -> dict:
             raise ValueError(f"{name} is not a number")
         try:
             v = float(raw_value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"{name} is not a number") from None
         if not (lo <= v <= hi):
             raise ValueError(f"{name} must be between {lo} and {hi}")
@@ -237,7 +247,7 @@ def build_minimal_env(
         port = 8787
     if not (1024 <= port <= 65535):
         port = 8787
-    tok = (token or "").strip() or secrets.token_urlsafe(24)
+    tok = sanitize_env_value("LOCAL_API_TOKEN", token) or secrets.token_urlsafe(24)
     lines = [
         f"# Bootstrap — finish setup at http://127.0.0.1:{port}/setup",
         "SETUP_COMPLETE=false",
@@ -423,17 +433,26 @@ def patch_env_vars(
             raise ValueError(f"{k} is not writable")
         clean[k] = sanitize_env_value(k, v)
 
-    text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    lines = text.split("\n")
-
+    text = env_path.read_text(encoding="utf-8-sig") if env_path.exists() else ""
     remaining = dict(clean)
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in remaining:
-            lines[i] = f"{key}={remaining.pop(key)}"
+    updated: set[str] = set()
+    rewritten: list[str] = []
+    for binding in parse_stream(StringIO(text)):
+        if binding.error:
+            raise ValueError("Invalid dotenv syntax")
+        original = binding.original.string
+        key = (binding.key or "").upper()
+        key = _ENV_UPDATE_KEY_ALIASES.get(key, key)
+        if key in clean:
+            if key in updated:
+                continue
+            leading_newlines = original[: len(original) - len(original.lstrip("\n"))]
+            trailing_newline = "\n" if original.endswith("\n") else ""
+            original = f"{leading_newlines}{key}={clean[key]}{trailing_newline}"
+            updated.add(key)
+            remaining.pop(key, None)
+        rewritten.append(original)
+    lines = "".join(rewritten).split("\n")
 
     if remaining:
         footer = "# --- updated by settings (AI keys) ---"

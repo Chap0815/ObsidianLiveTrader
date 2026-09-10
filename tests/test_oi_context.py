@@ -85,6 +85,25 @@ async def test_build_market_snapshot_mexc_like_client_yields_none_market():
     assert snap.market["oi_change_pct_1h"] is None
 
 
+@pytest.mark.asyncio
+async def test_build_market_snapshot_degrades_malformed_market_extras():
+    class _MalformedExtrasClient(_FakeMarketClient):
+        async def market_extras(self, symbol):
+            return ["not", "a", "mapping"]
+
+    snap = await build_market_snapshot(
+        "BTC_USDT", "15m", "1H", _MalformedExtrasClient()
+    )
+
+    assert snap.market == {
+        "open_interest": None,
+        "premium": None,
+        "prev_day_px": None,
+        "oi_change_pct_1h": None,
+        "oi_change_pct_4h": None,
+    }
+
+
 def _hl_client():
     from app.hyperliquid.client import HyperliquidClient
     return HyperliquidClient(testnet=True)  # no keys needed for OI-history math

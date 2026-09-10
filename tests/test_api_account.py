@@ -474,3 +474,40 @@ def test_account_mexc_error_returns_200_with_error(monkeypatch):
     assert body["error"] == "signature invalid"
     assert body["equity_usdt"] == 0.0
     assert body["positions"] == []
+
+
+@pytest.mark.asyncio
+async def test_account_hot_swap_rejects_old_client_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.main as main
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_snapshot():
+        started.set()
+        await release.wait()
+        return {"equity_usdt": 999.0, "positions": []}
+
+    old_client = SimpleNamespace(account_snapshot=old_snapshot)
+    new_client = object()
+    state = SimpleNamespace(mexc=old_client, exchange=old_client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    task = asyncio.create_task(main.account(request, None))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    state.mexc = new_client
+    state.exchange = new_client
+    release.set()
+    with pytest.raises(main.HTTPException) as exc:
+        await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Exchange changed while loading data. Retry the request."

@@ -186,6 +186,54 @@ async def test_set_armed_rules_mark_be_done_set_alert_state_persist_idempotent(d
 
 
 @pytest.mark.asyncio
+async def test_position_mgmt_json_columns_reject_non_object_values(db_path):
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs())
+
+    # A legacy/corrupt database can still contain valid JSON with the wrong
+    # shape.  Every repository read must preserve the documented dict contract.
+    async with db._acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE position_management
+            SET armed_rules = ?, last_alert_state = ?
+            WHERE symbol = ? AND side = ? AND status = 'OPEN'
+            """,
+            ('"corrupt"', '["bad"]', "BTC_USDT", "long"),
+        )
+        await conn.commit()
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["armed_rules"] == {}
+    assert row["last_alert_state"] == {}
+    rows = await db.list_open_position_mgmt()
+    assert rows[0]["armed_rules"] == {}
+    assert rows[0]["last_alert_state"] == {}
+
+
+@pytest.mark.asyncio
+async def test_position_mgmt_invalid_be_done_is_exposed_as_unknown(db_path):
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs())
+
+    async with db._acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE position_management SET be_done = ''
+            WHERE symbol = ? AND side = ? AND status = 'OPEN'
+            """,
+            ("BTC_USDT", "long"),
+        )
+        await conn.commit()
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] is None
+    assert (await db.list_open_position_mgmt())[0]["be_done"] is None
+
+
+@pytest.mark.asyncio
 async def test_close_position_mgmt_sets_status_closed(db_path):
     db = Database(db_path)
     await db.init()
@@ -218,6 +266,42 @@ async def test_disarm_all_empties_armed_rules_and_returns_count(db_path):
     for sym, side in (("BTC_USDT", "long"), ("ETH_USDT", "short")):
         row = await db.get_open_position_mgmt(sym, side)
         assert row["armed_rules"] == {}
+
+
+@pytest.mark.asyncio
+async def test_disarm_all_counts_only_actively_armed_rows(db_path):
+    db = Database(db_path)
+    await db.init()
+    for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT"):
+        await db.upsert_position_mgmt(**_base_kwargs(symbol=symbol, side="long"))
+    await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True})
+    await db.set_armed_rules(
+        "ETH_USDT", "long", {"auto_be": False, "auto_trail": False}
+    )
+
+    assert await db.disarm_all() == 1
+    assert await db.disarm_all() == 0
+    rows = await db.list_open_position_mgmt()
+    assert all(row["armed_rules"] == {} for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_disarm_all_does_not_rewrite_already_empty_rows(db_path, monkeypatch):
+    db = Database(db_path)
+    await db.init()
+    await db.upsert_position_mgmt(**_base_kwargs())
+    await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True})
+
+    monkeypatch.setattr("app.db.repo._now_ms", lambda: 1_800_000_000_000)
+    assert await db.disarm_all() == 1
+    first = await db.get_open_position_mgmt("BTC_USDT", "long")
+
+    monkeypatch.setattr("app.db.repo._now_ms", lambda: 1_900_000_000_000)
+    assert await db.disarm_all() == 0
+    second = await db.get_open_position_mgmt("BTC_USDT", "long")
+
+    assert first["updated_at"] == 1_800_000_000_000
+    assert second["updated_at"] == first["updated_at"]
 
 
 # ── 2026-07-20: shared-connection atomic-upsert fix (concurrent-write safety) ──

@@ -73,6 +73,42 @@ def test_compact_reads_omit_overflowed_relative_percentages():
     assert "price_vs_ema20_pct" not in daily_read
 
 
+def test_compact_reads_sanitize_scalar_indicator_values():
+    slice_dict = {
+        "tf": "15m",
+        "candles": [{"close": 100.0}],
+        "indicators": {
+            "as_of_close": 100.0,
+            "last": {
+                "ema20": 99.0,
+                "ema50": 98.0,
+                "ema200": 97.0,
+                "atr14": float("inf"),
+            },
+            "rvol": True,
+            "vol_trend": "sideways",
+        },
+        "structure": {},
+    }
+
+    tf_read = compact_tf_for_llm(slice_dict)["read"]
+    daily_read = compact_daily_for_llm(slice_dict)["read"]
+
+    assert tf_read["atr14"] is None
+    assert tf_read["rvol"] is None
+    assert tf_read["vol_trend"] is None
+    assert daily_read["atr14"] is None
+    assert daily_read["rvol"] is None
+
+    slice_dict["indicators"]["last"]["atr14"] = 2.5
+    slice_dict["indicators"]["rvol"] = 0.0
+    slice_dict["indicators"]["vol_trend"] = "flat"
+    valid_read = compact_tf_for_llm(slice_dict)["read"]
+    assert valid_read["atr14"] == 2.5
+    assert valid_read["rvol"] == 0.0
+    assert valid_read["vol_trend"] == "flat"
+
+
 def _market_api():
     slc = _slice_with_candles()
     daily = {"tf": "1D", "candles": slc["candles"], "indicators": slc["indicators"], "structure": {}}

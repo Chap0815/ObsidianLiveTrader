@@ -440,6 +440,74 @@ async def test_flatten_closes_only_new_vol_not_whole_position():
 
 
 @pytest.mark.asyncio
+async def test_auto_flatten_reports_when_preexisting_position_was_overclosed():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0})
+    pre = [
+        {
+            "positionId": 7,
+            "symbol": "BTC_USDT",
+            "positionType": 1,
+            "holdVol": 50.0,
+            "holdAvgPrice": 100_000.0,
+            "liquidatePrice": 90_000.0,
+        }
+    ]
+    post = [{**pre[0], "holdVol": 51.0}]
+    overclosed = [{**pre[0], "holdVol": 49.0}]
+    client.positions = AsyncMock(
+        side_effect=[pre, pre, pre, post, post, overclosed]
+    )
+    client.assets = AsyncMock(
+        return_value=[
+            {
+                "currency": "USDT",
+                "equity": 1_000_000.0,
+                "availableBalance": 900_000.0,
+            }
+        ]
+    )
+    svc = OrderService(
+        client,
+        _settings(max_risk_pct=100.0, max_notional_usdt=1_000_000.0),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"], prev.get("errors")
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_args.kwargs["vol"] == 1.0
+    assert out["flatten"]["overfilled"] is True
+    assert out["flatten"]["residual_vol"] == 49.0
+    assert any("OVERFILLED" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_marks_result_unverified_when_residual_read_fails():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0})
+    client.positions = AsyncMock(
+        side_effect=[
+            [],
+            [],
+            [],
+            _filled_pos(1.0),
+            _filled_pos(1.0),
+            MexcError("positions unavailable"),
+        ]
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"], prev.get("errors")
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert out["flatten"]["unverified"] is True
+    assert out["flatten"]["residual_vol"] is None
+    assert any("could not be verified" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
 async def test_flatten_unfilled_cancels_resting_not_prefill():
     """If no new fill after place, cancel resting entry — do not close pre_hold."""
     client = _happy_client({"orderId": 777})
@@ -932,7 +1000,11 @@ async def test_auto_flatten_timeout_recovers_exact_close_external_oid_once():
         return {
             "match": "history",
             "externalOid": recovery_oid,
-            "order": {"state": 3},
+            "order": {
+                "externalOid": recovery_oid,
+                "orderId": 7,
+                "state": 3,
+            },
         }
 
     client.order_by_external_oid = AsyncMock(side_effect=recover)
@@ -1132,8 +1204,8 @@ async def test_partial_close_fraction_rounds_to_lot():
     client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=1.0))
     # current hold = 7 contracts; 25% = 1.75 → floor to 1
     client.positions = AsyncMock(
-        return_value=[{"symbol": "BTC_USDT", "positionType": 1, "holdVol": 7.0,
-                       "holdAvgPrice": 100.0}]
+        return_value=[{"symbol": "BTC_USDT", "positionType": 1, "openType": 1,
+                       "holdVol": 7.0, "holdAvgPrice": 100.0}]
     )
     client.close_position_market = AsyncMock(return_value={"orderId": 9})
     svc = OrderService(client, _settings(), PreviewStore())
@@ -1151,8 +1223,8 @@ async def test_partial_close_below_min_blocked():
     client.exchange_id = "mexc"
     client.contract_meta = AsyncMock(return_value=_contract(vol_unit=1.0, min_vol=2.0))
     client.positions = AsyncMock(
-        return_value=[{"symbol": "BTC_USDT", "positionType": 1, "holdVol": 4.0,
-                       "holdAvgPrice": 100.0}]
+        return_value=[{"symbol": "BTC_USDT", "positionType": 1, "openType": 1,
+                       "holdVol": 4.0, "holdAvgPrice": 100.0}]
     )
     client.close_position_market = AsyncMock(return_value={"orderId": 9})
     svc = OrderService(client, _settings(), PreviewStore())
@@ -1415,6 +1487,44 @@ def test_orders_open_cancels_stop_read_after_primary_failure(monkeypatch):
     assert stop_cancelled is True
 
 
+@pytest.mark.asyncio
+async def test_orders_open_hot_swap_rejects_old_client_rows(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    monkeypatch.setattr(main, "get_settings", _open_orders_settings)
+    started: set[str] = set()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read(name):
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+        return [{"source": "old"}]
+
+    old_client = SimpleNamespace(
+        open_orders=lambda _symbol: read("orders"),
+        open_stop_orders=lambda _symbol: read("stops"),
+    )
+    new_client = object()
+    state = SimpleNamespace(mexc=old_client, exchange=old_client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    task = asyncio.create_task(main.orders_open(request, None, None))
+    await asyncio.wait_for(both_started.wait(), timeout=1.0)
+    state.mexc = new_client
+    state.exchange = new_client
+    release.set()
+    with pytest.raises(main.HTTPException) as exc:
+        await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Exchange changed while loading data. Retry the request."
+
+
 # ── Fix 5: armed trading requires a non-empty LOCAL_API_TOKEN ────────────────
 
 
@@ -1561,23 +1671,21 @@ async def test_manual_mode_persists_placed_manual_status_in_audit():
 
 
 @pytest.mark.asyncio
-async def test_pre_hold_failure_prevents_auto_close():
-    """If the pre-trade hold query fails AND the order response carries no fill
-    quantity, auto-flatten must execute NEITHER a market-close NOR a
-    differential-flatten — a failed pre_hold=0 would otherwise let the OLD
-    position be read as a fresh fill and closed."""
-    client = _happy_client({"orderId": 1})  # no fill field, no SL evidence
-    # preview risk, confirm risk, pre_hold (FAILS), post-place SL pos, flatten
+async def test_pre_hold_failure_blocks_entry_before_exchange_mutation():
+    """An unreliable pre-trade hold makes safe SL attribution/flatten impossible.
+
+    Confirm must stop before changing leverage or placing the entry, rather than
+    knowingly opening a position it could neither verify nor safely unwind.
+    """
+    client = _happy_client({"orderId": 1})
+    # preview risk, confirm risk, then the later pre-send hold read fails
     client.positions = AsyncMock(
         side_effect=[
             [],  # preview existing risk
             [],  # confirm existing risk
             MexcError("positions endpoint down"),  # pre_hold — unreliable
-            _filled_pos(1.0),  # post-place SL verify (no SL → unverified)
-            _filled_pos(1.0),  # flatten hold_now
         ]
     )
-    client.open_stop_orders = AsyncMock(return_value=[])  # SL genuinely missing
     svc = OrderService(
         client,
         _settings(auto_flatten_if_sl_unverified=True),
@@ -1585,12 +1693,14 @@ async def test_pre_hold_failure_prevents_auto_close():
     )
     prev = await svc.preview(_ticket())
     assert prev["ok"], prev.get("errors")
-    out = await svc.confirm(prev["token"])
-    assert out["sl_verified"] is False
-    # Fail-closed: nothing is closed or cancelled on unknown pre_hold.
+    with pytest.raises(OrderError, match="pre-trade position.*unavailable"):
+        await svc.confirm(prev["token"])
+
+    assert client.positions.await_args_list[-1].kwargs == {"fresh": True}
+    client.set_leverage.assert_not_awaited()
+    client.place_order.assert_not_awaited()
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
-    assert out["flatten"] and out["flatten"].get("action") == "skipped_pre_hold_unknown"
 
 
 @pytest.mark.asyncio
@@ -1763,8 +1873,8 @@ def _close_client(*, first_hold, reread, close_resp=None):
 
 
 def _pos(hold, side_type=1):
-    return [{"symbol": "BTC_USDT", "positionType": side_type, "holdVol": hold,
-             "holdAvgPrice": 100_000.0}]
+    return [{"symbol": "BTC_USDT", "positionType": side_type, "openType": 1,
+             "holdVol": hold, "holdAvgPrice": 100_000.0}]
 
 
 @pytest.mark.asyncio
@@ -1933,6 +2043,91 @@ def test_recovery_rejects_unknown_marker_even_with_exact_oid():
     assert not _recovery_is_match({"externalOid": "mlt-1"}, "mlt-1")
 
 
+@pytest.mark.parametrize(
+    "recovered",
+    [
+        {"match": "history", "externalOid": "mlt-1"},
+        {"match": "history", "externalOid": "mlt-1", "order": {}},
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "order": {"orderId": 7},
+        },
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "order": {"externalOid": "mlt-1", "orderId": 7, "oid": 8},
+        },
+        {
+            "match": "cloid",
+            "externalOid": "mlt-1",
+            "order": {"order": {"coin": "BTC"}},
+        },
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "external_oid": "mlt-other",
+            "order": {"externalOid": "mlt-1", "orderId": 7},
+        },
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "order": {
+                "externalOid": "mlt-1",
+                "external_oid": "mlt-other",
+                "orderId": 7,
+            },
+        },
+    ],
+)
+def test_recovery_marker_requires_concrete_order_identity(recovered):
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(recovered, "mlt-1")
+
+
+@pytest.mark.parametrize(
+    "recovered",
+    [
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "order": {"externalOid": "mlt-1", "orderId": 7, "oid": "7"},
+        },
+        {
+            "match": "cloid",
+            "externalOid": "mlt-1",
+            "order": {"order": {"coin": "BTC", "oid": 7}},
+        },
+    ],
+)
+def test_recovery_marker_accepts_concrete_order_identity(recovered):
+    from app.orders.service import _recovery_is_match
+
+    assert _recovery_is_match(recovered, "mlt-1")
+
+
+def test_recovery_rejects_oversized_digit_order_id_without_conversion_error():
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(
+        {"externalOid": "mlt-1", "orderId": "9" * 5000}, "mlt-1"
+    )
+
+
+def test_recovery_fallback_rejects_conflicting_external_oid_aliases():
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(
+        {
+            "externalOid": "mlt-1",
+            "external_oid": "mlt-other",
+            "orderId": 7,
+        },
+        "mlt-1",
+    )
+
+
 def test_recovered_mexc_order_exposes_own_fill_to_service():
     from app.orders.service import _extract_filled_vol
 
@@ -1961,6 +2156,23 @@ def test_negative_reported_fill_is_unknown_not_unfilled(response):
     assert _extract_filled_vol(response) is None
 
 
+def test_aggregate_reported_fill_overflow_is_unknown():
+    from app.orders.service import _extract_filled_vol
+
+    response = {
+        "response": {
+            "data": {
+                "statuses": [
+                    {"filled": {"totalSz": 1e308}},
+                    {"filled": {"totalSz": 1e308}},
+                ]
+            }
+        }
+    }
+
+    assert _extract_filled_vol(response) is None
+
+
 @pytest.mark.asyncio
 async def test_recovered_mexc_partial_fill_uses_order_fill_evidence():
     client = _happy_client({"orderId": 1})
@@ -1975,6 +2187,7 @@ async def test_recovered_mexc_partial_fill_uses_order_fill_evidence():
             "match": "history",
             "externalOid": external_oid,
             "order": {
+                "externalOid": external_oid,
                 "orderId": 7,
                 "symbol": "BTC_USDT",
                 "dealVol": "0.4",
@@ -2141,7 +2354,7 @@ async def test_place_order_uncertain_json_shape_recovers_via_external_oid():
         return {
             "match": "history",
             "externalOid": external_oid,
-            "order": {"orderId": 42, "state": 3},
+            "order": {"externalOid": external_oid, "orderId": 42, "state": 3},
         }
 
     client.order_by_external_oid = AsyncMock(side_effect=_recover)

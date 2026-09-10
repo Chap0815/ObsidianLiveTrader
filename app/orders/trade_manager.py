@@ -106,7 +106,7 @@ def evaluate_rules(
 
     # ── Auto-BE (autonomous) ────────────────────────────────────────────────
     if (
-        armed.get("auto_be")
+        armed.get("auto_be") is True
         and not mgmt.be_done
         and unreal_r is not None
         and unreal_r >= settings.tm_be_trigger_r
@@ -136,7 +136,7 @@ def evaluate_rules(
     uo = mgmt.user_override_hw
     uo_active = isinstance(uo, (int, float)) and math.isfinite(uo)
     if (
-        armed.get("auto_trail")
+        armed.get("auto_trail") is True
         and unreal_r is not None
         and unreal_r >= settings.tm_trail_activation_r
         and atr_ok
