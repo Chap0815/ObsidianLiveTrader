@@ -121,6 +121,7 @@ function positionContractSize(rawContractSize, fallback) {
  *  - null means "no usable label" — the caller falls back to geometry.
  */
 function classifyTriggerLabel(orderType) {
+  if (orderType != null && typeof orderType !== "string") return null;
   const s = String(orderType == null ? "" : orderType).trim().toLowerCase();
   if (!s) return null;
   if (s.indexOf("take") >= 0 || s === "tp" || s === "take_profit" ||
@@ -131,9 +132,170 @@ function classifyTriggerLabel(orderType) {
   return null;
 }
 
+/** Match an exact pair or, for Hyperliquid only, a reported bare base coin. */
+function symbolsMatch(reported, wanted, allowBareBaseAlias) {
+  if (typeof reported !== "string" || typeof wanted !== "string") return false;
+  const candidate = reported.trim().toUpperCase();
+  const target = wanted.trim().toUpperCase();
+  if (!candidate || !target) return false;
+  return candidate === target || (
+    allowBareBaseAlias === true &&
+    candidate.indexOf("_") < 0 &&
+    candidate === target.split("_", 1)[0]
+  );
+}
+
+function normalizeProtectionSide(value) {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "1" || normalized === "long") return "long";
+  if (normalized === "2" || normalized === "short") return "short";
+  return null;
+}
+
+function positiveFiniteNumber(value) {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 /**
- * Classify ONE exchange trigger order as protection → { sl, tp } (prices;
- * at most one set). Single FRONTEND source, mirroring the backend
+ * Treat persisted browser trade markers as untrusted input. Price fields may
+ * be numeric strings for backwards compatibility, but booleans, objects and
+ * non-positive/non-finite values must never become chart protection. Likewise,
+ * only the literal boolean `true` enables manual-mode behavior; a stored
+ * string such as "false" must not activate the manual-SL alarm.
+ */
+function normalizeTradeMarker(marker) {
+  const m = marker && typeof marker === "object" && !Array.isArray(marker)
+    ? marker
+    : {};
+  return {
+    sl: positiveFiniteNumber(m.sl),
+    tp: positiveFiniteNumber(m.tp),
+    manual: m.manual === true,
+  };
+}
+
+/**
+ * Read one persisted marker timestamp without trusting localStorage coercion.
+ * Marker times are generated as integer epoch milliseconds. Boolean, unsafe,
+ * non-positive and future values are invalid; `nowMs` is passed explicitly so
+ * this helper remains pure and deterministic in tests.
+ */
+function tradeMarkerTime(marker, field, nowMs) {
+  if (field !== "ts" && field !== "entryMs") return null;
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return null;
+  const value = positiveFiniteNumber(marker[field]);
+  const now = positiveFiniteNumber(nowMs);
+  if (value == null || now == null) return null;
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(now)) return null;
+  return value <= now ? value : null;
+}
+
+/** Exact browser-side interpretation of the documented normalized fill labels. */
+function classifyFillDir(direction) {
+  if (typeof direction !== "string") return null;
+  const value = direction.trim().toLowerCase();
+  if (value === "open long" || value === "open short") return "open";
+  if (value === "close long" || value === "close short") return "close";
+  if (
+    value === "liquidated long" || value === "liquidated short" ||
+    value === "long > short" || value === "short > long"
+  ) return "liq";
+  return null;
+}
+
+/** Normalized adapters emit exactly one of these execution-side literals. */
+function normalizeFillSide(side) {
+  return side === "buy" || side === "sell" ? side : null;
+}
+
+/** Validate the normalized millisecond fill timestamp at the browser boundary. */
+function fillTimeMs(value, nowMs) {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const parsed = Number(value);
+  const now = positiveFiniteNumber(nowMs);
+  if (!Number.isSafeInteger(parsed) || !Number.isSafeInteger(now)) return null;
+  if (parsed < 946684800000 || parsed > now + 5 * 60 * 1000) return null;
+  return parsed;
+}
+
+/**
+ * Validate one normalized exchange fill before any browser consumer sees it.
+ * Side, size, price and time define trade geometry and therefore must be known;
+ * optional fee/PnL values may be absent (zero), but never coercible objects,
+ * booleans or non-finite numbers. Returns a fresh normalized object or null.
+ */
+function normalizeFillRecord(fill, nowMs) {
+  if (!fill || typeof fill !== "object" || Array.isArray(fill)) return null;
+  const side = normalizeFillSide(fill.side);
+  const sz = positiveFiniteNumber(fill.sz);
+  const px = positiveFiniteNumber(fill.px);
+  const time = fillTimeMs(fill.time, nowMs);
+
+  function optionalFinite(value) {
+    if (value == null || value === "") return 0;
+    if (typeof value !== "number" && typeof value !== "string") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const fee = optionalFinite(fill.fee);
+  const closedPnl = optionalFinite(fill.closed_pnl);
+  if (side == null || sz == null || px == null || time == null || fee == null || closedPnl == null) {
+    return null;
+  }
+  const direction = typeof fill.dir === "string" ? fill.dir.trim().toLowerCase() : "";
+  const directionSide = {
+    "open long": "buy",
+    "close short": "buy",
+    "short > long": "buy",
+    "liquidated short": "buy",
+    "open short": "sell",
+    "close long": "sell",
+    "long > short": "sell",
+    "liquidated long": "sell",
+  }[direction];
+  if (directionSide != null && directionSide !== side) return null;
+  return Object.assign({}, fill, {
+    side: side,
+    sz: sz,
+    px: px,
+    time: time,
+    fee: fee,
+    closed_pnl: closedPnl,
+  });
+}
+
+/**
+ * Latest proven Flat->Open epoch for the current position side. Historical
+ * completed trades and add-on fills must not move the current zone start.
+ */
+function currentPositionEntryFillTime(fills, side, nowMs) {
+  if (!Array.isArray(fills)) return null;
+  const sideN = typeof side === "string" ? side.trim().toLowerCase() : "";
+  const expectedDir = sideN === "long" ? "open long"
+    : sideN === "short" ? "open short"
+    : null;
+  if (expectedDir == null) return null;
+  let latest = null;
+  fills.forEach(function (fill) {
+    if (!fill || typeof fill !== "object" || Array.isArray(fill)) return;
+    if (typeof fill.dir !== "string" || fill.dir.trim().toLowerCase() !== expectedDir) {
+      return;
+    }
+    const start = fill.start_position;
+    if (typeof start !== "number" || !Number.isFinite(start) || start !== 0) return;
+    const time = fillTimeMs(fill.time, nowMs);
+    if (time != null && (latest == null || time > latest)) latest = time;
+  });
+  return latest;
+}
+
+/**
+ * Classify ONE exchange trigger order as protection → { sl, tp } prices.
+ * Single FRONTEND source, mirroring the backend
  * app/orders/protection.py::classify_protection priority order (highest wins):
  *   1. an explicit stopLossPrice / takeProfitPrice FIELD (MEXC echoes these) —
  *      a field ALWAYS beats any inference;
@@ -156,21 +318,40 @@ function classifyTriggerLabel(orderType) {
 function classifyTriggers(order, side, entry, includeBeTolerance) {
   const o = order || {};
   const out = { sl: null, tp: null };
+  const sideN = typeof side === "string" ? side.trim().toLowerCase() : "";
+  const positionSides = ["positionType", "position_type"]
+    .filter(function (key) { return o[key] != null; })
+    .map(function (key) { return normalizeProtectionSide(o[key]); });
+  if (positionSides.length > 0) {
+    if (positionSides.some(function (value) { return value == null; }) ||
+        new Set(positionSides).size !== 1) return out;
+    if ((sideN === "long" || sideN === "short") && positionSides[0] !== sideN) {
+      return out;
+    }
+  }
   // 1) explicit field wins
-  const slField = Number(o.stopLossPrice);
-  if (Number.isFinite(slField) && slField > 0) { out.sl = slField; return out; }
-  const tpField = Number(o.takeProfitPrice);
-  if (Number.isFinite(tpField) && tpField > 0) { out.tp = tpField; return out; }
+  const slField = positiveFiniteNumber(o.stopLossPrice);
+  const tpField = positiveFiniteNumber(o.takeProfitPrice);
+  const invalidExplicit =
+    (o.stopLossPrice != null && slField == null) ||
+    (o.takeProfitPrice != null && tpField == null);
+  if (invalidExplicit) return out;
+  if (slField != null) out.sl = slField;
+  if (tpField != null) out.tp = tpField;
+  if (slField != null || tpField != null) return out;
   // trigger price (triggerPrice, else price)
-  const trg = Number(o.triggerPrice != null ? o.triggerPrice : o.price);
-  if (!Number.isFinite(trg) || trg <= 0) return out;
+  const trg = positiveFiniteNumber(
+    o.triggerPrice != null ? o.triggerPrice : o.price
+  );
+  if (trg == null) return out;
   // 2) orderType label
-  const kind = classifyTriggerLabel(o.orderType);
+  const label = o.orderType;
+  if (label != null && typeof label !== "string") return out;
+  const kind = classifyTriggerLabel(label);
   if (kind === "tp") { out.tp = trg; return out; }
   if (kind === "sl") { out.sl = trg; return out; }
   // 3) geometry (side + entry) — last resort
   const e = Number(entry);
-  const sideN = String(side == null ? "" : side).trim().toLowerCase();
   if (!(Number.isFinite(e) && e > 0) || (sideN !== "long" && sideN !== "short")) {
     return out; // unresolved → neither (never a fabricated SL)
   }
@@ -182,6 +363,29 @@ function classifyTriggers(order, side, entry, includeBeTolerance) {
   if (sideN === "short" ? !below : below) out.sl = trg; // adverse side = SL
   else out.tp = trg;
   return out;
+}
+
+/** Validated SL/TP, or a neutral unlabeled trigger for generic chart display. */
+function classifyChartTrigger(order) {
+  const o = order || {};
+  const classified = classifyTriggers(o, null, null, false);
+  const out = { sl: classified.sl, tp: classified.tp, trigger: null };
+  if (out.sl != null || out.tp != null) return out;
+  if (o.stopLossPrice != null || o.takeProfitPrice != null) return out;
+  if (o.orderType != null && typeof o.orderType !== "string") return out;
+  out.trigger = positiveFiniteNumber(
+    o.triggerPrice != null ? o.triggerPrice : o.price
+  );
+  return out;
+}
+
+/** Return the tightest valid SL, matching the backend selector exactly. */
+function mostProtectiveSl(candidates, side) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const sideN = typeof side === "string" ? side.trim().toLowerCase() : "";
+  if (sideN === "long") return Math.max(...candidates);
+  if (sideN === "short") return Math.min(...candidates);
+  return candidates[candidates.length - 1];
 }
 
 /**

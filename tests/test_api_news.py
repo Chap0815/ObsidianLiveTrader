@@ -115,6 +115,22 @@ def test_parse_news_date_unparseable_is_html_stripped():
     assert sort_key == 0.0
 
 
+def test_parse_feed_keeps_other_items_when_date_overflows_utc_conversion():
+    xml = """<rss><channel>
+      <item><title>Boundary date</title>
+        <pubDate>0001-01-01T00:00:00+14:00</pubDate></item>
+      <item><title>Valid date</title>
+        <pubDate>Wed, 08 Jul 2026 10:00:00 GMT</pubDate></item>
+    </channel></rss>"""
+
+    items = _parse_feed(xml, "Synthetic")
+
+    assert [item["title"] for item in items] == ["Boundary date", "Valid date"]
+    assert items[0]["published"] == "0001-01-01T00:00:00+14:00"
+    assert items[0]["_sort"] == 0.0
+    assert items[1]["_sort"] > 0.0
+
+
 def test_parse_feed_rss_strips_html_and_maps_fields():
     items = _parse_feed(RSS_XML, "CoinDesk")
     assert [i["title"] for i in items] == ["Bitcoin hits new high", "Older story"]

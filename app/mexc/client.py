@@ -46,6 +46,10 @@ _INTERVAL_SECONDS: dict[str, int] = {
     "Day1": 24 * 60 * 60,
 }
 
+# Allow ordinary host/exchange clock skew without exposing far-future market rows.
+_MIN_MARKET_TIMESTAMP_S = 1_000_000_000
+_MAX_MARKET_FUTURE_SKEW_MS = 5 * 60 * 1000
+
 # Account cards need contract sizes for correct position display, but these
 # public contract definitions do not need to be downloaded on every 30-second
 # account poll. Money-path contract checks intentionally do not use this cache.
@@ -120,7 +124,7 @@ def _fmt_price(v: Any, scale: int | None = None) -> str:
     except (TypeError, ValueError, OverflowError) as exc:
         raise MexcError(f"Invalid price value: {v!r}") from exc
     if not math.isfinite(parsed):
-        raise MexcError(f"Nicht-endlicher Preiswert: {v!r}")
+        raise MexcError(f"Non-finite price value: {v!r}")
     try:
         d = Decimal(str(v))
     except InvalidOperation as exc:
@@ -157,11 +161,20 @@ def _format_price_fields(body: dict[str, Any]) -> dict[str, Any]:
     untouched so they stay bare JSON numbers."""
     out = dict(body)
     for key in _PRICE_FIELDS:
-        if key in out and out[key] is not None:
-            formatted = _fmt_price(out[key])
-            if Decimal(formatted) < 0:
+        if key not in out:
+            continue
+        if out[key] is None:
+            if key != "price":
+                raise MexcError(f"{key} must be > 0")
+            continue
+        formatted = _fmt_price(out[key])
+        price = Decimal(formatted)
+        if key == "price":
+            if price < 0:
                 raise MexcError(f"{key} must be >= 0")
-            out[key] = formatted
+        elif price <= 0:
+            raise MexcError(f"{key} must be > 0")
+        out[key] = formatted
     return out
 
 
@@ -188,6 +201,7 @@ def normalize_klines(data: dict[str, Any]) -> list[Candle]:
     if any(len(arrays[name]) != n for name in names[1:]):
         raise MexcError("kline payload arrays have different lengths", raw=data)
     candles: list[Candle] = []
+    latest_candle_time = int(time.time() * 1000) + _MAX_MARKET_FUTURE_SKEW_MS
     for i in range(n):
         timestamp = _required_finite_float(times[i], "kline time")
         open_px = _required_finite_float(opens[i], "kline open")
@@ -196,15 +210,20 @@ def normalize_klines(data: dict[str, Any]) -> list[Candle]:
         close_px = _required_finite_float(closes[i], "kline close")
         volume = _required_finite_float(vols[i], "kline vol")
         amount = _required_finite_float(amounts[i], "kline amount")
-        if timestamp <= 0 or min(open_px, high_px, low_px, close_px) <= 0:
-            raise MexcError("kline time and prices must be > 0")
+        if timestamp < _MIN_MARKET_TIMESTAMP_S or not timestamp.is_integer():
+            raise MexcError("kline time must be a plausible positive integer")
+        timestamp_ms = _to_ms(timestamp)
+        if timestamp_ms > latest_candle_time:
+            raise MexcError("kline time is implausibly far in the future")
+        if min(open_px, high_px, low_px, close_px) <= 0:
+            raise MexcError("kline prices must be > 0")
         if high_px < max(open_px, close_px) or low_px > min(open_px, close_px):
             raise MexcError("kline OHLC geometry is invalid")
         if volume < 0 or amount < 0:
             raise MexcError("kline volume and amount must be >= 0")
         candles.append(
             Candle(
-                time=_to_ms(timestamp),
+                time=timestamp_ms,
                 open=open_px,
                 high=high_px,
                 low=low_px,
@@ -270,8 +289,10 @@ class MexcClient:
 
     def __init__(self, base_url: str, api_key: str = "", api_secret: str = ""):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.api_secret = api_secret
+        # Match setup and readiness semantics: surrounding whitespace is never
+        # part of a MEXC credential and must not make an empty key look usable.
+        self.api_key = (api_key or "").strip()
+        self.api_secret = (api_secret or "").strip()
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
         self._account_contract_sizes_cache: tuple[float, dict[str, float]] | None = None
         self._account_contract_sizes_lock = asyncio.Lock()
@@ -290,6 +311,7 @@ class MexcClient:
     ) -> Any:
         headers: dict[str, str] = {"Content-Type": "application/json"}
         req_params = params
+        request_path = path
         content: str | None = None
         param_string = ""
 
@@ -311,6 +333,13 @@ class MexcClient:
         if private:
             if not self.api_key or not self.api_secret:
                 raise MexcError("MEXC API keys not configured")
+            if method_u in ("GET", "DELETE"):
+                # Send the exact canonical bytes that are signed. Letting httpx
+                # rebuild a dict would restore insertion order, include None as
+                # an empty value and encode spaces as '+', invalidating the HMAC.
+                req_params = None
+                if param_string:
+                    request_path = f"{path}?{param_string}"
             req_time = str(int(time.time() * 1000))
             headers.update(
                 {
@@ -324,7 +353,11 @@ class MexcClient:
 
         try:
             r = await self._client.request(
-                method_u, path, params=req_params, content=content, headers=headers
+                method_u,
+                request_path,
+                params=req_params,
+                content=content,
+                headers=headers,
             )
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -355,19 +388,24 @@ class MexcClient:
                 )
             if success is not True:
                 raise MexcError("invalid MEXC success marker", raw=data)
-        # The official common response uses code=0 for success. Validate a
-        # present code independently of the success marker: a contradictory
-        # success:true/code:<error> envelope must never authorize a mutation.
-        # Some endpoint-specific success responses omit code, so absence stays
-        # compatible; a present value must be the exact numeric/string zero.
-        if isinstance(data, dict) and "code" in data:
-            code = data.get("code")
-            if isinstance(code, bool) or code not in (0, "0"):
+        # The official common response uses code=0 for success; some endpoints
+        # use an errorCode variant. Validate every present marker independently
+        # of success so a contradictory envelope never authorizes a mutation.
+        # Absence stays compatible; a present value must be integer/string zero.
+        # A JSON float such as 0.0 is not the documented status-code type and
+        # must not compare equal to integer zero by Python coercion.
+        if isinstance(data, dict):
+            for marker_name in ("code", "errorCode", "error_code"):
+                if marker_name not in data:
+                    continue
+                code = data.get(marker_name)
+                if _mexc_zero_code(code):
+                    continue
                 raise MexcError(
                     str(
                         data.get("message")
                         or data.get("msg")
-                        or f"MEXC error code={code}"
+                        or f"MEXC error {marker_name}={code}"
                     ),
                     raw=data,
                 )
@@ -380,7 +418,10 @@ class MexcClient:
     async def ping(self) -> int:
         """Server time in ms."""
         data = await self._request("GET", "/api/v1/contract/ping")
-        return int(data)
+        server_time = _required_int(data, "server time")
+        if server_time <= 0:
+            raise MexcError("server time must be > 0")
+        return server_time
 
     async def contract_detail(
         self, symbol: str | None = None
@@ -476,7 +517,7 @@ class MexcClient:
                 {
                     "symbol": sym,
                     "volume24": volume24 if volume24 is not None and volume24 >= 0 else 0.0,
-                    "funding": _opt_float(r.get("fundingRate")) or 0.0,
+                    "funding": _opt_float(r.get("fundingRate")),
                     "last": last if last is not None and last > 0 else None,
                     "price_change_pct": price_change_pct,
                     "open_interest": (
@@ -526,6 +567,11 @@ class MexcClient:
         if not isinstance(data, dict):
             raise MexcError("Unexpected kline payload", raw=data)
         candles = normalize_klines(data)
+        if sec and any(
+            first.time // (sec * 1000) == second.time // (sec * 1000)
+            for first, second in zip(candles, candles[1:])
+        ):
+            raise MexcError("duplicate kline interval")
         if limit_hint > 0 and len(candles) > limit_hint:
             candles = candles[-limit_hint:]
         return candles
@@ -589,9 +635,10 @@ class MexcClient:
             raise MexcError(
                 f"Funding symbol mismatch: wanted {symbol}, got {row_symbol}"
             )
+        funding_rate = _required_finite_float(row.get("fundingRate"), "fundingRate")
         return FundingRate(
             symbol=str(row.get("symbol") or symbol),
-            funding_rate=_opt_float(row.get("fundingRate")) or 0.0,
+            funding_rate=funding_rate,
             max_funding_rate=_opt_float(row.get("maxFundingRate")),
             min_funding_rate=_opt_float(row.get("minFundingRate")),
             collect_cycle=_opt_int(row.get("collectCycle")),
@@ -675,17 +722,35 @@ class MexcClient:
         MEXC exposes assets and positions as SEPARATE endpoints (no shared
         snapshot like HL), so this fires the two live reads CONCURRENTLY rather
         than sequentially and returns both. `symbol` scopes the positions read
-        exactly like positions(symbol). Errors propagate as MexcError (fail-
-        closed): the assets error is raised in preference to the positions one
-        (argument priority) so the failure ordering is deterministic and matches
-        the previous assets()-then-positions() sequence; either failure blocks
-        the order.
+        exactly like positions(symbol). Either error fails closed immediately:
+        the still-running sibling GET is cancelled and settled. If both already
+        failed, the assets error keeps deterministic priority.
         """
-        assets_raw, positions_raw = await asyncio.gather(
-            self.assets(fresh=fresh),
-            self.positions(symbol, fresh=fresh),
-            return_exceptions=True,
-        )
+        assets_task = asyncio.create_task(self.assets(fresh=fresh))
+        positions_task = asyncio.create_task(self.positions(symbol, fresh=fresh))
+        tasks = (assets_task, positions_task)
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            if any(task.cancelled() or task.exception() is not None for task in done):
+                for task in pending:
+                    task.cancel()
+            assets_raw, positions_raw = await asyncio.gather(
+                *tasks, return_exceptions=True
+            )
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        # Peer cancellation is not the root cause. Prefer actual Exceptions in
+        # argument order, then propagate a standalone cancellation/BaseException.
+        if isinstance(assets_raw, Exception):
+            raise assets_raw
+        if isinstance(positions_raw, Exception):
+            raise positions_raw
         if isinstance(assets_raw, BaseException):
             raise assets_raw
         if isinstance(positions_raw, BaseException):
@@ -771,6 +836,15 @@ class MexcClient:
         # entry order is sent.
         if not isinstance(data, dict) or data.get("success") is not True:
             raise MexcError("uncertain set-leverage response shape", raw=data)
+        for key in ("code", "errorCode", "error_code"):
+            if key not in data:
+                continue
+            marker = data.get(key)
+            if not _mexc_zero_code(marker):
+                raise MexcError(
+                    f"uncertain set-leverage response: {key}={marker!r}",
+                    raw=data,
+                )
         return data
 
     async def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -785,6 +859,53 @@ class MexcClient:
         symbol = body.get("symbol")
         if not isinstance(symbol, str) or not symbol.strip():
             raise MexcError("order symbol must be a non-empty string")
+        volume_raw = body.get("vol")
+        if isinstance(volume_raw, bool) or not isinstance(volume_raw, (int, float)):
+            raise MexcError("order volume must be a positive finite number")
+        try:
+            volume = float(volume_raw)
+        except OverflowError as exc:
+            raise MexcError("order volume must be a positive finite number") from exc
+        if not math.isfinite(volume) or volume <= 0:
+            raise MexcError("order volume must be a positive finite number")
+
+        side = body.get("side")
+        if isinstance(side, bool) or not isinstance(side, int) or side not in (1, 2, 3, 4):
+            raise MexcError("side must be an integer from 1 to 4")
+        order_type = body.get("type")
+        if (
+            isinstance(order_type, bool)
+            or not isinstance(order_type, int)
+            or order_type not in (1, 5)
+        ):
+            raise MexcError("type must be 1 (limit) or 5 (market)")
+        if order_type == 1:
+            price_raw = body.get("price")
+            if isinstance(price_raw, bool) or not isinstance(price_raw, (int, float)):
+                raise MexcError("limit order price must be a positive finite number")
+            try:
+                price = float(price_raw)
+            except OverflowError as exc:
+                raise MexcError(
+                    "limit order price must be a positive finite number"
+                ) from exc
+            if not math.isfinite(price) or price <= 0:
+                raise MexcError("limit order price must be a positive finite number")
+        open_type = body.get("openType")
+        if (
+            isinstance(open_type, bool)
+            or not isinstance(open_type, int)
+            or open_type not in (1, 2)
+        ):
+            raise MexcError("openType must be 1 (isolated) or 2 (cross)")
+        leverage = body.get("leverage")
+        if side in (1, 3) or leverage is not None:
+            if (
+                isinstance(leverage, bool)
+                or not isinstance(leverage, int)
+                or leverage <= 0
+            ):
+                raise MexcError("leverage must be a positive integer for open orders")
         data = await self._request(
             "POST",
             "/api/v1/private/order/create",
@@ -793,9 +914,28 @@ class MexcClient:
         )
 
         if isinstance(data, dict):
-            for key in ("orderId", "order_id", "oid"):
-                if _mexc_positive_order_id(data.get(key)):
-                    return data
+            if "success" in data and data.get("success") is not True:
+                raise MexcError(
+                    "uncertain order-create response: nested success is not true",
+                    raw=data,
+                )
+            for key in ("code", "errorCode", "error_code"):
+                if key not in data:
+                    continue
+                marker = data.get(key)
+                if not _mexc_zero_code(marker):
+                    raise MexcError(
+                        f"uncertain order-create response: nested {key}={marker!r}",
+                        raw=data,
+                    )
+            if any(key in data for key in ("orderId", "order_id", "oid")):
+                if _mexc_consistent_order_id(data) is None:
+                    raise MexcError(
+                        "uncertain order-create response: invalid or conflicting "
+                        "order IDs",
+                        raw=data,
+                    )
+                return data
         elif _mexc_positive_order_id(data):
             # Normalize MEXC's documented scalar create response to the same
             # shape consumed by cancellation and recovery code.
@@ -816,14 +956,20 @@ class MexcClient:
         requested: set[str] = set()
         for item in items:
             if isinstance(item, dict):
-                value = item.get("orderId")
-                if value is None:
-                    value = item.get("oid")
+                id_keys = [key for key in ("orderId", "oid") if key in item]
+                if len(id_keys) != 1:
+                    raise MexcError(
+                        "cancel requires exactly one orderId or oid per order"
+                    )
+                value = item.get(id_keys[0])
             else:
                 value = item
             if not _mexc_positive_order_id(value):
                 raise MexcError("cancel requires positive numeric order IDs")
-            requested.add(str(value))
+            order_id = str(int(value))
+            if order_id in requested:
+                raise MexcError("cancel request contains duplicate order IDs")
+            requested.add(order_id)
 
         data = await self._request(
             "POST",
@@ -839,25 +985,37 @@ class MexcClient:
             raise MexcError("uncertain cancel response shape", raw=data)
         if any("orderId" not in row or "errorCode" not in row for row in data):
             raise MexcError("cancel response row lacks orderId/errorCode", raw=data)
-        failed = next(
-            (
-                row
-                for row in data
-                if isinstance(row.get("errorCode"), bool)
-                or row.get("errorCode") not in (0, "0")
-            ),
-            None,
-        )
-        if failed is not None:
-            detail = failed.get("errorMsg") or failed.get("message") or "unknown"
-            raise MexcError(
-                f"cancel rejected: errorCode={failed.get('errorCode')} {detail}",
-                raw=data,
-            )
+        for row in data:
+            if "success" in row and row.get("success") is not True:
+                raise MexcError(
+                    "cancel rejected: nested success is not true",
+                    raw=data,
+                )
+            for marker_name in ("code", "errorCode", "error_code"):
+                if marker_name not in row:
+                    continue
+                marker = row.get(marker_name)
+                if _mexc_zero_code(marker):
+                    continue
+                detail = row.get("errorMsg") or row.get("message") or "unknown"
+                raise MexcError(
+                    f"cancel rejected: {marker_name}={marker} {detail}",
+                    raw=data,
+                )
 
-        returned = {str(row["orderId"]) for row in data}
-        if not requested.issubset(returned):
-            raise MexcError("cancel response does not identify requested order(s)", raw=data)
+        returned: set[str] = set()
+        for row in data:
+            returned_id = _mexc_consistent_order_id(row)
+            if returned_id is None:
+                raise MexcError(
+                    "cancel response does not exactly identify requested order(s)",
+                    raw=data,
+                )
+            returned.add(returned_id)
+        if returned != requested or len(data) != len(requested):
+            raise MexcError(
+                "cancel response does not exactly identify requested order(s)", raw=data
+            )
         return data
 
     _OPEN_ORDERS_PAGE_SIZE = 100
@@ -1268,20 +1426,26 @@ def _mexc_state_is_dead(row: Any) -> bool:
     """True only for an explicitly terminal MEXC order with a proven zero fill."""
     if not isinstance(row, dict):
         return False
-    raw = row.get("state")
-    if raw is None:
-        raw = row.get("orderState")
-    if raw is None:
-        raw = row.get("order_state")
-    if raw is None:
+    states: list[str] = []
+    for key in ("state", "orderState", "order_state"):
+        if key not in row:
+            continue
+        state = str(row.get(key)).strip().lower()
+        if state not in _MEXC_DEAD_STATES:
+            return False
+        states.append(state)
+    if not states:
         return False
-    if str(raw).strip().lower() not in _MEXC_DEAD_STATES:
-        return False
-    deal_raw = row.get("dealVol")
-    if deal_raw is None:
-        deal_raw = row.get("deal_vol")
-    deal = _opt_float(deal_raw)
-    return deal is not None and 0 <= deal <= 1e-12
+
+    fills: list[float] = []
+    for key in ("dealVol", "deal_vol"):
+        if key not in row:
+            continue
+        fill = _opt_float(row.get(key))
+        if fill is None or fill != 0.0:
+            return False
+        fills.append(fill)
+    return bool(fills)
 
 
 def _mexc_positive_order_id(value: Any) -> bool:
@@ -1290,8 +1454,52 @@ def _mexc_positive_order_id(value: Any) -> bool:
     if isinstance(value, int):
         return value > 0
     if isinstance(value, str):
-        return value.isdigit() and int(value) > 0
+        if not value.isdigit():
+            return False
+        try:
+            return int(value) > 0
+        except ValueError:
+            return False
     return False
+
+
+def _mexc_zero_code(value: Any) -> bool:
+    """True only for MEXC's documented integer/string zero status code."""
+    return (
+        isinstance(value, int) and not isinstance(value, bool) and value == 0
+    ) or (isinstance(value, str) and value == "0")
+
+
+def _mexc_consistent_order_id(row: Any) -> str | None:
+    """Canonical positive ID only when every present alias agrees."""
+    if not isinstance(row, dict):
+        return None
+    values: list[str] = []
+    for key in ("orderId", "order_id", "oid"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if not _mexc_positive_order_id(value):
+            return None
+        values.append(str(int(value)))
+    if not values or len(set(values)) != 1:
+        return None
+    return values[0]
+
+
+def _mexc_external_oid_matches(row: Any, external_oid: str) -> bool:
+    """Require every present client-ID alias to match the requested string."""
+    if not isinstance(row, dict) or not isinstance(external_oid, str) or not external_oid:
+        return False
+    values: list[str] = []
+    for key in ("externalOid", "external_oid"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if not isinstance(value, str) or not value:
+            return False
+        values.append(value)
+    return bool(values) and all(value == external_oid for value in values)
 
 
 def _mexc_recovery_identity_matches(
@@ -1300,13 +1508,9 @@ def _mexc_recovery_identity_matches(
     """Require a concrete order ID, exact externalOid and no symbol conflict."""
     if not isinstance(row, dict):
         return False
-    row_oid = row.get("externalOid") or row.get("external_oid")
-    if row_oid is None or str(row_oid) != str(external_oid):
+    if not _mexc_external_oid_matches(row, external_oid):
         return False
-    order_id = row.get("orderId")
-    if order_id is None:
-        order_id = row.get("order_id") or row.get("oid")
-    if not _mexc_positive_order_id(order_id):
+    if _mexc_consistent_order_id(row) is None:
         return False
     row_symbol = row.get("symbol")
     return row_symbol is None or str(row_symbol).upper() == str(symbol).upper()
@@ -1322,7 +1526,7 @@ def _opt_float(v: Any) -> float | None:
         return None
     try:
         value = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) else None
 
@@ -1333,7 +1537,7 @@ def _required_finite_float(v: Any, field: str) -> float:
         raise MexcError(f"{field} is not numeric")
     try:
         value = float(v)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise MexcError(f"{field} is not numeric") from exc
     if not math.isfinite(value):
         raise MexcError(f"{field} is non-finite")
@@ -1349,7 +1553,10 @@ def _required_int(v: Any, field: str) -> int:
     if isinstance(raw, int):
         return raw
     if isinstance(raw, str) and raw.strip().isdigit():
-        return int(raw.strip())
+        try:
+            return int(raw.strip())
+        except ValueError as exc:
+            raise MexcError(f"{field} is not an integer") from exc
     raise MexcError(f"{field} is not an integer")
 
 
@@ -1359,9 +1566,11 @@ def _opt_int(v: Any) -> int | None:
     that previously only checked `is not None`."""
     if v is None or v == "" or isinstance(v, bool):
         return None
+    if isinstance(v, float) and not v.is_integer():
+        return None
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1387,7 +1596,7 @@ def _first_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
                 continue
             try:
                 value = float(row[k])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if math.isfinite(value):
                 return value
@@ -1413,8 +1622,14 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
         or sz is None
         or sz <= 0
         or t is None
-        or t <= 0
+        # MEXC may return epoch seconds or milliseconds; smaller values cannot
+        # represent a real fill from this exchange and would fabricate 1970 age.
+        or t < _MIN_MARKET_TIMESTAMP_S
+        or not t.is_integer()
     ):
+        raise ValueError("MEXC deal row has invalid symbol/px/sz/time")
+    fill_time = _to_ms(t)
+    if fill_time > int(time.time() * 1000) + _MAX_MARKET_FUTURE_SKEW_MS:
         raise ValueError("MEXC deal row has invalid symbol/px/sz/time")
 
     side_i: int | None
@@ -1434,6 +1649,7 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
     side = "buy" if side_i in (1, 2) else "sell"
 
     closed_pnl = _first_float(row, ("profit", "closedPnl", "realizedPnl"))
+    oid_raw = row.get("orderId")
 
     return {
         "symbol": symbol,
@@ -1444,10 +1660,10 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
         # Deal-Zeitformat ist nicht live-verifiziert; der Marker-Layer erwartet
         # ms -> defensiv durch _to_ms, damit ein Sekunden-Payload die Marker
         # nicht still auf 1970 setzt.
-        "time": _to_ms(t),
+        "time": fill_time,
         "dir": _MEXC_FILL_DIR[side_i],
         "closed_pnl": closed_pnl,
-        "oid": None if isinstance(row.get("orderId"), bool) else row.get("orderId"),
+        "oid": oid_raw if _mexc_positive_order_id(oid_raw) else None,
         "fee": (
             0.0
             if row.get("fee") in (None, "")

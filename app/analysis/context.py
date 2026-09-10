@@ -149,7 +149,7 @@ _DEFAULT_MARKET_EXTRAS: dict[str, Any] = {
 
 
 # Daily candles change slowly; build_market_snapshot runs on every poll and coin
-# switch, so cache the 1D fetch per (symbol, interval) for 5 min to cut one
+# switch, so cache the 1D fetch per (client, symbol, interval) for 5 min to cut one
 # klines() call per poll. In-memory, process-local; clear_daily_cache() for tests.
 #
 # The cache is DEPTH-AWARE (audit B1): the entry stores the depth (`limit_hint`)
@@ -160,11 +160,13 @@ _DEFAULT_MARKET_EXTRAS: dict[str, Any] = {
 # the normal scan->analyze path. We now refetch when the cached series is
 # shallower than requested, and keep the deepest result.
 _DAILY_TTL_S: float = 300.0
-_daily_cache: dict[tuple[str, str], tuple[float, list[Candle], int]] = {}
+_daily_cache: dict[tuple[Any, str, str], tuple[float, list[Candle], int]] = {}
+_daily_cache_locks: dict[tuple[Any, str, str], list[Any]] = {}
 
 
 def clear_daily_cache() -> None:
     _daily_cache.clear()
+    _daily_cache_locks.clear()
 
 
 async def _fetch_daily_candles(
@@ -184,17 +186,34 @@ async def _fetch_daily_candles(
     DEPTH-AWARE: a cached series is only reused when it was fetched at least as
     deep as the current request. A shallow scan fetch is therefore NEVER served
     to a deeper analysis request (which would leave EMA200/ema_stack "unknown")."""
-    key = (symbol, daily)
+    key = (client, symbol, daily)
     now = time.monotonic()
     hit = _daily_cache.get(key)
     if hit is not None and (now - hit[0]) < ttl and hit[2] >= limit_hint:
         return hit[1]
+    entry = _daily_cache_locks.get(key)
+    if entry is None:
+        entry = [asyncio.Lock(), 0]
+        _daily_cache_locks[key] = entry
+    entry[1] += 1
     try:
-        candles = await client.klines(symbol, daily, limit_hint=limit_hint, paced=paced)
-    except Exception:
-        return []  # do not cache errors
-    _daily_cache[key] = (now, candles, limit_hint)
-    return candles
+        async with entry[0]:
+            now = time.monotonic()
+            hit = _daily_cache.get(key)
+            if hit is not None and (now - hit[0]) < ttl and hit[2] >= limit_hint:
+                return hit[1]
+            try:
+                candles = await client.klines(
+                    symbol, daily, limit_hint=limit_hint, paced=paced
+                )
+            except Exception:
+                return []  # do not cache errors
+            _daily_cache[key] = (time.monotonic(), candles, limit_hint)
+            return candles
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and _daily_cache_locks.get(key) is entry:
+            del _daily_cache_locks[key]
 
 
 async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
@@ -211,6 +230,8 @@ async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
         extras = await fn(symbol)
     except Exception:
         return dict(_DEFAULT_MARKET_EXTRAS)
+    if not isinstance(extras, dict):
+        return dict(_DEFAULT_MARKET_EXTRAS)
     return {**_DEFAULT_MARKET_EXTRAS, **(extras or {})}
 
 
@@ -223,7 +244,9 @@ async def _fetch_market_extras(client: Any, symbol: str) -> dict[str, Any]:
 # degrades to None (block omitted) — it must NEVER break analyze.
 _BTC_REGIME_SYMBOL = "BTC_USDT"
 _BTC_REGIME_TTL_S: float = 300.0
-_btc_regime_cache: dict[tuple[str, str], tuple[float, dict[str, Any] | None]] = {}
+_btc_regime_cache: dict[
+    tuple[Any, str, str, int, int], tuple[float, dict[str, Any] | None]
+] = {}
 
 
 def clear_btc_regime_cache() -> None:
@@ -303,7 +326,7 @@ def regime_tag(btc_regime: dict[str, Any] | None, atr_pct: float | None) -> str:
         return "unknown"
     try:
         pct = float(atr_pct)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "unknown"
     if pct != pct or pct < 0:  # NaN / negative guard
         return "unknown"
@@ -328,7 +351,7 @@ async def fetch_btc_regime(
     """Compact BTC regime anchor: btc_daily_stack, btc_htf_stack,
     btc_price_vs_ema20_pct (1H stretch). Cached ~5 min and reused across all
     altcoin analyses. Returns None on any failure/empty data (block omitted)."""
-    key = (htf, daily)
+    key = (client, htf, daily, htf_limit_hint, daily_limit_hint)
     now = time.monotonic()
     hit = _btc_regime_cache.get(key)
     if hit is not None and (now - hit[0]) < ttl:
@@ -351,7 +374,7 @@ async def fetch_btc_regime(
         "btc_htf_stack": htf_stack,
         "btc_price_vs_ema20_pct": htf_stretch,
     }
-    _btc_regime_cache[key] = (now, block)
+    _btc_regime_cache[key] = (time.monotonic(), block)
     return block
 
 

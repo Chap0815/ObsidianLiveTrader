@@ -10,7 +10,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app.realtime import hl_proxy
-from app.realtime.hl_proxy import _normalize_hl, _pump_client
+from app.realtime.hl_proxy import _normalize_hl, _pump_client, _timestamp_or_zero
 
 
 def test_trade_message_wrong_coin_is_skipped_not_forwarded():
@@ -97,6 +97,26 @@ def test_trade_message_skips_non_object_rows():
     assert len(out["trades"]) == 1
 
 
+def test_trade_list_is_sorted_before_latest_trade_is_selected():
+    older = 1_700_000_100_000
+    newer = older + 1_000
+    out = _normalize_hl(
+        {
+            "channel": "trades",
+            "data": [
+                {"coin": "BTC", "px": "60100", "sz": "1", "time": newer},
+                {"coin": "BTC", "px": "60000", "sz": "1", "time": older},
+            ],
+        },
+        coin="BTC",
+    )
+
+    assert out is not None
+    assert [trade["time"] for trade in out["trades"]] == [older, newer]
+    assert out["time"] == newer
+    assert out["px"] == 60_100
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -141,6 +161,88 @@ def test_normalizer_rejects_invalid_live_prices(payload):
     ],
 )
 def test_price_message_wrong_coin_is_skipped(msg):
+    assert _normalize_hl(msg, coin="BTC") is None
+
+
+@pytest.mark.parametrize("row_interval", [None, 15, "1h"])
+def test_candle_wrong_or_missing_interval_is_skipped(row_interval):
+    candle = {
+        "t": 1_700_000_000_000,
+        "o": "59990",
+        "h": "60010",
+        "l": "59980",
+        "c": "60000",
+        "s": "BTC",
+        "i": row_interval,
+    }
+
+    assert (
+        _normalize_hl(
+            {"channel": "candle", "data": candle}, coin="BTC", interval="15m"
+        )
+        is None
+    )
+
+
+def _candle(*, timestamp, close):
+    return {
+        "t": timestamp,
+        "o": str(close),
+        "h": str(close + 1),
+        "l": str(close - 1),
+        "c": str(close),
+        "v": "1",
+        "s": "BTC",
+        "i": "15m",
+    }
+
+
+def test_candle_list_is_sorted_before_latest_bar_is_selected():
+    older = 1_700_000_100_000
+    newer = older + 15 * 60_000
+
+    out = _normalize_hl(
+        {
+            "channel": "candle",
+            "data": [
+                _candle(timestamp=newer, close=60_100),
+                _candle(timestamp=older, close=60_000),
+            ],
+        },
+        coin="BTC",
+        interval="15m",
+    )
+
+    assert out is not None
+    assert [bar["time_ms"] for bar in out["bars"]] == [older, newer]
+    assert out["bar"] == out["bars"][-1]
+    assert out["bar"]["close"] == 60_100
+
+
+@pytest.mark.parametrize("offset_ms", [0, 60_000])
+def test_candle_list_rejects_duplicate_chart_bucket(offset_ms):
+    timestamp = 1_700_000_100_000
+    msg = {
+        "channel": "candle",
+        "data": [
+            _candle(timestamp=timestamp, close=60_000),
+            _candle(timestamp=timestamp + offset_ms, close=60_100),
+        ],
+    }
+
+    assert _normalize_hl(msg, coin="BTC", interval="15m") is None
+
+
+def test_crossed_bbo_is_skipped():
+    msg = {
+        "channel": "bbo",
+        "data": {
+            "coin": "BTC",
+            "time": 1_700_000_000_000,
+            "bbo": [{"px": "60001"}, {"px": "59999"}],
+        },
+    }
+
     assert _normalize_hl(msg, coin="BTC") is None
 
 
@@ -197,6 +299,7 @@ def test_bbo_rejects_falsy_nonstring_coin_identity(invalid_coin):
                     "c": "60000",
                     "v": "2",
                     "s": "BTC",
+                    "i": "15m",
                 },
             },
             "candle",
@@ -222,7 +325,7 @@ def test_bbo_rejects_falsy_nonstring_coin_identity(invalid_coin):
     ],
 )
 def test_normalizer_keeps_valid_price_channels(payload, expected_type, expected_price):
-    out = _normalize_hl(payload, coin="BTC")
+    out = _normalize_hl(payload, coin="BTC", interval="15m")
 
     assert out is not None
     assert out["type"] == expected_type
@@ -281,6 +384,57 @@ def test_negative_realtime_timestamp_uses_receive_time_fallback(channel):
     assert out is not None
     timestamp = out["bar"]["time_ms"] if channel == "candle" else out["time"]
     assert timestamp == 0
+
+
+@pytest.mark.parametrize("channel", ["trades", "candle"])
+@pytest.mark.parametrize(
+    "bad_timestamp",
+    [
+        1_700_000_000_000.5,
+        999_999_999_999,
+        1_800_000_000_000 + 5 * 60 * 1000 + 1,
+    ],
+)
+def test_implausible_realtime_timestamp_uses_receive_time_fallback(
+    monkeypatch, channel, bad_timestamp
+):
+    monkeypatch.setattr(hl_proxy.time, "time", lambda: 1_800_000_000.0)
+    if channel == "trades":
+        msg = {
+            "channel": channel,
+            "data": [
+                {
+                    "coin": "BTC",
+                    "px": "60000",
+                    "sz": "0.1",
+                    "time": bad_timestamp,
+                }
+            ],
+        }
+    else:
+        msg = {
+            "channel": channel,
+            "data": {
+                "t": bad_timestamp,
+                "o": "59990",
+                "h": "60010",
+                "l": "59980",
+                "c": "60000",
+                "s": "BTC",
+            },
+        }
+
+    out = _normalize_hl(msg, coin="BTC")
+
+    assert out is not None
+    timestamp = out["bar"]["time_ms"] if channel == "candle" else out["time"]
+    assert timestamp == 0
+
+
+def test_realtime_timestamp_keeps_plausible_exact_milliseconds(monkeypatch):
+    monkeypatch.setattr(hl_proxy.time, "time", lambda: 1_800_000_000.0)
+
+    assert _timestamp_or_zero("1800000000000") == 1_800_000_000_000
 
 
 @pytest.mark.parametrize(("field", "value"), [("h", "59989"), ("l", "60001")])
@@ -551,7 +705,9 @@ async def test_session_reports_unhealthy_when_no_data_forwarded(monkeypatch):
     up = _FakeUpstream(recv_items=[ConnectionError("dropped immediately")])
     client_task = _never_done_client_task()
     try:
-        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+        healthy = await hl_proxy._run_upstream_session(
+            client, up, "BTC", client_task, interval="15m"
+        )
     finally:
         client_task.cancel()
     assert healthy is False
@@ -572,7 +728,9 @@ async def test_session_reports_unhealthy_when_only_sub_ack(monkeypatch):
     )
     client_task = _never_done_client_task()
     try:
-        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+        healthy = await hl_proxy._run_upstream_session(
+            client, up, "BTC", client_task, interval="15m"
+        )
     finally:
         client_task.cancel()
     assert healthy is False
@@ -600,7 +758,57 @@ async def test_session_reports_healthy_when_real_data_forwarded(monkeypatch):
     )
     client_task = _never_done_client_task()
     try:
-        healthy = await hl_proxy._run_upstream_session(client, up, "BTC", client_task)
+        healthy = await hl_proxy._run_upstream_session(
+            client, up, "BTC", client_task, interval="15m"
+        )
     finally:
         client_task.cancel()
     assert healthy is True
+
+
+@pytest.mark.asyncio
+async def test_proxy_drops_stale_market_frames_across_upstream_reconnect(monkeypatch):
+    base = 1_700_000_100_000
+    fresh_trade = {
+        "channel": "trades",
+        "data": [{"coin": "BTC", "px": "60100", "sz": "1", "time": base + 60_000}],
+    }
+    stale_trade = {
+        "channel": "trades",
+        "data": [{"coin": "BTC", "px": "60000", "sz": "1", "time": base + 30_000}],
+    }
+    stale_candle = {
+        "channel": "candle",
+        "data": _candle(timestamp=base - 15 * 60_000, close=59_900),
+    }
+    client = _FakeClientForProxy()
+    upstreams = [
+        _FakeUpstream(
+            recv_items=[json.dumps(fresh_trade), ConnectionError("first drop")]
+        ),
+        _FakeUpstream(
+            recv_items=[
+                json.dumps(stale_trade),
+                json.dumps(stale_candle),
+                ConnectionError("second drop"),
+            ]
+        ),
+        _FakeUpstream(on_enter=client.release),
+    ]
+    _patch_connect(monkeypatch, upstreams)
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 0.0)
+    monkeypatch.setattr(hl_proxy, "HL_HEARTBEAT_INTERVAL", 100.0)
+    monkeypatch.setattr(hl_proxy, "HL_IDLE_TIMEOUT", 100.0)
+
+    await hl_proxy.proxy_hyperliquid_market(
+        client, _settings(), symbol="BTC", tf="15m"
+    )
+
+    market_frames = [
+        frame
+        for frame in client.sent
+        if frame.get("type") in {"trade", "mid", "candle"}
+    ]
+    assert [(frame["type"], frame.get("px")) for frame in market_frames] == [
+        ("trade", 60_100.0)
+    ]

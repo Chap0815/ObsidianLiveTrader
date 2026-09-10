@@ -75,6 +75,16 @@ def test_setup_confidence_invalid_value_falls_back_to_default():
     assert p.setup_confidence == "medium"
 
 
+def test_overflowed_conviction_score_falls_back_to_default():
+    raw = json.dumps({**VALID_BUY, "conviction_score": 1}).replace(
+        '"conviction_score": 1', '"conviction_score": 1e999'
+    )
+
+    p = parse_proposal(raw)
+
+    assert p.conviction_score is None
+
+
 def test_model_direct_rejects_invalid_literal():
     """Pydantic model itself still enforces the enum when constructed directly
     (the tolerant coercion lives in parse_proposal, not the schema)."""

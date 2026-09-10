@@ -50,12 +50,18 @@ def _client_ctx():
     )
 
 
+async def _disabled_resolver(_app):
+    return None
+
+
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "j.db"))
     monkeypatch.setenv("LLM_PROVIDER", "claude")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-claude")
     monkeypatch.setenv("MEXC_API_KEY", "k")
     monkeypatch.setenv("MEXC_API_SECRET", "s")
+    monkeypatch.setenv("JOURNAL_ENABLED", "true")
+    monkeypatch.setattr("app.journal.resolver.run_resolver_loop", _disabled_resolver)
     get_settings.cache_clear()
 
 

@@ -47,9 +47,9 @@ _UNSET: Any = object()
 async def _safe_user_fills(client: Any, symbol: str) -> list[dict[str, Any]] | None:
     """ONE best-effort user_fills read, reused by BOTH the opened_at estimate and
     the HL trade-epoch signature within a single position cycle (Finding 3:
-    previously each fetched its own copy). Returns None when the client exposes
-    no ``user_fills`` (MEXC) or the read RAISED — callers treat None exactly like
-    an empty/failed fill window (journal fallback / inconclusive signature)."""
+    previously each fetched its own copy). Called only for Hyperliquid, whose
+    Flat→Open fills identify a trade epoch. Returns None when the read is
+    unavailable/failed; callers use journal fallback / inconclusive signature."""
     if not hasattr(client, "user_fills"):
         return None
     try:
@@ -85,7 +85,7 @@ def _iso_to_ms(value: Any) -> int | None:
         return None
     try:
         return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
 
@@ -108,15 +108,27 @@ async def _best_effort_opened_at(
     try:
         times = []
         for f in fills or []:
-            d = str(f.get("dir") or "").lower()
-            t = int(f.get("time") or 0)
-            if "open" in d and want in d and t > 0:
+            if not isinstance(f, dict):
+                continue
+            direction = f.get("dir")
+            if not isinstance(direction, str):
+                continue
+            d = direction.lower()
+            timestamp = f.get("time")
+            if isinstance(timestamp, bool):
+                continue
+            try:
+                t = int(timestamp or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if d == f"open {want}" and t > 0:
                 times.append(t)
         if times:
             return min(times)
     except Exception:
         pass
-    # 2) Journal approximation (MEXC has no user_fills; also HL fallback).
+    # 2) Journal approximation (MEXC fills lack current-position identity; also
+    # the Hyperliquid fallback when no usable epoch fill is available).
     # F5: recent_journal is newest-first, so returning the FIRST match picked the
     # YOUNGEST row — every fresh proposal then "rejuvenated" opened_at and the
     # time-stop could never reach its threshold. Take the OLDEST matching row in
@@ -161,7 +173,10 @@ def _position_id_signature(pos: Any) -> int | None:
     if isinstance(pid, str):
         text = pid.strip()
         if text.isdigit():
-            parsed = int(text)
+            try:
+                parsed = int(text)
+            except ValueError:
+                return None
             return parsed if parsed > 0 else None
     return None
 
@@ -188,18 +203,28 @@ async def _hl_epoch_signature(
             fills = await client.user_fills(symbol)
         except Exception:
             return None
+    if not isinstance(fills, list):
+        return None
     epochs: list[int] = []
     for f in fills or []:
-        d = str(f.get("dir") or "").lower()
-        if "open" not in d or want not in d:
+        if not isinstance(f, dict):
+            continue
+        direction = f.get("dir")
+        if not isinstance(direction, str):
+            continue
+        d = direction.lower()
+        if d != f"open {want}":
             continue
         sp = f.get("start_position")
+        timestamp = f.get("time")
+        if isinstance(sp, bool) or isinstance(timestamp, bool):
+            continue
         try:
             spf = float(sp)
-        except (TypeError, ValueError):
-            continue  # unknown start_position → can't confirm a flat→open epoch
-        t = int(f.get("time") or 0)
-        if abs(spf) < 1e-12 and t > 0:  # position was FLAT before this fill
+            t = int(timestamp or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue  # unknown epoch fields → can't confirm a flat→open epoch
+        if spf == 0.0 and t > 0:  # position was exactly FLAT before this fill
             epochs.append(t)
     return max(epochs) if epochs else None
 
@@ -285,6 +310,10 @@ async def _current_sl(
     """
     try:
         stops = await client.open_stop_orders(symbol)
+        if not isinstance(stops, list) or not all(
+            isinstance(row, dict) for row in stops
+        ):
+            return None, False
         # MEXC plan-order endpoints can return account-wide rows even when a
         # symbol was requested.  Never let an explicitly foreign trigger drive
         # this position's baseline or an automatic stop move.  Hyperliquid
@@ -293,7 +322,7 @@ async def _current_sl(
         want = symbol.upper()
         is_hl = getattr(client, "exchange_id", "") == "hyperliquid"
         matching_stops = []
-        for row in stops or []:
+        for row in stops:
             row_symbol = str(row.get("symbol") or "").upper()
             if row_symbol and row_symbol != want:
                 if not (
@@ -340,8 +369,13 @@ async def ensure_baseline(
     """
     if current_sl is _UNSET:
         current_sl, _sl_ok = await _current_sl(client, symbol, side, entry)
-    # ONE user_fills read shared by opened_at + the reopen signature below.
-    if fills is _UNSET:
+    is_hl = hasattr(client, "place_stop_order")
+    # Only HL fills carry start_position, which links Flat→Open evidence to a
+    # trade epoch. MEXC's account-wide deals cannot identify the current position;
+    # using them here can borrow an old trade's age and adds a needless API read.
+    if not is_hl:
+        fills = None
+    elif fills is _UNSET:
         fills = await _safe_user_fills(client, symbol)
     # r1 is fixed at baseline time. With no known SL it can't be computed → 0.0,
     # which evaluate_rules reads as "no R signal" (no auto-BE / no time-stop-R
@@ -350,7 +384,6 @@ async def ensure_baseline(
     # F2: stable exchange reopen-signature (HL trade-epoch fill / MEXC positionId;
     # None = inconclusive → no reset).
     open_sig = await _open_signature(client, pos, symbol, side, fills=fills)
-    is_hl = hasattr(client, "place_stop_order")
     if is_hl and open_sig is not None:
         # The HL signature is the validated Flat→Open fill timestamp and is more
         # precise than the generic oldest-open-fill approximation.
@@ -411,11 +444,13 @@ async def _process_position(
     entry = pos.get("entry_price")
     if not symbol or side not in ("long", "short"):
         return
+    if isinstance(entry, bool):
+        return
     try:
         entry = float(entry)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return
-    if entry <= 0:
+    if not math.isfinite(entry) or entry <= 0:
         return
 
     current_sl, sl_ok = await _current_sl(client, symbol, side, entry)
@@ -424,10 +459,15 @@ async def _process_position(
     # next cycle retries); never guess.
     try:
         ticker = await client.ticker(symbol)
-        mark = float(ticker.last_price) if ticker.last_price else None
+        last_price = ticker.last_price
+        mark = (
+            float(last_price)
+            if last_price and not isinstance(last_price, bool)
+            else None
+        )
     except Exception:
         mark = None
-    if mark is None or mark <= 0:
+    if mark is None or not math.isfinite(mark) or mark <= 0:
         return
 
     # Durable baseline via the SHARED helper (identical freeze/reset semantics
@@ -447,6 +487,12 @@ async def _process_position(
     mgmt_row = await db.get_open_position_mgmt(symbol, side)
     if mgmt_row is None:
         return
+    stored_alert_state = mgmt_row.get("last_alert_state")
+    if not isinstance(stored_alert_state, dict):
+        stored_alert_state = {}
+    be_done = mgmt_row.get("be_done")
+    if type(be_done) is not int or be_done not in (0, 1):
+        return
 
     baseline = MgmtBaseline(
         entry=float(mgmt_row.get("entry_snap") or entry),
@@ -455,8 +501,8 @@ async def _process_position(
         opened_at_ms=int(mgmt_row.get("opened_at") or now_ms),
         invalidation_price=mgmt_row.get("invalidation_price"),
         armed_rules=mgmt_row.get("armed_rules") or {},
-        be_done=bool(mgmt_row.get("be_done")),
-        last_alert_state=mgmt_row.get("last_alert_state") or {},
+        be_done=be_done == 1,
+        last_alert_state=stored_alert_state,
         high_water=mgmt_row.get("high_water"),
         user_override_hw=mgmt_row.get("user_override_hw"),
     )
@@ -466,7 +512,7 @@ async def _process_position(
     # trail move this cycle (never trail on an unknown ATR).
     armed = baseline.armed_rules if isinstance(baseline.armed_rules, dict) else {}
     atr = None
-    if armed.get("auto_trail"):
+    if armed.get("auto_trail") is True:
         atr = await _atr_for(app, client, settings, symbol, now_ms)
 
     actions = evaluate_rules(
@@ -644,7 +690,8 @@ async def _process_position(
                                     "reason": chosen.reason,
                                     "new_sl": chosen.new_sl,
                                     "message": (
-                                        f"App hat SL auf BE gezogen ({chosen.reason})."
+                                        "App moved the SL to break-even "
+                                        f"({chosen.reason})."
                                     ),
                                     "ts": now_ms,
                                 }
@@ -653,7 +700,9 @@ async def _process_position(
                                     "active": True,
                                     "reason": chosen.reason,
                                     "new_sl": chosen.new_sl,
-                                    "message": "App hat SL nachgezogen (Trail).",
+                                    "message": (
+                                        "App tightened the SL (trailing stop)."
+                                    ),
                                     "ts": now_ms,
                                 }
                         state_dirty = True
@@ -684,8 +733,8 @@ async def _process_position(
                             "active": True,
                             "halted": n >= _BE_MAX_ATTEMPTS,
                             "message": (
-                                f"Auto-Management: SL-Move NICHT bestaetigt "
-                                f"({n}/{_BE_MAX_ATTEMPTS}, {status}) — Retry."
+                                f"Auto-management: SL move not confirmed "
+                                f"({n}/{_BE_MAX_ATTEMPTS}, {status}) — retry."
                             ),
                             "ts": now_ms,
                         }
@@ -762,7 +811,10 @@ async def _atr_for(
             atr = None  # never act on a non-finite / non-positive ATR
     except Exception:
         atr = None  # fail-safe: no ATR → no trail move this cycle
-    cache[key] = {"atr": atr, "ts": cache_now_ms}
+    # Start the TTL only after the potentially slow upstream read finishes.
+    # Otherwise a fetch lasting one monitor interval is already stale when the
+    # next same-symbol position in this cycle asks for it.
+    cache[key] = {"atr": atr, "ts": int(time.monotonic() * 1000)}
     return atr
 
 
@@ -786,13 +838,30 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
     if not isinstance(positions, list):
         log.warning("trade monitor: invalid account_snapshot shape")
         return
-    snapshot_complete = not any(
-        not isinstance(pos, dict)
-        or not isinstance(pos.get("symbol"), str)
-        or not pos["symbol"].strip()
-        or pos.get("side") not in ("long", "short")
-        for pos in positions
-    )
+    snapshot_complete = True
+    for pos in positions:
+        hold_raw = pos.get("hold_vol") if isinstance(pos, dict) else None
+        try:
+            hold = float(hold_raw) if not isinstance(hold_raw, bool) else None
+        except (TypeError, ValueError, OverflowError):
+            hold = None
+        if (
+            not isinstance(pos, dict)
+            or not isinstance(pos.get("symbol"), str)
+            or not pos["symbol"].strip()
+            or pos.get("side") not in ("long", "short")
+            or hold is None
+            or not math.isfinite(hold)
+            or hold <= 0
+        ):
+            snapshot_complete = False
+            break
+    if not snapshot_complete:
+        # An unidentified/invalid row could be a malformed duplicate of a
+        # valid-looking position. The snapshot is therefore not authoritative
+        # enough for any automatic money action or disappearance decision.
+        log.warning("trade monitor: invalid position in account_snapshot")
+        return
 
     # Build the shared-lock service ONCE per cycle (single seam for auto-BE
     # writes). Never fatal — if it can't be built, positions still evaluate for
@@ -804,11 +873,38 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
 
     absence = _absence_counts(app)
     live_keys: set[tuple[Any, Any]] = set()
+    first_position_by_key: dict[tuple[Any, Any], dict[str, Any]] = {}
+    conflicting_keys: set[tuple[Any, Any]] = set()
+    for candidate in positions:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_key = (candidate.get("symbol"), candidate.get("side"))
+        if not candidate_key[0] or candidate_key[1] not in ("long", "short"):
+            continue
+        first = first_position_by_key.setdefault(candidate_key, candidate)
+        if candidate != first:
+            conflicting_keys.add(candidate_key)
+
+    reported_conflicts: set[tuple[Any, Any]] = set()
     for pos in positions:
         symbol = pos.get("symbol") if isinstance(pos, dict) else None
         side = pos.get("side") if isinstance(pos, dict) else None
         if symbol and side in ("long", "short"):
             key = (symbol, side)
+            if key in conflicting_keys:
+                live_keys.add(key)
+                if key not in reported_conflicts:
+                    log.warning(
+                        "trade monitor: conflicting duplicate live position %s %s; "
+                        "auto-actions skipped",
+                        symbol,
+                        side,
+                    )
+                    reported_conflicts.add(key)
+                continue
+            if key in live_keys:
+                log.warning("trade monitor: duplicate live position %s %s", symbol, side)
+                continue
             live_keys.add(key)
             # C3: a position that was ABSENT on a prior cycle (absence>0) and is now
             # back is a POTENTIAL same-price reopen within the close grace — the
@@ -832,12 +928,6 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
             # One bad position must never abort the sweep (spec §3.7).
             log.warning("trade monitor: position cycle failed", exc_info=True)
             continue
-
-    if not snapshot_complete:
-        # Valid rows were still processed independently above, but a partial
-        # snapshot cannot prove that any other managed position vanished.
-        log.warning("trade monitor: invalid position in account_snapshot")
-        return
 
     # Positions no longer live → close their mgmt record (frees the OPEN slot so
     # a later re-open starts a fresh baseline). Only after _CLOSE_GRACE_CYCLES

@@ -1,6 +1,6 @@
 """GET /api/mini — lightweight multi-coin candle snapshot for the overview grid."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -283,3 +283,99 @@ async def test_mini_different_cache_keys_refresh_concurrently():
     assert all(response.status_code == 200 for response in responses)
     assert max_inflight == 2
     assert app.state.mini_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_mini_hot_swap_rejects_old_client_payload():
+    import asyncio
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_klines(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return _candles([100.0, 101.0])
+
+    old_client = SimpleNamespace(klines=old_klines)
+    new_client = object()
+    old_cache = {}
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        mini_cache=old_cache,
+        mini_locks={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    task = asyncio.create_task(
+        main.mini(request, symbols="BTC_USDT", tf="15m", limit=2)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    state.mexc = new_client
+    state.exchange = new_client
+    state.mini_cache = {}
+    release.set()
+    with pytest.raises(main.HTTPException) as exc:
+        await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == (
+        "Exchange changed while loading data. Retry the request."
+    )
+    assert old_cache == {}
+    assert state.mini_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_mini_waiter_rejects_old_cache_hit_after_hot_swap():
+    import asyncio
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @asynccontextmanager
+    async def delayed_lock(*_args):
+        started.set()
+        await release.wait()
+        yield
+
+    old_client = SimpleNamespace(klines=AsyncMock())
+    new_client = object()
+    old_cache = {}
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        mini_cache=old_cache,
+        mini_locks={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    with patch("app.main._keyed_singleflight_lock", new=delayed_lock):
+        task = asyncio.create_task(
+            main.mini(request, symbols="BTC_USDT", tf="15m", limit=2)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        old_cache[(("BTC_USDT",), "15m", 2)] = (
+            main._time.monotonic(),
+            {"results": [{"source": "old-cache"}], "errors": []},
+        )
+        state.mexc = new_client
+        state.exchange = new_client
+        state.mini_cache = {}
+        release.set()
+        with pytest.raises(main.HTTPException) as exc:
+            await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == (
+        "Exchange changed while loading data. Retry the request."
+    )
+    old_client.klines.assert_not_awaited()

@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import math
 
+import pytest
+
 from app.orders.be_math import break_even_price
 from app.orders.trade_manager import (
     Alert,
@@ -341,6 +343,32 @@ def test_non_dict_armed_and_alert_state_no_crash():
         mgmt=mgmt, now_ms=0, settings=_settings(),
     )
     # armed coerced to {} → no auto-BE; no crash on the thesis/time-stop .get.
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+@pytest.mark.parametrize(
+    ("rule", "value"),
+    [
+        ("auto_be", 1),
+        ("auto_be", "true"),
+        ("auto_trail", 1),
+        ("auto_trail", "false"),
+    ],
+)
+def test_nonboolean_armed_rule_never_emits_money_action(rule, value):
+    mgmt = _mgmt(armed_rules={rule: value}, high_water=125.0)
+
+    actions = evaluate_rules(
+        side="long",
+        entry=100.0,
+        current_sl=90.0,
+        mark=120.0,
+        mgmt=mgmt,
+        now_ms=0,
+        settings=_settings(),
+        atr=5.0,
+    )
+
     assert not [a for a in actions if isinstance(a, MoveSlToBe)]
 
 

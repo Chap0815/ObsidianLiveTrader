@@ -77,11 +77,13 @@ def validate_order(
 
     existing_risk_f = 0.0
     try:
+        if isinstance(existing_same_side_risk_usdt, bool):
+            raise ValueError
         candidate_existing_risk = float(existing_same_side_risk_usdt)
         if not math.isfinite(candidate_existing_risk) or candidate_existing_risk < 0:
             raise ValueError
         existing_risk_f = candidate_existing_risk
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         errors.append("existing same-side risk is invalid (must be finite and non-negative)")
 
     # ── Arming switch (preview + confirm) ──────────────────────────────
@@ -93,52 +95,80 @@ def validate_order(
         errors.append(msg)
 
     # ── Contract / apiAllowed ──────────────────────────────────────────
-    if not contract.api_allowed:
+    if contract.api_allowed is not True:
         errors.append(
-            f"Symbol {contract.symbol or ticket.symbol} has apiAllowed=false — API orders rejected"
+            f"Symbol {contract.symbol or ticket.symbol} does not have literal "
+            "apiAllowed=true — API orders rejected"
         )
-    if settings.exchange == "mexc" and contract.state != 0:
+    if settings.exchange == "mexc" and (
+        type(contract.state) is not int or contract.state != 0
+    ):
         errors.append(
             f"Symbol {contract.symbol or ticket.symbol} has state={contract.state} "
             "— new entries require an enabled MEXC contract (state=0)"
         )
 
-    if not math.isfinite(float(contract.contract_size)):
-        errors.append("Invalid non-finite contract_size from exchange meta")
-    elif contract.contract_size <= 0:
+    def contract_float(field_name: str) -> float:
+        raw_value = getattr(contract, field_name)
+        if isinstance(raw_value, bool):
+            errors.append(f"Invalid {field_name} from exchange meta")
+            return float("nan")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            errors.append(f"Invalid {field_name} from exchange meta")
+            return float("nan")
+        if not math.isfinite(value):
+            errors.append(f"Invalid non-finite {field_name} from exchange meta")
+            return float("nan")
+        return value
+
+    contract_size = contract_float("contract_size")
+    price_unit = contract_float("price_unit")
+    vol_unit = contract_float("vol_unit")
+    min_vol = contract_float("min_vol")
+    max_vol = contract_float("max_vol")
+    min_notional = contract_float("min_notional")
+
+    if math.isfinite(contract_size) and contract_size <= 0:
         errors.append("Invalid contract_size from exchange meta")
 
-    for contract_field in (
-        "price_unit",
-        "vol_unit",
-        "min_vol",
-        "max_vol",
-        "min_notional",
+    for field_name, value in (
+        ("vol_unit", vol_unit),
+        ("min_vol", min_vol),
+        ("max_vol", max_vol),
     ):
-        if not math.isfinite(float(getattr(contract, contract_field))):
-            errors.append(f"Invalid non-finite {contract_field} from exchange meta")
-
-    for positive_field in ("vol_unit", "min_vol", "max_vol"):
-        if float(getattr(contract, positive_field)) <= 0:
-            errors.append(f"Invalid {positive_field} from exchange meta")
-    for nonnegative_field in ("price_unit", "min_notional"):
-        if float(getattr(contract, nonnegative_field)) < 0:
-            errors.append(f"Invalid {nonnegative_field} from exchange meta")
-    if contract.max_vol > 0 and contract.min_vol > contract.max_vol:
+        if math.isfinite(value) and value <= 0:
+            errors.append(f"Invalid {field_name} from exchange meta")
+    for field_name, value in (
+        ("price_unit", price_unit),
+        ("min_notional", min_notional),
+    ):
+        if math.isfinite(value) and value < 0:
+            errors.append(f"Invalid {field_name} from exchange meta")
+    if max_vol > 0 and min_vol > max_vol:
         errors.append("Invalid min_vol/max_vol bounds from exchange meta")
+    min_leverage = (
+        contract.min_leverage if type(contract.min_leverage) is int else None
+    )
+    max_leverage = (
+        contract.max_leverage if type(contract.max_leverage) is int else None
+    )
     if (
-        contract.min_leverage < 1
-        or contract.max_leverage < 1
-        or contract.min_leverage > contract.max_leverage
+        min_leverage is None
+        or max_leverage is None
+        or min_leverage < 1
+        or max_leverage < 1
+        or min_leverage > max_leverage
     ):
         errors.append("Invalid leverage bounds from exchange meta")
 
     # ── Side / type / open_type ────────────────────────────────────────
-    side = (ticket.side or "").lower()
+    side = ticket.side if type(ticket.side) is str else ""
     if side not in ("long", "short"):
         errors.append("side must be 'long' or 'short'")
 
-    order_type = (ticket.order_type or "").lower()
+    order_type = ticket.order_type if type(ticket.order_type) is str else ""
     if order_type not in ("market", "limit"):
         errors.append("order_type must be 'market' or 'limit'")
 
@@ -154,7 +184,15 @@ def validate_order(
     # Manual SL/TP mode places NO exchange triggers (the trader manages exits),
     # so a missing take_profit is not a gate failure — the RRR check below warns
     # instead of hard-blocking (STRICT_RRR still applies to auto mode).
-    manual_sltp = (getattr(ticket, "trigger_mode", "auto") or "auto").lower() == "manual"
+    trigger_mode = (
+        ticket.trigger_mode.lower() if type(ticket.trigger_mode) is str else ""
+    )
+    if trigger_mode not in ("auto", "manual"):
+        errors.append("trigger_mode must be 'auto' or 'manual'")
+    manual_sltp = trigger_mode == "manual"
+
+    if type(ticket.scale_out) is not bool:
+        errors.append("scale_out must be a boolean")
 
     # R-04: block manual trigger_mode already in the GATE (preview + confirm),
     # not just at confirm time — a preview that will be refused on confirm
@@ -168,7 +206,7 @@ def validate_order(
             "ALLOW_MANUAL_TRIGGER to permit it."
         )
 
-    open_type = int(ticket.open_type or 1)
+    open_type = ticket.open_type if type(ticket.open_type) is int else None
     if open_type not in (1, 2):
         errors.append("open_type must be 1 (isolated) or 2 (cross)")
     elif open_type == 2 and not settings.allow_cross_margin:
@@ -177,30 +215,39 @@ def validate_order(
         )
 
     # ── G2 leverage ────────────────────────────────────────────────────
-    lev = int(ticket.leverage)
-    if lev < 1:
+    leverage_valid = type(ticket.leverage) is int
+    lev = ticket.leverage if leverage_valid else 0
+    if not leverage_valid:
+        errors.append("leverage must be an integer")
+    elif lev < 1:
         errors.append("leverage must be >= 1")
-    if lev > settings.max_leverage:
+    if leverage_valid and lev > settings.max_leverage:
         errors.append(
             f"leverage {lev} exceeds MAX_LEVERAGE={settings.max_leverage}"
         )
-    if contract.max_leverage and lev > contract.max_leverage:
+    if leverage_valid and max_leverage is not None and lev > max_leverage:
         errors.append(
-            f"leverage {lev} exceeds contract maxLeverage={contract.max_leverage}"
+            f"leverage {lev} exceeds contract maxLeverage={max_leverage}"
         )
-    if contract.min_leverage and lev < contract.min_leverage:
+    if leverage_valid and min_leverage is not None and lev < min_leverage:
         errors.append(
-            f"leverage {lev} below contract minLeverage={contract.min_leverage}"
+            f"leverage {lev} below contract minLeverage={min_leverage}"
         )
 
     # ── G6 precision: vol / price ──────────────────────────────────────
-    raw_vol = float(ticket.vol)
-    if raw_vol <= 0:
+    volume_valid = True
+    try:
+        if isinstance(ticket.vol, bool):
+            raise ValueError
+        raw_vol = float(ticket.vol)
+        if not math.isfinite(raw_vol):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        volume_valid = False
+        raw_vol = 0.0
+        errors.append("vol must be a finite number")
+    if volume_valid and raw_vol <= 0:
         errors.append("vol must be > 0")
-
-    vol_unit = float(contract.vol_unit or 0)
-    min_vol = float(contract.min_vol or 0)
-    max_vol = float(contract.max_vol or 0)
 
     if vol_unit > 0:
         rounded_vol = round_down_to_unit(raw_vol, vol_unit)
@@ -217,30 +264,56 @@ def validate_order(
         errors.append(f"vol rounds to 0 with volUnit={vol_unit}")
 
     rounded_price: float | None = None
-    price_unit = float(contract.price_unit or 0)
+    limit_price_f: float | None = None
     if order_type == "limit":
-        if ticket.price is None or float(ticket.price) <= 0:
+        if ticket.price is not None and not isinstance(ticket.price, bool):
+            try:
+                candidate_limit_price = float(ticket.price)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(candidate_limit_price) and candidate_limit_price > 0:
+                    limit_price_f = candidate_limit_price
+        if limit_price_f is None:
             errors.append("limit order requires price > 0")
         else:
-            raw_px = float(ticket.price)
             rounded_price = (
-                round_to_unit(raw_px, price_unit) if price_unit > 0 else raw_px
+                round_to_unit(limit_price_f, price_unit)
+                if price_unit > 0
+                else limit_price_f
             )
             if rounded_price <= 0:
                 errors.append("rounded limit price is invalid")
 
     # ── Entry reference for risk ───────────────────────────────────────
+    last_price_f: float | None = None
+    if last_price is not None and not isinstance(last_price, bool):
+        try:
+            candidate_last_price = float(last_price)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(candidate_last_price) and candidate_last_price > 0:
+                last_price_f = candidate_last_price
+
+    ticket_entry_f: float | None = None
+    if ticket.entry is not None:
+        try:
+            if isinstance(ticket.entry, bool):
+                raise ValueError
+            ticket_entry_f = float(ticket.entry)
+            if not math.isfinite(ticket_entry_f):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            ticket_entry_f = None
+            errors.append("ticket.entry must be a finite number")
+
     entry_for_risk: float | None = None
     if order_type == "market":
-        if (
-            last_price is not None
-            and math.isfinite(float(last_price))
-            and float(last_price) > 0
-            and side in ("long", "short")
-        ):
+        if last_price_f is not None and side in ("long", "short"):
             try:
                 entry_for_risk = adverse_market_entry(
-                    float(last_price), side, settings.market_entry_slippage_pct
+                    last_price_f, side, settings.market_entry_slippage_pct
                 )
             except ValueError as exc:
                 errors.append(f"invalid market risk reference: {exc}")
@@ -264,36 +337,60 @@ def validate_order(
         # (spoofed entry closer to SL would understate MAX_RISK_PCT / pass bad geometry).
         if rounded_price is not None and float(rounded_price) > 0:
             entry_for_risk = float(rounded_price)
-            if ticket.entry is not None and float(ticket.entry) > 0:
-                te = float(ticket.entry)
+            if ticket_entry_f is not None and ticket_entry_f > 0:
+                te = ticket_entry_f
                 if abs(te - entry_for_risk) / max(entry_for_risk, 1e-12) * 100.0 > 0.05:
                     warnings.append(
                         f"ticket.entry {te} ignored for risk; using limit price "
                         f"{entry_for_risk}"
                     )
-        elif ticket.price is not None and float(ticket.price) > 0:
-            entry_for_risk = float(ticket.price)
+        elif limit_price_f is not None:
+            entry_for_risk = limit_price_f
         else:
             errors.append("limit order needs price for risk calc")
 
     # ── Price drift (confirm vs preview) ───────────────────────────────
+    preview_price_f: float | None = None
     if (
         for_confirm
         and preview_last_price is not None
-        and float(preview_last_price) > 0
-        and last_price is not None
-        and float(last_price) > 0
+        and not isinstance(preview_last_price, bool)
     ):
-        prev = float(preview_last_price)
-        now = float(last_price)
+        try:
+            candidate_preview_price = float(preview_last_price)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(candidate_preview_price) and candidate_preview_price > 0:
+                preview_price_f = candidate_preview_price
+
+    if (
+        for_confirm
+        and preview_price_f is not None
+        and last_price_f is not None
+    ):
+        prev = preview_price_f
+        now = last_price_f
         drift_pct = abs(now - prev) / prev * 100.0
-        max_drift = float(getattr(settings, "max_price_drift_pct", 0.5) or 0.5)
-        if drift_pct > max_drift + 1e-12:
+        try:
+            raw_max_drift = getattr(settings, "max_price_drift_pct", 0.5)
+            if isinstance(raw_max_drift, bool):
+                raise ValueError
+            max_drift = float(raw_max_drift)
+            if not math.isfinite(max_drift) or not (0 <= max_drift <= 100):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
             errors.append(
-                f"price drift {drift_pct:.3f}% exceeds MAX_PRICE_DRIFT_PCT="
-                f"{max_drift} (preview {prev} → now {now}) — re-preview"
+                "MAX_PRICE_DRIFT_PCT is invalid — expected a finite number "
+                "in [0, 100]"
             )
-    elif for_confirm and (preview_last_price is None or float(preview_last_price) <= 0):
+        else:
+            if drift_pct > max_drift + 1e-12:
+                errors.append(
+                    f"price drift {drift_pct:.3f}% exceeds MAX_PRICE_DRIFT_PCT="
+                    f"{max_drift} (preview {prev} → now {now}) — re-preview"
+                )
+    elif for_confirm and preview_price_f is None:
         # The preview captured no usable baseline price (its ticker returned no
         # price), so the confirm-vs-preview drift check can't run. Surface it as a
         # warning instead of silently skipping — the one-time token's TTL bounds
@@ -306,7 +403,22 @@ def validate_order(
     # ── SL required unless unprotected allowed ─────────────────────────
     sl = ticket.stop_loss
     rounded_stop: float | None = None
-    if sl is None or float(sl) <= 0:
+    sl_f: float | None = None
+    invalid_sl = False
+    if sl is not None:
+        try:
+            if isinstance(sl, bool):
+                raise ValueError
+            sl_f = float(sl)
+            if not math.isfinite(sl_f):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            sl_f = None
+            invalid_sl = True
+
+    if invalid_sl:
+        errors.append("stop_loss must be a finite number")
+    elif sl_f is None or sl_f <= 0:
         if not settings.allow_unprotected_entry:
             errors.append(
                 "stop_loss required (ALLOW_UNPROTECTED_ENTRY=false). "
@@ -316,18 +428,8 @@ def validate_order(
             warnings.append(
                 "No stop_loss — unprotected entry allowed by config (dangerous)"
             )
-        sl_f: float | None = None
+        sl_f = None
     else:
-        sl_f = float(sl)
-        # Defect B (CRITICAL) defense-in-depth: a NaN/Inf stop_loss fails EVERY
-        # comparison below silently (NaN <= 0, NaN >= entry are all False), and
-        # on an HL-style contract (price_unit==0) the side-aware rounding that
-        # would otherwise raise on NaN is SKIPPED — so a non-HTTP caller that
-        # bypasses the OrderTicket pydantic validator could carry an unusable
-        # stop with unbounded risk straight through the gate (ok=True, no
-        # errors). Reject it here too so the gate fails CLOSED regardless.
-        if not math.isfinite(sl_f):
-            errors.append("Stop loss is not a valid number (NaN/Infinity)")
         if entry_for_risk is not None and side in ("long", "short"):
             if side == "long" and sl_f >= entry_for_risk:
                 errors.append("long stop_loss must be below entry")
@@ -356,8 +458,22 @@ def validate_order(
 
     rounded_tp: float | None = None
     tp = ticket.take_profit
-    if tp is not None and float(tp) > 0:
-        rounded_tp = float(tp)
+    tp_f: float | None = None
+    invalid_tp = False
+    if tp is not None:
+        try:
+            if isinstance(tp, bool):
+                raise ValueError
+            tp_f = float(tp)
+            if not math.isfinite(tp_f):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            tp_f = None
+            invalid_tp = True
+    if invalid_tp:
+        errors.append("take_profit must be a finite number")
+    elif tp_f is not None and tp_f > 0:
+        rounded_tp = tp_f
         if price_unit > 0:
             # R-02: same conservative side-aware rounding for TP (long floors
             # toward entry, short ceils toward entry) so RRR is never
@@ -365,7 +481,12 @@ def validate_order(
             rounded_tp = round_trigger_to_unit(rounded_tp, price_unit, side=side, kind="tp")
 
     # ── Equity fail-closed (G3 requires known equity) ──────────────────
-    equity_f = float(equity) if equity is not None else 0.0
+    try:
+        if equity is None or isinstance(equity, bool):
+            raise ValueError
+        equity_f = float(equity)
+    except (TypeError, ValueError, OverflowError):
+        equity_f = 0.0
     if not math.isfinite(equity_f) or equity_f <= 0:
         errors.append(
             "equity unknown/zero — fail-closed (MAX_RISK_PCT cannot be enforced)"
@@ -380,11 +501,11 @@ def validate_order(
         and entry_for_risk is not None
         and math.isfinite(entry_for_risk)
         and rounded_vol > 0
-        and contract.contract_size > 0
+        and contract_size > 0
     ):
         calculated_risk = risk_usdt(
             rounded_vol,
-            contract.contract_size,
+            contract_size,
             entry_for_risk,
             sl_f,
             slippage_pct=settings.risk_slippage_pct,
@@ -430,6 +551,19 @@ def validate_order(
                         )
 
     # ── G4 RRR ─────────────────────────────────────────────────────────
+    min_rrr_f: float | None = None
+    try:
+        if isinstance(settings.min_rrr, bool):
+            raise ValueError
+        min_rrr_f = float(settings.min_rrr)
+        if not math.isfinite(min_rrr_f) or not (0 <= min_rrr_f <= 1000):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        min_rrr_f = None
+        errors.append(
+            "MIN_RRR is invalid — expected a finite number in [0, 1000]"
+        )
+
     rrr: float | None = None
     if (
         sl_f is not None
@@ -446,8 +580,8 @@ def validate_order(
             if not math.isfinite(calculated_rrr):
                 raise ValueError("RRR is not finite")
             rrr = calculated_rrr
-            if rrr + 1e-12 < settings.min_rrr:
-                msg = f"RRR {rrr:.3f} < MIN_RRR={settings.min_rrr}"
+            if min_rrr_f is not None and rrr + 1e-12 < min_rrr_f:
+                msg = f"RRR {rrr:.3f} < MIN_RRR={min_rrr_f}"
                 if settings.strict_rrr:
                     errors.append(msg + " (STRICT_RRR=true)")
                 else:
@@ -470,8 +604,8 @@ def validate_order(
 
     # ── Max notional ───────────────────────────────────────────────────
     notional = 0.0
-    if entry_for_risk is not None and rounded_vol > 0 and contract.contract_size > 0:
-        calculated_notional = rounded_vol * contract.contract_size * entry_for_risk
+    if entry_for_risk is not None and rounded_vol > 0 and contract_size > 0:
+        calculated_notional = rounded_vol * contract_size * entry_for_risk
         if not math.isfinite(calculated_notional):
             errors.append("calculated notional is not finite — fail-closed")
         else:
@@ -508,7 +642,6 @@ def validate_order(
                         f"notional {notional:.2f} USDT exceeds {pct_cap:.0f}% of equity "
                         f"(cap {cap:.2f} USDT) — MAX_NOTIONAL_PCT_OF_EQUITY"
                     )
-            min_notional = float(contract.min_notional or 0)
             if min_notional > 0 and notional + 1e-9 < min_notional:
                 errors.append(
                     f"notional {notional:.4f} below exchange minimum "
@@ -516,7 +649,15 @@ def validate_order(
                 )
 
     # ── Available margin ───────────────────────────────────────────────
-    available_f = float(available_usdt) if available_usdt is not None else None
+    if available_usdt is None:
+        available_f = None
+    else:
+        try:
+            if isinstance(available_usdt, bool):
+                raise ValueError
+            available_f = float(available_usdt)
+        except (TypeError, ValueError, OverflowError):
+            available_f = float("nan")
     if available_f is not None and not math.isfinite(available_f):
         errors.append("available USDT is not finite — fail-closed")
     elif available_f is not None and available_f <= 0 and equity_f > 0:

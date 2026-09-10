@@ -8,6 +8,8 @@ response must surface as an error (→ UNKNOWN downstream), never as a confident
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -23,6 +25,25 @@ def _client(info: MagicMock) -> HyperliquidClient:
     c._info = info
     c._get_info = MagicMock(return_value=info)
     return c
+
+
+class _ObservedAsyncLock:
+    """Expose the second lock attempt so a mocked first read can finish."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._attempts = 0
+        self.second_waiter = threading.Event()
+
+    async def __aenter__(self):
+        self._attempts += 1
+        if self._attempts == 2:
+            self.second_waiter.set()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        self._lock.release()
 
 
 @pytest.mark.asyncio
@@ -86,14 +107,77 @@ async def test_metadata_cache_ttl_uses_monotonic_time(monkeypatch):
         ]
     )
     client = _client(info)
+    clock = {"now": 1_000.0}
     fake_time = MagicMock()
     fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
-    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 5_000.0])
+    fake_time.monotonic = MagicMock(side_effect=lambda: clock["now"])
     monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
 
     assert await client.list_symbols() == ["BTC"]
+    clock["now"] = 5_000.0
     assert await client.list_symbols() == ["ETH"]
     assert info.meta.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_metadata_reads_share_one_upstream_fetch():
+    class ObservedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._guard = threading.Lock()
+            self._attempts = 0
+            self.second_waiter = threading.Event()
+
+        def __enter__(self):
+            with self._guard:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_waiter.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    fetch_lock = ObservedLock()
+    metadata = {"universe": [{"name": "BTC"}]}
+    info = MagicMock()
+
+    def fetch_metadata():
+        assert fetch_lock.second_waiter.wait(timeout=2.0)
+        return metadata
+
+    info.meta = MagicMock(side_effect=fetch_metadata)
+    client = _client(info)
+    client._meta_fetch_lock = fetch_lock
+
+    first, second = await asyncio.gather(
+        asyncio.to_thread(client._load_meta_sync),
+        asyncio.to_thread(client._load_meta_sync),
+    )
+
+    assert first == second == metadata
+    assert info.meta.call_count == 1
+
+
+def test_metadata_cache_ttl_starts_after_slow_fetch(monkeypatch):
+    clock = {"now": 100.0}
+    metadata = {"universe": [{"name": "BTC"}]}
+    info = MagicMock()
+
+    def fetch_metadata():
+        clock["now"] = 3_701.0
+        return metadata
+
+    info.meta = MagicMock(side_effect=fetch_metadata)
+    client = _client(info)
+    monkeypatch.setattr(
+        "app.hyperliquid.client.time.monotonic", lambda: clock["now"]
+    )
+
+    assert client._load_meta_sync() == metadata
+    assert client._load_meta_sync() == metadata
+    assert info.meta.call_count == 1
 
 
 def test_oi_history_sampling_uses_monotonic_time(monkeypatch):
@@ -120,6 +204,23 @@ async def test_ticker_rejects_nonfinite_mid_price(mid):
 
     with pytest.raises(HyperliquidError, match="Non-finite mid price"):
         await client.ticker("BTC")
+
+
+@pytest.mark.asyncio
+async def test_numeric_overflow_keeps_hyperliquid_adapter_semantics():
+    huge = 10**400
+    ticker_info = MagicMock()
+    ticker_info.all_mids = MagicMock(return_value={"BTC": huge})
+
+    with pytest.raises(HyperliquidError, match="Invalid mid price"):
+        await _client(ticker_info).ticker("BTC")
+
+    position_info = MagicMock()
+    position_info.user_state = MagicMock(
+        return_value=_state_with_open_position(unrealizedPnl=huge)
+    )
+    row = (await _client(position_info).positions(fresh=True))[0]
+    assert row["unRealizedPnl"] is None
 
 
 @pytest.mark.asyncio
@@ -182,6 +283,58 @@ async def test_klines_reject_missing_or_invalid_required_values(field, value):
 
 
 @pytest.mark.asyncio
+async def test_klines_reject_fractional_timestamp():
+    row = {
+        "t": 1_700_000_000_000.5,
+        "o": 1,
+        "h": 1,
+        "l": 1,
+        "c": 1,
+        "v": 0,
+    }
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+
+    with pytest.raises(HyperliquidError, match="kline time"):
+        await _client(info).klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_far_future_timestamp(monkeypatch):
+    monkeypatch.setattr("app.hyperliquid.client.time.time", lambda: 1_700_000_000.0)
+    row = {
+        "t": 1_700_000_300_001,
+        "o": 1,
+        "h": 1,
+        "l": 1,
+        "c": 1,
+        "v": 0,
+    }
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+
+    with pytest.raises(HyperliquidError, match="kline time"):
+        await _client(info).klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_implausibly_old_timestamp():
+    row = {
+        "t": 999_999_999_999,
+        "o": 1,
+        "h": 1,
+        "l": 1,
+        "c": 1,
+        "v": 0,
+    }
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row])
+
+    with pytest.raises(HyperliquidError, match="kline time"):
+        await _client(info).klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("field", "value"), [("h", 9), ("l", 11)])
 async def test_klines_reject_impossible_ohlc_geometry(field, value):
     row = {"t": 1_700_000_000_000, "o": 10, "h": 11, "l": 9, "c": 10, "v": 1}
@@ -200,12 +353,12 @@ async def test_klines_normalize_provider_rows_to_chronological_order():
 
     info = MagicMock()
     info.candles_snapshot = MagicMock(
-        return_value=[row(1_700_000_002_000, 12), row(1_700_000_001_000, 11)]
+        return_value=[row(1_700_000_900_000, 12), row(1_700_000_000_000, 11)]
     )
 
     candles = await _client(info).klines("BTC", "15m")
 
-    assert [c.time for c in candles] == [1_700_000_001_000, 1_700_000_002_000]
+    assert [c.time for c in candles] == [1_700_000_000_000, 1_700_000_900_000]
     assert candles[-1].close == 12
 
 
@@ -225,6 +378,20 @@ async def test_klines_reject_duplicate_timestamps():
     info.candles_snapshot = MagicMock(return_value=[row(11), row(12)])
 
     with pytest.raises(HyperliquidError, match="duplicate kline timestamp"):
+        await _client(info).klines("BTC", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_duplicate_interval_bucket():
+    def row(timestamp, close):
+        return {"t": timestamp, "o": close, "h": close, "l": close, "c": close, "v": 1}
+
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(
+        return_value=[row(1_700_000_001_000, 11), row(1_700_000_002_000, 12)]
+    )
+
+    with pytest.raises(HyperliquidError, match="duplicate kline interval"):
         await _client(info).klines("BTC", "15m")
 
 
@@ -393,6 +560,27 @@ async def test_open_orders_rejects_malformed_rows(overrides):
     c = _client(info)
 
     with pytest.raises(HyperliquidError, match="open_orders"):
+        await c.open_orders("BTC")
+
+
+@pytest.mark.asyncio
+async def test_open_orders_rejects_oversized_digit_order_id_as_invalid_row():
+    info = MagicMock()
+    info.open_orders = MagicMock(
+        return_value=[
+            {
+                "coin": "BTC",
+                "oid": "9" * 5000,
+                "side": "B",
+                "sz": "0.01",
+                "limitPx": "60000",
+                "reduceOnly": False,
+            }
+        ]
+    )
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="invalid row"):
         await c.open_orders("BTC")
 
 
@@ -762,6 +950,8 @@ async def test_user_fills_rejects_unrecognized_top_level_shape(payload):
         ("sz", "0"),
         ("side", "unknown"),
         ("time", "NaN"),
+        ("time", 1.5),
+        ("time", 1),
         ("time", 0),
         ("time", True),
     ],
@@ -772,6 +962,58 @@ async def test_user_fills_skips_invalid_required_fields(field, value):
     c = _client(info)
 
     assert await c.user_fills("BTC") == []
+
+
+@pytest.mark.asyncio
+async def test_user_fills_skips_implausibly_future_timestamp(monkeypatch):
+    now_s = 1_700_000_000.0
+    monkeypatch.setattr("app.hyperliquid.client.time.time", lambda: now_s)
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[
+            _valid_fill(time=int(now_s * 1000) + 300_001),
+            _valid_fill(time=int(now_s * 1000) + 300_000),
+        ]
+    )
+
+    rows = await _client(info).user_fills("BTC")
+
+    assert [row["time"] for row in rows] == [int(now_s * 1000) + 300_000]
+
+
+@pytest.mark.asyncio
+async def test_user_fills_does_not_stringify_non_string_direction():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[_valid_fill(dir={"open": "long"})]
+    )
+
+    row = (await _client(info).user_fills("BTC"))[0]
+
+    assert row["dir"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "direction"),
+    [
+        ("A", "Open Long"),
+        ("B", "Open Short"),
+        ("B", "Close Long"),
+        ("A", "Close Short"),
+    ],
+)
+async def test_user_fills_degrades_known_direction_side_contradiction(
+    side, direction
+):
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[_valid_fill(side=side, dir=direction)]
+    )
+
+    row = (await _client(info).user_fills("BTC"))[0]
+
+    assert row["dir"] == ""
 
 
 @pytest.mark.asyncio
@@ -825,6 +1067,95 @@ async def test_user_fills_drop_boolean_optional_values_and_oid():
     assert row["oid"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_oid",
+    [0, -1, 1.5, "1.5", {}, pytest.param("9" * 5_000, id="oversized-digits")],
+)
+async def test_user_fills_drop_invalid_oid_values(bad_oid):
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=[_valid_fill(oid=bad_oid)])
+
+    row = (await _client(info).user_fills("BTC"))[0]
+
+    assert row["oid"] is None
+
+
+@pytest.mark.asyncio
+async def test_user_fills_symbol_filters_share_short_ttl_upstream_read():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[
+            _valid_fill(coin="BTC", time=1_700_000_000_000),
+            _valid_fill(coin="ETH", time=1_700_000_001_000),
+        ]
+    )
+    client = _client(info)
+
+    btc = await client.user_fills("BTC_USDT")
+    eth = await client.user_fills("ETH_USDT")
+
+    assert [row["symbol"] for row in btc] == ["BTC"]
+    assert [row["symbol"] for row in eth] == ["ETH"]
+    assert info.user_fills.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_fills_cache_is_scoped_to_account_address():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        side_effect=[
+            [_valid_fill(coin="BTC")],
+            [_valid_fill(coin="ETH")],
+        ]
+    )
+    client = _client(info)
+
+    first = await client.user_fills()
+    client.account_address = "0x0000000000000000000000000000000000000002"
+    second = await client.user_fills()
+
+    assert [row["symbol"] for row in first] == ["BTC"]
+    assert [row["symbol"] for row in second] == ["ETH"]
+    assert info.user_fills.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_user_fills_cache_ttl_starts_after_slow_fetch(monkeypatch):
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=[_valid_fill()])
+    client = _client(info)
+    fake_time = MagicMock()
+    fake_time.monotonic = MagicMock(side_effect=[100.0, 100.0, 103.0, 103.0])
+    monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
+
+    await client.user_fills("BTC_USDT")
+    await client.user_fills("BTC_USDT")
+
+    assert info.user_fills.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_user_fills_reads_share_one_upstream_fetch():
+    read_lock = _ObservedAsyncLock()
+
+    def fetch_fills(_addr):
+        assert read_lock.second_waiter.wait(timeout=2.0)
+        return [_valid_fill()]
+
+    info = MagicMock()
+    info.user_fills = MagicMock(side_effect=fetch_fills)
+    client = _client(info)
+    client._user_fills_read_lock = read_lock
+
+    first, second = await asyncio.gather(
+        client.user_fills("BTC"), client.user_fills("BTC")
+    )
+
+    assert first == second
+    assert info.user_fills.call_count == 1
+
+
 # ── user_state short-TTL cache + 429 resilience (over-poll → 429 → 502 fix) ───
 
 
@@ -842,6 +1173,72 @@ async def test_assets_and_positions_share_one_user_state_within_ttl():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_user_state_reads_share_one_upstream_fetch():
+    read_lock = _ObservedAsyncLock()
+
+    def fetch_state(_addr):
+        assert read_lock.second_waiter.wait(timeout=2.0)
+        return _COMPLETE_STATE
+
+    info = MagicMock()
+    info.user_state = MagicMock(side_effect=fetch_state)
+    client = _client(info)
+    client._user_state_read_lock = read_lock
+
+    assets, positions = await asyncio.gather(client.assets(), client.positions())
+
+    assert assets[0]["equity"] == 1000.0
+    assert positions == []
+    assert info.user_state.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_user_state_read_bypasses_slow_cached_read():
+    first_started = threading.Event()
+    fresh_started = threading.Event()
+    release_first = threading.Event()
+    call_guard = threading.Lock()
+    calls = 0
+    newer_state = {
+        **_COMPLETE_STATE,
+        "marginSummary": {
+            **_COMPLETE_STATE["marginSummary"],
+            "accountValue": "2000",
+        },
+    }
+
+    def fetch_state(_addr):
+        nonlocal calls
+        with call_guard:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+            return _COMPLETE_STATE
+        fresh_started.set()
+        return newer_state
+
+    info = MagicMock()
+    info.user_state = MagicMock(side_effect=fetch_state)
+    client = _client(info)
+
+    cached_read = asyncio.create_task(client.assets())
+    assert await asyncio.to_thread(first_started.wait, 2.0)
+    fresh_read = asyncio.create_task(client.assets(fresh=True))
+    bypassed = await asyncio.to_thread(fresh_started.wait, 0.25)
+    release_first.set()
+    cached_result, fresh_result = await asyncio.gather(cached_read, fresh_read)
+    cached_after = await client.assets()
+
+    assert bypassed
+    assert cached_result[0]["equity"] == 1000.0
+    assert fresh_result[0]["equity"] == 2000.0
+    assert cached_after[0]["equity"] == 2000.0
+    assert info.user_state.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_user_state_cache_ttl_uses_monotonic_time(monkeypatch):
     newer_state = {
         **_COMPLETE_STATE,
@@ -855,7 +1252,9 @@ async def test_user_state_cache_ttl_uses_monotonic_time(monkeypatch):
     client = _client(info)
     fake_time = MagicMock()
     fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
-    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 5_000.0, 5_000.0])
+    fake_time.monotonic = MagicMock(
+        side_effect=[1_000.0, 5_000.0, 5_000.0, 5_000.0]
+    )
     monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
 
     assert (await client.assets())[0]["equity"] == 1000.0
@@ -1204,14 +1603,77 @@ def test_market_context_cache_ttl_uses_monotonic_time(monkeypatch):
     info = MagicMock()
     info.meta_and_asset_ctxs = MagicMock(side_effect=[first, second])
     client = _client(info)
+    clock = {"now": 1_000.0}
     fake_time = MagicMock()
     fake_time.time = MagicMock(side_effect=[1_000.0, 100.0])
-    fake_time.monotonic = MagicMock(side_effect=[1_000.0, 1_003.0])
+    fake_time.monotonic = MagicMock(side_effect=lambda: clock["now"])
     monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
 
     assert client._meta_ctxs_sync() == first
+    clock["now"] = 1_003.0
     assert client._meta_ctxs_sync() == second
     assert info.meta_and_asset_ctxs.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_market_context_reads_share_one_upstream_fetch():
+    class ObservedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._guard = threading.Lock()
+            self._attempts = 0
+            self.second_waiter = threading.Event()
+
+        def __enter__(self):
+            with self._guard:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_waiter.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    fetch_lock = ObservedLock()
+    meta_ctx = ({"universe": [{"name": "BTC"}]}, [{"funding": "0.001"}])
+    info = MagicMock()
+
+    def fetch_context():
+        assert fetch_lock.second_waiter.wait(timeout=2.0)
+        return meta_ctx
+
+    info.meta_and_asset_ctxs = MagicMock(side_effect=fetch_context)
+    client = _client(info)
+    client._ctx_fetch_lock = fetch_lock
+
+    first, second = await asyncio.gather(
+        asyncio.to_thread(client._meta_ctxs_sync),
+        asyncio.to_thread(client._meta_ctxs_sync),
+    )
+
+    assert first == second == meta_ctx
+    assert info.meta_and_asset_ctxs.call_count == 1
+
+
+def test_market_context_cache_ttl_starts_after_slow_fetch(monkeypatch):
+    clock = {"now": 100.0}
+    meta_ctx = ({"universe": [{"name": "BTC"}]}, [{"funding": "0.001"}])
+    info = MagicMock()
+
+    def fetch_context():
+        clock["now"] = 103.0
+        return meta_ctx
+
+    info.meta_and_asset_ctxs = MagicMock(side_effect=fetch_context)
+    client = _client(info)
+    monkeypatch.setattr(
+        "app.hyperliquid.client.time.monotonic", lambda: clock["now"]
+    )
+
+    assert client._meta_ctxs_sync() == meta_ctx
+    assert client._meta_ctxs_sync() == meta_ctx
+    assert info.meta_and_asset_ctxs.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -1234,29 +1696,25 @@ async def test_funding_rate_reads_from_ctx_without_all_mids():
 
 
 @pytest.mark.asyncio
-async def test_funding_rate_falls_back_to_zero_when_ctx_missing_coin():
-    """If the ctx doesn't carry the coin (or funding), fall back safely to 0.0
-    with the same return shape rather than raising."""
+async def test_funding_rate_rejects_ctx_missing_coin():
     info = MagicMock()
     meta_ctx = ({"universe": [{"name": "SOL"}]}, [{"funding": 0.001}])
     info.meta_and_asset_ctxs = MagicMock(return_value=meta_ctx)
     c = _client(info)
-    fr = await c.funding_rate("BTC_USDT")
-    assert fr.symbol == "BTC"
-    assert fr.funding_rate == 0.0
+    with pytest.raises(HyperliquidError, match="funding"):
+        await c.funding_rate("BTC_USDT")
 
 
 @pytest.mark.asyncio
-async def test_funding_rate_falls_back_to_zero_when_value_is_nonfinite():
+async def test_funding_rate_rejects_nonfinite_value():
     info = MagicMock()
     info.meta_and_asset_ctxs = MagicMock(
         return_value=[{"universe": [{"name": "BTC"}]}, [{"funding": "NaN"}]]
     )
     client = _client(info)
 
-    result = await client.funding_rate("BTC_USDT")
-
-    assert result.funding_rate == 0.0
+    with pytest.raises(HyperliquidError, match="funding"):
+        await client.funding_rate("BTC_USDT")
 
 
 @pytest.mark.asyncio
@@ -1281,11 +1739,11 @@ async def test_market_context_does_not_match_nonstring_market_identity(invalid_n
     client = _client(info)
 
     ticker = await client.ticker(requested)
-    funding = await client.funding_rate(requested)
+    with pytest.raises(HyperliquidError, match="funding"):
+        await client.funding_rate(requested)
     extras = await client.market_extras(requested)
 
     assert ticker.funding_rate is None
-    assert funding.funding_rate == 0.0
     assert extras["open_interest"] is None
     assert extras["premium"] is None
     assert extras["prev_day_px"] is None
@@ -1352,7 +1810,7 @@ async def test_market_overview_sanitizes_invalid_ranking_fields():
     assert rows[0]["symbol"] == "GOOD"
     bad = rows[1]
     assert bad["volume24"] == 0.0
-    assert bad["funding"] == 0.0
+    assert bad["funding"] is None
     assert bad["last"] is None
     assert bad["price_change_pct"] is None
     assert bad["open_interest"] is None
@@ -1426,7 +1884,7 @@ async def test_market_overview_treats_malformed_context_as_missing(invalid_ctx):
     assert row == {
         "symbol": "BTC",
         "volume24": 0.0,
-        "funding": 0.0,
+        "funding": None,
         "last": None,
         "price_change_pct": None,
         "open_interest": None,

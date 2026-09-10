@@ -84,7 +84,7 @@ var state = {
   historyClearBusy: false, // history reset in flight
   _historySeq: 0, // latest-wins guard for overlapping history reads
   _cancelBusy: {}, // per-order cancel guards (F6/F7)
-  llmLabel: "KI", // active provider label for the analyze spinner
+  llmLabel: "AI", // active provider label for the analyze spinner
   apiAllowed: null,
   market: null,
   ws: null,
@@ -146,8 +146,8 @@ var state = {
   newsStale: false, // /api/news served a stale cached payload (V3-04)
   _newsBusy: false, // in-flight /api/news fetch guard
   _newsLast: 0, // ms timestamp of the last successful /api/news fetch
-  reevalBusy: {}, // symbol -> true while /api/reevaluate is in flight (double-click guard)
-  reevalResults: {}, // symbol -> last /api/reevaluate response (or {error}), survives re-renders
+  reevalBusy: {}, // symbol|side -> true while /api/reevaluate is in flight
+  reevalResults: {}, // symbol|side -> last /api/reevaluate response (or {error})
   // Task 40 (N3-14 Stufe 1): Trades-tab sub-view — "roundtrips" (folded HL
   // fills) or "fills" (raw per-fill ledger, the pre-existing view).
   tradesSubTab: "roundtrips",

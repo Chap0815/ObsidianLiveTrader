@@ -1,7 +1,15 @@
 """Security / config remaining audit fixes."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock
+
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from app.config import Settings
 from app.security import normalize_symbol
@@ -22,6 +30,106 @@ def test_settings_port_matches_setup_and_env_builder_bounds(port):
 @pytest.mark.parametrize("port", [1024, 8787, 65_535])
 def test_settings_port_accepts_documented_bounds(port):
     assert Settings(port=port).port == port
+
+
+@pytest.mark.parametrize("exchange", ["", "   "])
+def test_settings_rejects_blank_exchange(exchange):
+    with pytest.raises(ValidationError, match="EXCHANGE must be"):
+        Settings(_env_file=None, exchange=exchange)
+
+
+def test_exchange_factory_rejects_unknown_mutated_exchange():
+    from app.exchange_factory import create_exchange_client, exchange_ready
+
+    settings = Settings(
+        _env_file=None,
+        exchange="mexc",
+        mexc_api_key="synthetic-key",
+        mexc_api_secret="synthetic-secret",
+    )
+    settings.exchange = "unknown"
+
+    assert settings.exchange_ready is False
+    assert exchange_ready(settings) is False
+    with pytest.raises(ValueError, match="EXCHANGE must be"):
+        create_exchange_client(settings)
+
+
+def test_hyperliquid_whitespace_private_key_is_not_ready():
+    from app.exchange_factory import exchange_ready
+
+    settings = Settings(
+        _env_file=None,
+        exchange="hyperliquid",
+        hl_private_key=" \t ",
+    )
+
+    assert settings.hl_ready is False
+    assert settings.exchange_ready is False
+    assert exchange_ready(settings) is False
+
+
+@pytest.mark.parametrize(
+    ("private_key", "account_address"),
+    [
+        ("synthetic-hl-key", ""),
+        ("0x" + "a" * 63, ""),
+        ("0x" + "0" * 64, ""),
+        ("0x" + "f" * 64, ""),
+        ("0x" + "a" * 64, "not-an-address"),
+        ("0x" + "a" * 64, "0x" + "b" * 39),
+    ],
+)
+def test_hyperliquid_malformed_credentials_are_not_ready(
+    private_key, account_address
+):
+    from app.exchange_factory import exchange_ready
+
+    settings = Settings(
+        _env_file=None,
+        exchange="hyperliquid",
+        hl_private_key=private_key,
+        hl_account_address=account_address,
+    )
+
+    assert settings.hl_ready is False
+    assert settings.exchange_ready is False
+    assert exchange_ready(settings) is False
+
+
+@pytest.mark.parametrize("account_address", ["", "0x" + "b" * 40])
+def test_hyperliquid_well_formed_credentials_are_ready(account_address):
+    from app.exchange_factory import exchange_ready
+
+    settings = Settings(
+        _env_file=None,
+        exchange="hyperliquid",
+        hl_private_key="0x" + "a" * 64,
+        hl_account_address=account_address,
+    )
+
+    assert settings.hl_ready is True
+    assert settings.exchange_ready is True
+    assert exchange_ready(settings) is True
+
+
+@pytest.mark.parametrize(
+    ("api_key", "api_secret"),
+    [(" \t ", "synthetic-secret"), ("synthetic-key", " \t ")],
+)
+def test_mexc_whitespace_credentials_are_not_ready(api_key, api_secret):
+    from app.exchange_factory import exchange_ready
+
+    settings = Settings(
+        _env_file=None,
+        exchange="mexc",
+        mexc_api_key=api_key,
+        mexc_api_secret=api_secret,
+    )
+
+    assert settings.mexc_ready is False
+    assert settings.exchange_ready is False
+    assert exchange_ready(settings) is False
 
 
 def test_mexc_url_must_https_allowlist():
@@ -46,6 +154,54 @@ def test_mexc_uses_current_api_host_and_migrates_legacy_default():
     )
     with pytest.raises(ValidationError):
         Settings(_env_file=None, mexc_base_url="https://futures.mexc.com")
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        (
+            "hl_base_url",
+            "https://user:secret@api.hyperliquid-testnet.xyz",
+        ),
+        (
+            "hl_base_url",
+            "https://api.hyperliquid-testnet.xyz?token=secret",
+        ),
+        ("mexc_base_url", "https://user:secret@api.mexc.com"),
+        ("mexc_base_url", "https://api.mexc.com?token=secret"),
+    ],
+)
+def test_exchange_base_urls_reject_embedded_secret_components(field, url):
+    with pytest.raises(ValidationError, match="must not include"):
+        Settings(_env_file=None, **{field: url})
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("hl_base_url", "https://api.hyperliquid-testnet.xyz/unexpected"),
+        ("hl_base_url", "https://api.hyperliquid-testnet.xyz:444"),
+        ("mexc_base_url", "https://api.mexc.com/unexpected"),
+        ("mexc_base_url", "https://api.mexc.com:444"),
+    ],
+)
+def test_exchange_base_urls_reject_noncanonical_endpoint_shape(field, url):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: url})
+
+
+def test_exchange_base_urls_allow_explicit_default_https_port():
+    assert (
+        Settings(
+            _env_file=None,
+            hl_base_url="https://api.hyperliquid-testnet.xyz:443",
+        ).hl_base_url
+        == "https://api.hyperliquid-testnet.xyz:443"
+    )
+    assert (
+        Settings(_env_file=None, mexc_base_url="https://api.mexc.com:443").mexc_base_url
+        == "https://api.mexc.com:443"
+    )
 
 
 def test_hyperliquid_network_flag_and_base_url_cannot_disagree():
@@ -75,6 +231,39 @@ def test_ollama_url_must_be_loopback():
         Settings(ollama_base_url="https://169.254.169.254/v1")
     s = Settings(ollama_base_url="http://127.0.0.1:11434/v1")
     assert "127.0.0.1" in s.ollama_base_url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://placeholder@127.0.0.1:11434/v1",
+        "http://127.0.0.1:11434/v1?mode=bad",
+        "http://127.0.0.1:11434/v1#bad",
+    ],
+)
+def test_ollama_url_rejects_embedded_secret_components(url):
+    with pytest.raises(ValidationError, match="must not include"):
+        Settings(_env_file=None, ollama_base_url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:notaport/v1",
+        "http://127.0.0.1:65536/v1",
+    ],
+)
+def test_ollama_url_rejects_invalid_ports(url):
+    with pytest.raises(ValidationError, match="valid port"):
+        Settings(_env_file=None, ollama_base_url=url)
+
+
+def test_ollama_url_allows_custom_valid_local_port():
+    settings = Settings(
+        _env_file=None,
+        ollama_base_url="http://localhost:23456/v1",
+    )
+    assert settings.ollama_base_url == "http://localhost:23456/v1"
 
 
 def test_risk_floats_reject_nan_and_infinity():
@@ -132,15 +321,139 @@ def test_risk_floats_accept_valid_values():
     assert s2.max_notional_usdt == 0.0
 
 
-def test_tm_settings_defaults():
+def test_tm_settings_defaults(monkeypatch):
     """Trade-Management-Layer defaults are safe-by-default and readable."""
-    s = Settings()
+    monkeypatch.delenv("TM_ENABLED")
+    s = Settings(_env_file=None)
     assert s.tm_enabled is True
     assert s.tm_monitor_interval_s == 20
     assert s.tm_be_trigger_r == 1.0
     assert s.tm_be_fee_rt == 0.0006
     assert s.tm_time_stop_hours == 4.0
     assert s.tm_time_stop_min_r == 0.5
+
+
+def test_test_harness_disables_background_network_loops():
+    """Ordinary TestClient lifespans must not start real exchange readers."""
+    s = Settings(_env_file=None)
+    assert s.journal_enabled is False
+    assert s.tm_enabled is False
+
+
+def test_test_harness_does_not_read_repository_env():
+    """Unit tests use explicit synthetic env files, never the local secret file."""
+    assert Settings.model_config.get("env_file") is None
+
+
+def _probe_test_database_path(sentinel: Path) -> tuple[str, str]:
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        "import os, runpy\n"
+        "state = runpy.run_path('tests/conftest.py')\n"
+        "print('SELECTED=' + os.environ['DATABASE_PATH'])\n"
+        "print('DECLARED=' + state['_TEST_DB'])\n"
+    )
+    safe_env = {
+        name: os.environ[name]
+        for name in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+        if name in os.environ
+    }
+    safe_env["DATABASE_PATH"] = str(sentinel)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=safe_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    return values["SELECTED"], values["DECLARED"]
+
+
+def test_test_harness_overrides_external_database_path(tmp_path):
+    sentinel = tmp_path / "must-not-use.db"
+    selected, declared = _probe_test_database_path(sentinel)
+    assert selected == declared
+    assert selected != str(sentinel)
+
+
+def test_test_harness_uses_process_unique_database_directory(tmp_path):
+    first, _ = _probe_test_database_path(tmp_path / "first.db")
+    second, _ = _probe_test_database_path(tmp_path / "second.db")
+    assert Path(first).parent != Path(second).parent
+
+
+def _probe_test_runtime_env(overrides: dict[str, str], names: tuple[str, ...]) -> dict[str, str]:
+    root = Path(__file__).resolve().parents[1]
+    script = (
+        "import os, runpy\n"
+        "runpy.run_path('tests/conftest.py')\n"
+        f"names = {names!r}\n"
+        "[print(name + '=' + os.environ.get(name, '')) for name in names]\n"
+    )
+    safe_env = {
+        name: os.environ[name]
+        for name in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+        if name in os.environ
+    }
+    safe_env.update(overrides)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=safe_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def test_test_harness_forces_disarmed_test_runtime():
+    names = (
+        "EXCHANGE",
+        "HL_TESTNET",
+        "TRADING_ENABLED",
+        "MAINNET_ACK",
+        "INCLUDE_ACCOUNT_IN_LLM",
+        "LLM_PROVIDER",
+    )
+    values = _probe_test_runtime_env(
+        {
+            "EXCHANGE": "hyperliquid",
+            "HL_TESTNET": "false",
+            "TRADING_ENABLED": "true",
+            "MAINNET_ACK": "true",
+            "INCLUDE_ACCOUNT_IN_LLM": "true",
+            "LLM_PROVIDER": "openai",
+        },
+        names,
+    )
+    assert values == {
+        "EXCHANGE": "mexc",
+        "HL_TESTNET": "true",
+        "TRADING_ENABLED": "false",
+        "MAINNET_ACK": "false",
+        "INCLUDE_ACCOUNT_IN_LLM": "false",
+        "LLM_PROVIDER": "claude",
+    }
+
+
+def test_test_harness_clears_inherited_credentials():
+    names = (
+        "MEXC_API_KEY",
+        "MEXC_API_SECRET",
+        "HL_PRIVATE_KEY",
+        "HL_ACCOUNT_ADDRESS",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_API_KEY",
+        "XAI_API_KEY",
+        "OPENAI_API_KEY",
+    )
+    values = _probe_test_runtime_env(
+        {name: "synthetic-parent-secret" for name in names}, names
+    )
+    assert values == {name: "" for name in names}
 
 
 def test_tm_settings_reject_out_of_bounds_and_nan():
@@ -201,6 +514,47 @@ def test_llm_base_urls_https_allowlist():
     assert "anthropic.com" in s.anthropic_base_url
     assert "api.x.ai" in s.xai_base_url
     assert "openai.com" in s.openai_base_url
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("anthropic_base_url", "https://user:secret@api.anthropic.com"),
+        ("xai_base_url", "https://api.x.ai/v1?token=secret"),
+        ("openai_base_url", "https://api.openai.com/v1#secret"),
+    ],
+)
+def test_llm_base_urls_reject_embedded_secret_components(field, url):
+    with pytest.raises(ValidationError, match="must not include"):
+        Settings(_env_file=None, **{field: url})
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("anthropic_base_url", "https://api.anthropic.com/v1"),
+        ("xai_base_url", "https://api.x.ai"),
+        ("openai_base_url", "https://api.openai.com/v2"),
+        ("anthropic_base_url", "https://api.anthropic.com:444"),
+        ("xai_base_url", "https://api.x.ai:444/v1"),
+        ("openai_base_url", "https://api.openai.com:444/v1"),
+    ],
+)
+def test_llm_base_urls_reject_noncanonical_endpoint_shape(field, url):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: url})
+
+
+def test_llm_base_urls_allow_explicit_default_https_port():
+    settings = Settings(
+        _env_file=None,
+        anthropic_base_url="https://api.anthropic.com:443",
+        xai_base_url="https://api.x.ai:443/v1",
+        openai_base_url="https://api.openai.com:443/v1",
+    )
+    assert settings.anthropic_base_url == "https://api.anthropic.com:443"
+    assert settings.xai_base_url == "https://api.x.ai:443/v1"
+    assert settings.openai_base_url == "https://api.openai.com:443/v1"
 
 
 def test_symbol_regex():
@@ -314,6 +668,75 @@ def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
     assert r4.status_code == 403 and "cross-origin" in r4.json()["detail"].lower()
 
 
+@pytest.mark.asyncio
+async def test_position_management_api_is_private_off_loopback(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.security as security
+
+    monkeypatch.setattr(
+        security,
+        "get_settings",
+        lambda: SimpleNamespace(local_api_token="", trading_enabled=False),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/positions/alerts",
+            "raw_path": b"/api/positions/alerts",
+            "query_string": b"",
+            "headers": [],
+            "client": ("192.0.2.10", 12345),
+            "server": ("localhost", 8787),
+        }
+    )
+    call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+    response = await security.loopback_or_token_middleware(request, call_next)
+
+    assert response.status_code == 403
+    call_next.assert_not_awaited()
+
+
+@pytest.mark.parametrize("client", [None, ("127.attacker", 12345)])
+@pytest.mark.asyncio
+async def test_private_api_fails_closed_for_unknown_or_non_ip_client(
+    monkeypatch, client
+):
+    from types import SimpleNamespace
+
+    import app.security as security
+
+    monkeypatch.setattr(
+        security,
+        "get_settings",
+        lambda: SimpleNamespace(local_api_token="", trading_enabled=False),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/account",
+            "raw_path": b"/api/account",
+            "query_string": b"",
+            "headers": [],
+            "client": client,
+            "server": ("localhost", 8787),
+        }
+    )
+    call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+    response = await security.loopback_or_token_middleware(request, call_next)
+
+    assert response.status_code == 403
+    call_next.assert_not_awaited()
+
+
 def test_resolved_llm_provider_falls_back_to_a_configured_one():
     """LLM_PROVIDER=claude with no Anthropic key must resolve to a provider that
     IS configured (e.g. xai) instead of failing the analysis on unconfigured
@@ -325,6 +748,85 @@ def test_resolved_llm_provider_falls_back_to_a_configured_one():
     # a configured provider is left unchanged
     s2 = Settings(llm_provider="xai", xai_api_key="xai-abc")
     assert s2.resolved_llm_provider == "xai"
+
+
+@pytest.mark.parametrize(
+    ("provider", "key_field", "ready_property"),
+    [
+        ("claude", "anthropic_api_key", "claude_ready"),
+        ("xai", "xai_api_key", "xai_ready"),
+        ("openai", "openai_api_key", "openai_ready"),
+    ],
+)
+def test_cloud_llm_whitespace_api_key_is_not_ready(
+    provider, key_field, ready_property
+):
+    settings = Settings(
+        _env_file=None,
+        llm_provider=provider,
+        **{key_field: " \t "},
+    )
+
+    assert getattr(settings, ready_property) is False
+    assert settings.llm_ready is False
+
+
+def test_resolved_llm_provider_skips_whitespace_key():
+    settings = Settings(
+        _env_file=None,
+        llm_provider="claude",
+        anthropic_api_key="",
+        xai_api_key=" \t ",
+        openai_api_key="synthetic-openai-key",
+    )
+
+    assert settings.resolved_llm_provider == "openai"
+
+
+@pytest.mark.parametrize(
+    ("provider", "key_field", "model_field", "ready_property"),
+    [
+        ("claude", "anthropic_api_key", "anthropic_model", "claude_ready"),
+        ("xai", "xai_api_key", "xai_model", "xai_ready"),
+        ("openai", "openai_api_key", "openai_model", "openai_ready"),
+    ],
+)
+def test_cloud_llm_whitespace_model_is_not_ready(
+    provider, key_field, model_field, ready_property
+):
+    settings = Settings(
+        _env_file=None,
+        llm_provider=provider,
+        **{key_field: "synthetic-key", model_field: " \t "},
+    )
+
+    assert getattr(settings, model_field) == ""
+    assert getattr(settings, ready_property) is False
+    assert settings.llm_ready is False
+
+
+def test_ollama_whitespace_model_is_not_ready():
+    settings = Settings(
+        _env_file=None,
+        llm_provider="ollama",
+        ollama_model=" \t ",
+    )
+
+    assert settings.ollama_model == ""
+    assert settings.ollama_ready is False
+    assert settings.llm_ready is False
+
+
+def test_resolved_llm_provider_skips_key_with_whitespace_model():
+    settings = Settings(
+        _env_file=None,
+        llm_provider="claude",
+        anthropic_api_key="synthetic-claude-key",
+        anthropic_model=" \t ",
+        xai_api_key="synthetic-xai-key",
+    )
+
+    assert settings.resolved_llm_provider == "xai"
 
 
 def test_api_responses_have_no_store_and_nosniff():

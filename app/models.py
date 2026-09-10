@@ -292,19 +292,37 @@ class ReevaluateProposal(BaseModel):
 
     action: ReevaluateAction
     # Reuses the same low/medium/high scale as setup_confidence.
-    confidence: SetupConfidence = "medium"
+    # Missing/malformed model output must not fabricate medium certainty.
+    confidence: SetupConfidence = "low"
     reason: str = ""
     new_sl: float | None = None
     new_tp: float | None = None
-    # Suggested share of the current hold to close (0-100). Only meaningful
+    # Suggested share of the current hold to close (0 < pct < 100). Only meaningful
     # for PARTIAL_CLOSE; null otherwise.
-    partial_close_pct: float | None = Field(None, ge=0, le=100)
+    partial_close_pct: float | None = Field(None, ge=0, lt=100)
     risk_notes: str = ""
 
     @field_validator("new_sl", "new_tp", "partial_close_pct", mode="before")
     @classmethod
     def _reject_boolean_numbers(cls, v: Any) -> Any:
         return _reject_bool_numeric(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _degrade_missing_reason(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        reason = data.get("reason")
+        if "reason" not in data or (isinstance(reason, str) and not reason.strip()):
+            normalized = dict(data)
+            normalized["reason"] = "No rationale provided; verify manually."
+            normalized["confidence"] = "low"
+            return normalized
+        if isinstance(reason, str) and reason != reason.strip():
+            normalized = dict(data)
+            normalized["reason"] = reason.strip()
+            return normalized
+        return data
 
     @field_validator("new_sl", "new_tp", "partial_close_pct")
     @classmethod
@@ -316,9 +334,33 @@ class ReevaluateProposal(BaseModel):
             raise ValueError("must be a finite number (NaN/Infinity rejected)")
         return v
 
+    @field_validator("new_sl", "new_tp")
+    @classmethod
+    def _reject_nonpositive_price_levels(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("price level must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def _require_action_value(self):
+        if self.action == "MOVE_SL_BE" and self.new_sl is None:
+            raise ValueError("MOVE_SL_BE requires new_sl")
+        if self.action == "PARTIAL_CLOSE" and (
+            self.partial_close_pct is None or self.partial_close_pct <= 0
+        ):
+            raise ValueError("PARTIAL_CLOSE requires partial_close_pct > 0")
+        if self.action != "PARTIAL_CLOSE" and self.partial_close_pct is not None:
+            raise ValueError("partial_close_pct is only valid for PARTIAL_CLOSE")
+        if self.action in ("HOLD", "CLOSE") and (
+            self.new_sl is not None or self.new_tp is not None
+        ):
+            raise ValueError(f"{self.action} cannot include new_sl or new_tp")
+        return self
+
 
 class ReevaluateRequest(BaseModel):
     symbol: str = "BTC_USDT"
+    side: Literal["long", "short"] | None = None
     tf: str = "15m"
     htf: str = "1H"
 
@@ -457,6 +499,12 @@ class ClosePositionRequest(BaseModel):
             raise ValueError("must be a finite number (NaN/Infinity rejected)")
         return v
 
+    @model_validator(mode="after")
+    def _reject_ambiguous_size(self) -> "ClosePositionRequest":
+        if self.vol is not None and self.fraction is not None:
+            raise ValueError("provide either vol or fraction, not both")
+        return self
+
 
 class CancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -471,7 +519,9 @@ class CancelRequest(BaseModel):
         return _reject_bool_numeric(v)
 
     @model_validator(mode="after")
-    def _reject_two_order_id_fields(self):
+    def _require_one_order_id_field(self):
+        if self.order_id is None and self.orderId is None:
+            raise ValueError("order_id or orderId is required")
         if self.order_id is not None and self.orderId is not None:
             raise ValueError("provide only one of order_id or orderId")
         return self

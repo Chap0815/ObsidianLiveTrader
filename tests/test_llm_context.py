@@ -16,6 +16,8 @@ from app.config import Settings
 from app.journal.stats import build_stats_response, build_track_record
 from app.llm.client import (
     _ema_stack_label,
+    _relative_pct,
+    _series_tail,
     build_llm_context,
     build_original_thesis,
 )
@@ -57,6 +59,32 @@ def test_ema_stack_pullback_keeps_regime():
     bear = {"ema20": 90.0, "ema50": 100.0, "ema200": 110.0}
     assert _ema_stack_label(bear, 103.0) == "bearish"  # above e50, below e200
     assert _ema_stack_label(bear, 111.0) == "mixed"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [True, float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+)
+def test_ema_stack_rejects_invalid_price_inputs(bad_value):
+    valid = {"ema20": 105.0, "ema50": 100.0, "ema200": 90.0}
+    invalid_ema = {**valid, "ema20": bad_value}
+
+    assert _ema_stack_label(invalid_ema, 110.0) == "unknown"
+    assert _ema_stack_label(valid, bad_value) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [True, float("nan"), float("inf"), float("-inf"), 10**400, "not-a-number"],
+)
+def test_indicator_series_tail_replaces_invalid_values_with_none(bad_value):
+    assert _series_tail([1.23456789, bad_value, None]) == [1.234568, None, None]
+
+
+@pytest.mark.parametrize("bad_value", [True, "100", 0.0, -1.0])
+def test_relative_pct_rejects_invalid_price_inputs(bad_value):
+    assert _relative_pct(bad_value, 100.0) is None
+    assert _relative_pct(100.0, bad_value) is None
 
 
 # --- K2-02: BTC regime anchor in the analyze context ------------------------
@@ -124,6 +152,79 @@ async def test_fetch_btc_regime_shape_and_cache():
     # second call within TTL is fully served from cache (no new upstream fetch)
     await fetch_btc_regime(client)
     assert client.calls == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_fetch_btc_regime_cache_is_scoped_to_client():
+    clear_btc_regime_cache()
+    clear_daily_cache()
+    first = _BtcClient()
+    second = _BtcClient()
+
+    await fetch_btc_regime(first)
+    await fetch_btc_regime(second)
+
+    assert first.calls == {"1H": 1, "1D": 1}
+    assert second.calls == {"1H": 1, "1D": 1}
+
+
+@pytest.mark.asyncio
+async def test_fetch_btc_regime_cache_is_scoped_to_requested_depth():
+    clear_btc_regime_cache()
+    clear_daily_cache()
+
+    class _DepthBtcClient(_BtcClient):
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            self.calls[interval] = self.calls.get(interval, 0) + 1
+            return [
+                Candle(
+                    time=(1_700_000_000 + i * 3_600) * 1000,
+                    open=100.0 + i,
+                    high=101.0 + i,
+                    low=99.0 + i,
+                    close=100.0 + i,
+                    vol=5.0,
+                )
+                for i in range(limit_hint)
+            ]
+
+    client = _DepthBtcClient()
+    shallow = await fetch_btc_regime(
+        client, htf_limit_hint=20, daily_limit_hint=20
+    )
+    deep = await fetch_btc_regime(
+        client, htf_limit_hint=260, daily_limit_hint=260
+    )
+
+    assert shallow["btc_daily_stack"] == "unknown"
+    assert deep["btc_daily_stack"] == "bullish"
+    assert client.calls == {"1H": 2, "1D": 2}
+
+
+@pytest.mark.asyncio
+async def test_fetch_btc_regime_ttl_starts_after_successful_fetch(monkeypatch):
+    clear_btc_regime_cache()
+    clear_daily_cache()
+    elapsed = [1_000.0]
+    monkeypatch.setattr(
+        ctxmod,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed[0]),
+    )
+
+    class _AdvancingBtcClient(_BtcClient):
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            candles = await super().klines(
+                symbol, interval, limit_hint=limit_hint, paced=paced
+            )
+            elapsed[0] += 151.0
+            return candles
+
+    client = _AdvancingBtcClient()
+    first = await fetch_btc_regime(client, ttl=300.0)
+    second = await fetch_btc_regime(client, ttl=300.0)
+
+    assert second is first
 
 
 @pytest.mark.asyncio
@@ -233,6 +334,23 @@ def test_track_record_absent_below_min_sample():
     assert "TRACK RECORD (calibration hint)" not in build_system_prompt(ctx)
 
 
+def test_track_record_omits_expectancy_from_undersampled_r_values():
+    raw = _raw_stats()
+    raw["overall_net_sample"] = 1
+    raw["by_confidence"]["high"]["realized_r_sample"] = 1
+    raw["by_setup"]["pullback"]["realized_r_sample"] = 1
+
+    track_record = build_track_record(
+        build_stats_response(raw, min_sample=20), min_sample=20
+    )
+
+    assert track_record is not None
+    assert track_record["overall"]["n"] == 25
+    assert "net_expectancy_r" not in track_record["overall"]
+    assert "avg_r" not in track_record["by_confidence"]["high"]
+    assert "avg_r" not in track_record["by_setup"]["pullback"]
+
+
 # --- R2-04: aggregate remaining risk budget when a position exists ------------
 
 
@@ -337,3 +455,41 @@ def test_reevaluate_context_contains_original_thesis():
     assert "ORIGINAL THESIS (consistency anchor)" in with_thesis
     assert "state explicitly whether it still holds" in with_thesis
     assert "ORIGINAL THESIS (consistency anchor)" not in build_reevaluate_system_prompt()
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        {"action": "HOLD", "entry_price": 100.0},
+        {"action": True, "entry_price": 100.0},
+        {"action": "BUY", "entry_price": True},
+        {"action": "BUY", "entry_price": 0},
+        {"action": "BUY", "entry_price": float("nan")},
+        {"action": "BUY", "entry_price": 10**400},
+    ],
+)
+def test_original_thesis_rejects_invalid_directional_anchor(proposal):
+    assert build_original_thesis(proposal) is None
+
+
+def test_original_thesis_bounds_and_sanitizes_persisted_fields():
+    thesis = build_original_thesis(
+        {
+            "action": "BUY",
+            "entry_price": 100,
+            "stop_loss": float("inf"),
+            "tp1": False,
+            "setup_confidence": "certain",
+            "chart_pattern": " x " * 100,
+            "rationale": " rationale " * 500,
+        }
+    )
+
+    assert thesis is not None
+    assert thesis["action"] == "BUY"
+    assert thesis["entry_price"] == 100.0
+    assert "stop_loss" not in thesis
+    assert "tp1" not in thesis
+    assert "setup_confidence" not in thesis
+    assert len(thesis["chart_pattern"]) == 80
+    assert len(thesis["rationale"]) == 1000

@@ -1,8 +1,10 @@
 """GET /api/fills — account executions for chart trade markers."""
 
+import asyncio
 import httpx
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.hyperliquid.errors import HyperliquidError
@@ -103,3 +105,34 @@ def test_fills_exchange_error_soft():
     body = r.json()
     assert body["supported"] is True
     assert "info down" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_fills_hot_swap_rejects_old_client_rows():
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_fills(*, symbol, limit):
+        started.set()
+        await release.wait()
+        return [{"source": "old"}]
+
+    old_client = SimpleNamespace(user_fills=old_fills)
+    new_client = object()
+    state = SimpleNamespace(mexc=old_client, exchange=old_client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    task = asyncio.create_task(main.fills(request, None, 100, None))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    state.mexc = new_client
+    state.exchange = new_client
+    release.set()
+    with pytest.raises(main.HTTPException) as exc:
+        await task
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Exchange changed while loading data. Retry the request."

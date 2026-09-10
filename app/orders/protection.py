@@ -35,7 +35,7 @@ def _positive_price(value: object) -> float | None:
     return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
-def classify_order_label(label: str | None) -> str | None:
+def classify_order_label(label: object) -> str | None:
     """Classify an order purely by its type/kind label → 'sl' | 'tp' | None.
 
     None means "no usable label" (empty/plan/unknown) — the caller decides the
@@ -47,6 +47,8 @@ def classify_order_label(label: str | None) -> str | None:
     auto-flatten verifier skip a real stop (fail-open). This keeps the verifier
     bit-identical to its prior inline rule.
     """
+    if label is not None and not isinstance(label, str):
+        return None
     s = (label or "").strip().lower()
     if not s:
         return None
@@ -54,6 +56,17 @@ def classify_order_label(label: str | None) -> str | None:
         return "tp"
     if "stop" in s or "sl" in s:
         return "sl"
+    return None
+
+
+def _position_side(value: object) -> str | None:
+    if isinstance(value, bool):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "long"):
+        return "long"
+    if normalized in ("2", "short"):
+        return "short"
     return None
 
 
@@ -82,7 +95,7 @@ def classify_unlabeled_trigger(
 
 
 def classify_protection(
-    stops: list[dict], *, side: str | None = None, entry: float | None = None
+    stops: list[object], *, side: str | None = None, entry: float | None = None
 ) -> tuple[float | None, float | None]:
     """Best-effort current (sl, tp) from open trigger orders for one symbol.
 
@@ -103,14 +116,38 @@ def classify_protection(
     """
     sl_candidates: list[float] = []
     tp: float | None = None
+    side_n = (side or "").strip().lower()
     for row in stops or []:
+        if not isinstance(row, dict):
+            continue
+        position_types = [
+            row.get(key)
+            for key in ("positionType", "position_type")
+            if key in row and row.get(key) is not None
+        ]
+        if position_types:
+            normalized_types = [_position_side(value) for value in position_types]
+            if any(value is None for value in normalized_types) or len(
+                set(normalized_types)
+            ) != 1:
+                continue
+            if (
+                side_n in ("long", "short")
+                and normalized_types[0] != side_n
+            ):
+                continue
         sl_field = _positive_price(row.get("stopLossPrice"))
+        tp_field = _positive_price(row.get("takeProfitPrice"))
+        invalid_explicit = (
+            row.get("stopLossPrice") is not None and sl_field is None
+        ) or (row.get("takeProfitPrice") is not None and tp_field is None)
+        if invalid_explicit:
+            continue
         if sl_field is not None:
             sl_candidates.append(sl_field)
-            continue
-        tp_field = _positive_price(row.get("takeProfitPrice"))
         if tp_field is not None:
             tp = tp_field
+        if sl_field is not None or tp_field is not None:
             continue
         raw_trg = row.get("triggerPrice")
         if raw_trg is None:
@@ -118,7 +155,10 @@ def classify_protection(
         trg = _positive_price(raw_trg)
         if trg is None:
             continue
-        kind = classify_order_label(row.get("orderType"))
+        label_raw = row.get("orderType")
+        if label_raw is not None and not isinstance(label_raw, str):
+            continue
+        kind = classify_order_label(label_raw)
         if kind == "tp":
             tp = trg
         elif kind == "sl":

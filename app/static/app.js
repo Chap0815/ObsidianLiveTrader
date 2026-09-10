@@ -493,25 +493,25 @@
       const short = String(p.side || "").toLowerCase() === "short";
 
       // SL/TP levels from the open trigger orders on the exchange (auto mode)
-      let sl = null;
       let tp = null;
+      const zoneSlCandidates = [];
       const stops = (state.openOrders && state.openOrders.stop_orders) || [];
       stops.forEach(function (s) {
         if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
         // T41b: one frontend source for SL/TP classification (field → label →
         // geometry), mirroring app/orders/protection.py.
         const c = classifyTriggers(s, short ? "short" : "long", entry);
-        if (c.sl != null) sl = c.sl;
+        if (c.sl != null) zoneSlCandidates.push(c.sl);
         if (c.tp != null) tp = c.tp;
       });
+      let sl = mostProtectiveSl(zoneSlCandidates, short ? "short" : "long");
       // Fallback for MANUAL mode (no exchange trigger): the SL/TP the trader
       // set at entry, remembered on confirm. This is the ONE place the manual
       // trader still gets a visual SL/TP zone.
-      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
-      if (mk) {
-        if (sl == null && mk.sl) sl = mk.sl;
-        if (tp == null && mk.tp) tp = mk.tp;
-      }
+      const rawMk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
+      const mk = normalizeTradeMarker(rawMk);
+      if (sl == null && mk.sl != null) sl = mk.sl;
+      if (tp == null && mk.tp != null) tp = mk.tp;
 
       const yEntry = series.priceToCoordinate(entry);
       if (yEntry == null) return;
@@ -523,9 +523,10 @@
       // storage), else the persisted raw-ms entry time re-bucketed to the
       // CURRENT tf, else the legacy in-memory value as a last resort.
       let xStart = 0;
-      let et = oldestOpenFillTime(p.symbol);
-      if (et == null && mk && mk.entryMs) {
-        et = barOpenTimeSec(mk.entryMs, state.tf || "15m");
+      let et = currentOpenFillTime(p.symbol, short ? "short" : "long");
+      const markerEntryMs = tradeMarkerTime(rawMk, "entryMs", Date.now());
+      if (et == null && markerEntryMs != null) {
+        et = barOpenTimeSec(markerEntryMs, state.tf || "15m");
       }
       if (et == null) {
         et = state.tradeEntryTimes && state.tradeEntryTimes[p.symbol];
@@ -833,12 +834,7 @@
       ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
     }
     const isHyperliquid = ex === "hyperliquid";
-    if (isHyperliquid) {
-      const ca = na.split("_")[0];
-      const cb = nb.split("_")[0];
-      return ca !== "" && ca === cb;
-    }
-    return na === nb;
+    return symbolsMatch(na, nb, isHyperliquid);
   }
 
   /** Task 40 (N3-14): same exchange lookup as symMatch, exposed standalone —
@@ -873,38 +869,17 @@
     return ex === "hyperliquid" ? s.split("_")[0] : s;
   }
 
-  /** Three-way fill classification (C3-02): Hyperliquid's free-text `dir`
-   *  field says what actually happened. A naive `dir.indexOf("close")`
-   *  check only recognizes ordinary closes — liquidations ("Liquidated
-   *  Long") and position flips ("Long > Short") contain no "close"
-   *  substring, so they fell through to the OPEN branch and the worst
-   *  possible event (a liquidation) rendered as a normal, full-color,
-   *  deliberate-looking entry marker. Detect both explicitly so they get
-   *  their own (unmissable) treatment instead. */
-  function classifyFillDir(dir) {
-    const s = String(dir || "").toLowerCase();
-    if (s.indexOf("liquidat") !== -1 || s.indexOf(">") !== -1) return "liq";
-    if (s.indexOf("close") !== -1) return "close";
-    return "open";
-  }
-
-  /** C3-07: the most durable source for "when did this position start" is
-   *  the oldest still-known OPEN fill for the symbol — it needs no
-   *  persistence at all and survives a full localStorage wipe. Preferred
-   *  over the persisted tradeMarkers.entryMs when fills are loaded (HL
-   *  only; MEXC has no fill history so this always falls through). Returns
-   *  the entry bucketed to the CURRENT tf, or null if no open fill is known. */
-  function oldestOpenFillTime(symbol) {
-    const fills = state.fills || [];
-    let minMs = null;
-    fills.forEach(function (f) {
-      if (!symMatch(f.symbol, symbol)) return;
-      if (classifyFillDir(f.dir) !== "open") return;
-      const t = Number(f.time);
-      if (!(t > 0)) return;
-      if (minMs == null || t < minMs) minMs = t;
+  /** C3-07: prefer the latest proven Flat->Open fill for this position side.
+   *  That survives localStorage loss without anchoring a reopened position to
+   *  an older completed trade. MEXC has no start_position evidence and safely
+   *  falls through to the persisted/manual marker below. */
+  function currentOpenFillTime(symbol, side) {
+    const matchingFills = (state.fills || []).filter(function (fill) {
+      return fill && typeof fill === "object" && !Array.isArray(fill) &&
+        symMatch(fill.symbol, symbol);
     });
-    return minMs == null ? null : barOpenTimeSec(minMs, state.tf || "15m");
+    const entryMs = currentPositionEntryFillTime(matchingFills, side, Date.now());
+    return entryMs == null ? null : barOpenTimeSec(entryMs, state.tf || "15m");
   }
 
   function drawProposalLines() {
@@ -925,12 +900,12 @@
       };
       // Core trade — hidden once applied to the ticket (ticket lines take over)
       if (!state.proposalApplied) {
-        addChartLine(specs, p.entry_price, chartColors.kiEntry, 2, "KI Entry", 2);
-        addChartLine(specs, p.stop_loss, chartColors.short, 1, "KI SL -1R");
-        addChartLine(specs, p.tp1, chartColors.long, 1, tpTitle("KI TP1", p.tp1));
+        addChartLine(specs, p.entry_price, chartColors.kiEntry, 2, "AI Entry", 2);
+        addChartLine(specs, p.stop_loss, chartColors.short, 1, "AI SL -1R");
+        addChartLine(specs, p.tp1, chartColors.long, 1, tpTitle("AI TP1", p.tp1));
       }
-      addChartLine(specs, p.tp2, chartColors.long, 4, tpTitle("KI TP2", p.tp2));
-      addChartLine(specs, p.tp3, chartColors.long, 4, tpTitle("KI TP3", p.tp3));
+      addChartLine(specs, p.tp2, chartColors.long, 4, tpTitle("AI TP2", p.tp2));
+      addChartLine(specs, p.tp3, chartColors.long, 4, tpTitle("AI TP3", p.tp3));
 
       // Analysis levels
       const kl = p.key_levels || {};
@@ -984,32 +959,11 @@
     });
     (d.stop_orders || []).forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
-      let drew = false;
-      const slPx = Number(s.stopLossPrice);
-      const tpPx = Number(s.takeProfitPrice);
-      if (Number.isFinite(slPx) && slPx > 0) {
-        addChartLine(specs, slPx, chartColors.short, 2, "SL active");
-        drew = true;
-      }
-      if (Number.isFinite(tpPx) && tpPx > 0) {
-        addChartLine(specs, tpPx, chartColors.long, 2, "TP active");
-        drew = true;
-      }
-      if (!drew) {
-        const px = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-        // T41b: shared label classifier (mirrors app/orders/protection.py) —
-        // the combined "tpsl" order carries a STOP and now correctly draws as
-        // "SL aktiv", not "TP aktiv" (the old `indexOf("tp") === 0` prefix
-        // rule mislabeled it). No side/entry here, so an unlabeled trigger
-        // stays SL for visibility (never fabricated as a favourable TP line).
-        const isTp = classifyTriggerLabel(s.orderType) === "tp";
-        addChartLine(
-          specs,
-          px,
-          isTp ? chartColors.long : chartColors.short,
-          2,
-          isTp ? "TP active" : "SL active"
-        );
+      const c = classifyChartTrigger(s);
+      if (c.sl != null) addChartLine(specs, c.sl, chartColors.short, 2, "SL active");
+      if (c.tp != null) addChartLine(specs, c.tp, chartColors.long, 2, "TP active");
+      if (c.trigger != null) {
+        addChartLine(specs, c.trigger, chartColors.order, 2, "Trigger active");
       }
     });
     applyLineGroup(state.orderLines, "order", specs);
@@ -1044,21 +998,10 @@
     });
     (d.stop_orders || []).forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, state.symbol)) return;
-      const slPx = Number(s.stopLossPrice);
-      const tpPx = Number(s.takeProfitPrice);
-      let drew = false;
-      if (Number.isFinite(slPx) && slPx > 0) {
-        out.push(slPx);
-        drew = true;
-      }
-      if (Number.isFinite(tpPx) && tpPx > 0) {
-        out.push(tpPx);
-        drew = true;
-      }
-      if (!drew) {
-        const px = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-        if (Number.isFinite(px) && px > 0) out.push(px);
-      }
+      const c = classifyChartTrigger(s);
+      [c.sl, c.tp, c.trigger].forEach(function (px) {
+        if (px != null) out.push(px);
+      });
     });
     return out;
   }
@@ -1323,10 +1266,9 @@
     positions.forEach(function (p) {
       const key = markerKey(p.symbol); // A3-01: same schema the marker was written under
       if (!symMatch(p.symbol, state.symbol)) return; // only compare live price against the active symbol's SL
-      const mk = state.tradeMarkers && state.tradeMarkers[key];
-      if (!mk || !mk.manual || !mk.sl) { state.slAlarm[key] = false; return; }
-      const sl = Number(mk.sl);
-      if (!Number.isFinite(sl) || sl <= 0) return;
+      const mk = normalizeTradeMarker(state.tradeMarkers && state.tradeMarkers[key]);
+      if (!mk.manual || mk.sl == null) { state.slAlarm[key] = false; return; }
+      const sl = mk.sl;
       const short = String(p.side || "").toLowerCase() === "short";
       // E3-06 SAFETY: the alarm must fail TOWARD alerting. We test BOTH the raw
       // last-traded tick AND the mark-corrected price and fire on the UNION — so
@@ -2135,8 +2077,10 @@
    *  number instead of two calcs quietly drifting apart. */
   function positionRiskUsdt(p) {
     if (!p) return null;
-    const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
-    const sl = mk && Number(mk.sl);
+    const mk = normalizeTradeMarker(
+      state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)]
+    );
+    const sl = mk.sl;
     const entry = Number(p.entry_price);
     const vol = Number(p.hold_vol);
     if (!Number.isFinite(sl) || !sl || !Number.isFinite(entry) || !Number.isFinite(vol) || !vol) {
@@ -2263,7 +2207,7 @@
     if (o.reduceOnly) {
       // closes the opposite side of the order
       const region = reduceOrderRegion(o);
-      const suffix = region === "SL" ? " (SL-Bereich)" : region === "TP" ? " (TP-Bereich)" : "";
+      const suffix = region === "SL" ? " (SL zone)" : region === "TP" ? " (TP zone)" : "";
       if (isBuy) return '<span class="side-tag tag-short">↓ Reduce Short' + suffix + '</span>';
       if (isSell) return '<span class="side-tag tag-long">↑ Reduce Long' + suffix + '</span>';
       return '<span class="side-tag tag-flat">Reduce</span>';
@@ -2376,7 +2320,6 @@
    *  means open orders aren't loaded yet → show "loading", never a false
    *  "no stop-loss" alarm. */
   function findPositionProtection(p) {
-    let sl = null;
     let tp = null;
     const oo = state.openOrders;
     // ordersKnown only when the stop-order lookup actually SUCCEEDED. A
@@ -2406,26 +2349,30 @@
     let slVol = 0;
     let slVolAllReadable = true;
     let sawSlOrder = false;
+    const slCandidates = [];
     stops.forEach(function (s) {
       if (s.symbol && !symMatch(s.symbol, p.symbol)) return;
       const c = classifyTriggers(s, short ? "short" : "long", entry);
       if (c.sl != null) {
-        sl = c.sl;
+        slCandidates.push(c.sl);
         sawSlOrder = true;
         // Same vol read as the trigger-order list (N3-11): field name varies by
         // exchange (MEXC `vol`, others `sz`/`quantity`).
-        const v = Number(s.vol != null ? s.vol : s.sz != null ? s.sz : s.quantity);
-        if (Number.isFinite(v) && v > 0) slVol += v;
+        const v = positiveFiniteNumber(
+          s.vol != null ? s.vol : s.sz != null ? s.sz : s.quantity
+        );
+        if (v != null) slVol += v;
         else slVolAllReadable = false;
       }
       if (c.tp != null) tp = c.tp;
     });
-    const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
+    let sl = mostProtectiveSl(slCandidates, short ? "short" : "long");
+    const mk = normalizeTradeMarker(
+      state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)]
+    );
     let manual = false;
-    if (mk) {
-      if (sl == null && mk.sl) { sl = mk.sl; manual = !!mk.manual; }
-      if (tp == null && mk.tp) tp = mk.tp;
-    }
+    if (sl == null && mk.sl != null) { sl = mk.sl; manual = mk.manual; }
+    if (tp == null && mk.tp != null) tp = mk.tp;
     // Coverage verdict — CONSERVATIVE: only assert under-coverage when the SL
     // came from exchange orders whose sizes were ALL readable. A manual-marker
     // SL (no exchange size), an unreadable size, or an unknown hold_vol all fall
@@ -2600,7 +2547,7 @@
       " · " +
       fmt(vol, 4) +
       "</span></div>" +
-      '<div class="ir-cell ir-pnlcell"><span class="ir-lbl">Unrealisiert</span>' +
+      '<div class="ir-cell ir-pnlcell"><span class="ir-lbl">Unrealized PnL</span>' +
       '<span class="ir-bigpnl ' +
       pnlCls +
       '"><span class="js-ir-pnl">' +
@@ -2610,10 +2557,10 @@
         ? '<small class="js-ir-roe">' + (roe >= 0 ? "+" : "") + fmt(roe, 1) + "% ROE</small>"
         : "") +
       "</span></div>" +
-      '<div class="ir-cell"><span class="ir-lbl">Schutz</span>' +
+      '<div class="ir-cell"><span class="ir-lbl">Protection</span>' +
       protHtml +
       "</div>" +
-      '<div class="ir-cell"><span class="ir-lbl">Liq-Distanz</span>' +
+      '<div class="ir-cell"><span class="ir-lbl">Liq. distance</span>' +
       '<span class="ir-v ir-num">' +
       (liqPct != null ? fmt(liqPct, 1) + "%" : "—") +
       "</span>" +
@@ -2794,7 +2741,10 @@
       if (a === "reeval") {
         // "KI: Position bewerten" — advisory only, never trades.
         e.stopPropagation();
-        runReevaluate(actionEl.getAttribute("data-sym"));
+        runReevaluate(
+          actionEl.getAttribute("data-sym"),
+          actionEl.getAttribute("data-side")
+        );
         return;
       }
     }
@@ -2925,7 +2875,8 @@
     // Computed once, reused for BOTH the HTML and the fingerprint so the SL
     // banner / reeval block can't drift between what's shown and what's hashed.
     const slHtml = slStatusBanner(p);
-    const reevalHtml = reevalResultHtml(p.symbol);
+    const reevalHtml = reevalResultHtml(p.symbol, sideVal);
+    const reevalKey = _reevalKey(p.symbol, sideVal);
     // Task 7: ⚡ Auto-BE arming toggle — computed once, reused for BOTH the
     // HTML and the fingerprint (same discipline as slHtml/reevalHtml above)
     // so the button can never drift from what the fp hashed.
@@ -3016,9 +2967,9 @@
       "</div>" +
       '<div class="cp-reeval">' +
       '<button type="button" class="cp-reeval-btn" data-action="reeval" data-sym="' +
-      escapeHtml(String(p.symbol || "")) + '">AI: Review position</button>' +
-      '<div class="cp-reeval-result" data-sym-result="' +
-      escapeHtml(String(p.symbol || "").toUpperCase()) + '">' +
+      escapeHtml(String(p.symbol || "")) + '" data-side="' + sideVal +
+      '" data-reeval-key="' + reevalKey + '">AI: Review position</button>' +
+      '<div class="cp-reeval-result" data-reeval-key="' + reevalKey + '">' +
       reevalHtml +
       "</div>" +
       "</div>" +
@@ -3275,13 +3226,71 @@
     return c === "high" ? "High" : c === "medium" ? "Medium" : "Low";
   }
 
-  /** Render the cached /api/reevaluate result (or error) for one symbol, or
+  function _reevalKey(sym, side) {
+    const symbol = String(sym || "").toUpperCase().trim();
+    const direction = String(side || "").toLowerCase().trim();
+    if (!symbol || (direction !== "long" && direction !== "short")) return "";
+    return encodeURIComponent(symbol) + "|" + direction;
+  }
+
+  /** Identity of the currently open position snapshot behind an AI review.
+   *  Entry and size join the exchange position id because Hyperliquid uses the
+   *  coin itself as its id. Sorting keeps duplicate/hedged rows deterministic. */
+  function _reevalPositionFingerprint(sym, side) {
+    const direction = String(side || "").toLowerCase().trim();
+    const positions = (state.account && state.account.positions) || [];
+    const rows = positions
+      .filter(function (p) {
+        return (
+          symMatch(p.symbol, sym) &&
+          String(p.side || "").toLowerCase() === direction &&
+          Math.abs(Number(p.hold_vol) || 0) > 0
+        );
+      })
+      .map(function (p) {
+        const positionId = p.position_id != null ? p.position_id : p.positionId;
+        const entry = Number(p.entry_price);
+        const hold = Number(p.hold_vol);
+        return JSON.stringify([
+          positionId == null ? "" : String(positionId),
+          Number.isFinite(entry) ? entry : null,
+          Number.isFinite(hold) ? hold : null,
+        ]);
+      })
+      .sort();
+    return rows.length ? JSON.stringify(rows) : "";
+  }
+
+  /** Full advisory context identity. A position review is not reusable after
+   *  changing either timeframe or the selected AI provider. */
+  function _reevalReviewFingerprint(sym, side) {
+    const positionFingerprint = _reevalPositionFingerprint(sym, side);
+    if (!positionFingerprint) return "";
+    const providerSelect = $("llm-select");
+    const provider = providerSelect ? String(providerSelect.value || "") : "";
+    return JSON.stringify([
+      positionFingerprint,
+      String(state.tf || "15m"),
+      String(state.htf || "1H"),
+      provider,
+    ]);
+  }
+
+  /** Render the cached /api/reevaluate result (or error) for one position, or
    *  "" when nothing has been fetched yet — the position card then just
    *  shows the "KI: Position bewerten" button with no extra block. */
-  function reevalResultHtml(sym) {
-    const key = String(sym || "").toUpperCase().trim();
+  function reevalResultHtml(sym, side) {
+    const key = _reevalKey(sym, side);
     const entry = key ? state.reevalResults[key] : null;
     if (!entry) return "";
+    const currentFingerprint = _reevalReviewFingerprint(sym, side);
+    if (
+      !entry.reviewFingerprint ||
+      entry.reviewFingerprint !== currentFingerprint
+    ) {
+      delete state.reevalResults[key];
+      return "";
+    }
     if (entry.error) {
       const text = String(entry.error);
       if (isLlmWarnMessage(text)) {
@@ -3333,21 +3342,35 @@
 
   /** KI reevaluation of one ALREADY OPEN position ("KI: Position bewerten").
    *  Advisory only — never places, moves or closes anything itself. Guards
-   *  against double-click/race per symbol via state.reevalBusy. */
-  async function runReevaluate(sym) {
-    const key = String(sym || "").toUpperCase().trim();
+   *  against double-click/race per position via state.reevalBusy. */
+  async function runReevaluate(sym, side) {
+    const symbolKey = String(sym || "").toUpperCase().trim();
+    const sideKey = String(side || "").toLowerCase().trim();
+    const key = _reevalKey(symbolKey, sideKey);
     if (!key) return;
+    const reviewFingerprint = _reevalReviewFingerprint(symbolKey, sideKey);
+    if (!reviewFingerprint) return;
     if (state.reevalBusy[key]) return;
     state.reevalBusy[key] = true;
 
-    const btn = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
-    const out = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
+    function cacheReevalResult(value) {
+      const currentFingerprint = _reevalReviewFingerprint(symbolKey, sideKey);
+      if (currentFingerprint !== reviewFingerprint) return false;
+      state.reevalResults[key] =
+        value && typeof value === "object"
+          ? Object.assign({}, value, { reviewFingerprint: reviewFingerprint })
+          : value;
+      return true;
+    }
+
+    const btn = document.querySelector('.cp-reeval-btn[data-reeval-key="' + key + '"]');
+    const out = document.querySelector('.cp-reeval-result[data-reeval-key="' + key + '"]');
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Bewerte…";
+      btn.textContent = "Reviewing…";
     }
     if (out) {
-      out.innerHTML = '<div class="cp-reeval-out cp-reeval-loading">KI bewertet Position…</div>';
+      out.innerHTML = '<div class="cp-reeval-out cp-reeval-loading">AI is reviewing the position…</div>';
     }
 
     try {
@@ -3355,7 +3378,8 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          symbol: key,
+          symbol: symbolKey,
+          side: sideKey,
           tf: state.tf || "15m",
           htf: state.htf || "1H",
         }),
@@ -3370,26 +3394,26 @@
         const detail =
           (data && (data.detail || data.message)) || res.statusText || "Position review failed";
         const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
-        state.reevalResults[key] = { error: msg };
+        cacheReevalResult({ error: msg });
       } else {
-        state.reevalResults[key] = data;
+        cacheReevalResult(data);
       }
     } catch (err) {
-      state.reevalResults[key] = {
+      cacheReevalResult({
         error: "Network error: " + (err && err.message ? err.message : err),
-      };
+      });
     } finally {
       state.reevalBusy[key] = false;
       // Re-render just this card's result block; a full renderPositions()
       // would be fine too, but this avoids reshuffling the whole panel.
-      const out2 = document.querySelector('.cp-reeval-result[data-sym-result="' + key + '"]');
+      const out2 = document.querySelector('.cp-reeval-result[data-reeval-key="' + key + '"]');
       if (out2) {
         // The card's "KI wechseln" button (if this result is a provider error)
         // is handled by the #positions-body delegated listener — no per-element
         // wiring needed here anymore (T34).
-        out2.innerHTML = reevalResultHtml(key);
+        out2.innerHTML = reevalResultHtml(symbolKey, sideKey);
       }
-      const btn2 = document.querySelector('.cp-reeval-btn[data-sym="' + key + '"]');
+      const btn2 = document.querySelector('.cp-reeval-btn[data-reeval-key="' + key + '"]');
       if (btn2) {
         btn2.disabled = false;
         btn2.textContent = "AI: Review position";
@@ -3556,27 +3580,28 @@
       // Active SL/TP triggers (protective orders on the exchange)
       const stopsHtml = stops
         .map(function (s) {
-          const slPx = Number(s.stopLossPrice);
-          const tpPx = Number(s.takeProfitPrice);
-          const trgPx = Number(s.triggerPrice != null ? s.triggerPrice : s.price);
-          // T41b: shared classifier (field → label, mirrors protection.py). No
-          // position side/entry in this list, so geometry is skipped; an
-          // unlabeled trigger reads as SL (never a fabricated TP).
-          const isTp = classifyTriggers(s).tp != null;
-          const px = Number.isFinite(slPx) && slPx > 0 ? slPx
-            : Number.isFinite(tpPx) && tpPx > 0 ? tpPx
-            : trgPx;
+          const c = classifyChartTrigger(s);
+          const isSl = c.sl != null;
+          const isTp = c.tp != null;
+          const px = isSl ? c.sl : isTp ? c.tp : c.trigger;
+          const triggerClass = isSl ? "tag-short" : isTp ? "tag-long" : "";
+          const triggerLabel = isSl && isTp ? "SL / TP ACTIVE"
+            : isSl ? "SL ACTIVE" : isTp ? "TP ACTIVE"
+            : c.trigger != null ? "TRIGGER ACTIVE" : "TRIGGER UNKNOWN";
+          const priceKv = isSl && isTp
+            ? posKv("SL", fmt(c.sl, 4)) + posKv("TP", fmt(c.tp, 4))
+            : posKv("Trigger", fmt(px, 4));
           // N3-11: volume + signed distance to the live market so a resting
           // trigger is legible at a glance. Volume field name varies by
           // exchange (MEXC `vol`, others `sz`/`quantity`); show it only when a
           // finite value exists rather than a misleading "—". These trigger
           // rows are pre-filtered to the ACTIVE symbol, so state.lastPx is the
           // right reference for the distance.
-          const svolRaw = Number(
+          const svolRaw = positiveFiniteNumber(
             s.vol != null ? s.vol : s.sz != null ? s.sz : s.quantity
           );
           const volKv =
-            Number.isFinite(svolRaw) && svolRaw > 0 ? posKv("Vol", fmt(svolRaw, 4)) : "";
+            svolRaw != null ? posKv("Vol", fmt(svolRaw, 4)) : "";
           const mkt = Number(state.lastPx);
           const distPct =
             Number.isFinite(mkt) && mkt > 0 && Number.isFinite(px) && px > 0
@@ -3596,14 +3621,14 @@
             soid != null
               ? '<button type="button" class="btn-cancel-order btn-cancel-trigger" data-oid="' +
                 escapeHtml(String(soid)) +
-                '" data-sl="' + (isTp ? "0" : "1") + '">Cancel</button>'
+                '" data-sl="' + (isSl ? "1" : "0") + '">Cancel</button>'
               : "";
           return (
             '<div class="order-row order-row-trigger">' +
             '<span class="pos-sym">' + escapeHtml(s.symbol || "—") + "</span>" +
-            '<span class="side-tag ' + (isTp ? "tag-long" : "tag-short") + '">' +
-            (isTp ? "TP ACTIVE" : "SL ACTIVE") + "</span>" +
-            posKv("Trigger", fmt(px, 4)) +
+            '<span class="side-tag ' + triggerClass + '">' +
+            triggerLabel + "</span>" +
+            priceKv +
             volKv +
             distKv +
             cancelBtn +
@@ -3873,7 +3898,16 @@
       // reports supported=false for any exchange client without a working
       // user_fills, so MEXC (and any future exchange) works through this
       // SAME code path with no frontend special-case.
-      state.fills = data.supported && Array.isArray(data.fills) ? data.fills : [];
+      // Treat even same-origin JSON as untrusted at the browser boundary. A
+      // malformed side used to become an implicit SELL in the trade ledger;
+      // invalid numeric fields could poison VWAP/round-trip totals with 0/NaN/
+      // Infinity. Drop the whole row when its trade identity is not provable.
+      const fillsNow = Date.now();
+      state.fills = data.supported && Array.isArray(data.fills)
+        ? data.fills.map(function (fill) {
+          return normalizeFillRecord(fill, fillsNow);
+        }).filter(function (fill) { return fill != null; })
+        : [];
       applyTradeMarkers();
       try { renderTrades(); } catch (_) {}
       return data;
@@ -3955,11 +3989,16 @@
     // the LIQ marker must still dominate that bucket (see anyLiq below).
     const relevantFills = [];
     (state.fills || []).forEach(function (f) {
-      if (!symMatch(f.symbol, state.symbol) || !(Number(f.time) > 0)) return;
-      const side = f.side === "buy" ? "buy" : "sell";
-      const time = barOpenTimeSec(f.time, tf);
+      if (!f || typeof f !== "object" || Array.isArray(f)) return;
+      if (!symMatch(f.symbol, state.symbol)) return;
+      const fillTime = fillTimeMs(f.time, Date.now());
+      if (fillTime == null) return;
+      const side = normalizeFillSide(f.side);
+      if (side == null) return;
+      const time = barOpenTimeSec(fillTime, tf);
       if (firstT != null && (time < firstT || time > upperT)) return; // outside window
       const cls = classifyFillDir(f.dir); // C3-02: "open" | "close" | "liq"
+      if (cls == null) return;
       relevantFills.push({ f: f, side: side, time: time, cls: cls });
     });
     const liqBucket = new Set();
@@ -4608,13 +4647,16 @@
   function migrateTradeMarkerKeys(raw) {
     const out = {};
     let changed = false;
+    const nowMs = Date.now();
     Object.keys(raw || {}).forEach(function (rawKey) {
       const canon = markerKey(rawKey);
       if (!canon) return;
       if (canon !== rawKey) changed = true;
       const incoming = raw[rawKey];
       const existing = out[canon];
-      if (!existing || Number((incoming && incoming.ts) || 0) >= Number(existing.ts || 0)) {
+      const incomingTs = tradeMarkerTime(incoming, "ts", nowMs) || 0;
+      const existingTs = tradeMarkerTime(existing, "ts", nowMs) || 0;
+      if (!existing || incomingTs >= existingTs) {
         out[canon] = incoming;
       }
     });
@@ -4631,19 +4673,23 @@
       const stored = migrateTradeMarkerKeys(_readMarkersRaw()).markers;
       const mine = state.tradeMarkers || {};
       const merged = {};
+      const nowMs = Date.now();
       const keys = new Set(
         Object.keys(stored).concat(Object.keys(mine), Object.keys(_tradeMarkersSynced))
       );
       keys.forEach(function (key) {
         const a = mine[key];
         const b = stored[key];
-        if (a && (!b || Number(a.ts || 0) >= Number(b.ts || 0))) {
+        const aTs = tradeMarkerTime(a, "ts", nowMs) || 0;
+        const bTs = tradeMarkerTime(b, "ts", nowMs) || 0;
+        if (a && (!b || aTs >= bTs)) {
           merged[key] = a; // ours is newer, or nobody else has it
           return;
         }
         if (b) {
           const synced = _tradeMarkersSynced[key];
-          if (!a && synced && Number(b.ts || 0) <= Number(synced.ts || 0)) {
+          const syncedTs = tradeMarkerTime(synced, "ts", nowMs) || 0;
+          if (!a && synced && bTs <= syncedTs) {
             return; // we deleted it locally and nobody else touched it since -> stays deleted
           }
           merged[key] = b; // theirs is newer, or unknown to us -> keep it
@@ -4685,13 +4731,15 @@
   function pruneTradeMarkers() {
     const positions = (state.account && state.account.positions) || [];
     let changed = false;
+    const nowMs = Date.now();
     Object.keys(state.tradeMarkers || {}).forEach(function (key) {
       // A3-01: keys are canonical markerKey() form now, so compare on that
       // (not symMatch) — a bare-key equality check is exact and cheaper.
       const hasPos = positions.some(function (p) { return markerKey(p.symbol) === key; });
       if (hasPos) return;
       const mk = state.tradeMarkers[key] || {};
-      const fresh = Number(mk.ts) > 0 && Date.now() - Number(mk.ts) < 5 * 60 * 1000;
+      const markerTs = tradeMarkerTime(mk, "ts", nowMs);
+      const fresh = markerTs != null && nowMs - markerTs < 5 * 60 * 1000;
       if (fresh) return;
       delete state.tradeMarkers[key];
       changed = true;
@@ -5070,6 +5118,12 @@
     }
   }
 
+  function _formatRWithSample(value, metricSample, fallbackSample) {
+    if (value == null) return "—";
+    const sample = metricSample == null ? fallbackSample : metricSample;
+    return fmt(value, 2) + " (n=" + fmt(sample, 0) + ")";
+  }
+
   /** One {name -> {wins, losses, sample, win_rate, avg_realized_rrr, low_sample}}
    *  breakdown as a compact table; "" when there is nothing to show (empty DB).
    *  Task 40 (N3-17): each row is now clickable — `field` names the Entries-
@@ -5107,7 +5161,9 @@
         (g.win_rate != null ? fmt(g.win_rate * 100, 1) + "%" : "—") +
         "</td>" +
         "<td>" +
-        (g.avg_realized_rrr != null ? fmt(g.avg_realized_rrr, 2) : "—") +
+        _formatRWithSample(
+          g.avg_realized_rrr, g.realized_r_sample, g.sample
+        ) +
         "</td>" +
         "</tr>";
     }
@@ -5161,7 +5217,9 @@
             : "") +
           "</span>" +
           '<span class="journal-stat"><b>Ø realized R:</b> ' +
-          (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
+          _formatRWithSample(
+            ov.avg_realized_rrr, ov.realized_r_sample, sample
+          ) +
           "</span>" +
           (ov.low_sample
             ? '<span class="journal-lowflag">insufficient data</span>'
@@ -5375,7 +5433,7 @@
     let html = '<div class="journal-breakdown"><h4>' + escapeHtml(title) + "</h4>";
     html +=
       '<table class="journal-breakdown-table"><thead><tr>' +
-      "<th></th><th>n</th><th>Win-Rate</th><th>Wilson-LB</th><th>Ø R brutto</th>" +
+      "<th></th><th>n</th><th>Win rate</th><th>Wilson LB</th><th>Avg gross R</th>" +
       "</tr></thead><tbody>";
     for (const k of keys) {
       const g = groups[k] || {};
@@ -5386,7 +5444,9 @@
         "<td>" + fmt(g.sample, 0) + "</td>" +
         "<td>" + (g.win_rate != null ? fmt(g.win_rate * 100, 1) + "%" : "—") + "</td>" +
         "<td>" + (lo != null ? fmt(lo * 100, 1) + "%" : "—") + "</td>" +
-        "<td>" + (g.avg_realized_rrr != null ? fmt(g.avg_realized_rrr, 2) : "—") + "</td>" +
+        "<td>" + _formatRWithSample(
+          g.avg_realized_rrr, g.realized_r_sample, g.sample
+        ) + "</td>" +
         "</tr>";
     }
     html += "</tbody></table></div>";
@@ -5469,8 +5529,14 @@
       " (n=" + fmt(sample, 0) + ")" +
       (ci && ci[0] != null ? " · Wilson-LB " + fmt(ci[0] * 100, 1) + "%" : "") + "</span>" +
       '<span class="journal-stat"><b>Ø realized R:</b> ' +
-      (ov.avg_realized_rrr != null ? fmt(ov.avg_realized_rrr, 2) : "—") +
-      (ov.avg_realized_rrr_net != null ? " (net " + fmt(ov.avg_realized_rrr_net, 2) + ")" : "") +
+      _formatRWithSample(
+        ov.avg_realized_rrr, ov.realized_r_sample, sample
+      ) +
+      (ov.avg_realized_rrr_net != null
+        ? " (net " + _formatRWithSample(
+            ov.avg_realized_rrr_net, ov.net_sample, sample
+          ) + ")"
+        : "") +
       "</span>" +
       (ov.low_sample ? '<span class="journal-lowflag">insufficient data</span>' : "") +
       "</div></div>";
@@ -5708,7 +5774,7 @@
       html +=
         '<table class="history-table rt-table"><thead><tr>' +
         "<th>Time</th><th>Side</th><th>Size</th><th>Avg entry</th><th>Avg exit</th>" +
-        "<th>PnL</th><th>Fees</th><th>Netto</th><th>Fills</th><th></th>" +
+        "<th>PnL</th><th>Fees</th><th>Net</th><th>Fills</th><th></th>" +
         "</tr></thead><tbody>";
       folded.closed.forEach(function (rt) {
         const entryPx = rt.entrySz > 0 ? rt.entryNotional / rt.entrySz : 0;
@@ -6806,13 +6872,13 @@
     state.analyzeBusy = true;
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Analysiere…";
+      btn.textContent = "Analyzing…";
     }
     setApplyEnabled(false);
     const bodyEl = $("proposal-body");
     if (bodyEl) {
       bodyEl.className = "placeholder";
-      bodyEl.textContent = (state.llmLabel || "KI") + " analysiert…";
+      bodyEl.textContent = (state.llmLabel || "AI") + " is analyzing…";
     }
     state.proposal = null;
     state.proposalSymbol = null;
@@ -7085,6 +7151,7 @@
     else if (tf === "4H") htf = "1D";
     else if (tf === "1D") htf = "1D";
     state.htf = htf;
+    if (state.account) renderPositions(state.account);
     // Reflect state → DOM (input/output only): mark exactly the active button.
     document.querySelectorAll(".tf-btn").forEach(function (b) {
       b.classList.toggle("active", b.getAttribute("data-tf") === tf);
@@ -7595,10 +7662,12 @@
     if (pos) {
       // A3-01: route through markerKey() so a manual SL/TP still draws even when
       // the tile's display symbol is a typed full pair on Hyperliquid.
-      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(key)];
+      const mk = normalizeTradeMarker(
+        state.tradeMarkers && state.tradeMarkers[markerKey(key)]
+      );
       marks.push({ price: Number(pos.entry_price), color: chartColors.level });
-      if (mk && mk.sl) marks.push({ price: Number(mk.sl), color: chartColors.short });
-      if (mk && mk.tp) marks.push({ price: Number(mk.tp), color: chartColors.long });
+      if (mk.sl != null) marks.push({ price: mk.sl, color: chartColors.short });
+      if (mk.tp != null) marks.push({ price: mk.tp, color: chartColors.long });
     }
     const candles = d.candles || [];
     const lastC = candles.length ? candles[candles.length - 1] : null;
@@ -7867,7 +7936,7 @@
     const p = (data && data.providers || []).find(function (x) {
       return x.id === providerId;
     });
-    return (p && p.label) || providerId || "KI";
+    return (p && p.label) || providerId || "AI";
   }
 
   function applyLlmStatus(data) {
@@ -7915,6 +7984,7 @@
         return;
       }
       applyLlmStatus(data);
+      if (state.account) renderPositions(state.account);
       showToast("AI provider changed: " + llmLabelFor(data, data.provider), "ok");
     } catch (err) {
       showToast("Could not switch AI provider: " + (err && err.message), "err");
@@ -8151,6 +8221,31 @@
     }
   }
 
+  function slMoveResultToast(data, requestedPx, successPrefix) {
+    data = data && typeof data === "object" ? data : {};
+    const warnings = Array.isArray(data.warnings)
+      ? data.warnings.filter(Boolean).map(String)
+      : [];
+    if (data.verified !== true) {
+      const status = data.status ? " (" + String(data.status) + ")" : "";
+      const detail = warnings.length ? " — " + warnings.join("; ") : "";
+      return {
+        message:
+          "⚠ Stop change not verified" + status + detail +
+          " — check open stops on the exchange before acting again.",
+        kind: "err",
+      };
+    }
+    const warningText = warnings.length ? " — ⚠ " + warnings.join("; ") : "";
+    return {
+      message:
+        successPrefix +
+        fmt(data.new_sl != null ? data.new_sl : requestedPx, 6) +
+        warningText,
+      kind: warningText ? "err" : "ok",
+    };
+  }
+
   /** N3-09: Move/replace the stop-loss of an OPEN position to an ARBITRARY
    *  price `px`. A REAL money action: always confirmed, guarded against
    *  double-submit (state.slBusy), and any backend detail is surfaced verbatim.
@@ -8186,16 +8281,12 @@
         showToast(detailToText(data.detail || data), "err");
         return;
       }
-      const warn =
-        Array.isArray(data.warnings) && data.warnings.length
-          ? " — ⚠ " + data.warnings.join("; ")
-          : "";
-      showToast(
-        (isBe ? "SL moved to break-even: " : "SL set: ") +
-          fmt(data.new_sl != null ? data.new_sl : px, 6) +
-          warn,
-        warn ? "err" : "ok"
+      const toast = slMoveResultToast(
+        data,
+        px,
+        isBe ? "SL moved to break-even: " : "SL set: "
       );
+      showToast(toast.message, toast.kind);
       loadAccount();
       loadOpenOrders();
     } catch (err) {
@@ -8261,11 +8352,11 @@
         if (c.sl != null) sl = c.sl;
         if (c.tp != null) tp = c.tp;
       });
-      const mk = state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)];
-      if (mk) {
-        if (sl == null && mk.sl) sl = mk.sl;
-        if (tp == null && mk.tp) tp = mk.tp;
-      }
+      const mk = normalizeTradeMarker(
+        state.tradeMarkers && state.tradeMarkers[markerKey(p.symbol)]
+      );
+      if (sl == null && mk.sl != null) sl = mk.sl;
+      if (tp == null && mk.tp != null) tp = mk.tp;
       if (sl == null || !(sl > 0)) continue; // no stop → nothing to drag
       const vol = Number(p.hold_vol) || 0;
       const cs = positionContractSize(p.contract_size, contractSize());
@@ -8414,16 +8505,8 @@
         showToast(detailToText(data.detail || data), "err");
         return;
       }
-      const warn =
-        Array.isArray(data.warnings) && data.warnings.length
-          ? " — ⚠ " + data.warnings.join("; ")
-          : "";
-      showToast(
-        "SL moved: " +
-          fmt(data.new_sl != null ? data.new_sl : newSl, 6) +
-          warn,
-        warn ? "err" : "ok"
-      );
+      const toast = slMoveResultToast(data, newSl, "SL moved: ");
+      showToast(toast.message, toast.kind);
       loadAccount();
       loadOpenOrders();
     } catch (err) {

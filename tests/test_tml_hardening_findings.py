@@ -417,3 +417,29 @@ async def test_f5_opened_at_journal_fallback_uses_oldest_match():
     got = await monitor._best_effort_opened_at(client, _DB(), "BTC_USDT", "long", NOW_MS)
     expected = monitor._iso_to_ms("2026-07-20T09:00:00+00:00")
     assert got == expected
+
+
+@pytest.mark.asyncio
+async def test_opened_at_skips_platform_invalid_journal_date_and_keeps_searching():
+    class _DB:
+        async def recent_journal(self, limit=50):
+            return [
+                {
+                    "symbol": "BTC_USDT",
+                    "direction": "long",
+                    # A naive boundary year reaches Windows' local-time
+                    # conversion and raises OSError unless _iso_to_ms contains it.
+                    "created_at": "0001-01-01T00:00:00",
+                },
+                {
+                    "symbol": "BTC_USDT",
+                    "direction": "long",
+                    "created_at": "2026-07-20T09:00:00+00:00",
+                },
+            ]
+
+    got = await monitor._best_effort_opened_at(
+        SimpleNamespace(), _DB(), "BTC_USDT", "long", NOW_MS
+    )
+
+    assert got == monitor._iso_to_ms("2026-07-20T09:00:00+00:00")

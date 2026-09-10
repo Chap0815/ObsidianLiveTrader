@@ -72,12 +72,43 @@ async def test_single_pass_resolves_win_and_loss(db_path):
 
 
 @pytest.mark.asyncio
+async def test_single_pass_does_not_resolve_terminal_after_internal_gap(db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_long(db)
+    # 15m history jumps from t0 to +30m. A hidden +15m candle could have hit
+    # the stop before the visible +30m TP, so WIN is not provable.
+    client = FakeClient(
+        {
+            "BTC_USDT": [
+                _candle(0, 100.5, 99.5),
+                _candle(30, 102.5, 100.0),
+            ]
+        }
+    )
+
+    await resolve_pending_once(
+        db, client, window_s=WINDOW, now=T0 + timedelta(hours=1)
+    )
+
+    rows = await db.recent_journal()
+    assert rows[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
 async def test_single_pass_expires_after_window(db_path):
     db = Database(db_path)
     await db.init()
     jid = await _seed_long(db)
-    # A candle at t0 itself gives full coverage back to created_at.
-    client = FakeClient({"BTC_USDT": [_candle(0, 100.5, 99.5), _candle(10, 100.5, 99.5)]})
+    # The returned history spans t0 through the resolution deadline.
+    client = FakeClient(
+        {
+            "BTC_USDT": [
+                _candle(offset, 100.5, 99.5)
+                for offset in range(0, 24 * 60 + 1, 15)
+            ]
+        }
+    )
     now = T0 + timedelta(hours=48)  # past window
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
     rows = await db.recent_journal()
@@ -243,7 +274,10 @@ async def test_market_entry_fills_without_straddle_resolves_win(db_path):
     await db.init()
     mkt_id = await _seed_long(db, symbol="BTC_USDT", order_type="market")
     lim_id = await _seed_long(db, symbol="ETH_USDT", order_type="limit")
-    gap_up = [_candle(0, 105.0, 103.0), _candle(30, 106.0, 104.0)]
+    gap_up = [
+        _candle(offset, 106.0, 103.0)
+        for offset in range(0, 24 * 60 + 1, 15)
+    ]
     client = FakeClient({"BTC_USDT": list(gap_up), "ETH_USDT": list(gap_up)})
     now = T0 + timedelta(hours=48)
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)

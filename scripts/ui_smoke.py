@@ -410,6 +410,74 @@ async def chart_layout_checks(page, width, height):
 
 
 async def interaction_checks(page, calls, health, account):
+    sl_unverified = await page.evaluate(
+        """async () => {
+          const originalFetch = window.fetch.bind(window);
+          const originalConfirm = window.confirm;
+          const originalAccount = Trader.state.account;
+          let modifyCalls = 0;
+          window.fetch = (input, opts = {}) => {
+            const raw = input && input.url ? input.url : input;
+            const url = new URL(String(raw), location.href);
+            if (url.pathname !== '/api/orders/modify-sl') {
+              return originalFetch(input, opts);
+            }
+            modifyCalls += 1;
+            return Promise.resolve(new Response(JSON.stringify({
+              ok: true,
+              verified: false,
+              status: 'modify_sl_unverified_old_kept',
+              new_sl: 63000,
+              warnings: ['New SL was not verified; the old SL was kept.']
+            }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+          };
+          window.confirm = () => true;
+          try {
+            const probeAccount = {
+              equity_usdt: 12500,
+              available_usdt: 12000,
+              positions: [{
+                symbol: 'BTC', side: 'long', hold_vol: 0.01,
+                entry_price: 64000, leverage: 2, liquidate_price: 50000,
+                unrealized_pnl: 0, contract_size: 1
+              }]
+            };
+            Trader.state.account = probeAccount;
+            Trader.renderPositions(probeAccount);
+            document.querySelector('.cp-sl-edit-btn').click();
+            const input = document.querySelector('.cp-sl-input');
+            input.value = '63000';
+            document.querySelector('.cp-sl-set-btn').click();
+            for (let i = 0; i < 100 && modifyCalls < 1; i += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            const toast = document.getElementById('toast');
+            for (let i = 0; i < 100 && (!toast || toast.classList.contains('hidden')); i += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            return {
+              calls: modifyCalls,
+              text: toast ? toast.textContent : '',
+              errorStyle: !!toast && toast.classList.contains('err')
+            };
+          } finally {
+            window.fetch = originalFetch;
+            window.confirm = originalConfirm;
+            Trader.state.account = originalAccount;
+            Trader.renderPositions(originalAccount || {positions: []});
+          }
+        }"""
+    )
+    assert sl_unverified["calls"] == 1, "Unverified SL probe did not reach the API"
+    assert sl_unverified["errorStyle"], "Unverified SL result was not styled as an error"
+    assert "not verified" in sl_unverified["text"].lower(), (
+        "Unverified SL result was not stated explicitly"
+    )
+    assert not sl_unverified["text"].startswith("SL set:"), (
+        "Unverified SL result was falsely announced as successfully set"
+    )
+    print("PASS unverified SL replacement is not announced as moved")
+
     await page.evaluate(
         """() => {
           const originalFetch = window.fetch.bind(window);
@@ -624,6 +692,53 @@ async def interaction_checks(page, calls, health, account):
     )
     await page.evaluate("__journalProbe.restore()")
     print("PASS superseded journal stats and entries reads are both aborted")
+
+    r_sample_labels = await page.evaluate(
+        """() => {
+          const stats = {
+            totals: {proposals: 25},
+            overall: {
+              sample: 25, win_rate: 0.6, win_rate_ci95: [0.4, 0.75],
+              avg_realized_rrr: -1, realized_r_sample: 1,
+              avg_realized_rrr_net: -0.8, net_sample: 1,
+              low_sample: false
+            },
+            by_confidence: {
+              high: {
+                sample: 25, win_rate: 0.6, win_rate_ci95: [0.4, 0.75],
+                avg_realized_rrr: 2, realized_r_sample: 1,
+                low_sample: false
+              }
+            },
+            by_action: {}, by_provider: {}, by_setup: {}, by_regime: {}, caveats: []
+          };
+          Trader.renderJournal(stats, []);
+          const journalMetric = Array.from(
+            document.querySelectorAll('#journal-body .journal-stat')
+          ).find((node) => node.textContent.includes('realized R'));
+          const journalGroup = document.querySelector(
+            '#journal-body .journal-breakdown tbody td:last-child'
+          );
+          Trader.renderCalibration(stats);
+          const calibrationMetric = Array.from(
+            document.querySelectorAll('#calibration-body .journal-stat')
+          ).find((node) => node.textContent.includes('realized R'));
+          const calibrationGroup = document.querySelector(
+            '#calibration-body .journal-breakdown tbody td:last-child'
+          );
+          return {
+            journalMetric: journalMetric && journalMetric.textContent,
+            journalGroup: journalGroup && journalGroup.textContent,
+            calibrationMetric: calibrationMetric && calibrationMetric.textContent,
+            calibrationGroup: calibrationGroup && calibrationGroup.textContent
+          };
+        }"""
+    )
+    assert "n=1" in (r_sample_labels["journalMetric"] or "")
+    assert "n=1" in (r_sample_labels["journalGroup"] or "")
+    assert (r_sample_labels["calibrationMetric"] or "").count("n=1") == 2
+    assert "n=1" in (r_sample_labels["calibrationGroup"] or "")
+    print("PASS realized-R averages show their own sample counts")
 
     await page.evaluate(
         """() => {

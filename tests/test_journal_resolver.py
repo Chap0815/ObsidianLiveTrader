@@ -96,8 +96,14 @@ def test_first_terminal_candle_wins():
 
 
 def test_neither_within_window_expired():
-    # Coverage reaches t0 (candle at offset 0) -> a real EXPIRED is safe to report.
-    o = _long(candles=[_candle(0, 100.5, 99.5), _candle(5, 100.5, 99.5)])  # never touches
+    # History spans t0 through the deadline -> a real EXPIRED is safe to report.
+    o = _long(
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(5, 100.5, 99.5),
+            _candle(24 * 60, 100.5, 99.5),
+        ]
+    )
     assert o.status == EXPIRED
     assert o.realized_r is None
 
@@ -113,6 +119,19 @@ def test_incomplete_coverage_stays_pending_not_expired():
     # no touch is seen in what we DID fetch, we must not fabricate EXPIRED --
     # a real WIN/LOSS could have happened before our earliest fetched candle.
     o = _long(candles=[_candle(120, 100.5, 99.5)])  # first candle 2h after t0
+    assert o.status == PENDING
+
+
+def test_incomplete_tail_coverage_stays_pending_not_expired():
+    # History starts at t0 but stops halfway through the resolution window.
+    # A TP/SL touch may be hidden in the missing tail, so elapsed wall-clock
+    # time alone cannot prove EXPIRED.
+    o = _long(
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(12 * 60, 100.5, 99.5),
+        ]
+    )
     assert o.status == PENDING
 
 
@@ -134,9 +153,11 @@ def test_later_terminal_touch_without_t0_coverage_stays_pending():
 
 
 def test_full_coverage_expired_after_window():
-    # Coverage reaches back to (before) t0 explicitly -> EXPIRED as before.
+    # Coverage reaches from t0 through the deadline explicitly.
     pre = _candle(0, 100.5, 99.5)
-    o = _long(candles=[pre, _candle(30, 100.2, 99.8)])
+    o = _long(
+        candles=[pre, _candle(30, 100.2, 99.8), _candle(24 * 60, 100.2, 99.8)]
+    )
     assert o.status == EXPIRED
 
 
@@ -144,6 +165,18 @@ def test_candle_before_t0_ignored():
     # A pre-t0 candle would have hit tp1, but it's before entry -> ignored.
     pre = {"time": T0_MS - 60_000, "high": 103.0, "low": 101.0}
     o = _long(candles=[pre], now=T0 + timedelta(hours=1))
+    assert o.status == PENDING
+
+
+def test_candle_after_resolver_now_cannot_resolve_outcome():
+    now = T0 + timedelta(hours=1)
+    o = _long(
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(61, 102.5, 100.0),
+        ],
+        now=now,
+    )
     assert o.status == PENDING
 
 
@@ -196,10 +229,31 @@ def test_untouched_entry_is_no_fill():
     # so the limit never fills -- even though it later trades through tp1 (102).
     # Old resolver miscounted this as a WIN; it must now be NO_FILL (excluded
     # from win/loss), with no fictional R.
-    o = _long(candles=[_candle(0, 105.0, 103.0), _candle(30, 106.0, 104.0)])
+    o = _long(
+        candles=[
+            _candle(0, 105.0, 103.0),
+            _candle(30, 106.0, 104.0),
+            _candle(24 * 60, 106.0, 104.0),
+        ]
+    )
     assert o.status == NO_FILL
     assert o.realized_r is None
     assert o.realized_r_net is None
+
+
+@pytest.mark.parametrize("order_type", [True, "MARKET", "stop"])
+def test_invalid_persisted_order_type_is_skipped(order_type):
+    outcome = _long(
+        order_type=order_type,
+        candles=[
+            _candle(0, 105.0, 103.0),
+            _candle(24 * 60, 106.0, 104.0),
+        ],
+    )
+
+    assert outcome.status == SKIPPED
+    assert outcome.realized_r is None
+    assert outcome.realized_r_net is None
 
 
 # ── Task 19 / F2-06: tf-scaled resolution window ─────────────────────────────

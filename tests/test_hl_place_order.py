@@ -191,6 +191,16 @@ async def test_hl_contract_meta_rejects_fractional_integer_limits(field):
         await c.contract_meta("BTC")
 
 
+@pytest.mark.asyncio
+async def test_hl_contract_meta_wraps_oversized_integer_string():
+    row = {"name": "BTC", "szDecimals": 5, "maxLeverage": "9" * 5000}
+    c = _client()
+    c._meta_cache = (time.monotonic(), {"universe": [row]})
+
+    with pytest.raises(HyperliquidError, match="maxLeverage"):
+        await c.contract_meta("BTC")
+
+
 def _sl_trigger_calls(c) -> list:
     return [
         call
@@ -231,6 +241,51 @@ async def test_set_leverage_accepts_documented_default_success():
     "response",
     [
         {"status": "err", "response": "bad leverage"},
+        {
+            "status": "ok",
+            "response": {
+                "type": "default",
+                "data": {"statuses": [{"error": ""}]},
+            },
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": None}},
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": [None]}},
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": ["accepted"]}},
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": [{}]}},
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": []}},
+        },
+        {
+            "status": "ok",
+            "response": {
+                "type": "default",
+                "data": {"statuses": [{"filled": {"oid": 1}}]},
+            },
+        },
+        {
+            "status": "ok",
+            "response": {
+                "type": "default",
+                "data": {"statuses": [{"resting": {"oid": 1}}]},
+            },
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"statuses": ["success"]}},
+        },
         {"status": "ok"},
         {"status": "ok", "response": {}},
         {},
@@ -425,6 +480,45 @@ async def test_hl_place_order_rejects_unknown_order_type(order_type):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reduce_only", [1, "false"])
+async def test_hl_place_order_rejects_nonboolean_reduce_only_before_send(reduce_only):
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="reduceOnly"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                "reduceOnly": reduce_only,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_place_order_rejects_reduce_only_market_before_send():
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="reduce-only market"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                "reduceOnly": True,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body",
     [
@@ -456,6 +550,44 @@ async def test_hl_place_order_rejects_nonfinite_inputs_before_send(body):
 
 
 @pytest.mark.asyncio
+async def test_hl_market_order_rejects_negative_price_before_send():
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="order price"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                "price": -1.0,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_market_order_rejects_price_rounded_to_zero_before_send():
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="rounds to zero"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                "price": 0.01,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_hl_place_order_rejects_negative_stop_before_entry_send():
     c = _client()
 
@@ -476,12 +608,88 @@ async def test_hl_place_order_rejects_negative_stop_before_entry_send():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stopLossPrice", 0),
+        ("stopLossPrice", None),
+        ("stopLossPrice", ""),
+        ("takeProfitPrice", -1),
+        ("takeProfitPrice", 0),
+        ("takeProfitPrice", None),
+        ("takeProfitPrice", ""),
+        ("takeProfitPrice2", None),
+        ("takeProfitPrice2", ""),
+    ],
+)
+async def test_hl_place_order_rejects_explicit_invalid_trigger_before_entry_send(
+    field, value
+):
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="price must be > 0"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                field: value,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {
+            "symbol": "BTC",
+            "side": 3,
+            "type": "market",
+            "vol": 0.01,
+            "stopLossPrice": 0.01,
+        },
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "market",
+            "vol": 0.01,
+            "takeProfitPrice": 0.01,
+        },
+        {
+            "symbol": "BTC",
+            "side": 1,
+            "type": "market",
+            "vol": 0.01,
+            "takeProfitPrice": 0.2,
+            "takeProfitPrice2": 0.01,
+            "tp1Share": 0.5,
+        },
+    ],
+)
+async def test_hl_place_order_rejects_trigger_rounded_to_zero_before_entry_send(body):
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="rounds to zero"):
+        await c.place_order(body)
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "ladder_fields",
     [
         {"takeProfitPrice2": "not-a-number", "tp1Share": 0.5},
         {"takeProfitPrice2": float("nan"), "tp1Share": 0.5},
         {"takeProfitPrice2": 120.0, "tp1Share": "not-a-number"},
         {"takeProfitPrice2": 120.0, "tp1Share": float("nan")},
+        {"takeProfitPrice2": 0.0, "tp1Share": 0.5},
+        {"takeProfitPrice2": 120.0, "tp1Share": 1.0},
     ],
 )
 async def test_hl_place_order_validates_tp_ladder_before_entry_send(ladder_fields):
@@ -591,6 +799,23 @@ async def test_order_by_external_oid_partial_fill_then_cancel_is_recovered(cance
 
 
 @pytest.mark.asyncio
+async def test_order_by_external_oid_keeps_any_positive_partial_fill():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value=_cloid_status(
+            "canceled", orig_sz="1", sz="0.9999999999995"
+        )
+    )
+    c._info = info
+
+    result = await c.order_by_external_oid("BTC", "mlt-tiny-partial")
+
+    assert result["match"] == "cloid"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("live_status", ["filled", "open", "triggered", "resting"])
 async def test_order_by_external_oid_accepts_live_cloid_status(live_status):
     """Live/recoverable inner states remain valid cloid hits (recovered)."""
@@ -655,6 +880,42 @@ async def test_order_by_external_oid_malformed_sizes_cannot_prove_dead(
     c._info = info
 
     result = await c.order_by_external_oid("BTC", "mlt-malformed-size")
+    assert result["match"] == "cloid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_status", ["cancelPending", "notRejected"])
+async def test_order_by_external_oid_unknown_token_status_cannot_prove_dead(
+    unknown_status,
+):
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value=_cloid_status(unknown_status, orig_sz="0.01", sz="0.01")
+    )
+    c._info = info
+
+    result = await c.order_by_external_oid("BTC", "mlt-unknown-status")
+
+    assert result["match"] == "cloid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_status", [" canceled ", "CANCELED"])
+async def test_order_by_external_oid_malformed_status_spelling_cannot_prove_dead(
+    malformed_status,
+):
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value=_cloid_status(malformed_status, orig_sz="0.01", sz="0.01")
+    )
+    c._info = info
+
+    result = await c.order_by_external_oid("BTC", "mlt-malformed-status")
+
     assert result["match"] == "cloid"
 
 
@@ -875,10 +1136,56 @@ async def test_close_recheck_rejects_nonstring_market_identity(invalid_coin):
     c._info = _fake_info(invalid_coin, 0.5)
     c._exchange.market_close = MagicMock(return_value=_OK)
 
-    with pytest.raises(HyperliquidError, match="no open long position"):
+    with pytest.raises(HyperliquidError, match="position identity"):
         await c.close_position_market(
             str(invalid_coin).upper(), side="long", vol=0.5
         )
+
+    c._exchange.market_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_recheck_rejects_duplicate_live_symbol_rows():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value={
+            "marginSummary": {"accountValue": "1000"},
+            "assetPositions": [
+                {"position": {"coin": "BTC", "szi": "0.3"}},
+                {"position": {"coin": "BTC", "szi": "0.2"}},
+            ],
+        }
+    )
+    c._info = info
+    c._exchange.market_close = MagicMock(return_value=_OK)
+
+    with pytest.raises(HyperliquidError, match="ambiguous"):
+        await c.close_position_market("BTC", side="long", vol=0.5)
+
+    c._exchange.market_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_recheck_rejects_unknown_nonzero_position_identity():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.user_state = MagicMock(
+        return_value={
+            "marginSummary": {"accountValue": "1000"},
+            "assetPositions": [
+                {"position": {"coin": True, "szi": "0.2"}},
+                {"position": {"coin": "BTC", "szi": "0.5"}},
+            ],
+        }
+    )
+    c._info = info
+    c._exchange.market_close = MagicMock(return_value=_OK)
+
+    with pytest.raises(HyperliquidError, match="identity"):
+        await c.close_position_market("BTC", side="long", vol=0.5)
 
     c._exchange.market_close.assert_not_called()
 
@@ -1008,6 +1315,19 @@ async def test_close_unrecognized_success_shape_raises_for_reconciliation():
 
     with pytest.raises(HyperliquidError, match="uncertain close response"):
         await c.close_position_market("BTC", side="long", vol=0.5)
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_resting_response_without_market_fill():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)
+    c._exchange.market_close = MagicMock(return_value=_resp_resting(oid=777))
+
+    with pytest.raises(HyperliquidError, match="market fill missing"):
+        await c.close_position_market("BTC", side="long", vol=0.5)
+
+    c._exchange.market_close.assert_called_once()
 
 
 # ── F-02: protective triggers must be sized to the ACTUAL entry fill ─────────
@@ -1244,6 +1564,49 @@ async def test_hl_cancel_rejects_invalid_request_before_send(body):
 
     with pytest.raises(HyperliquidError):
         await c.cancel_order(body)
+
+    c._exchange.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_cancel_rejects_conflicting_id_aliases_before_send():
+    c = _client()
+    c._exchange.cancel = MagicMock(return_value=_CANCEL_OK)
+
+    with pytest.raises(HyperliquidError, match="exactly one"):
+        await c.cancel_order({"orderId": 123, "oid": 456, "symbol": "BTC"})
+
+    c._exchange.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_cancel_batch_validates_all_targets_before_first_send():
+    c = _client()
+    c._exchange.cancel = MagicMock(return_value=_CANCEL_OK)
+
+    with pytest.raises(HyperliquidError):
+        await c.cancel_order(
+            [
+                {"orderId": 123, "symbol": "BTC"},
+                {"orderId": 0, "symbol": "BTC"},
+            ]
+        )
+
+    c._exchange.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_cancel_batch_rejects_duplicate_targets_before_send():
+    c = _client()
+    c._exchange.cancel = MagicMock(return_value=_CANCEL_OK)
+
+    with pytest.raises(HyperliquidError, match="duplicate"):
+        await c.cancel_order(
+            [
+                {"orderId": 123, "symbol": "BTC"},
+                {"orderId": "123", "symbol": "BTC"},
+            ]
+        )
 
     c._exchange.cancel.assert_not_called()
 

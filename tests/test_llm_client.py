@@ -261,6 +261,19 @@ def test_reevaluation_salvage_path_emits_warning(caplog):
     assert any("recovered via salvage" in r.getMessage() for r in warnings)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "HOLD"},
+        {"action": "HOLD", "confidence": "certain"},
+    ],
+)
+def test_reevaluation_missing_or_invalid_confidence_defaults_low(payload):
+    proposal = parse_reevaluation(json.dumps(payload))
+
+    assert proposal.confidence == "low"
+
+
 @pytest.mark.asyncio
 async def test_xai_analyze_budget_and_timeout(monkeypatch):
     """Task 12 (O2-12/L2X-11): grok-4 is always-on-reasoning and reasoning

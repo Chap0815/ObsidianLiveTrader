@@ -56,6 +56,7 @@ def _block(
     clean_wins: int = 0,
     clean_losses: int = 0,
     no_fill: int = 0,
+    realized_r_sample: int | None = None,
 ) -> dict[str, Any]:
     """One per-group stats block.
 
@@ -68,8 +69,9 @@ def _block(
     setup was actually reachable).
     """
     sample = wins + losses
+    r_sample = sample if realized_r_sample is None else realized_r_sample
     win_rate = _round(wins / sample) if sample else None
-    avg_r = _round(sum_r / sample) if sample else None
+    avg_r = _round(sum_r / r_sample) if r_sample else None
     clean_sample = clean_wins + clean_losses
     clean_win_rate = _round(clean_wins / clean_sample) if clean_sample else None
     return {
@@ -79,6 +81,7 @@ def _block(
         "win_rate": win_rate,
         "win_rate_ci95": wilson_ci(wins, losses),
         "avg_realized_rrr": avg_r,
+        "realized_r_sample": r_sample,
         "ambiguous": ambiguous,
         "clean_win_rate": clean_win_rate,
         "no_fill": no_fill,
@@ -99,6 +102,11 @@ def _groups(raw_groups: dict[str, Any], min_sample: int) -> dict[str, Any]:
             clean_wins=int(g.get("clean_wins", 0)),
             clean_losses=int(g.get("clean_losses", 0)),
             no_fill=int(g.get("no_fill", 0)),
+            realized_r_sample=(
+                int(g["realized_r_sample"])
+                if g.get("realized_r_sample") is not None
+                else None
+            ),
         )
     return out
 
@@ -113,6 +121,8 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
     wins = int(raw.get("wins", 0))
     losses = int(raw.get("losses", 0))
     sample = wins + losses
+    r_sample_raw = raw.get("overall_r_sample")
+    r_sample = sample if r_sample_raw is None else int(r_sample_raw)
     # F2-07: dedicated NET denominator — only WIN/LOSS rows that actually carry
     # a net value (pre-migration rows have NULL net and must not dilute it).
     net_sample = int(raw.get("overall_net_sample", 0))
@@ -162,9 +172,10 @@ def build_stats_response(raw: dict[str, Any], *, min_sample: int) -> dict[str, A
             "sample": sample,
             "win_rate": _round(wins / sample) if sample else None,
             "win_rate_ci95": wilson_ci(wins, losses),
-            "avg_realized_rrr": _round(float(raw.get("overall_sum_r", 0.0)) / sample)
-            if sample
+            "avg_realized_rrr": _round(float(raw.get("overall_sum_r", 0.0)) / r_sample)
+            if r_sample
             else None,
+            "realized_r_sample": r_sample,
             # F2-07: NET expectancy (after round-trip costs) — Task 21 learns
             # on this, not the gross avg above. Uses a DEDICATED denominator
             # (only rows with a non-NULL net) so pre-migration WIN/LOSS rows
@@ -210,9 +221,10 @@ def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, A
     (never recomputed).
 
     Shape (only the fields the model needs to CALIBRATE its own confidence):
-      overall: {n, net_expectancy_r, win_rate_lo, fill}
-      by_confidence / by_setup: {name: {n, win_rate_lo, avg_r, fill}} — only groups
-        whose own n >= min_sample (small groups are dropped, never shown as edge).
+      overall: {n, win_rate_lo, fill[, net_expectancy_r]}
+      by_confidence / by_setup: {name: {n, win_rate_lo, fill[, avg_r]}} — only
+        groups whose own n >= min_sample (small groups are dropped, never shown
+        as edge). Expectancy fields additionally require their own R-value sample.
       `fill` = resolved / (resolved + NO_FILL): win_rate_lo is on filled rows only,
         so a low fill flags an edge that is often unreachable (selection bias).
 
@@ -235,25 +247,34 @@ def build_track_record(stats: dict[str, Any], *, min_sample: int) -> dict[str, A
         for name, block in (grp or {}).items():
             gn = int(block.get("sample") or 0)
             if gn >= min_sample:
-                out[name] = {
+                item = {
                     "n": gn,
                     "win_rate_lo": _lower_bound(block),
-                    "avg_r": block.get("avg_realized_rrr"),
                     # `fill` = fraction of this group's LIMIT setups that filled;
                     # the win_rate_lo above is on the filled rows ONLY, so a low
                     # `fill` flags an edge that is often unreachable. Compact by
                     # design (one extra number per group) — token-cheap.
                     "fill": block.get("fill_rate"),
                 }
+                r_n = int(block.get("realized_r_sample") or 0)
+                avg_r = block.get("avg_realized_rrr")
+                if r_n >= min_sample and avg_r is not None:
+                    item["avg_r"] = avg_r
+                out[name] = item
         return out
 
+    overall_track = {
+        "n": n,
+        "win_rate_lo": _lower_bound(overall),
+        "fill": overall.get("fill_rate"),
+    }
+    net_n = int(overall.get("net_sample") or 0)
+    net_expectancy = overall.get("avg_realized_rrr_net")
+    if net_n >= min_sample and net_expectancy is not None:
+        overall_track["net_expectancy_r"] = net_expectancy
+
     return {
-        "overall": {
-            "n": n,
-            "net_expectancy_r": overall.get("avg_realized_rrr_net"),
-            "win_rate_lo": _lower_bound(overall),
-            "fill": overall.get("fill_rate"),
-        },
+        "overall": overall_track,
         "by_confidence": _groups(stats.get("by_confidence")),
         "by_setup": _groups(stats.get("by_setup")),
     }

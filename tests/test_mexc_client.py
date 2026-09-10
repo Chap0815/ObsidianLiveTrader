@@ -4,6 +4,7 @@ raw JSON text sent to the exchange (json.dumps of a small float like
 0.00002 produces "2e-05", which MEXC's exchange-side parser can reject or
 misinterpret for low-price coins such as SHIB/PEPE)."""
 
+import asyncio
 import re
 
 import httpx
@@ -16,6 +17,7 @@ from app.mexc.client import (
     _opt_int,
     map_position,
     parse_contract_meta,
+    sign_payload,
 )
 from app.mexc.errors import MexcError
 
@@ -23,6 +25,83 @@ from app.mexc.errors import MexcError
 # followed by e/E and an exponent. Field names like "leverage" also contain
 # a bare "e", so the check must be exponent-shaped, not a blanket substring.
 _SCI_NOTATION = re.compile(r"\d[eE][+-]?\d")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_key", "api_secret"),
+    [(" \t ", "synthetic-secret"), ("synthetic-key", " \t ")],
+)
+async def test_private_request_rejects_whitespace_credentials_before_transport(
+    api_key, api_secret
+):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        pytest.fail("private transport must not run without usable credentials")
+
+    client = MexcClient("https://contract.mexc.com", api_key, api_secret)
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(
+        base_url=client.base_url,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(MexcError, match="API keys not configured"):
+            await client.assets()
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_private_get_sends_exact_canonical_signed_query():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = request.url.query.decode("ascii")
+        request_time = request.headers["Request-Time"]
+        captured["query"] = query
+        captured["signature"] = request.headers["Signature"]
+        captured["expected_signature"] = sign_payload("k", "s", request_time, query)
+        return httpx.Response(200, json={"success": True, "data": []})
+
+    client = _client_with_handler(handler)
+    try:
+        await client._request(
+            "GET",
+            "/api/v1/private/account/assets",
+            params={"z": "a b", "skip": None, "a": "1&2"},
+            private=True,
+        )
+    finally:
+        await client.aclose()
+
+    assert captured["query"] == "a=1%262&z=a%20b"
+    assert captured["signature"] == captured["expected_signature"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_time", [True, 1.5, "1.5", 0, -1, None, {}])
+async def test_ping_rejects_invalid_server_time(invalid_time):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"success": True, "data": invalid_time},
+        )
+
+    with pytest.raises(MexcError, match="server time"):
+        await _client_with_handler(handler).ping()
+
+
+def _valid_order_body(**overrides):
+    body = {
+        "symbol": "BTC_USDT",
+        "vol": 1,
+        "side": 1,
+        "type": 5,
+        "openType": 1,
+        "leverage": 5,
+    }
+    body.update(overrides)
+    return body
 
 
 def _mock_client(capture: dict) -> MexcClient:
@@ -69,9 +148,9 @@ async def test_mexc_price_no_scientific_notation():
 def test_fmt_price_rejects_non_finite():
     # Infinity/NaN must not reach Decimal.quantize (raises InvalidOperation,
     # which is not a MexcError and would bypass order-error handling).
-    with pytest.raises(MexcError):
+    with pytest.raises(MexcError, match="Non-finite price value"):
         _fmt_price(float("inf"))
-    with pytest.raises(MexcError):
+    with pytest.raises(MexcError, match="Non-finite price value"):
         _fmt_price(float("nan"))
 
 
@@ -148,12 +227,54 @@ async def test_place_order_hard_rejects_negative_stop_before_send():
                 "vol": 1,
                 "side": 1,
                 "type": 5,
+                "openType": 1,
+                "leverage": 5,
                 "price": 0,
                 "stopLossPrice": -1,
             }
         )
 
     assert "content" not in capture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (field, value)
+        for field in (
+            "stopLossPrice",
+            "takeProfitPrice",
+            "takeProfitPrice2",
+            "triggerPrice",
+        )
+        for value in (0, None)
+    ],
+)
+async def test_place_order_rejects_empty_protective_price_before_send(field, value):
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"success": True, "data": {"orderId": 7}})
+
+    client = _client_with_handler(handler)
+    body = {
+        "symbol": "BTC_USDT",
+        "vol": 1,
+        "side": 1,
+        "type": 5,
+        "openType": 1,
+        "leverage": 5,
+        "price": 0,
+        field: value,
+    }
+
+    with pytest.raises(MexcError, match=field):
+        await client.place_order(body)
+
+    assert requests == 0
 
 
 @pytest.mark.asyncio
@@ -179,6 +300,105 @@ async def test_mexc_place_order_rejects_invalid_symbol_before_send(invalid_symbo
                 "leverage": 5,
             }
         )
+
+    assert requests == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_volume", [None, True, 0, -1, "1"])
+async def test_mexc_place_order_rejects_invalid_volume_before_send(invalid_volume):
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"success": True, "data": {"orderId": 7}})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(MexcError, match="order volume"):
+        await client.place_order(
+            {
+                "symbol": "BTC_USDT",
+                "vol": invalid_volume,
+                "side": 1,
+                "type": 5,
+                "openType": 1,
+                "leverage": 5,
+            }
+        )
+
+    assert requests == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("side", None),
+        ("side", True),
+        ("side", 0),
+        ("side", "1"),
+        ("type", None),
+        ("type", True),
+        ("type", 0),
+        ("type", "5"),
+        ("openType", None),
+        ("openType", True),
+        ("openType", 3),
+        ("openType", "1"),
+        ("leverage", None),
+        ("leverage", True),
+        ("leverage", 0),
+        ("leverage", 1.5),
+        ("leverage", "5"),
+    ],
+)
+async def test_mexc_place_order_rejects_invalid_routing_before_send(
+    field, invalid_value
+):
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"success": True, "data": {"orderId": 7}})
+
+    body = {
+        "symbol": "BTC_USDT",
+        "vol": 1,
+        "side": 1,
+        "type": 5,
+        "openType": 1,
+        "leverage": 5,
+    }
+    body[field] = invalid_value
+
+    client = _client_with_handler(handler)
+    with pytest.raises(MexcError, match=field):
+        await client.place_order(body)
+
+    assert requests == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "price_fields",
+    [{}, {"price": None}, {"price": 0}, {"price": "100"}],
+)
+async def test_mexc_place_order_rejects_invalid_limit_price_before_send(price_fields):
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"success": True, "data": {"orderId": 7}})
+
+    body = _valid_order_body(type=1)
+    body.update(price_fields)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(MexcError, match="limit order price"):
+        await client.place_order(body)
 
     assert requests == 0
 
@@ -276,7 +496,7 @@ async def test_mexc_place_order_rejects_ambiguous_success_payload(payload):
 
     client = _client_with_handler(handler)
     with pytest.raises(MexcError, match="uncertain order-create response"):
-        await client.place_order({"symbol": "BTC_USDT"})
+        await client.place_order(_valid_order_body())
 
 
 @pytest.mark.asyncio
@@ -284,9 +504,7 @@ async def test_mexc_place_order_accepts_positive_scalar_order_id():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"success": True, "data": 7})
 
-    result = await _client_with_handler(handler).place_order(
-        {"symbol": "BTC_USDT"}
-    )
+    result = await _client_with_handler(handler).place_order(_valid_order_body())
     assert result == {"orderId": 7}
 
 
@@ -297,16 +515,85 @@ async def test_mexc_place_order_accepts_positive_scalar_order_id():
         ("102057569836905984", {"orderId": "102057569836905984"}),
         ({"orderId": "102057569836905984"}, {"orderId": "102057569836905984"}),
         ({"oid": 7}, {"oid": 7}),
+        ({"orderId": 7, "errorCode": 0}, {"orderId": 7, "errorCode": 0}),
+        ({"orderId": 7, "success": True}, {"orderId": 7, "success": True}),
+        ({"orderId": 7, "oid": "7"}, {"orderId": 7, "oid": "7"}),
     ],
 )
 async def test_mexc_place_order_accepts_positive_documented_order_id(payload, expected):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"success": True, "data": payload})
 
-    result = await _client_with_handler(handler).place_order(
-        {"symbol": "BTC_USDT"}
-    )
+    result = await _client_with_handler(handler).place_order(_valid_order_body())
     assert result == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_fields",
+    [
+        {"errorCode": 3001},
+        {"errorCode": None},
+        {"errorCode": True},
+        {"errorCode": 0.0},
+        {"code": 2011},
+        {"code": 0.0},
+        {"success": False},
+        {"success": "true"},
+    ],
+)
+async def test_mexc_place_order_rejects_nested_failure_with_order_id(failure_fields):
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = {"orderId": 7, **failure_fields}
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="uncertain order-create response"):
+        await _client_with_handler(handler).place_order(_valid_order_body())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"orderId": 7, "oid": 8},
+        {"orderId": "7", "order_id": "8"},
+        {"orderId": 7, "oid": True},
+    ],
+)
+async def test_mexc_place_order_rejects_conflicting_order_id_aliases(payload):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="uncertain order-create response"):
+        await _client_with_handler(handler).place_order(_valid_order_body())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["errorCode", "error_code"])
+async def test_mexc_place_order_rejects_outer_failure_marker(marker):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                marker: 3001,
+                "data": {"orderId": 7},
+            },
+        )
+
+    with pytest.raises(MexcError, match="MEXC error"):
+        await _client_with_handler(handler).place_order(_valid_order_body())
+
+
+@pytest.mark.asyncio
+async def test_mexc_place_order_rejects_oversized_digit_order_id_response():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"success": True, "data": "9" * 5000}
+        )
+
+    with pytest.raises(MexcError, match="uncertain order-create response"):
+        await _client_with_handler(handler).place_order(_valid_order_body())
 
 
 @pytest.mark.asyncio
@@ -320,16 +607,7 @@ async def test_mexc_place_order_rejects_nonfinite_json_before_send():
 
     client = _client_with_handler(handler)
     with pytest.raises(MexcError, match="JSON"):
-        await client.place_order(
-            {
-                "symbol": "BTC_USDT",
-                "vol": float("nan"),
-                "side": 1,
-                "type": 5,
-                "openType": 1,
-                "leverage": 5,
-            }
-        )
+        await client.place_order(_valid_order_body(metadata=float("nan")))
 
     assert requests == 0
 
@@ -418,6 +696,49 @@ async def test_mexc_set_leverage_accepts_documented_public_success():
         "BTC_USDT", 5, 1, position_type=1
     )
     assert result == {"success": True, "code": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": True},
+        {"success": True, "code": 0},
+        {"success": True, "errorCode": "0"},
+    ],
+)
+async def test_mexc_set_leverage_accepts_unambiguous_nested_success(payload):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    result = await _client_with_handler(handler).set_leverage(
+        "BTC_USDT", 5, 1, position_type=1
+    )
+    assert result == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": True, "code": 2011},
+        {"success": True, "code": None},
+        {"success": True, "code": True},
+        {"success": True, "code": 0.0},
+        {"success": True, "errorCode": 3001},
+        {"success": True, "errorCode": None},
+        {"success": True, "errorCode": False},
+        {"success": True, "errorCode": 0.0},
+    ],
+)
+async def test_mexc_set_leverage_rejects_nested_failure_marker(payload):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="uncertain set-leverage response"):
+        await _client_with_handler(handler).set_leverage(
+            "BTC_USDT", 5, 1, position_type=1
+        )
 
 
 @pytest.mark.asyncio
@@ -522,8 +843,92 @@ async def test_mexc_cancel_rejects_response_for_different_order():
 
 
 @pytest.mark.asyncio
+async def test_mexc_cancel_rejects_conflicting_response_id_aliases():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [
+                    {
+                        "orderId": 7,
+                        "oid": 8,
+                        "errorCode": 0,
+                        "errorMsg": "success",
+                    }
+                ],
+            },
+        )
+
+    with pytest.raises(MexcError, match="requested order"):
+        await _client_with_handler(handler).cancel_order([7])
+
+
+@pytest.mark.asyncio
+async def test_mexc_cancel_rejects_response_with_unrequested_order():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [
+                    {"orderId": 7, "errorCode": 0, "errorMsg": "success"},
+                    {"orderId": 8, "errorCode": 0, "errorMsg": "success"},
+                ],
+            },
+        )
+
+    with pytest.raises(MexcError, match="requested order"):
+        await _client_with_handler(handler).cancel_order([7])
+
+
+@pytest.mark.asyncio
+async def test_mexc_cancel_rejects_duplicate_order_ids_before_send():
+    sent = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent = True
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [{"orderId": 7, "errorCode": 0, "errorMsg": "success"}],
+            },
+        )
+
+    with pytest.raises(MexcError, match="duplicate"):
+        await _client_with_handler(handler).cancel_order([7, "7"])
+
+    assert sent is False
+
+
+@pytest.mark.asyncio
+async def test_mexc_cancel_rejects_conflicting_id_aliases_before_send():
+    sent = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sent
+        sent = True
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [{"orderId": 7, "errorCode": 0, "errorMsg": "success"}],
+            },
+        )
+
+    with pytest.raises(MexcError, match="exactly one"):
+        await _client_with_handler(handler).cancel_order([{"orderId": 7, "oid": 8}])
+
+    assert sent is False
+
+
+@pytest.mark.asyncio
 async def test_mexc_cancel_accepts_matching_result_row():
-    payload = [{"orderId": 7, "errorCode": 0, "errorMsg": "success"}]
+    payload = [
+        {"orderId": 7, "oid": "7", "errorCode": 0, "errorMsg": "success"}
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"success": True, "data": payload})
@@ -543,8 +948,31 @@ async def test_mexc_cancel_raises_on_matching_error_result_row():
 
 
 @pytest.mark.asyncio
-async def test_mexc_cancel_rejects_boolean_error_code():
-    payload = [{"orderId": 7, "errorCode": False, "errorMsg": "unknown"}]
+@pytest.mark.parametrize("error_code", [False, 0.0])
+async def test_mexc_cancel_rejects_invalid_error_code_type(error_code):
+    payload = [{"orderId": 7, "errorCode": error_code, "errorMsg": "unknown"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="cancel rejected"):
+        await _client_with_handler(handler).cancel_order([7])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_fields",
+    [
+        {"success": False},
+        {"success": "true"},
+        {"code": 3001},
+        {"error_code": None},
+    ],
+)
+async def test_mexc_cancel_rejects_contradictory_nested_marker(failure_fields):
+    payload = [
+        {"orderId": 7, "errorCode": 0, "errorMsg": "success", **failure_fields}
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"success": True, "data": payload})
@@ -591,7 +1019,9 @@ async def test_mexc_cancel_rejects_empty_request_before_send():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", [2011, 500, 200, "200", True, False, "", None])
+@pytest.mark.parametrize(
+    "code", [2011, 500, 200, "200", True, False, 0.0, "", None]
+)
 async def test_mexc_request_rejects_invalid_code_even_with_success_true(code):
     """The official common response requires code=0 for success."""
 
@@ -836,6 +1266,74 @@ async def test_mexc_recovery_keeps_cancelled_order_when_zero_fill_not_proven(
 
 
 @pytest.mark.asyncio
+async def test_mexc_recovery_keeps_order_when_terminal_state_aliases_conflict():
+    target_oid = "cli-conflicting-state"
+    row = {
+        "externalOid": target_oid,
+        "orderId": 9,
+        "symbol": "BTC_USDT",
+        "state": 4,
+        "orderState": 3,
+        "dealVol": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(target_oid):
+            return httpx.Response(200, json=row)
+        return httpx.Response(200, json={"resultList": []})
+
+    result = await _client_with_handler(handler).order_by_external_oid(
+        "BTC_USDT", target_oid
+    )
+    assert result["match"] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_keeps_order_when_zero_fill_aliases_conflict():
+    target_oid = "cli-conflicting-fill"
+    row = {
+        "externalOid": target_oid,
+        "orderId": 9,
+        "symbol": "BTC_USDT",
+        "state": 4,
+        "dealVol": 0,
+        "deal_vol": "0.4",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(target_oid):
+            return httpx.Response(200, json=row)
+        return httpx.Response(200, json={"resultList": []})
+
+    result = await _client_with_handler(handler).order_by_external_oid(
+        "BTC_USDT", target_oid
+    )
+    assert result["match"] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_mexc_recovery_keeps_order_for_any_positive_reported_fill():
+    target_oid = "cli-tiny-positive-fill"
+    row = {
+        "externalOid": target_oid,
+        "orderId": 9,
+        "symbol": "BTC_USDT",
+        "state": 4,
+        "dealVol": "0.0000000000005",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(target_oid):
+            return httpx.Response(200, json=row)
+        return httpx.Response(200, json={"resultList": []})
+
+    result = await _client_with_handler(handler).order_by_external_oid(
+        "BTC_USDT", target_oid
+    )
+    assert result["match"] == "direct"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "row",
     [
@@ -847,6 +1345,34 @@ async def test_mexc_recovery_keeps_cancelled_order_when_zero_fill_not_proven(
         },
         {
             "externalOid": "cli-identity",
+            "symbol": "BTC_USDT",
+            "state": 2,
+        },
+        {
+            "externalOid": "cli-identity",
+            "orderId": 7,
+            "oid": 8,
+            "symbol": "BTC_USDT",
+            "state": 2,
+        },
+        {
+            "externalOid": "cli-identity",
+            "orderId": 7,
+            "oid": True,
+            "symbol": "BTC_USDT",
+            "state": 2,
+        },
+        {
+            "externalOid": "cli-identity",
+            "external_oid": "cli-other",
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "state": 2,
+        },
+        {
+            "externalOid": "",
+            "external_oid": "cli-identity",
+            "orderId": 7,
             "symbol": "BTC_USDT",
             "state": 2,
         },
@@ -1469,11 +1995,14 @@ async def test_mexc_user_fills_rejects_unrecognized_page_shape(payload):
         ("price", 0),
         ("vol", "Infinity"),
         ("vol", 0),
+        ("timestamp", 1),
         ("timestamp", 0),
         ("side", True),
         ("side", 1.5),
         ("price", True),
+        ("price", 10**400),
         ("vol", True),
+        ("timestamp", 1.5),
         ("timestamp", True),
     ],
 )
@@ -1493,6 +2022,29 @@ async def test_mexc_user_fills_skips_invalid_required_values(field, value):
     c = _client_with_handler(handler)
 
     assert await c.user_fills() == []
+
+
+@pytest.mark.asyncio
+async def test_mexc_user_fills_skips_implausibly_future_timestamp(monkeypatch):
+    now_s = 1_700_000_000.0
+    monkeypatch.setattr("app.mexc.client.time.time", lambda: now_s)
+    rows = [
+        {
+            "symbol": "BTC_USDT",
+            "side": 1,
+            "vol": 1.0,
+            "price": 100.0,
+            "timestamp": int(now_s * 1000) + offset,
+        }
+        for offset in (300_001, 300_000)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resultList": rows})
+
+    normalized = await _client_with_handler(handler).user_fills("BTC_USDT")
+
+    assert [row["time"] for row in normalized] == [int(now_s * 1000) + 300_000]
 
 
 @pytest.mark.asyncio
@@ -1539,6 +2091,29 @@ async def test_mexc_user_fills_degrades_boolean_optional_values_to_none():
 
     assert out[0]["closed_pnl"] is None
     assert out[0]["fee"] is None
+    assert out[0]["oid"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_oid",
+    [0, -1, 1.5, "1.5", {}, pytest.param("9" * 5_000, id="oversized-digits")],
+)
+async def test_mexc_user_fills_degrades_invalid_oid_values_to_none(bad_oid):
+    row = {
+        "symbol": "BTC_USDT",
+        "side": 2,
+        "vol": 1.0,
+        "price": 100.0,
+        "timestamp": 1_700_000_000_000,
+        "orderId": bad_oid,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resultList": [row]})
+
+    out = await _client_with_handler(handler).user_fills(symbol="BTC_USDT")
+
     assert out[0]["oid"] is None
 
 
@@ -1593,6 +2168,16 @@ def test_opt_int_none_returns_none():
 
 @pytest.mark.parametrize("value", [True, False])
 def test_opt_int_boolean_returns_none(value):
+    assert _opt_int(value) is None
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf")])
+def test_opt_int_infinite_float_returns_none(value):
+    assert _opt_int(value) is None
+
+
+@pytest.mark.parametrize("value", [1.5, -1.5])
+def test_opt_int_fractional_float_returns_none(value):
     assert _opt_int(value) is None
 
 
@@ -1689,9 +2274,67 @@ async def test_klines_reject_impossible_ohlc_geometry(field, value):
 
 
 @pytest.mark.asyncio
+async def test_klines_reject_fractional_timestamp():
+    payload = {
+        "time": [1_700_000_000.5],
+        "open": [10],
+        "high": [10],
+        "low": [10],
+        "close": [10],
+        "vol": [1],
+        "amount": [10],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="kline time"):
+        await _client_with_handler(handler).klines("BTC_USDT", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_far_future_timestamp(monkeypatch):
+    monkeypatch.setattr("app.mexc.client.time.time", lambda: 1_700_000_000.0)
+    payload = {
+        "time": [1_700_000_301],
+        "open": [10],
+        "high": [10],
+        "low": [10],
+        "close": [10],
+        "vol": [1],
+        "amount": [10],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="kline time"):
+        await _client_with_handler(handler).klines("BTC_USDT", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_implausibly_old_timestamp():
+    payload = {
+        "time": [999_999_999],
+        "open": [10],
+        "high": [10],
+        "low": [10],
+        "close": [10],
+        "vol": [1],
+        "amount": [10],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="kline time"):
+        await _client_with_handler(handler).klines("BTC_USDT", "15m")
+
+
+@pytest.mark.asyncio
 async def test_klines_normalize_provider_rows_to_chronological_order():
     payload = {
-        "time": [1_700_000_002, 1_700_000_001],
+        "time": [1_700_000_900, 1_700_000_000],
         "open": [12, 11],
         "high": [12, 11],
         "low": [12, 11],
@@ -1705,7 +2348,7 @@ async def test_klines_normalize_provider_rows_to_chronological_order():
 
     candles = await _client_with_handler(handler).klines("BTC_USDT", "15m")
 
-    assert [c.time for c in candles] == [1_700_000_001_000, 1_700_000_002_000]
+    assert [c.time for c in candles] == [1_700_000_000_000, 1_700_000_900_000]
     assert candles[-1].close == 12
 
 
@@ -1725,6 +2368,25 @@ async def test_klines_reject_duplicate_timestamps():
         return httpx.Response(200, json={"success": True, "data": payload})
 
     with pytest.raises(MexcError, match="duplicate kline timestamp"):
+        await _client_with_handler(handler).klines("BTC_USDT", "15m")
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_duplicate_interval_bucket():
+    payload = {
+        "time": [1_700_000_001, 1_700_000_002],
+        "open": [11, 12],
+        "high": [11, 12],
+        "low": [11, 12],
+        "close": [11, 12],
+        "vol": [1, 1],
+        "amount": [11, 12],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": payload})
+
+    with pytest.raises(MexcError, match="duplicate kline interval"):
         await _client_with_handler(handler).klines("BTC_USDT", "15m")
 
 
@@ -1815,6 +2477,26 @@ def test_contract_meta_rejects_boolean_numeric_limits(field):
         parse_contract_meta(row)
 
 
+def test_numeric_overflow_keeps_mexc_adapter_semantics():
+    huge = 10**400
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": huge,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": 50,
+        "minLeverage": 1,
+        "apiAllowed": True,
+        "state": 0,
+    }
+
+    with pytest.raises(MexcError, match="contractSize"):
+        parse_contract_meta(row)
+    assert _opt_float(huge) is None
+
+
 @pytest.mark.parametrize("field", ["maxLeverage", "minLeverage"])
 def test_contract_meta_rejects_fractional_integer_limits(field):
     row = {
@@ -1832,6 +2514,24 @@ def test_contract_meta_rejects_fractional_integer_limits(field):
     row[field] = 1.5
 
     with pytest.raises(MexcError, match=field):
+        parse_contract_meta(row)
+
+
+def test_contract_meta_wraps_oversized_integer_string():
+    row = {
+        "symbol": "BTC_USDT",
+        "contractSize": 0.001,
+        "priceUnit": 0.1,
+        "volUnit": 1,
+        "minVol": 1,
+        "maxVol": 1000,
+        "maxLeverage": "9" * 5000,
+        "minLeverage": 1,
+        "apiAllowed": True,
+        "state": 0,
+    }
+
+    with pytest.raises(MexcError, match="maxLeverage"):
         parse_contract_meta(row)
 
 
@@ -1970,20 +2670,20 @@ async def test_funding_rate_empty_string_optional_fields_degrade_to_none():
 
 
 @pytest.mark.asyncio
-async def test_funding_rate_nonfinite_value_degrades_to_zero():
+@pytest.mark.parametrize("invalid_rate", ["NaN", None, ""])
+async def test_funding_rate_rejects_invalid_required_value(invalid_rate):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "success": True,
-                "data": {"symbol": "BTC_USDT", "fundingRate": "NaN"},
+                "data": {"symbol": "BTC_USDT", "fundingRate": invalid_rate},
             },
         )
 
     client = _client_with_handler(handler)
-    result = await client.funding_rate("BTC_USDT")
-
-    assert result.funding_rate == 0.0
+    with pytest.raises(MexcError, match="fundingRate"):
+        await client.funding_rate("BTC_USDT")
 
 
 @pytest.mark.asyncio
@@ -2019,7 +2719,7 @@ async def test_market_overview_sanitizes_invalid_ranking_fields():
     assert rows[0]["symbol"] == "GOOD_USDT"
     bad = rows[1]
     assert bad["volume24"] == 0.0
-    assert bad["funding"] == 0.0
+    assert bad["funding"] is None
     assert bad["last"] is None
     assert bad["price_change_pct"] is None
     assert bad["open_interest"] is None
@@ -2251,6 +2951,41 @@ async def test_assets_rejects_unrecognized_or_non_object_rows(payload):
 
     with pytest.raises(MexcError, match="account-assets response"):
         await _client_with_handler(handler).assets(fresh=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_endpoint", ["assets", "positions"])
+async def test_account_state_cancels_hanging_sibling_on_read_error(failed_endpoint):
+    client = MexcClient("https://contract.mexc.com", "k", "s")
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    async def fail(*_args, **_kwargs):
+        await sibling_started.wait()
+        raise MexcError(f"{failed_endpoint} failed")
+
+    async def hang(*_args, **_kwargs):
+        sibling_started.set()
+        try:
+            await never_finishes.wait()
+        finally:
+            sibling_cancelled.set()
+
+    if failed_endpoint == "assets":
+        client.assets = fail
+        client.positions = hang
+    else:
+        client.assets = hang
+        client.positions = fail
+
+    try:
+        with pytest.raises(MexcError, match=f"{failed_endpoint} failed"):
+            await asyncio.wait_for(client.account_state(fresh=True), timeout=0.25)
+        assert sibling_cancelled.is_set()
+    finally:
+        never_finishes.set()
+        await client.aclose()
 
 
 @pytest.mark.asyncio

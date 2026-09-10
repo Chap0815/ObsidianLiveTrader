@@ -33,7 +33,7 @@
      `PERSIST` are globals every later script references by bare name. `state`
      used to live inside app.js's IIFE; loading it first makes it the ONE object
      all modules see (api.js reads PERSIST.TOKEN; app.js references `state`). #}
-  <script src="/static/store.js?v={{ asset_version|default('r25') }}"></script>
+  <script src="/static/store.js?v={{ asset_version|default('r29') }}"></script>
   {# A3-01: pure format helpers extracted to utils.js. Classic script (NOT a
      module) loaded IMMEDIATELY BEFORE app.js so its top-level functions are
      globals app.js can call by bare name — same-origin /static under CSP
@@ -45,7 +45,7 @@
      backend classifier app/orders/protection.py. Classic script loaded AFTER
      utils.js and IMMEDIATELY BEFORE app.js so its functions are globals app.js
      calls by bare name (same tag pattern as utils.js). #}
-  <script src="/static/trade-math.js?v={{ asset_version|default('r25') }}"></script>
+  <script src="/static/trade-math.js?v={{ asset_version|default('r36') }}"></script>
   {# A3-07/A3-08 (Task 42): pure, STATE-FREE network core — authHeaders,
      apiFetch, and the per-resource AbortController helpers (apiFetchAbortable /
      abortResource). Classic script loaded AFTER trade-math.js and IMMEDIATELY
@@ -53,7 +53,7 @@
      tag pattern as utils.js / trade-math.js). Loading BEFORE app.js is why it
      must not reference app.js's `state` — the state object is not yet defined. #}
   <script src="/static/api.js?v={{ asset_version|default('r25') }}"></script>
-  <script src="/static/app.js?v={{ asset_version|default('r27-en') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r44') }}"></script>
   {% endblock %}
   {% block scripts %}{% endblock %}
 </body>

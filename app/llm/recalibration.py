@@ -17,6 +17,7 @@ Design (conservative by construction):
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 # Tier order for downgrade steps (index-based: one step weaker per downgrade).
@@ -60,7 +61,7 @@ def _lb_and_n(block: Any) -> tuple[float | None, int]:
         return None, 0
     try:
         n = int(block.get("sample") or block.get("n") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n = 0
     lo = block.get("win_rate_lo")
     if lo is None:
@@ -69,7 +70,9 @@ def _lb_and_n(block: Any) -> tuple[float | None, int]:
             lo = ci[0]
     try:
         lo_f = float(lo) if lo is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        lo_f = None
+    if lo_f is not None and (not math.isfinite(lo_f) or not 0 <= lo_f <= 1):
         lo_f = None
     return lo_f, n
 

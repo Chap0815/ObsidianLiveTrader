@@ -88,3 +88,33 @@ def test_private_endpoint_rejects_wrong_cookie(tokened_app):
         tc.cookies.set("local_auth", "wrong-token")
         r = tc.get("/api/llm")
     assert r.status_code == 401, r.text
+
+
+def test_dashboard_clears_stale_auth_cookie_after_token_removal(
+    tokened_app, monkeypatch
+):
+    with TestClient(tokened_app) as tc:
+        tc.get("/")
+        monkeypatch.setenv("LOCAL_API_TOKEN", "")
+        get_settings.cache_clear()
+
+        response = tc.get("/")
+
+    cookie = response.headers.get("set-cookie", "").lower()
+    assert "local_auth=" in cookie
+    assert "max-age=0" in cookie
+
+
+def test_setup_redirect_clears_stale_auth_cookie(tokened_app, monkeypatch):
+    import app.main as main
+
+    with TestClient(tokened_app) as tc:
+        tc.get("/")
+        monkeypatch.setattr(main, "_setup_needed", lambda: True)
+
+        response = tc.get("/", follow_redirects=False)
+
+    assert response.status_code == 303
+    cookie = response.headers.get("set-cookie", "").lower()
+    assert "local_auth=" in cookie
+    assert "max-age=0" in cookie

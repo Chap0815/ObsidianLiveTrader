@@ -51,7 +51,9 @@ def _check_python_version(version_info: tuple | None = None) -> None:
 _check_python_version()
 
 import argparse  # noqa: E402
+import hashlib  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
@@ -158,11 +160,9 @@ def _select_requirements_file() -> Path | None:
 
 
 def _deps_marker_state(req: Path) -> str:
-    """Marker-Inhalt: Dateiname + mtime des TATSÄCHLICH benutzten Files, damit
-    ein Wechsel lock<->txt immer neu installiert (nicht nur eine mtime, sonst
-    würde ein neu aufgetauchtes requirements.lock übersehen, solange die
-    marker-mtime jünger als beide Dateien ist)."""
-    return f"{req.name}:{req.stat().st_mtime}"
+    """Identify the selected requirements file by name and exact content."""
+    digest = hashlib.sha256(req.read_bytes()).hexdigest()
+    return f"{req.name}:sha256:{digest}"
 
 
 def ensure_deps(vpy: Path, *, skip: bool) -> None:
@@ -254,74 +254,120 @@ def run_setup_cli(vpy: Path) -> None:
         raise SystemExit(code)
 
 
-def read_setup_complete() -> bool:
+_LAUNCH_ENV_KEYS = frozenset(
+    {"SETUP_COMPLETE", "HOST", "PORT", "EXCHANGE", "HL_TESTNET", "TRADING_ENABLED"}
+)
+_ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+_ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off", "n", "f"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_ENV_INTEGER_RE = re.compile(r"[+-]?[0-9]+(?:_[0-9]+)*(?:\.0+)?\Z")
+
+
+def _parse_env_scalar(raw: str) -> str:
+    value = raw.strip()
+    for index, char in enumerate(value):
+        if char == "#" and index > 0 and value[index - 1].isspace():
+            value = value[:index].rstrip()
+            break
+    if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+        value = value[1:-1]
+    return value
+
+
+def _read_env_assignments() -> dict[str, str]:
     env_path = ROOT / ".env"
     if not env_path.is_file():
+        return {}
+    data: dict[str, str] = {}
+    with env_path.open(encoding="utf-8-sig") as handle:
+        for line in handle:
+            assignment = line.strip()
+            if not assignment or assignment.startswith("#") or "=" not in assignment:
+                continue
+            if (
+                assignment.startswith("export")
+                and len(assignment) > len("export")
+                and assignment[len("export")].isspace()
+            ):
+                assignment = assignment[len("export") :].lstrip()
+            key, _, value = assignment.partition("=")
+            key = key.strip().upper()
+            if key in _LAUNCH_ENV_KEYS:
+                data[key] = _parse_env_scalar(value)
+    return data
+
+
+def read_setup_complete() -> bool:
+    configured = _read_env_assignments().get("SETUP_COMPLETE")
+    if configured is None or configured.lower() in _ENV_FALSE_VALUES:
         return False
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        if k.strip() == "SETUP_COMPLETE":
-            return v.strip().lower() in ("1", "true", "yes", "on")
-    return False
+    if configured.lower() in _ENV_TRUE_VALUES:
+        return True
+    raise SystemExit("ERROR: SETUP_COMPLETE must be a valid boolean in .env")
+
+
+def _parse_env_port(configured: str) -> int:
+    if not _ENV_INTEGER_RE.fullmatch(configured):
+        raise SystemExit("ERROR: PORT must be an integer from 1024 to 65535 in .env")
+    integer_text = configured.replace("_", "").partition(".")[0]
+    try:
+        port = int(integer_text)
+    except ValueError:
+        raise SystemExit(
+            "ERROR: PORT must be an integer from 1024 to 65535 in .env"
+        ) from None
+    if not (1024 <= port <= 65535):
+        raise SystemExit("ERROR: PORT must be an integer from 1024 to 65535 in .env")
+    return port
 
 
 def read_port_host() -> tuple[str, int]:
-    env_path = ROOT / ".env"
     host = "127.0.0.1"
     port = 8787
-    if not env_path.is_file():
-        return host, port
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        k, v = k.strip(), v.strip()
-        if k == "HOST" and v:
-            host = v
-        if k == "PORT" and v.isdigit():
-            port = int(v)
+    data = _read_env_assignments()
+    configured_host = data.get("HOST")
+    if configured_host is not None:
+        if configured_host not in _LOOPBACK_HOSTS:
+            raise SystemExit(
+                "ERROR: HOST must be 127.0.0.1, localhost, or ::1 in .env"
+            )
+        host = configured_host
+    configured_port = data.get("PORT")
+    if configured_port is not None:
+        port = _parse_env_port(configured_port)
     return host, port
 
 
 def read_exchange_banner() -> str:
-    env_path = ROOT / ".env"
-    if not env_path.is_file():
+    if not (ROOT / ".env").is_file():
         return "exchange=?"
-    data: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        data[k.strip()] = v.strip()
-    ex = data.get("EXCHANGE", "mexc")
-    if ex == "hyperliquid":
-        net = (
-            "TESTNET"
-            if data.get("HL_TESTNET", "true").lower() == "true"
-            else "MAINNET"
-        )
+    data = _read_env_assignments()
+    configured_exchange = data.get("EXCHANGE")
+    ex = (
+        "hyperliquid"
+        if configured_exchange is None
+        else configured_exchange.strip().lower()
+    )
+    if ex in ("hl", "hyperliquid"):
+        network_value = data.get("HL_TESTNET", "true").lower()
+        if network_value in _ENV_TRUE_VALUES:
+            net = "TESTNET"
+        elif network_value in _ENV_FALSE_VALUES:
+            net = "MAINNET"
+        else:
+            return "Hyperliquid network=?"
         return f"Hyperliquid {net}"
-    return "MEXC"
+    return "MEXC" if ex == "mexc" else "exchange=?"
 
 
 def read_trading_banner() -> str:
     """Return an honest, secret-free trading state for launcher output."""
-    env_path = ROOT / ".env"
-    if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            key, _, value = stripped.partition("=")
-            if key.strip() == "TRADING_ENABLED":
-                armed = value.strip().lower() in ("1", "true", "yes", "on")
-                return "ARMED — order submission is enabled" if armed else "DISARMED (safe default)"
-    return "DISARMED (safe default)"
+    configured = _read_env_assignments().get("TRADING_ENABLED")
+    if configured is None or configured.lower() in _ENV_FALSE_VALUES:
+        return "DISARMED (safe default)"
+    if configured.lower() in _ENV_TRUE_VALUES:
+        return "ARMED — order submission is enabled"
+    return "UNKNOWN — invalid TRADING_ENABLED value"
 
 
 def _port_in_use(host: str, port: int) -> bool:
@@ -331,12 +377,25 @@ def _port_in_use(host: str, port: int) -> bool:
     OS error) returns False so the normal startup proceeds."""
     check_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            result = s.connect_ex((check_host, port))
-            return result == 0
+        with socket.create_connection((check_host, port), timeout=0.5):
+            return True
     except OSError:
         return False
+
+
+def _local_url(host: str, port: int, path: str = "") -> str:
+    authority = f"[{host}]" if ":" in host else host
+    return f"http://{authority}:{port}{path}"
+
+
+def _port_arg(raw: str) -> int:
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("port must be an integer") from None
+    if not (1024 <= port <= 65535):
+        raise argparse.ArgumentTypeError("port must be between 1024 and 65535")
+    return port
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -356,7 +415,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-setup", action="store_true", help="Skip setup bootstrap")
     p.add_argument(
         "--port",
-        type=int,
+        type=_port_arg,
         default=None,
         help="Port for the bootstrap .env (default 8787). Set this on first "
         "launch if the port is occupied; changes made in /setup apply on the "
@@ -391,13 +450,13 @@ def main() -> None:
             bootstrap_env(vpy, port=(args.port or 8787))
 
     host, port = read_port_host()
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    if host not in _LOOPBACK_HOSTS:
         print(f"WARNING: HOST={host} is not loopback — forcing 127.0.0.1")
         host = "127.0.0.1"
 
     # Open the browser at /setup while setup is incomplete, else the dashboard.
     setup_open = not read_setup_complete()
-    url = f"http://127.0.0.1:{port}{'/setup' if setup_open else ''}"
+    url = _local_url(host, port, "/setup" if setup_open else "")
     print()
     print(f"Exchange: {read_exchange_banner()}")
     print(f"Server:   {url}")

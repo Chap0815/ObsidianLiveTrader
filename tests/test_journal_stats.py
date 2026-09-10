@@ -69,6 +69,30 @@ def test_nonfinite_historical_r_averages_degrade_to_null_json_safely():
     json.dumps(response, allow_nan=False)
 
 
+@pytest.mark.asyncio
+async def test_missing_historical_gross_r_does_not_dilute_known_average(db_path):
+    db = Database(db_path)
+    await db.init()
+    missing = await db.insert_journal_entry(
+        **_base_kwargs(context_hash="missing-gross-r")
+    )
+    known = await db.insert_journal_entry(
+        **_base_kwargs(context_hash="known-gross-r")
+    )
+    await db.update_journal_outcome(missing, status="WIN", realized_r=None)
+    await db.update_journal_outcome(known, status="LOSS", realized_r=-1.0)
+
+    response = build_stats_response(await db.journal_stats(), min_sample=20)
+
+    assert response["overall"]["sample"] == 2
+    assert response["overall"]["realized_r_sample"] == 1
+    assert response["overall"]["avg_realized_rrr"] == -1.0
+    confidence = response["by_confidence"]["high"]
+    assert confidence["sample"] == 2
+    assert confidence["realized_r_sample"] == 1
+    assert confidence["avg_realized_rrr"] == -1.0
+
+
 # ── Migration on a pre-populated old DB ─────────────────────────────────
 
 # Old journal_entries schema WITHOUT realized_r_net and WITHOUT the Task-20

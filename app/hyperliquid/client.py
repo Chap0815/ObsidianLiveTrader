@@ -14,6 +14,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from threading import Lock
 from typing import Any
 
 from app.hyperliquid.errors import HyperliquidError
@@ -34,7 +35,7 @@ def _opt_f(v: Any) -> float | None:
         return None
     try:
         value = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) else None
 
@@ -45,7 +46,7 @@ def _required_finite_float(v: Any, field: str) -> float:
         raise HyperliquidError(f"Invalid {field}")
     try:
         value = float(v)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise HyperliquidError(f"Invalid {field}") from exc
     if not math.isfinite(value):
         raise HyperliquidError(f"Non-finite {field}")
@@ -58,7 +59,10 @@ def _required_int(v: Any, field: str, *, minimum: int) -> int:
     if isinstance(v, int):
         value = v
     elif isinstance(v, str) and v.isdigit():
-        value = int(v)
+        try:
+            value = int(v)
+        except ValueError as exc:
+            raise HyperliquidError(f"{field} is missing or invalid") from exc
     else:
         raise HyperliquidError(f"{field} is missing or invalid")
     if value < minimum:
@@ -96,6 +100,13 @@ _USER_STATE_TTL_S = 2.0
 # read/display/monitor paths. Equity/positions don't meaningfully move in 8s;
 # beyond it we fail honestly rather than trust arbitrarily stale money data.
 _USER_STATE_MAX_STALE_S = 8.0
+
+# userFills is account-wide even when callers request one symbol. A short raw
+# cache lets rapid per-symbol monitor/UI reads share that identical upstream call.
+_USER_FILLS_TTL_S = 2.0
+# Allow ordinary host/exchange clock skew, but never trust far-future market rows.
+_MIN_MARKET_TIMESTAMP_MS = 1_000_000_000_000
+_MAX_MARKET_FUTURE_SKEW_MS = 5 * 60 * 1000
 
 # Transient-429 retry for READ/data paths only (see _to_thread). A market scan
 # (candle/meta fan-out over the whole universe) or a boot burst briefly trips
@@ -275,6 +286,11 @@ class HyperliquidClient:
         self._executor_data = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="hl-data"
         )
+        # Fresh account snapshots gate money decisions but remain idempotent
+        # reads. Keep them off both scanner workers and mutation-only workers.
+        self._executor_account = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="hl-account"
+        )
         # Max adverse fill for market orders (fraction for SDK)
         self.market_slippage = max(0.0005, float(market_slippage_pct) / 100.0)
         self.base_url = (
@@ -284,16 +300,34 @@ class HyperliquidClient:
         self.private_key = (private_key or "").strip()
         self.account_address = (account_address or "").strip()
         self._info = None
+        self._info_init_lock = Lock()
         self._exchange = None
         self._meta_cache: tuple[float, dict[str, Any]] | None = None
+        self._meta_fetch_lock = Lock()
         # Short-TTL cache for meta_and_asset_ctxs (whole-universe fetch used for
         # funding). ticker() and funding_rate() both need it — without this each
         # /api/market call hit the upstream 2× on top of every poll.
         self._ctx_cache: tuple[float, Any] | None = None
+        self._ctx_fetch_lock = Lock()
         # Short-TTL cache for user_state, keyed by (ts, validated_state, addr) so a
         # changed account_address never serves another account's state. See
         # _user_state_cached() and the _USER_STATE_* constants above.
         self._user_state_cache: tuple[float, dict[str, Any], str] | None = None
+        self._user_fills_cache: tuple[float, list[Any], str] | None = None
+        # Cache hits stay cheap, while each account-wide endpoint admits only one
+        # blocking refresh at a time. The epoch prevents an in-flight pre-trade
+        # read from repopulating either cache after a mutation invalidates it.
+        self._account_cache_guard = Lock()
+        self._user_state_fetch_lock = Lock()
+        self._user_fills_fetch_lock = Lock()
+        # Coalesce at the coroutine boundary so waiters do not occupy the
+        # size-bounded data executor while one SDK request is in flight.
+        self._user_state_read_lock = asyncio.Lock()
+        self._user_fills_read_lock = asyncio.Lock()
+        self._account_cache_epoch = 0
+        self._user_state_fetch_seq = 0
+        self._user_state_cache_epoch = 0
+        self._user_fills_cache_epoch = 0
         # One-shot flag so a sustained 429 burst logs the stale-serve warning once,
         # not on every degraded poll; reset on the next successful fetch.
         self._user_state_stale_warned: bool = False
@@ -321,9 +355,13 @@ class HyperliquidClient:
         now = time.monotonic()
         if self._ctx_cache is not None and (now - self._ctx_cache[0]) < ttl:
             return self._ctx_cache[1]
-        ctx = self._get_info().meta_and_asset_ctxs()
-        self._ctx_cache = (now, ctx)
-        return ctx
+        with self._ctx_fetch_lock:
+            now = time.monotonic()
+            if self._ctx_cache is not None and (now - self._ctx_cache[0]) < ttl:
+                return self._ctx_cache[1]
+            ctx = self._get_info().meta_and_asset_ctxs()
+            self._ctx_cache = (time.monotonic(), ctx)
+            return ctx
 
     def _record_oi_and_change(
         self, coin: str, oi: float | None, *, now: float | None = None
@@ -412,13 +450,18 @@ class HyperliquidClient:
 
     def _get_info(self):
         if self._info is None:
-            from hyperliquid.info import Info
+            with self._info_init_lock:
+                if self._info is None:
+                    from hyperliquid.info import Info
 
-            # timeout= muss schon in den Konstruktor: Info.__init__ macht selbst
-            # HTTP-POSTs (spot_meta/meta), bevor _apply_http_timeout greifen kann.
-            info = Info(self.base_url, skip_ws=True, timeout=self._http_timeout_s)
-            self._apply_http_timeout(info)
-            self._info = info
+                    # timeout= muss schon in den Konstruktor: Info.__init__ macht
+                    # selbst HTTP-POSTs (spot_meta/meta), bevor
+                    # _apply_http_timeout greifen kann.
+                    info = Info(
+                        self.base_url, skip_ws=True, timeout=self._http_timeout_s
+                    )
+                    self._apply_http_timeout(info)
+                    self._info = info
         return self._info
 
     def _get_exchange(self):
@@ -448,30 +491,70 @@ class HyperliquidClient:
         return addr or ""
 
     async def aclose(self) -> None:
+        sdk_instances = (
+            self._info,
+            self._exchange,
+            getattr(self._exchange, "info", None),
+        )
+        sessions: list[Any] = []
+        seen_session_ids: set[int] = set()
+        for instance in sdk_instances:
+            session = getattr(instance, "session", None)
+            if session is None or id(session) in seen_session_ids:
+                continue
+            seen_session_ids.add(id(session))
+            sessions.append(session)
         self._info = None
         self._exchange = None
-        # Q-01: shut down BOTH dedicated executors so their worker threads don't
+        # Q-01: shut down all dedicated executors so their worker threads don't
         # outlive the client. cancel_futures drops still-queued work.
         self._executor_trade.shutdown(wait=False, cancel_futures=True)
         self._executor_data.shutdown(wait=False, cancel_futures=True)
+        self._executor_account.shutdown(wait=False, cancel_futures=True)
+        # The SDK owns one requests.Session per API object; Exchange also owns
+        # an internal Info instance with another pool. Dropping the objects alone
+        # leaves those sockets open until garbage collection/process exit.
+        for session in sessions:
+            close = getattr(session, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception:
+                log.warning(
+                    "Failed to close a Hyperliquid SDK HTTP session",
+                    exc_info=True,
+                )
 
     async def _to_thread(
-        self, fn, *args, money_path: bool = False, paced: bool = False, **kwargs
+        self,
+        fn,
+        *args,
+        money_path: bool = False,
+        account_read: bool = False,
+        paced: bool = False,
+        **kwargs,
     ):
         """Run SDK call on a dedicated, size-bounded executor.
 
-        Q-01: money-path calls (place/cancel/close/modify) route to the RESERVED
-        ``_executor_trade`` so a scanner/data fan-out that fills ``_executor_data``
-        can never starve confirm/close. Using our own bounded executors (instead
-        of ``asyncio.to_thread``'s shared default pool) also means one stalled HL
-        endpoint can't exhaust the process-wide thread pool.
+        Q-01: mutation calls route to the RESERVED ``_executor_trade`` and fresh
+        account snapshots to ``_executor_account``, so a scanner/data fan-out
+        that fills ``_executor_data`` cannot starve confirm/close. Using bounded
+        executors instead of the shared default pool also means one stalled HL
+        endpoint cannot exhaust the process-wide thread pool.
 
         ALL failures become HyperliquidError — the SDK raises its own
         ServerError/ClientError (e.g. testnet 502) which would otherwise escape
         the ExchangeError handlers as HTTP 500.
         """
         loop = asyncio.get_running_loop()
-        executor = self._executor_trade if money_path else self._executor_data
+        executor = (
+            self._executor_trade
+            if money_path
+            else self._executor_account
+            if account_read
+            else self._executor_data
+        )
         call = functools.partial(fn, *args, **kwargs) if (args or kwargs) else fn
         attempts = 0
         while True:
@@ -504,15 +587,24 @@ class HyperliquidClient:
         now = time.monotonic()
         if self._meta_cache is not None and (now - self._meta_cache[0]) < _META_TTL_S:
             return self._meta_cache[1]
-        info = self._get_info()
-        meta = info.meta()
-        if not isinstance(meta, dict):
-            raise HyperliquidError("unrecognized metadata response shape")
-        raw_universe = meta.get("universe")
-        if raw_universe is not None and not isinstance(raw_universe, (list, tuple)):
-            raise HyperliquidError("unrecognized metadata response shape")
-        self._meta_cache = (now, meta)
-        return meta
+        with self._meta_fetch_lock:
+            now = time.monotonic()
+            if (
+                self._meta_cache is not None
+                and (now - self._meta_cache[0]) < _META_TTL_S
+            ):
+                return self._meta_cache[1]
+            info = self._get_info()
+            meta = info.meta()
+            if not isinstance(meta, dict):
+                raise HyperliquidError("unrecognized metadata response shape")
+            raw_universe = meta.get("universe")
+            if raw_universe is not None and not isinstance(
+                raw_universe, (list, tuple)
+            ):
+                raise HyperliquidError("unrecognized metadata response shape")
+            self._meta_cache = (time.monotonic(), meta)
+            return meta
 
     def _asset_row(self, coin: str) -> dict[str, Any]:
         meta = self._load_meta_sync()
@@ -616,7 +708,7 @@ class HyperliquidClient:
                         "volume24": (
                             volume24 if volume24 is not None and volume24 >= 0 else 0.0
                         ),
-                        "funding": _opt_f(ctx.get("funding")) or 0.0,
+                        "funding": _opt_f(ctx.get("funding")),
                         "last": mark,
                         # Task 24: momentum + positioning fields for the universe.
                         # open_interest is a LEVEL (OI-Δ needs history -> not here);
@@ -724,34 +816,40 @@ class HyperliquidClient:
         so build_market_snapshot triggered all_mids() twice per HL snapshot. The
         funding value already lives in the SAME 2s ctx cache market_extras() and
         ticker() use, so read it there directly and skip the extra round-trip.
-        Falls back to 0.0 if the ctx doesn't carry funding for the coin.
+        Missing or invalid symbol-specific funding is rejected rather than
+        fabricated as a neutral 0.0 observation.
         """
 
         def _f():
             coin = to_hl_coin(symbol)
-            funding = 0.0
-            try:
-                meta_ctx = self._meta_ctxs_sync()
-                universe = meta_ctx[0].get("universe") if meta_ctx else []
-                ctxs = meta_ctx[1] if meta_ctx and len(meta_ctx) > 1 else []
-                for i, u in enumerate(universe or []):
-                    if not isinstance(u, dict):
-                        continue
-                    raw_name = u.get("name")
-                    if (
-                        isinstance(raw_name, str)
-                        and raw_name.strip().upper() == coin
-                        and i < len(ctxs)
-                    ):
-                        funding = _opt_f(ctxs[i].get("funding")) or 0.0
-                        break
-            except Exception:
-                funding = 0.0
-            return FundingRate(
-                symbol=coin,
-                funding_rate=funding,
-                timestamp=int(time.time() * 1000),
-            )
+            meta_ctx = self._meta_ctxs_sync()
+            if (
+                not isinstance(meta_ctx, (list, tuple))
+                or len(meta_ctx) < 2
+                or not isinstance(meta_ctx[0], dict)
+                or not isinstance(meta_ctx[1], (list, tuple))
+            ):
+                raise HyperliquidError("unrecognized funding response shape")
+            universe = meta_ctx[0].get("universe")
+            ctxs = meta_ctx[1]
+            if not isinstance(universe, (list, tuple)):
+                raise HyperliquidError("unrecognized funding response shape")
+            for i, u in enumerate(universe):
+                if not isinstance(u, dict):
+                    continue
+                raw_name = u.get("name")
+                if isinstance(raw_name, str) and raw_name.strip().upper() == coin:
+                    if i >= len(ctxs) or not isinstance(ctxs[i], dict):
+                        raise HyperliquidError(f"Invalid funding data for {coin}")
+                    funding = _required_finite_float(
+                        ctxs[i].get("funding"), f"funding rate for {coin}"
+                    )
+                    return FundingRate(
+                        symbol=coin,
+                        funding_rate=funding,
+                        timestamp=int(time.time() * 1000),
+                    )
+            raise HyperliquidError(f"No funding data for {coin}")
 
         return await self._to_thread(_f)
 
@@ -828,6 +926,7 @@ class HyperliquidClient:
                 "1d": 24 * 60 * 60_000,
             }.get(hl_iv, 15 * 60_000)
             start = end - bar_ms * max(int(limit_hint), 10)
+            latest_candle_time = end + _MAX_MARKET_FUTURE_SKEW_MS
             info = self._get_info()
             raw = info.candles_snapshot(coin, hl_iv, start, end)
             if not isinstance(raw, list):
@@ -842,8 +941,19 @@ class HyperliquidClient:
                 low_px = _required_finite_float(r.get("l"), "kline low")
                 close_px = _required_finite_float(r.get("c"), "kline close")
                 volume = _required_finite_float(r.get("v"), "kline vol")
-                if timestamp <= 0 or min(open_px, high_px, low_px, close_px) <= 0:
-                    raise HyperliquidError("kline time and prices must be > 0")
+                if (
+                    timestamp < _MIN_MARKET_TIMESTAMP_MS
+                    or not timestamp.is_integer()
+                ):
+                    raise HyperliquidError(
+                        "kline time must be a plausible positive integer"
+                    )
+                if timestamp > latest_candle_time:
+                    raise HyperliquidError(
+                        "kline time is implausibly far in the future"
+                    )
+                if min(open_px, high_px, low_px, close_px) <= 0:
+                    raise HyperliquidError("kline prices must be > 0")
                 if high_px < max(open_px, close_px) or low_px > min(
                     open_px, close_px
                 ):
@@ -864,6 +974,11 @@ class HyperliquidClient:
             out.sort(key=lambda candle: candle.time)
             if any(a.time == b.time for a, b in zip(out, out[1:])):
                 raise HyperliquidError("duplicate kline timestamp")
+            if any(
+                first.time // bar_ms == second.time // bar_ms
+                for first, second in zip(out, out[1:])
+            ):
+                raise HyperliquidError("duplicate kline interval")
             if limit_hint > 0 and len(out) > limit_hint:
                 out = out[-limit_hint:]
             return out
@@ -933,54 +1048,118 @@ class HyperliquidClient:
         NOTE: this is deliberately NOT used by the F-08 close-path TOCTOU re-read,
         which must stay a fresh live read to catch an externally flipped position.
         """
+        if fresh:
+            # Money-decision reads must neither wait behind a display refresh nor
+            # use its result. A sequence keeps an older overlapping read from
+            # overwriting this newer snapshot when it finishes later.
+            with self._account_cache_guard:
+                fetch_epoch = self._account_cache_epoch
+                self._user_state_fetch_seq += 1
+                fetch_seq = self._user_state_fetch_seq
+            state = self._validate_user_state(info.user_state(addr))
+            fetched_at = time.monotonic()
+            with self._account_cache_guard:
+                if (
+                    self._account_cache_epoch == fetch_epoch
+                    and self._user_state_fetch_seq == fetch_seq
+                ):
+                    self._user_state_cache = (fetched_at, state, addr)
+                    self._user_state_cache_epoch = fetch_epoch
+                    self._user_state_stale_warned = False
+            return state
+
         allow_stale = not fresh
-        cache = self._user_state_cache
+        with self._account_cache_guard:
+            cache = self._user_state_cache
+            cache_epoch = self._user_state_cache_epoch
+            account_epoch = self._account_cache_epoch
         if (
             not fresh
+            and cache_epoch == account_epoch
             and cache is not None
             and cache[2] == addr
             and (time.monotonic() - cache[0]) < ttl
         ):
             return self._validate_user_state(cache[1])
-        try:
-            state = self._validate_user_state(info.user_state(addr))
-        except Exception as e:
-            # Measure staleness AFTER the (possibly slow / up-to-http_timeout_s
-            # blocking) fetch, so the 8s bound reflects the ACTUAL age of what
-            # we'd serve — a timed-out fetch must not serve ~18s-old money data
-            # while logging it as "aged 7.9s".
-            now = time.monotonic()
+
+        with self._user_state_fetch_lock:
+            # Another worker may have refreshed while this one waited.
+            with self._account_cache_guard:
+                cache = self._user_state_cache
+                cache_epoch = self._user_state_cache_epoch
+                fetch_epoch = self._account_cache_epoch
             if (
-                allow_stale
+                not fresh
+                and cache_epoch == fetch_epoch
                 and cache is not None
                 and cache[2] == addr
-                and (now - cache[0]) <= _USER_STATE_MAX_STALE_S
+                and (time.monotonic() - cache[0]) < ttl
             ):
-                if not self._user_state_stale_warned:
-                    log.warning(
-                        "user_state fetch failed (%s); serving cached state "
-                        "aged %.1fs (<= %.1fs bound) to ride out the burst",
-                        e,
-                        now - cache[0],
-                        _USER_STATE_MAX_STALE_S,
-                    )
-                    self._user_state_stale_warned = True
                 return self._validate_user_state(cache[1])
-            raise
-        self._user_state_cache = (time.monotonic(), state, addr)
-        self._user_state_stale_warned = False
-        return state
+            with self._account_cache_guard:
+                self._user_state_fetch_seq += 1
+                fetch_seq = self._user_state_fetch_seq
+            try:
+                state = self._validate_user_state(info.user_state(addr))
+            except Exception as e:
+                # Measure staleness AFTER the (possibly slow / up-to-http_timeout_s
+                # blocking) fetch, so the 8s bound reflects the ACTUAL age of what
+                # we'd serve — a timed-out fetch must not serve ~18s-old money data
+                # while logging it as "aged 7.9s".
+                now = time.monotonic()
+                with self._account_cache_guard:
+                    cache_is_current = (
+                        self._account_cache_epoch == fetch_epoch
+                        and cache_epoch == fetch_epoch
+                    )
+                    cache_is_usable = (
+                        allow_stale
+                        and cache_is_current
+                        and cache is not None
+                        and cache[2] == addr
+                        and (now - cache[0]) <= _USER_STATE_MAX_STALE_S
+                    )
+                    should_warn = (
+                        cache_is_usable and not self._user_state_stale_warned
+                    )
+                    if should_warn:
+                        self._user_state_stale_warned = True
+                if cache_is_usable:
+                    if should_warn:
+                        log.warning(
+                            "user_state fetch failed (%s); serving cached state "
+                            "aged %.1fs (<= %.1fs bound) to ride out the burst",
+                            e,
+                            now - cache[0],
+                            _USER_STATE_MAX_STALE_S,
+                        )
+                    return self._validate_user_state(cache[1])
+                raise
+            fetched_at = time.monotonic()
+            with self._account_cache_guard:
+                if (
+                    self._account_cache_epoch == fetch_epoch
+                    and self._user_state_fetch_seq == fetch_seq
+                ):
+                    self._user_state_cache = (fetched_at, state, addr)
+                    self._user_state_cache_epoch = fetch_epoch
+                    self._user_state_stale_warned = False
+            return state
 
     def _invalidate_user_state_cache(self) -> None:
-        """Drop the cached user_state after a position-changing mutation.
+        """Drop cached account reads after a position-changing mutation.
 
         Defense-in-depth for the fresh-read TTL fix: money-DECISION reads already
         force a live fetch, but this makes even NON-fresh readers (monitor/display,
         and any follow-up read within the 2s TTL) observe the POST-trade account
-        promptly instead of a place/close/stop/cancel-stale snapshot. Kept cheap:
-        a single atomic attribute clear, the next read simply refetches once.
+        promptly instead of a place/close/stop/cancel-stale snapshot. The epoch
+        also prevents an already-running old read from repopulating either cache,
+        without making the money path wait for a blocking data request.
         """
-        self._user_state_cache = None
+        with self._account_cache_guard:
+            self._account_cache_epoch += 1
+            self._user_state_cache = None
+            self._user_fills_cache = None
 
     def _resolve_addr(self) -> str | None:
         """Account address, deriving + caching it from the private key if needed.
@@ -1099,7 +1278,10 @@ class HyperliquidClient:
             return [] if state is None else self._assets_from_state(state)
 
         try:
-            return await self._to_thread(_a)
+            if fresh:
+                return await self._to_thread(_a, account_read=True)
+            async with self._user_state_read_lock:
+                return await self._to_thread(_a)
         except Exception as e:
             raise HyperliquidError(f"user_state failed: {e}") from e
 
@@ -1111,7 +1293,10 @@ class HyperliquidClient:
             return [] if state is None else self._positions_from_state(state, symbol)
 
         try:
-            return await self._to_thread(_p)
+            if fresh:
+                return await self._to_thread(_p, account_read=True)
+            async with self._user_state_read_lock:
+                return await self._to_thread(_p)
         except Exception as e:
             raise HyperliquidError(f"positions failed: {e}") from e
 
@@ -1143,7 +1328,10 @@ class HyperliquidClient:
             )
 
         try:
-            return await self._to_thread(_as)
+            if fresh:
+                return await self._to_thread(_as, account_read=True)
+            async with self._user_state_read_lock:
+                return await self._to_thread(_as)
         except Exception as e:
             raise HyperliquidError(f"user_state failed: {e}") from e
 
@@ -1166,15 +1354,51 @@ class HyperliquidClient:
 
                 addr = Account.from_key(self.private_key).address
                 self.account_address = addr
-            info = self._get_info()
-            fills = info.user_fills(addr)
-            if not isinstance(fills, list):
-                raise HyperliquidError(
-                    "user_fills returned an unrecognized shape "
-                    f"({type(fills).__name__})"
-                )
+            with self._account_cache_guard:
+                cache = self._user_fills_cache
+                cache_epoch = self._user_fills_cache_epoch
+                account_epoch = self._account_cache_epoch
+            now = time.monotonic()
+            if (
+                cache_epoch == account_epoch
+                and cache is not None
+                and cache[2] == addr
+                and (now - cache[0]) < _USER_FILLS_TTL_S
+            ):
+                fills = cache[1]
+            else:
+                with self._user_fills_fetch_lock:
+                    # Another worker may have refreshed while this one waited.
+                    with self._account_cache_guard:
+                        cache = self._user_fills_cache
+                        cache_epoch = self._user_fills_cache_epoch
+                        fetch_epoch = self._account_cache_epoch
+                    now = time.monotonic()
+                    if (
+                        cache_epoch == fetch_epoch
+                        and cache is not None
+                        and cache[2] == addr
+                        and (now - cache[0]) < _USER_FILLS_TTL_S
+                    ):
+                        fills = cache[1]
+                    else:
+                        info = self._get_info()
+                        fills = info.user_fills(addr)
+                        if not isinstance(fills, list):
+                            raise HyperliquidError(
+                                "user_fills returned an unrecognized shape "
+                                f"({type(fills).__name__})"
+                            )
+                        # TTL starts after the blocking SDK read; otherwise a slow
+                        # read can return with its cache already expired.
+                        fetched_at = time.monotonic()
+                        with self._account_cache_guard:
+                            if self._account_cache_epoch == fetch_epoch:
+                                self._user_fills_cache = (fetched_at, fills, addr)
+                                self._user_fills_cache_epoch = fetch_epoch
             coin_f = to_hl_coin(symbol) if symbol else None
             out: list[dict[str, Any]] = []
+            latest_fill_time = int(time.time() * 1000) + _MAX_MARKET_FUTURE_SKEW_MS
             for f in fills:
                 if not isinstance(f, dict):
                     continue
@@ -1185,11 +1409,11 @@ class HyperliquidClient:
                 side_raw = str(f.get("side") or "")
                 px = _opt_f(f.get("px"))
                 sz = _opt_f(f.get("sz"))
-                if isinstance(f.get("time"), bool):
-                    continue
                 try:
-                    fill_time = int(f.get("time"))
-                except (TypeError, ValueError, OverflowError):
+                    fill_time = _required_int(
+                        f.get("time"), "fill time", minimum=_MIN_MARKET_TIMESTAMP_MS
+                    )
+                except HyperliquidError:
                     continue
                 if (
                     not coin
@@ -1199,8 +1423,29 @@ class HyperliquidClient:
                     or sz is None
                     or sz <= 0
                     or fill_time <= 0
+                    or fill_time > latest_fill_time
                 ):
                     continue
+                direction_raw = f.get("dir")
+                direction = direction_raw if isinstance(direction_raw, str) else ""
+                # The SDK supplies execution side and semantic direction as
+                # separate fields. A recognized contradiction must not become
+                # Flat->Open evidence for position-management baselines or a
+                # misleading browser marker. Preserve unknown future labels,
+                # but degrade known contradictory labels to unknown.
+                direction_side = {
+                    "open long": "B",
+                    "close short": "B",
+                    "short > long": "B",
+                    "liquidated short": "B",
+                    "open short": "A",
+                    "close long": "A",
+                    "long > short": "A",
+                    "liquidated long": "A",
+                }.get(direction.lower())
+                if direction_side is not None and direction_side != side_raw:
+                    direction = ""
+                oid_raw = f.get("oid")
                 fee_raw = f.get("fee")
                 fee = 0.0 if fee_raw in (None, "") else _opt_f(fee_raw)
                 try:
@@ -1211,15 +1456,13 @@ class HyperliquidClient:
                             "sz": sz,
                             "side": "buy" if side_raw == "B" else "sell",
                             "time": fill_time,
-                            "dir": str(f.get("dir") or ""),
+                            "dir": direction,
                             # F2: signed position size BEFORE this fill. ==0 marks
                             # a Flat->Open (trade-epoch) fill; used to derive a
                             # STABLE reopen signature. Kept as a float when present.
                             "start_position": _opt_f(f.get("startPosition")),
                             "closed_pnl": _opt_f(f.get("closedPnl")),
-                            "oid": None
-                            if isinstance(f.get("oid"), bool)
-                            else f.get("oid"),
+                            "oid": oid_raw if _is_positive_oid(oid_raw) else None,
                             "fee": fee,
                         }
                     )
@@ -1229,7 +1472,8 @@ class HyperliquidClient:
             return out[: max(1, int(limit))]
 
         try:
-            return await self._to_thread(_f)
+            async with self._user_fills_read_lock:
+                return await self._to_thread(_f)
         except HyperliquidError:
             raise
         except Exception as e:
@@ -1275,6 +1519,7 @@ class HyperliquidClient:
         # a rejection or an uncertain mutation result and must block the entry.
         error = _status_error(result)
         response = result.get("response") if isinstance(result, dict) else None
+        response_data = response.get("data") if isinstance(response, dict) else None
         if error:
             raise HyperliquidError(f"set_leverage rejected: {error}", raw=result)
         if (
@@ -1282,6 +1527,7 @@ class HyperliquidClient:
             or result.get("status") != "ok"
             or not isinstance(response, dict)
             or response.get("type") != "default"
+            or (isinstance(response_data, dict) and "statuses" in response_data)
         ):
             raise HyperliquidError("uncertain set_leverage response shape", raw=result)
         return result
@@ -1329,13 +1575,22 @@ class HyperliquidClient:
                 is_market = False
             else:
                 raise HyperliquidError(f"unsupported order type {otype!r}")
-            reduce_only = bool(body.get("reduceOnly") or body.get("r") or False)
+            for key in ("reduceOnly", "r"):
+                if key in body and not isinstance(body[key], bool):
+                    raise HyperliquidError(f"{key} must be a boolean")
+            reduce_only = body.get("reduceOnly", False) or body.get("r", False)
+            if is_market and reduce_only:
+                raise HyperliquidError(
+                    "reduce-only market orders must use close_position_market"
+                )
             price_raw = body.get("price")
             px = (
                 0.0
                 if price_raw in (None, "")
                 else _required_finite_float(price_raw, "order price")
             )
+            if px < 0:
+                raise HyperliquidError("order price must be >= 0")
 
             # Tick rounding per HL rules (5 sig figs / max decimals via szDecimals)
             row = self._asset_row(coin)
@@ -1344,21 +1599,26 @@ class HyperliquidClient:
             )
             if px > 0:
                 px = round_hl_price(px, sz_dec)
+                if px <= 0:
+                    raise HyperliquidError(
+                        "order price rounds to zero at exchange precision"
+                    )
 
-            sl = body.get("stopLossPrice")
-            tp = body.get("takeProfitPrice")
-            sl_value = (
-                None
-                if sl in (None, "")
-                else _required_finite_float(sl, "stop-loss price")
+            def _optional_trigger_value(field: str, label: str) -> float | None:
+                if field not in body:
+                    return None
+                raw = body[field]
+                if raw is None or raw == "":
+                    raise HyperliquidError(f"{label} must be > 0")
+                value = _required_finite_float(raw, label)
+                if value <= 0:
+                    raise HyperliquidError(f"{label} must be > 0")
+                return value
+
+            sl_value = _optional_trigger_value("stopLossPrice", "stop-loss price")
+            tp_value = _optional_trigger_value(
+                "takeProfitPrice", "take-profit price"
             )
-            tp_value = (
-                None
-                if tp in (None, "")
-                else _required_finite_float(tp, "take-profit price")
-            )
-            if sl_value is not None and sl_value < 0:
-                raise HyperliquidError("stop-loss price must be >= 0")
             # X2-05: side-aware rounding TOWARD entry so the exchange-tick
             # precision cut can never make the real trigger riskier (SL) or
             # overstate reward (TP) beyond the already risk-approved SL/TP.
@@ -1372,11 +1632,8 @@ class HyperliquidClient:
                 if tp_value is not None and tp_value > 0
                 else None
             )
-            tp2 = body.get("takeProfitPrice2")
-            tp2_value = (
-                None
-                if tp2 in (None, "")
-                else _required_finite_float(tp2, "second take-profit price")
+            tp2_value = _optional_trigger_value(
+                "takeProfitPrice2", "second take-profit price"
             )
             tp2_px = (
                 round_hl_price_side_aware(
@@ -1385,12 +1642,25 @@ class HyperliquidClient:
                 if tp2_value is not None and tp2_value > 0
                 else None
             )
+            for label, rounded_trigger in (
+                ("stop-loss price", sl_px),
+                ("take-profit price", tp_px),
+                ("second take-profit price", tp2_px),
+            ):
+                if rounded_trigger is not None and rounded_trigger <= 0:
+                    raise HyperliquidError(
+                        f"{label} rounds to zero at exchange precision"
+                    )
             share_raw = body.get("tp1Share")
             share = (
                 0.0
                 if share_raw in (None, "")
                 else _required_finite_float(share_raw, "first take-profit share")
             )
+            if tp2_value is not None and not (0.0 < share < 1.0):
+                raise HyperliquidError(
+                    "first take-profit share must be between 0 and 1"
+                )
 
             # Stamp OUR externalOid onto the exchange order as a Cloid so a
             # transport timeout can recover the real (possibly filled) order and
@@ -1661,9 +1931,12 @@ class HyperliquidClient:
                     raise HyperliquidError(
                         "HL cancel needs {orderId, symbol} per order"
                     )
-                raw_oid = item.get("orderId")
-                if raw_oid is None:
-                    raw_oid = item.get("oid")
+                id_keys = [key for key in ("orderId", "oid") if key in item]
+                if len(id_keys) != 1:
+                    raise HyperliquidError(
+                        "HL cancel requires exactly one orderId or oid per order"
+                    )
+                raw_oid = item.get(id_keys[0])
                 raw_symbol = item.get("symbol")
                 if not isinstance(raw_symbol, str) or not raw_symbol.strip():
                     raise HyperliquidError(
@@ -1700,11 +1973,10 @@ class HyperliquidClient:
             if isinstance(body, list):
                 if not body:
                     raise HyperliquidError("HL cancel request must not be empty")
-                results = []
-                for item in body:
-                    coin, oid = cancel_target(item)
-                    results.append(cancel_one(coin, oid))
-                return results
+                targets = [cancel_target(item) for item in body]
+                if len(set(targets)) != len(targets):
+                    raise HyperliquidError("HL cancel request contains duplicate orders")
+                return [cancel_one(coin, oid) for coin, oid in targets]
             coin, oid = cancel_target(body)
             return cancel_one(coin, oid)
 
@@ -1932,18 +2204,36 @@ class HyperliquidClient:
             if not addr:
                 raise HyperliquidError("account address unavailable for live close check")
             state = self._validate_user_state(info.user_state(addr))
-            live_szi = 0.0
+            matching_sizes: list[float] = []
             for ap in state["assetPositions"]:
-                pos = ap.get("position") or {}
-                raw_coin = pos.get("coin")
-                if (
-                    isinstance(raw_coin, str)
-                    and raw_coin.strip().upper() == coin
+                if not isinstance(ap, dict) or not isinstance(
+                    ap.get("position"), dict
                 ):
-                    live_szi = _required_finite_float(
+                    raise HyperliquidError("invalid live position row")
+                pos = ap["position"]
+                raw_coin = pos.get("coin")
+                normalized_coin = (
+                    raw_coin.strip().upper() if isinstance(raw_coin, str) else ""
+                )
+                if not normalized_coin:
+                    unknown_szi = _required_finite_float(
                         pos.get("szi"), "live position size"
                     )
-                    break
+                    if abs(unknown_szi) >= 1e-12:
+                        raise HyperliquidError("invalid live position identity")
+                    continue
+                if normalized_coin != coin:
+                    continue
+                live_szi = _required_finite_float(
+                    pos.get("szi"), "live position size"
+                )
+                if abs(live_szi) >= 1e-12:
+                    matching_sizes.append(live_szi)
+            if len(matching_sizes) > 1:
+                raise HyperliquidError(
+                    f"ambiguous live position rows for {coin}; refusing close"
+                )
+            live_szi = matching_sizes[0] if matching_sizes else 0.0
             live_side = (
                 "long" if live_szi > 0 else ("short" if live_szi < 0 else None)
             )
@@ -1984,6 +2274,10 @@ class HyperliquidClient:
                     else "close rejected"
                 )
                 raise HyperliquidError(f"{prefix}: {err}", raw=result)
+            if _extract_filled_sz(result) <= 0:
+                raise HyperliquidError(
+                    "uncertain close response: market fill missing", raw=result
+                )
             return result
 
         try:
@@ -2084,18 +2378,39 @@ class HyperliquidClient:
         return hits if hits else {}
 
 
-# Hyperliquid orderStatus inner-status vocabulary (X-05). The deterministic
-# query_order_by_cloid resolves an order to a single lifecycle status. LIVE /
-# recoverable states — open, filled, triggered, resting — are valid recovery
-# hits. TERMINAL-DEAD states are every canceled/rejected variant HL emits
-# (canceled, marginCanceled, reduceOnlyCanceled, scheduledCancel, rejected,
-# tickRejected, perpMarginRejected, …). Rather than enumerate a list HL keeps
-# extending, key off the unambiguous "cancel"/"reject" tokens: NO live state
-# contains either, and every dead one contains exactly one. This is the HL
-# analogue of _mexc_state_is_dead. Fail-safe: a missing/unexpected status is NOT
-# dead — never discard a genuinely recoverable order (that reopens the silent
-# phantom-loss the whole guard exists to prevent).
-_HL_DEAD_STATE_TOKENS = ("cancel", "reject")
+# Exact terminal values documented for Hyperliquid's orderStatus response.
+# Unknown, misspelled or differently cased values cannot prove an order dead:
+# retaining recovery is safer than permitting a duplicate replacement.
+_HL_DEAD_STATES = frozenset(
+    {
+        "canceled",
+        "rejected",
+        "marginCanceled",
+        "vaultWithdrawalCanceled",
+        "openInterestCapCanceled",
+        "selfTradeCanceled",
+        "reduceOnlyCanceled",
+        "siblingFilledCanceled",
+        "delistedCanceled",
+        "liquidatedCanceled",
+        "scheduledCancel",
+        "tickRejected",
+        "minTradeNtlRejected",
+        "perpMarginRejected",
+        "reduceOnlyRejected",
+        "badAloPxRejected",
+        "iocCancelRejected",
+        "badTriggerPxRejected",
+        "marketOrderNoLiquidityRejected",
+        "positionIncreaseAtOpenInterestCapRejected",
+        "positionFlipAtOpenInterestCapRejected",
+        "tooAggressiveAtOpenInterestCapRejected",
+        "openInterestIncreaseRejected",
+        "insufficientSpotBalanceRejected",
+        "oracleRejected",
+        "perpMaxPositionRejected",
+    }
+)
 
 
 def _hl_order_state_is_dead(order_wrapper: Any) -> bool:
@@ -2118,8 +2433,7 @@ def _hl_order_state_is_dead(order_wrapper: Any) -> bool:
     st = order_wrapper.get("status")
     if not isinstance(st, str):
         return False
-    st_l = st.strip().lower()
-    if not any(tok in st_l for tok in _HL_DEAD_STATE_TOKENS):
+    if st not in _HL_DEAD_STATES:
         return False
     order = order_wrapper.get("order")
     if not isinstance(order, dict):
@@ -2128,10 +2442,11 @@ def _hl_order_state_is_dead(order_wrapper: Any) -> bool:
     rem = _opt_f(order.get("sz"))
     if orig is None or rem is None:
         return False  # fail-safe: sizes missing/unparseable → not dead
-    # Zero-fill (within float noise) is the only terminal-dead case.
+    # Exact zero-fill is the only terminal-dead case. Any positive difference
+    # may be a real partial fill and must keep the idempotent recovery path alive.
     if orig <= 0 or rem < 0 or rem > orig:
         return False  # malformed sizes cannot prove a zero fill
-    return (orig - rem) <= 1e-12
+    return orig == rem
 
 
 def _hl_recovery_identity_matches(
@@ -2168,11 +2483,19 @@ def _status_error(result: Any) -> str | None:
         return str(result.get("status"))
     try:
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-        for st in statuses:
-            if isinstance(st, dict) and "error" in st:
-                return str(st["error"])
     except Exception:
-        return None
+        return "invalid exchange statuses"
+    if not isinstance(statuses, list):
+        return "invalid exchange statuses"
+    for st in statuses:
+        if st == "success":
+            continue
+        if not isinstance(st, dict):
+            return "invalid exchange statuses"
+        if "error" in st:
+            return str(st["error"]).strip() or "unknown exchange error"
+        if not any(isinstance(st.get(key), dict) for key in ("filled", "resting")):
+            return "invalid exchange statuses"
     return None
 
 
@@ -2182,7 +2505,12 @@ def _is_positive_oid(value: Any) -> bool:
     if isinstance(value, int):
         return value > 0
     if isinstance(value, str):
-        return value.isdigit() and int(value) > 0
+        if not value.isdigit():
+            return False
+        try:
+            return int(value) > 0
+        except ValueError:
+            return False
     return False
 
 

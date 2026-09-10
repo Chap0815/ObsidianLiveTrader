@@ -1,4 +1,5 @@
 import math
+import re
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,21 @@ HL_ALLOWED_HOSTS = frozenset(
 ANTHROPIC_ALLOWED_HOSTS = frozenset({"api.anthropic.com"})
 XAI_ALLOWED_HOSTS = frozenset({"api.x.ai"})
 OPENAI_ALLOWED_HOSTS = frozenset({"api.openai.com"})
+
+_HL_PRIVATE_KEY_RE = re.compile(r"0x[0-9a-fA-F]{64}")
+_HL_ACCOUNT_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+_SECP256K1_ORDER = int(
+    "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16
+)
+
+
+def is_valid_hl_private_key(value: str) -> bool:
+    """Return whether value encodes a valid secp256k1 private scalar."""
+    normalized = (value or "").strip()
+    return bool(
+        _HL_PRIVATE_KEY_RE.fullmatch(normalized)
+        and 0 < int(normalized[2:], 16) < _SECP256K1_ORDER
+    )
 
 # Risk presets. RISK_PROFILE picks a preset; any value explicitly set in .env
 # always wins over the preset (only unset fields are filled from it). The
@@ -65,7 +81,7 @@ RISK_PROFILES: dict[str, dict[str, object]] = {
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(ROOT / ".env"),
-        env_file_encoding="utf-8",
+        env_file_encoding="utf-8-sig",
         extra="ignore",
         populate_by_name=True,
     )
@@ -308,12 +324,23 @@ class Settings(BaseSettings):
     @field_validator("exchange")
     @classmethod
     def exchange_ok(cls, v: str) -> str:
-        x = (v or "mexc").strip().lower()
+        x = (v or "").strip().lower()
         if x in ("hl", "hyperliquid"):
             return "hyperliquid"
         if x == "mexc":
             return "mexc"
         raise ValueError("EXCHANGE must be 'mexc' or 'hyperliquid'")
+
+    @field_validator(
+        "anthropic_model",
+        "xai_model",
+        "openai_model",
+        "ollama_model",
+        "scanner_model",
+    )
+    @classmethod
+    def llm_model_trimmed(cls, v: str) -> str:
+        return (v or "").strip()
 
     @field_validator("scanner_mode")
     @classmethod
@@ -388,6 +415,14 @@ class Settings(BaseSettings):
         parsed = urlparse(raw)
         if parsed.scheme != "https":
             raise ValueError("MEXC_BASE_URL must use https://")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("MEXC_BASE_URL must not include credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("MEXC_BASE_URL must not include a query or fragment")
+        if parsed.path:
+            raise ValueError("MEXC_BASE_URL must not include a path")
+        if parsed.port not in (None, 443):
+            raise ValueError("MEXC_BASE_URL must use the default HTTPS port")
         host = (parsed.hostname or "").lower()
         if host == MEXC_LEGACY_HOST:
             return MEXC_API_BASE_URL
@@ -407,6 +442,14 @@ class Settings(BaseSettings):
         parsed = urlparse(raw)
         if parsed.scheme != "https":
             raise ValueError("HL_BASE_URL must use https://")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("HL_BASE_URL must not include credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("HL_BASE_URL must not include a query or fragment")
+        if parsed.path:
+            raise ValueError("HL_BASE_URL must not include a path")
+        if parsed.port not in (None, 443):
+            raise ValueError("HL_BASE_URL must use the default HTTPS port")
         host = (parsed.hostname or "").lower()
         if host not in HL_ALLOWED_HOSTS:
             raise ValueError(
@@ -443,6 +486,14 @@ class Settings(BaseSettings):
         parsed = urlparse(raw)
         if parsed.scheme not in ("http", "https"):
             raise ValueError("OLLAMA_BASE_URL must use http:// or https://")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("OLLAMA_BASE_URL must not include credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("OLLAMA_BASE_URL must not include a query or fragment")
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("OLLAMA_BASE_URL must include a valid port") from exc
         host = (parsed.hostname or "").lower()
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError(
@@ -452,13 +503,27 @@ class Settings(BaseSettings):
         return raw
 
     @staticmethod
-    def _https_host_allowlist(raw: str, *, name: str, allowed: frozenset[str]) -> str:
+    def _https_host_allowlist(
+        raw: str,
+        *,
+        name: str,
+        allowed: frozenset[str],
+        allowed_paths: frozenset[str],
+    ) -> str:
         v = (raw or "").strip().rstrip("/")
         if not v:
             raise ValueError(f"{name} must not be empty")
         parsed = urlparse(v)
         if parsed.scheme != "https":
             raise ValueError(f"{name} must use https://")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(f"{name} must not include credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError(f"{name} must not include query parameters or fragments")
+        if parsed.path not in allowed_paths:
+            raise ValueError(f"{name} has an unsupported API path")
+        if parsed.port not in (None, 443):
+            raise ValueError(f"{name} must use the default HTTPS port")
         host = (parsed.hostname or "").lower()
         if host not in allowed:
             raise ValueError(
@@ -473,6 +538,7 @@ class Settings(BaseSettings):
             v or "https://api.anthropic.com",
             name="ANTHROPIC_BASE_URL",
             allowed=ANTHROPIC_ALLOWED_HOSTS,
+            allowed_paths=frozenset({""}),
         )
 
     @field_validator("xai_base_url")
@@ -482,6 +548,7 @@ class Settings(BaseSettings):
             v or "https://api.x.ai/v1",
             name="XAI_BASE_URL",
             allowed=XAI_ALLOWED_HOSTS,
+            allowed_paths=frozenset({"/v1"}),
         )
 
     @field_validator("openai_base_url")
@@ -491,6 +558,7 @@ class Settings(BaseSettings):
             v or "https://api.openai.com/v1",
             name="OPENAI_BASE_URL",
             allowed=OPENAI_ALLOWED_HOSTS,
+            allowed_paths=frozenset({"/v1"}),
         )
 
     # ── F-06: money/risk floats must be finite and within sane bounds. NaN
@@ -741,34 +809,59 @@ class Settings(BaseSettings):
 
     @property
     def mexc_ready(self) -> bool:
-        return bool(self.mexc_api_key and self.mexc_api_secret)
+        return bool(
+            (self.mexc_api_key or "").strip()
+            and (self.mexc_api_secret or "").strip()
+        )
 
     @property
     def hl_ready(self) -> bool:
-        return bool(self.hl_private_key)
+        private_key = (self.hl_private_key or "").strip()
+        account_address = (self.hl_account_address or "").strip()
+        return bool(
+            is_valid_hl_private_key(private_key)
+            and (
+                not account_address
+                or _HL_ACCOUNT_ADDRESS_RE.fullmatch(account_address)
+            )
+        )
 
     @property
     def exchange_ready(self) -> bool:
         if self.exchange == "hyperliquid":
             return self.hl_ready
-        return self.mexc_ready
+        if self.exchange == "mexc":
+            return self.mexc_ready
+        return False
 
     @property
     def xai_ready(self) -> bool:
-        return bool(self.xai_api_key)
+        return bool(
+            (self.xai_api_key or "").strip()
+            and (self.xai_model or "").strip()
+        )
 
     @property
     def claude_ready(self) -> bool:
-        return bool(self.anthropic_api_key)
+        return bool(
+            (self.anthropic_api_key or "").strip()
+            and (self.anthropic_model or "").strip()
+        )
 
     @property
     def openai_ready(self) -> bool:
-        return bool(self.openai_api_key)
+        return bool(
+            (self.openai_api_key or "").strip()
+            and (self.openai_model or "").strip()
+        )
 
     @property
     def ollama_ready(self) -> bool:
         # Local server, no key — reachable-or-not shows up at call time
-        return bool(self.ollama_base_url)
+        return bool(
+            (self.ollama_base_url or "").strip()
+            and (self.ollama_model or "").strip()
+        )
 
     @property
     def llm_ready(self) -> bool:
