@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-"""Task 0 — Manual MEXC vertical spike (LIVE; uses .env keys).
+"""Read-only MEXC connectivity and contract-metadata probe.
 
-Run ONLY when you intend to hit the real exchange with a trade-only key
-(no withdraw). Do NOT invoke this from automated pytest.
+MEXC does not provide a futures Testnet. This tool therefore never sets
+leverage, places an order or cancels an order. Public connectivity and contract
+metadata are checked by default. Add --with-account only when authenticated
+asset and position reads are explicitly intended.
 
-Steps (documented):
-  1. ping / server time
-  2. contract/detail for DEFAULT_SYMBOL → apiAllowed, contractSize, units
-  3. private assets
-  4. open positions
-  5. set leverage (isolated long default) on an apiAllowed symbol
-  6. place minimum-vol limit order FAR from market + unique externalOid
-  7. cancel that order
-  8. print redacted request/response shapes
-
-Usage (from project root):
+Usage (from the project root):
   .\\.venv\\Scripts\\python.exe scripts\\mexc_spike.py
-  .\\.venv\\Scripts\\python.exe scripts\\mexc_spike.py --dry-read   # no place/cancel
-  .\\.venv\\Scripts\\python.exe scripts\\mexc_spike.py --place      # place+cancel far limit
+  .\\.venv\\Scripts\\python.exe scripts\\mexc_spike.py --with-account
 
-Never commits secrets. Never prints ApiKey / secret / Signature.
+Never commits secrets and never prints credentials, signatures or tokens.
 """
 
 from __future__ import annotations
@@ -27,194 +18,263 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
-# Project root on path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import get_settings  # noqa: E402
-from app.mexc.client import MexcClient  # noqa: E402
+from app.mexc.client import (  # noqa: E402
+    MexcClient,
+    _required_contract_symbol,
+    map_position,
+    usdt_balances,
+)
 from app.mexc.errors import MexcError  # noqa: E402
 
+MEXC_HOST = "api.mexc.com"
 
-def _redact(obj):
-    """Drop anything that might look like a secret key in nested dumps."""
+
+def _safe_exception_detail(exc: BaseException) -> str:
+    return f"{type(exc).__name__}; provider details suppressed"
+
+
+def _canonical_client_error(client) -> str | None:
+    """Validate the constructed client before credentials can reach a request."""
+    raw_url = str(getattr(client, "base_url", "") or "")
+    parsed = urlparse(raw_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return "constructed client has an invalid MEXC endpoint"
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != MEXC_HOST
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        return "constructed client does not target the canonical MEXC endpoint"
+    return None
+
+
+def _redact(obj, *, secret_values: tuple[str, ...] = ()):
+    """Remove credential-shaped keys and configured values from diagnostics."""
+    # Replace longer values first so a key that is a prefix of its secret cannot
+    # expose the secret's remaining suffix in a diagnostic string or field name.
+    secrets = tuple(
+        sorted({value for value in secret_values if value}, key=len, reverse=True)
+    )
     if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            kl = str(k).lower()
-            if any(s in kl for s in ("secret", "signature", "apikey", "api_key", "authorization")):
-                out[k] = "***"
+        result = {}
+        for key, value in obj.items():
+            safe_key = str(key)
+            for secret in secrets:
+                safe_key = safe_key.replace(secret, "[redacted]")
+            normalized = "".join(
+                character for character in safe_key.lower() if character.isalnum()
+            )
+            if any(
+                marker in normalized
+                for marker in (
+                    "secret",
+                    "signature",
+                    "apikey",
+                    "accesskey",
+                    "authorization",
+                    "password",
+                    "privatekey",
+                    "passphrase",
+                    "credential",
+                    "cookie",
+                    "token",
+                )
+            ):
+                result[safe_key] = "***"
             else:
-                out[k] = _redact(v)
-        return out
+                result[safe_key] = _redact(value, secret_values=secrets)
+        return result
     if isinstance(obj, list):
-        return [_redact(x) for x in obj]
+        return [_redact(value, secret_values=secrets) for value in obj]
+    if isinstance(obj, str):
+        for secret in secrets:
+            obj = obj.replace(secret, "[redacted]")
     return obj
 
 
-async def run(place: bool, dry_read: bool) -> int:
-    s = get_settings()
-    if not s.mexc_ready:
-        print("FAIL: MEXC_API_KEY / MEXC_API_SECRET not set in .env")
+def _asset_summary(assets) -> dict[str, object]:
+    """Return a fixed, validated account balance view without raw provider fields."""
+    if not isinstance(assets, list) or not all(
+        isinstance(asset, dict) for asset in assets
+    ):
+        raise MexcError("account assets have an invalid shape")
+    present = any(
+        str(asset.get("currency") or "").upper() == "USDT" for asset in assets
+    )
+    equity, available = usdt_balances(assets)
+    return {
+        "currency": "USDT",
+        "present": present,
+        "equity": equity,
+        "availableBalance": available,
+    }
+
+
+def _position_summaries(positions) -> list[dict[str, object]]:
+    """Normalize every private position before selecting terminal-safe fields."""
+    if not isinstance(positions, list) or not all(
+        isinstance(position, dict) for position in positions
+    ):
+        raise MexcError("open positions have an invalid shape")
+    summaries: list[dict[str, object]] = []
+    for position in positions:
+        mapped = map_position(position)
+        symbol = _required_contract_symbol(mapped.get("symbol"))
+        side = mapped.get("side")
+        hold_volume = mapped.get("hold_vol")
+        entry_price = mapped.get("entry_price")
+        open_type = mapped.get("open_type")
+        if (
+            side not in ("long", "short")
+            or not isinstance(hold_volume, (int, float))
+            or isinstance(hold_volume, bool)
+            or hold_volume <= 0
+            or not isinstance(entry_price, (int, float))
+            or isinstance(entry_price, bool)
+            or entry_price <= 0
+            or open_type not in ("isolated", "cross")
+        ):
+            raise MexcError("open position contains invalid required values")
+        summaries.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "holdVolume": hold_volume,
+                "entryPrice": entry_price,
+                "leverage": mapped.get("leverage"),
+                "openType": open_type,
+            }
+        )
+    return summaries
+
+
+def _require_market_symbol(value, symbol: str, *, source: str) -> None:
+    observed = getattr(value, "symbol", None)
+    if type(observed) is not str or observed.strip().upper() != symbol:
+        raise MexcError(f"{source} symbol does not match the requested contract")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only MEXC probe (MEXC has no futures Testnet)"
+    )
+    parser.add_argument(
+        "--with-account",
+        action="store_true",
+        help="Also read authenticated assets and positions",
+    )
+    return parser
+
+
+async def run(*, with_account: bool) -> int:
+    settings = get_settings()
+    if getattr(settings, "exchange", None) != "mexc":
+        print("REFUSE: EXCHANGE must be mexc before the MEXC probe can run.")
+        return 2
+    if with_account and not settings.mexc_ready:
+        print(
+            "REFUSE: --with-account requires configured MEXC API credentials."
+        )
+        return 2
+    try:
+        symbol = _required_contract_symbol(
+            settings.default_symbol,
+            error_message="DEFAULT_SYMBOL is invalid for MEXC",
+        )
+    except MexcError:
+        print("REFUSE: DEFAULT_SYMBOL is invalid for MEXC.")
         return 2
 
-    symbol = s.default_symbol
-    client = MexcClient(s.mexc_base_url, s.mexc_api_key, s.mexc_api_secret)
-    try:
-        print("=== 1. ping ===")
-        ts = await client.ping()
-        print(f"server_time_ms={ts}")
+    api_key = settings.mexc_api_key if with_account else ""
+    api_secret = settings.mexc_api_secret if with_account else ""
+    client = None
+    exit_code = 0
 
-        print(f"=== 2. contract_detail {symbol} ===")
+    try:
+        client = MexcClient(settings.mexc_base_url, api_key, api_secret)
+        client_error = _canonical_client_error(client)
+        if client_error:
+            print(f"REFUSE: {client_error}")
+            return 2
+        print("=== 1. public ping ===")
+        server_time = await client.ping()
+        print(f"server_time_ms={server_time}")
+
+        print(f"=== 2. public contract detail: {symbol} ===")
         meta = await client.contract_meta(symbol)
+        _require_market_symbol(meta, symbol, source="contract metadata")
         print(
             f"symbol={meta.symbol} apiAllowed={meta.api_allowed} "
             f"contractSize={meta.contract_size} priceUnit={meta.price_unit} "
             f"volUnit={meta.vol_unit} minVol={meta.min_vol} maxVol={meta.max_vol} "
             f"maxLeverage={meta.max_leverage}"
         )
-        if not meta.api_allowed:
-            print("STOP: apiAllowed=false — do not place via API on this symbol")
-            return 3
 
-        print("=== 3. assets ===")
-        assets = await client.assets()
-        usdt = next(
-            (a for a in assets if str(a.get("currency", "")).upper() == "USDT"),
-            None,
-        )
-        print(_redact(usdt or {"note": "no USDT row"}))
-
-        print("=== 4. open positions ===")
-        positions = await client.positions()
-        print(f"count={len(positions)}")
-        for p in positions[:5]:
-            print(_redact({k: p.get(k) for k in (
-                "symbol", "positionType", "holdVol", "holdAvgPrice", "leverage", "openType"
-            )}))
-
-        if dry_read or not place:
-            print(
-                "=== skip place/cancel "
-                f"(dry_read={dry_read}, place={place}) ==="
-            )
-            print(
-                "Re-run with --place to set leverage + far limit min order + cancel.\n"
-                "Requires TRADING_ENABLED awareness: this script does NOT check the flag;\n"
-                "it is a manual operator tool. Prefer keeping TRADING_ENABLED=false in the app."
-            )
-            return 0
-
-        print("=== 5. set_leverage (isolated long, lev=5) ===")
-        try:
-            lev_resp = await client.set_leverage(symbol, 5, open_type=1, position_type=1)
-            print(_redact(lev_resp))
-        except MexcError as e:
-            print(f"set_leverage warning: {e}")
-
+        print(f"=== 3. public ticker: {symbol} ===")
         ticker = await client.ticker(symbol)
-        last = float(ticker.last_price or 0)
-        # Far below market for a long limit — unlikely to fill
-        far_price = round(last * 0.5 / meta.price_unit) * meta.price_unit if meta.price_unit else last * 0.5
-        vol = meta.min_vol if meta.min_vol > 0 else meta.vol_unit
-        external_oid = f"spike-{uuid.uuid4().hex[:16]}"
+        _require_market_symbol(ticker, symbol, source="ticker")
+        print(f"last_price={ticker.last_price}")
 
-        body = {
-            "symbol": symbol,
-            "price": far_price,
-            "vol": vol,
-            "side": 1,  # open long
-            "type": 1,  # limit
-            "openType": 1,  # isolated
-            "leverage": 5,
-            "externalOid": external_oid,
-            # SL far below far_price (long) — documents whether exchange accepts field
-            "stopLossPrice": round(far_price * 0.9 / meta.price_unit) * meta.price_unit
-            if meta.price_unit
-            else far_price * 0.9,
-        }
-        print("=== 6. place far limit WITH stopLossPrice ===")
-        print("request:", _redact(body))
-        try:
-            placed = await client.place_order(body)
-            print("response:", _redact(placed))
-        except MexcError as e:
-            print(f"PLACE FAILED: {e}")
-            print("raw:", _redact(getattr(e, "raw", None)))
+        if not with_account:
             print(
-                "Document this in docs/superpowers/plans/mexc-spike-results.md. "
-                "Do not enable TRADING_ENABLED until place/cancel works."
+                "=== authenticated reads skipped; use --with-account only when "
+                "account access is intended ==="
             )
-            return 4
+        else:
+            print("=== 4. authenticated assets ===")
+            assets = await client.assets()
+            print(
+                _redact(
+                    _asset_summary(assets),
+                    secret_values=(api_key, api_secret),
+                )
+            )
 
-        order_id = None
-        if isinstance(placed, dict):
-            order_id = placed.get("orderId") or placed.get("data")
-            if isinstance(order_id, dict):
-                order_id = order_id.get("orderId")
-            # SL echo check
-            for k in ("stopLossPrice", "stop_loss_price"):
-                if k in placed:
-                    print(f"SL field echoed in place response: {k}={placed.get(k)}")
-
-        print("=== 6b. open_stop_orders / open_orders (SL verify probe) ===")
-        try:
-            stops = await client.open_stop_orders(symbol)
-            print(f"stop_orders count={len(stops)}")
-            for srow in stops[:5]:
-                print(_redact(srow))
-        except MexcError as e:
-            print(f"open_stop_orders probe failed (path may differ): {e}")
-        try:
-            opens = await client.open_orders(symbol)
-            print(f"open_orders count={len(opens)}")
-        except MexcError as e:
-            print(f"open_orders: {e}")
-
-        print("=== 7. cancel ===")
-        if order_id is None:
-            print("No orderId in place response — cancel skipped; check open orders manually")
-            return 5
-        try:
-            cancelled = await client.cancel_order([order_id])
-            print("cancel response:", _redact(cancelled))
-        except MexcError as e:
-            print(f"CANCEL FAILED: {e}")
-            return 6
-
-        print("=== OK: place path /api/v1/private/order/create + cancel proven ===")
-        print(
-            "Review stop_orders output above. If SL never appears, keep "
-            "AUTO_FLATTEN_IF_SL_UNVERIFIED=true and do not trust naked create SL."
-        )
-        print(
-            "Write results (redacted) to docs/superpowers/plans/mexc-spike-results.md "
-            "before TRADING_ENABLED=true."
-        )
-        return 0
+            print("=== 5. authenticated open positions ===")
+            positions = await client.positions()
+            summaries = _position_summaries(positions)
+            print(f"count={len(summaries)}")
+            for summary in summaries[:5]:
+                print(
+                    _redact(
+                        summary,
+                        secret_values=(api_key, api_secret),
+                    )
+                )
+    except MexcError as exc:
+        print(f"FAIL: MEXC read-only probe failed: {_safe_exception_detail(exc)}")
+        exit_code = 1
+    except Exception as exc:  # noqa: BLE001 - never print a diagnostic traceback
+        print(f"FAIL: MEXC read-only probe failed: {_safe_exception_detail(exc)}")
+        exit_code = 1
     finally:
-        await client.aclose()
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as exc:  # noqa: BLE001 - keep CLI output secret-free
+                print(f"FAIL: MEXC client close failed: {_safe_exception_detail(exc)}")
+                exit_code = 1
+    return exit_code
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="MEXC Task 0 vertical spike (manual)")
-    p.add_argument(
-        "--place",
-        action="store_true",
-        help="Place far min limit + cancel (LIVE)",
-    )
-    p.add_argument(
-        "--dry-read",
-        action="store_true",
-        help="Only ping/detail/assets/positions (default if --place omitted)",
-    )
-    args = p.parse_args()
-    code = asyncio.run(run(place=args.place, dry_read=args.dry_read or not args.place))
-    raise SystemExit(code)
+    arguments = _build_parser().parse_args()
+    raise SystemExit(asyncio.run(run(with_account=arguments.with_account)))
 
 
 if __name__ == "__main__":

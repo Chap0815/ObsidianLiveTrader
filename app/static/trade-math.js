@@ -132,6 +132,34 @@ function classifyTriggerLabel(orderType) {
   return null;
 }
 
+/** Classify all provider label aliases only when they are typed and agree. */
+function classifyTriggerLabelFields(order) {
+  const o = order || {};
+  const kinds = [];
+  let primaryLabelSeen = false;
+  for (const key of ["orderType", "tpsl"]) {
+    if (o[key] == null) continue;
+    if (typeof o[key] !== "string") return { kind: null, valid: false };
+    const normalized = o[key].trim().toLowerCase();
+    if (!normalized || normalized === "plan") continue;
+    primaryLabelSeen = true;
+    const kind = classifyTriggerLabel(o[key]);
+    if (kind == null) return { kind: null, valid: false };
+    kinds.push(kind);
+  }
+  if (!primaryLabelSeen && o.type != null) {
+    if (typeof o.type !== "string") return { kind: null, valid: false };
+    const normalized = o.type.trim().toLowerCase();
+    if (normalized && normalized !== "plan") {
+      const kind = classifyTriggerLabel(o.type);
+      if (kind == null) return { kind: null, valid: false };
+      kinds.push(kind);
+    }
+  }
+  if (new Set(kinds).size > 1) return { kind: null, valid: false };
+  return { kind: kinds.length > 0 ? kinds[0] : null, valid: true };
+}
+
 /** Match an exact pair or, for Hyperliquid only, a reported bare base coin. */
 function symbolsMatch(reported, wanted, allowBareBaseAlias) {
   if (typeof reported !== "string" || typeof wanted !== "string") return false;
@@ -299,7 +327,7 @@ function currentPositionEntryFillTime(fills, side, nowMs) {
  * app/orders/protection.py::classify_protection priority order (highest wins):
  *   1. an explicit stopLossPrice / takeProfitPrice FIELD (MEXC echoes these) —
  *      a field ALWAYS beats any inference;
- *   2. a triggerPrice|price plus an orderType LABEL (classifyTriggerLabel);
+ *   2. a triggerPrice|price plus consistent orderType/tpsl/type LABEL aliases;
  *   3. side + entry GEOMETRY, last: a stop sits on the LOSS side of entry, a
  *      take-profit on the PROFIT side.
  * Like the backend, an unlabeled trigger whose side/entry can't be resolved is
@@ -319,6 +347,12 @@ function classifyTriggers(order, side, entry, includeBeTolerance) {
   const o = order || {};
   const out = { sl: null, tp: null };
   const sideN = typeof side === "string" ? side.trim().toLowerCase() : "";
+  const reduceOnlyValues = ["reduceOnly", "reduce_only"]
+    .filter(function (key) { return o[key] != null; })
+    .map(function (key) { return o[key]; });
+  if (reduceOnlyValues.some(function (value) { return typeof value !== "boolean"; }) ||
+      new Set(reduceOnlyValues).size > 1 ||
+      (reduceOnlyValues.length > 0 && reduceOnlyValues[0] === false)) return out;
   const positionSides = ["positionType", "position_type"]
     .filter(function (key) { return o[key] != null; })
     .map(function (key) { return normalizeProtectionSide(o[key]); });
@@ -344,12 +378,11 @@ function classifyTriggers(order, side, entry, includeBeTolerance) {
     o.triggerPrice != null ? o.triggerPrice : o.price
   );
   if (trg == null) return out;
-  // 2) orderType label
-  const label = o.orderType;
-  if (label != null && typeof label !== "string") return out;
-  const kind = classifyTriggerLabel(label);
-  if (kind === "tp") { out.tp = trg; return out; }
-  if (kind === "sl") { out.sl = trg; return out; }
+  // 2) provider label aliases
+  const labels = classifyTriggerLabelFields(o);
+  if (!labels.valid) return out;
+  if (labels.kind === "tp") { out.tp = trg; return out; }
+  if (labels.kind === "sl") { out.sl = trg; return out; }
   // 3) geometry (side + entry) — last resort
   const e = Number(entry);
   if (!(Number.isFinite(e) && e > 0) || (sideN !== "long" && sideN !== "short")) {
@@ -372,7 +405,7 @@ function classifyChartTrigger(order) {
   const out = { sl: classified.sl, tp: classified.tp, trigger: null };
   if (out.sl != null || out.tp != null) return out;
   if (o.stopLossPrice != null || o.takeProfitPrice != null) return out;
-  if (o.orderType != null && typeof o.orderType !== "string") return out;
+  if (!classifyTriggerLabelFields(o).valid) return out;
   out.trigger = positiveFiniteNumber(
     o.triggerPrice != null ? o.triggerPrice : o.price
   );

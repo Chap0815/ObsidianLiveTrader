@@ -145,12 +145,14 @@ def test_mini_invalid_interval_rejected_without_upstream_call():
 
 
 def test_mini_per_symbol_error_isolated():
+    marker = "SYNTHETIC_PRIVATE_MINI_UPSTREAM_ERROR"
+
     def _mk():
         mock = MagicMock()
 
         async def klines(symbol, interval, limit_hint=200, *, paced=False):
             if symbol == "ETH_USDT":
-                raise RuntimeError("boom")
+                raise RuntimeError(marker)
             return _candles([1.0, 1.1])
 
         mock.klines = AsyncMock(side_effect=klines)
@@ -166,7 +168,8 @@ def test_mini_per_symbol_error_isolated():
     assert r.status_code == 200
     body = r.json()
     assert [x["symbol"] for x in body["results"]] == ["BTC_USDT"]
-    assert len(body["errors"]) == 1 and body["errors"][0].startswith("ETH_USDT:")
+    assert body["errors"] == ["ETH_USDT: market data unavailable"]
+    assert marker not in r.text
 
 
 def test_mini_cache_ttl_skips_upstream_refetch():
@@ -209,12 +212,14 @@ def test_mini_cache_preserves_errors():
     """A cached payload must still carry per-symbol errors — a cache hit must
     not silently swallow a failure that was present on the cache-filling
     request (V3-02: errors are passed through, never dropped)."""
+    marker = "SYNTHETIC_PRIVATE_CACHED_MINI_ERROR"
+
     def _mk():
         mock = MagicMock()
 
         async def klines(symbol, interval, limit_hint=200, *, paced=False):
             if symbol == "ETH_USDT":
-                raise RuntimeError("boom")
+                raise RuntimeError(marker)
             return _candles([1.0, 1.1])
 
         mock.klines = AsyncMock(side_effect=klines)
@@ -233,7 +238,9 @@ def test_mini_cache_preserves_errors():
     assert r1.json() == r2.json()
     body2 = r2.json()
     assert [x["symbol"] for x in body2["results"]] == ["BTC_USDT"]
-    assert len(body2["errors"]) == 1 and body2["errors"][0].startswith("ETH_USDT:")
+    assert body2["errors"] == ["ETH_USDT: market data unavailable"]
+    assert marker not in r1.text
+    assert marker not in r2.text
     assert mock.klines.await_count == 2  # BTC + ETH fetched once each, not re-fetched
 
 

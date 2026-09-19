@@ -202,6 +202,17 @@ def test_map_account_snapshot_per_symbol_contract_size():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ['BTC_USDT"]#SELECTOR', "B_USDT", "BTC-USD"])
+async def test_mexc_positions_reject_malformed_exchange_symbol(symbol):
+    c = MexcClient("https://contract.mexc.com", "k", "s")
+    row = dict(SAMPLE_POSITIONS[0], symbol=symbol)
+    c._request = AsyncMock(return_value=[row])  # type: ignore[method-assign]
+
+    with pytest.raises(MexcError, match="position identity"):
+        await c.positions("BTC_USDT")
+
+
+@pytest.mark.asyncio
 async def test_mexc_account_snapshot_resolves_per_symbol_contract_size():
     """MexcClient.account_snapshot() wires real contract metadata into each
     position, so opening BTC (small contract size) and SHIB (large contract
@@ -454,6 +465,80 @@ def test_account_success_with_mock_client(monkeypatch):
     mock.account_snapshot.assert_awaited_once()
 
 
+def test_account_accepts_normalized_hyperliquid_position(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(
+            exchange="hyperliquid",
+            hl_private_key="0x" + "a" * 64,
+        ),
+    )
+    snapshot = map_account_snapshot(
+        [{"currency": "USDT", "equity": 100.0, "availableBalance": 80.0}],
+        [
+            {
+                "positionId": "BTC",
+                "symbol": "BTC",
+                "positionType": 1,
+                "openType": 2,
+                "holdVol": 0.01,
+                "holdAvgPrice": 100_000.0,
+                "leverage": 3,
+                "unRealizedPnl": 5.0,
+            }
+        ],
+    )
+    mock = MagicMock()
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == snapshot
+
+
+def test_account_validates_positions_against_declared_client_exchange(monkeypatch):
+    from app.config import Settings
+
+    # A resolved client is the authority for the adapter payload it produced.
+    # Global settings can lag or be replaced independently in integrations.
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    snapshot = map_account_snapshot(
+        [{"currency": "USDT", "equity": 100.0, "availableBalance": 80.0}],
+        [
+            {
+                "positionId": "BTC",
+                "symbol": "BTC",
+                "positionType": 1,
+                "openType": 2,
+                "holdVol": 0.01,
+                "holdAvgPrice": 100_000.0,
+                "leverage": 3,
+                "unRealizedPnl": 5.0,
+            }
+        ],
+    )
+    mock = MagicMock()
+    mock.exchange_id = "hyperliquid"
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == snapshot
+
+
 def test_account_mexc_error_returns_200_with_error(monkeypatch):
     from app.config import Settings
 
@@ -463,17 +548,211 @@ def test_account_mexc_error_returns_200_with_error(monkeypatch):
             exchange="mexc", mexc_api_key="k", mexc_api_secret="s"
         ),
     )
+    marker = "SYNTHETIC_PRIVATE_ACCOUNT_ERROR"
     mock = MagicMock()
-    mock.account_snapshot = AsyncMock(side_effect=MexcError("signature invalid"))
+    mock.account_snapshot = AsyncMock(side_effect=MexcError(marker))
     with TestClient(app) as client:
         client.app.state.mexc = mock
         client.app.state.exchange = mock
         r = client.get("/api/account")
     assert r.status_code == 200
     body = r.json()
-    assert body["error"] == "signature invalid"
+    assert body["error"] == "Exchange account data unavailable"
+    assert marker not in r.text
     assert body["equity_usdt"] == 0.0
     assert body["positions"] == []
+
+
+def test_account_does_not_reflect_adapter_snapshot_error_text(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(
+            exchange="mexc", mexc_api_key="k", mexc_api_secret="s"
+        ),
+    )
+    marker = "SYNTHETIC_PRIVATE_SNAPSHOT_ERROR"
+    mock = MagicMock()
+    mock.account_snapshot = AsyncMock(
+        return_value={
+            "equity_usdt": 100.0,
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": marker,
+        }
+    )
+
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "equity_usdt": 0.0,
+        "available_usdt": 0.0,
+        "positions": [],
+        "error": "Exchange account data unavailable",
+    }
+    assert marker not in response.text
+
+
+@pytest.mark.parametrize(
+    "malformed_snapshot",
+    [
+        None,
+        [],
+        {},
+        {"equity_usdt": 100.0, "positions": [], "error": None},
+        {
+            "equity_usdt": True,
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": None,
+        },
+        {
+            "equity_usdt": "100.0",
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": None,
+        },
+        {
+            "equity_usdt": 10**1000,
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": None,
+        },
+        {
+            "equity_usdt": float("nan"),
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": None,
+        },
+        {
+            "equity_usdt": 100.0,
+            "available_usdt": float("inf"),
+            "positions": [],
+            "error": None,
+        },
+        {
+            "equity_usdt": 100.0,
+            "available_usdt": 90.0,
+            "positions": None,
+            "error": None,
+        },
+        {
+            "equity_usdt": 100.0,
+            "available_usdt": 90.0,
+            "positions": [None],
+            "error": None,
+        },
+        {
+            "equity_usdt": 100.0,
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": {"private": "diagnostic"},
+        },
+        {
+            "equity_usdt": 100.0,
+            "available_usdt": 90.0,
+            "positions": [],
+            "error": None,
+            "private_diagnostic": "SYNTHETIC_PRIVATE_ACCOUNT_RAW",
+        },
+    ],
+)
+def test_account_rejects_malformed_adapter_snapshot(monkeypatch, malformed_snapshot):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    mock = MagicMock()
+    mock.account_snapshot = AsyncMock(return_value=malformed_snapshot)
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "equity_usdt": 0.0,
+        "available_usdt": 0.0,
+        "positions": [],
+        "error": "Exchange account data unavailable",
+    }
+    assert "SYNTHETIC_PRIVATE_ACCOUNT_RAW" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "BTC_USDT#SYNTHETIC_PRIVATE_POSITION_RAW"),
+        ("side", "flat"),
+        ("position_type", 2),
+        ("hold_vol", float("nan")),
+        ("entry_price", "109777.5"),
+        ("contract_size", 0.0),
+        ("unrealized_pnl", float("inf")),
+        ("state", "SYNTHETIC_PRIVATE_POSITION_RAW"),
+    ],
+)
+def test_account_rejects_malformed_normalized_position(monkeypatch, field, value):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    snapshot = map_account_snapshot(SAMPLE_ASSETS, SAMPLE_POSITIONS)
+    snapshot["positions"][0][field] = value
+    mock = MagicMock()
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "equity_usdt": 0.0,
+        "available_usdt": 0.0,
+        "positions": [],
+        "error": "Exchange account data unavailable",
+    }
+    assert "SYNTHETIC_PRIVATE_POSITION_RAW" not in response.text
+
+
+def test_account_rejects_extra_normalized_position_field(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    snapshot = map_account_snapshot(SAMPLE_ASSETS, SAMPLE_POSITIONS)
+    snapshot["positions"][0]["private_diagnostic"] = (
+        "SYNTHETIC_PRIVATE_POSITION_RAW"
+    )
+    mock = MagicMock()
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    with TestClient(app) as client:
+        client.app.state.mexc = mock
+        client.app.state.exchange = mock
+        response = client.get("/api/account")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "equity_usdt": 0.0,
+        "available_usdt": 0.0,
+        "positions": [],
+        "error": "Exchange account data unavailable",
+    }
+    assert "SYNTHETIC_PRIVATE_POSITION_RAW" not in response.text
 
 
 @pytest.mark.asyncio

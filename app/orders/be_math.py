@@ -38,6 +38,14 @@ import math
 def break_even_price(
     entry: float, is_short: bool, fee_rt: float = 0.0006
 ) -> float | None:
+    if (
+        isinstance(entry, bool)
+        or not isinstance(entry, (int, float))
+        or type(is_short) is not bool
+        or isinstance(fee_rt, bool)
+        or not isinstance(fee_rt, (int, float))
+    ):
+        return None
     if not math.isfinite(entry) or entry <= 0:
         return None
     # Trust boundary: a non-finite fee_rt must not silently yield a bogus but

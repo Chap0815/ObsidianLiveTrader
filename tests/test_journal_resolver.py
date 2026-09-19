@@ -168,6 +168,84 @@ def test_candle_before_t0_ignored():
     assert o.status == PENDING
 
 
+def test_market_touch_in_t0_straddling_candle_is_skipped():
+    created_at = T0 + timedelta(minutes=5)
+    o = _long(
+        order_type="market",
+        created_at=created_at,
+        candle_interval_s=15 * 60,
+        candles=[
+            _candle(0, 100.5, 98.5),
+            _candle(15, 100.5, 99.5),
+            _candle(30, 102.5, 100.0),
+        ],
+    )
+
+    assert o.status == SKIPPED
+
+
+def test_limit_fill_in_t0_straddling_candle_is_skipped():
+    created_at = T0 + timedelta(minutes=5)
+    o = _long(
+        order_type="limit",
+        created_at=created_at,
+        candle_interval_s=15 * 60,
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(15, 100.5, 99.5),
+            _candle(30, 102.5, 100.0),
+        ],
+    )
+
+    assert o.status == SKIPPED
+
+
+def test_safe_t0_partial_candle_allows_later_market_win():
+    created_at = T0 + timedelta(minutes=5)
+    o = _long(
+        order_type="market",
+        created_at=created_at,
+        candle_interval_s=15 * 60,
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(15, 102.5, 100.0),
+        ],
+    )
+
+    assert o.status == WIN
+
+
+def test_touch_in_deadline_straddling_candle_is_skipped():
+    created_at = T0 + timedelta(minutes=5)
+    neutral = [
+        _candle(offset, 100.5, 99.5)
+        for offset in range(0, 24 * 60, 15)
+    ]
+    o = _long(
+        order_type="market",
+        created_at=created_at,
+        candle_interval_s=15 * 60,
+        candles=[*neutral, _candle(24 * 60, 102.5, 100.0)],
+    )
+
+    assert o.status == SKIPPED
+
+
+def test_safe_partial_boundary_candles_allow_expiration():
+    created_at = T0 + timedelta(minutes=5)
+    o = _long(
+        order_type="market",
+        created_at=created_at,
+        candle_interval_s=15 * 60,
+        candles=[
+            _candle(offset, 100.5, 99.5)
+            for offset in range(0, 24 * 60 + 1, 15)
+        ],
+    )
+
+    assert o.status == EXPIRED
+
+
 def test_candle_after_resolver_now_cannot_resolve_outcome():
     now = T0 + timedelta(hours=1)
     o = _long(
@@ -178,6 +256,64 @@ def test_candle_after_resolver_now_cannot_resolve_outcome():
         now=now,
     )
     assert o.status == PENDING
+
+
+@pytest.mark.parametrize(
+    "invalid_candle",
+    [
+        {"time": True, "high": 102.5, "low": 100.0},
+        {"time": float(T0_MS + 5 * 60_000), "high": 102.5, "low": 100.0},
+        {"time": T0_MS + 5 * 60_000, "high": True, "low": 100.0},
+        {"time": T0_MS + 5 * 60_000, "high": 102.5, "low": False},
+        {"time": T0_MS + 5 * 60_000, "high": float("nan"), "low": 100.0},
+        {"time": T0_MS + 5 * 60_000, "high": float("inf"), "low": 100.0},
+        {"time": T0_MS + 5 * 60_000, "high": 102.5, "low": float("-inf")},
+        {"time": T0_MS + 5 * 60_000, "high": 99.0, "low": 100.0},
+        {"time": T0_MS + 5 * 60_000, "high": 102.5, "low": 0.0},
+        {"time": T0_MS + 5 * 60_000, "low": 100.0},
+    ],
+)
+def test_invalid_observed_candle_keeps_outcome_pending(invalid_candle):
+    outcome = _long(
+        order_type="market",
+        candles=[
+            _candle(0, 100.5, 99.5),
+            invalid_candle,
+            _candle(10, 102.5, 100.0),
+        ],
+    )
+
+    assert outcome.status == PENDING
+    assert outcome.realized_r is None
+    assert outcome.realized_r_net is None
+
+
+def test_duplicate_observed_candle_time_keeps_outcome_pending():
+    outcome = _long(
+        order_type="market",
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(5, 100.5, 99.5),
+            _candle(5, 102.5, 100.0),
+        ],
+    )
+
+    assert outcome.status == PENDING
+
+
+def test_overlapping_fixed_interval_candles_keep_outcome_pending():
+    outcome = _long(
+        order_type="market",
+        candle_interval_s=15 * 60,
+        candles=[
+            _candle(0, 100.5, 99.5),
+            _candle(5, 102.5, 100.0),
+        ],
+    )
+
+    assert outcome.status == PENDING
+    assert outcome.realized_r is None
+    assert outcome.realized_r_net is None
 
 
 def test_degenerate_long_geometry_skipped():

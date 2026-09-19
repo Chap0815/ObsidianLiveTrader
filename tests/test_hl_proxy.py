@@ -575,6 +575,46 @@ def _settings():
 
 
 @pytest.mark.asyncio
+async def test_proxy_bounds_upstream_receive_queue(monkeypatch):
+    client = _FakeClientForProxy()
+    upstream = _FakeUpstream(on_enter=client.release)
+    calls = _patch_connect(monkeypatch, [upstream])
+
+    await hl_proxy.proxy_hyperliquid_market(
+        client, _settings(), symbol="BTC", tf="15m"
+    )
+
+    assert calls[0][1]["max_size"] == 8 * 1024 * 1024
+    assert calls[0][1]["max_queue"] == hl_proxy.HL_MAX_UPSTREAM_QUEUE == 4
+
+
+@pytest.mark.asyncio
+async def test_proxy_unexpected_client_error_is_redacted(monkeypatch, caplog):
+    marker = "SYNTHETIC_CLIENT_TRANSPORT_SECRET"
+
+    class _FailingClient(_FakeClientForProxy):
+        async def receive_text(self):
+            raise RuntimeError(marker)
+
+    client = _FailingClient()
+    _patch_connect(monkeypatch, [_FakeUpstream()])
+
+    await hl_proxy.proxy_hyperliquid_market(
+        client, _settings(), symbol="BTC", tf="15m"
+    )
+
+    assert client.sent[-1] == {
+        "type": "status",
+        "status": "error",
+        "error": "Internal error",
+        "coin": "BTC",
+    }
+    assert marker not in str(client.sent)
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_proxy_reconnects_after_clean_upstream_close(monkeypatch):
     """E3-02: a clean upstream close must NOT tear down the browser session —
     the proxy reconnects (and emits a `degraded` status) while the client
@@ -591,6 +631,32 @@ async def test_proxy_reconnects_after_clean_upstream_close(monkeypatch):
 
     assert len(calls) >= 2  # upstream was reconnected after the clean close
     assert any(f.get("status") == "degraded" for f in client.sent)
+
+
+@pytest.mark.asyncio
+async def test_proxy_redacts_upstream_connect_error_from_log(monkeypatch, caplog):
+    client = _FakeClientForProxy()
+    recovered = _FakeUpstream(on_enter=client.release)
+    marker = "SYNTHETIC_UNTRUSTED_CONNECT_REASON"
+    attempts = 0
+
+    def fake_connect(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError(marker)
+        return recovered
+
+    monkeypatch.setattr(hl_proxy.websockets, "connect", fake_connect)
+    monkeypatch.setattr(hl_proxy, "HL_BACKOFF_START", 0.0)
+
+    await hl_proxy.proxy_hyperliquid_market(
+        client, _settings(), symbol="BTC", tf="15m"
+    )
+
+    assert attempts == 2
+    assert marker not in caplog.text
+    assert "ConnectionError" in caplog.text
 
 
 @pytest.mark.asyncio

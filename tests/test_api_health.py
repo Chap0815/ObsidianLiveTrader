@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -76,9 +77,92 @@ def test_health_does_not_report_provider_alias_as_fallback(monkeypatch):
     assert body["llm_fallback_active"] is False
 
 
+@pytest.mark.parametrize(
+    ("settings_kwargs", "allowed"),
+    [
+        (
+            {
+                "llm_provider": "claude",
+                "anthropic_api_key": "synthetic-claude-key",
+                "include_account_in_llm": False,
+            },
+            False,
+        ),
+        (
+            {
+                "llm_provider": "claude",
+                "anthropic_api_key": "synthetic-claude-key",
+                "include_account_in_llm": True,
+            },
+            True,
+        ),
+        ({"llm_provider": "ollama", "include_account_in_llm": False}, True),
+    ],
+)
+def test_health_reports_when_position_reevaluation_is_allowed(
+    monkeypatch, settings_kwargs, allowed
+):
+    monkeypatch.setattr(main, "get_settings", lambda: _settings(**settings_kwargs))
+    with TestClient(app) as client:
+        client.app.state.llm_override = None
+        body = client.get("/api/health").json()
+
+    assert body["position_reevaluation_allowed"] is allowed
+
+
 def _settings(**kwargs):
     from app.config import Settings
 
     base = dict(local_api_token="test-token")
     base.update(kwargs)
     return Settings(**base)
+
+
+@pytest.mark.parametrize(
+    ("settings_kwargs", "status_label", "network_label"),
+    [
+        (
+            {
+                "trading_enabled": False,
+                "exchange": "hyperliquid",
+                "hl_testnet": False,
+            },
+            "DISARMED",
+            "HYPERLIQUID · MAINNET",
+        ),
+        (
+            {
+                "trading_enabled": True,
+                "exchange": "hyperliquid",
+                "hl_testnet": True,
+            },
+            "ARMED · TESTNET",
+            "HYPERLIQUID · TESTNET",
+        ),
+        (
+            {
+                "trading_enabled": True,
+                "exchange": "mexc",
+                "mexc_api_key": "k",
+                "mexc_api_secret": "s",
+            },
+            "ARMED · REAL FUNDS",
+            "MEXC · LIVE VENUE",
+        ),
+    ],
+)
+def test_dashboard_initial_trading_status_matches_network(
+    monkeypatch, settings_kwargs, status_label, network_label
+):
+    monkeypatch.setattr(main, "_setup_needed", lambda: False)
+    monkeypatch.setattr(main, "get_settings", lambda: _settings(**settings_kwargs))
+
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert f'<span class="arm-text">{status_label}</span>' in response.text
+    exchange_id = settings_kwargs["exchange"]
+    assert (
+        f'<span id="exchange-label" data-exchange="{exchange_id}">{network_label}</span>'
+        in response.text
+    )

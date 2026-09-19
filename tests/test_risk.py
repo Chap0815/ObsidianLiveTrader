@@ -120,6 +120,59 @@ def test_suggest_vol_rejects_negative_existing_risk_like_order_gate():
 
 
 @pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("equity", "10000.0"),
+        ("risk_pct", "1.0"),
+        ("contract_size", "0.0001"),
+        ("entry", "100000.0"),
+        ("stop", "99000.0"),
+        ("vol_unit", "1.0"),
+        ("min_vol", "1.0"),
+        ("slippage_pct", "0.05"),
+        ("existing_risk_usdt", "0.0"),
+        ("available_usdt", "1000000.0"),
+        ("leverage", "5.0"),
+        ("max_notional_pct_of_equity", "1000.0"),
+    ],
+)
+def test_suggest_vol_rejects_untyped_numeric_inputs(field, bad_value):
+    values = {
+        "equity": 10_000.0,
+        "risk_pct": 1.0,
+        "contract_size": 0.0001,
+        "entry": 100_000.0,
+        "stop": 99_000.0,
+        "vol_unit": 1.0,
+        "min_vol": 1.0,
+        "side": "long",
+        "slippage_pct": 0.05,
+        "existing_risk_usdt": 0.0,
+        "available_usdt": 1_000_000.0,
+        "leverage": 5.0,
+        "max_notional_pct_of_equity": 1_000.0,
+    }
+    values[field] = bad_value
+
+    assert suggest_vol(**values) == 0.0
+
+
+def test_suggest_vol_clamps_to_contract_max_vol():
+    vol = suggest_vol(
+        10_000.0,
+        10.0,
+        0.0001,
+        100_000.0,
+        99_000.0,
+        1.0,
+        1.0,
+        max_vol=25.0,
+    )
+
+    assert vol == 25.0
+
+
+@pytest.mark.parametrize(
     "args",
     [
         (1e308, 100.0, 1.0, 100.0, 99.0, 1.0, 1.0),
@@ -147,6 +200,29 @@ def test_unit_rounding_fails_closed_when_finite_step_count_overflows(rounder):
 @pytest.mark.parametrize("direction", ["nearest", "up"])
 def test_unit_rounding_fails_closed_when_finite_rounded_product_overflows(direction):
     assert round_to_unit(1.7e308, 1e308, direction) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("value", "unit"),
+    [
+        (40.79149590537205, 1.5100843486053534e-13),
+        (736390840866.5428, 0.11796876633317496),
+    ],
+)
+def test_floor_rounding_never_increases_value_after_float_cleanup(value, unit):
+    assert round_down_to_unit(value, unit) <= value
+    assert round_to_unit(value, unit, "down") <= value
+
+
+@pytest.mark.parametrize(
+    ("value", "unit"),
+    [
+        (40128.83613532785, 1.995686167365203e-08),
+        (3.077599542181094e-10, 427.63294726533434),
+    ],
+)
+def test_ceil_rounding_never_decreases_value_after_float_cleanup(value, unit):
+    assert round_to_unit(value, unit, "up") >= value
 
 
 def test_gate_blocks_when_finite_volume_step_count_overflows():
@@ -266,7 +342,7 @@ def test_gate_rejects_invalid_ticket_leverage_without_coercion(bad_value):
     assert any("leverage must be an integer" in error for error in g.errors)
 
 
-@pytest.mark.parametrize("bad_vol", [True, 10**400])
+@pytest.mark.parametrize("bad_vol", [True, "1.0", 10**400])
 def test_gate_fails_closed_on_invalid_ticket_volume(bad_vol):
     ticket = _ticket()
     object.__setattr__(ticket, "vol", bad_vol)
@@ -280,7 +356,7 @@ def test_gate_fails_closed_on_invalid_ticket_volume(bad_vol):
     json.dumps(g.to_dict(), allow_nan=False)
 
 
-@pytest.mark.parametrize("bad_price", [True, 10**400])
+@pytest.mark.parametrize("bad_price", [True, "1.0", 10**400])
 def test_gate_fails_closed_on_invalid_limit_price(bad_price):
     ticket = _ticket(price=1.0, entry=1.0, stop_loss=0.9, take_profit=1.3)
     object.__setattr__(ticket, "price", bad_price)
@@ -295,7 +371,7 @@ def test_gate_fails_closed_on_invalid_limit_price(bad_price):
     json.dumps(g.to_dict(), allow_nan=False)
 
 
-@pytest.mark.parametrize("bad_entry", [True, 10**400])
+@pytest.mark.parametrize("bad_entry", [True, "100000.0", 10**400])
 def test_gate_fails_closed_on_invalid_advisory_entry(bad_entry):
     ticket = _ticket()
     object.__setattr__(ticket, "entry", bad_entry)
@@ -508,6 +584,19 @@ def test_mexc_enabled_contract_state_requires_literal_integer_zero(bad_state):
     assert any("state" in error.lower() for error in g.errors)
 
 
+def test_gate_rejects_contract_metadata_for_another_symbol():
+    gate = validate_order(
+        _ticket(),
+        _contract(symbol="ETH_USDT", contract_size=0.01),
+        10_000.0,
+        _settings(),
+        last_price=100_000.0,
+    )
+
+    assert gate.ok is False
+    assert "Contract metadata symbol does not match order symbol" in gate.errors
+
+
 def test_disarmed_preview_rejected():
     g = validate_order(
         _ticket(),
@@ -583,7 +672,16 @@ def test_gate_fails_closed_on_nonfinite_max_risk_pct():
 
 @pytest.mark.parametrize(
     "bad_risk",
-    [float("nan"), float("inf"), float("-inf"), -1.0, True, False, 10**400],
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        -1.0,
+        True,
+        False,
+        "1.0",
+        10**400,
+    ],
 )
 def test_gate_fails_closed_on_invalid_existing_same_side_risk(bad_risk):
     g = validate_order(
@@ -598,7 +696,7 @@ def test_gate_fails_closed_on_invalid_existing_same_side_risk(bad_risk):
     assert any("existing same-side risk" in e.lower() for e in g.errors)
 
 
-@pytest.mark.parametrize("bad_available", [True, 10**400])
+@pytest.mark.parametrize("bad_available", [True, "10000.0", 10**400])
 def test_gate_fails_closed_on_invalid_available_usdt(bad_available):
     g = validate_order(
         _ticket(),
@@ -648,7 +746,7 @@ def test_gate_fails_closed_on_nonfinite_contract_filter(field):
     "field",
     ["contract_size", "price_unit", "vol_unit", "min_vol", "max_vol", "min_notional"],
 )
-@pytest.mark.parametrize("bad_value", [True, 10**400])
+@pytest.mark.parametrize("bad_value", [True, "1.0", 10**400])
 def test_gate_fails_closed_on_invalid_contract_filter_type(field, bad_value):
     contract = _contract()
     object.__setattr__(contract, field, bad_value)
@@ -793,6 +891,27 @@ def test_order_ticket_rejects_boolean_numeric_fields(field):
         _ticket(**{field: True})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("proposal_id", "1"),
+        ("vol", "1"),
+        ("leverage", "1"),
+        ("price", "1"),
+        ("entry", "1"),
+        ("stop_loss", "1"),
+        ("take_profit", "1"),
+        ("tp2", "1"),
+        ("tp1_share", "0.5"),
+        ("open_type", "1"),
+        ("risk_pct", "1"),
+    ],
+)
+def test_order_ticket_rejects_numeric_string_fields(field, value):
+    with pytest.raises(ValidationError):
+        _ticket(**{field: value})
+
+
 def test_order_ticket_keeps_optional_none():
     """The new validator must not reject legitimate absent optionals."""
     t = _ticket(stop_loss=None, take_profit=None, tp2=None, entry=None)
@@ -820,7 +939,7 @@ def test_gate_fails_closed_on_nan_stop_loss_hl_contract():
     assert math.isfinite(g.risk_pct)  # no NaN leaks into the reported risk
 
 
-@pytest.mark.parametrize("bad_stop", [True, 10**400])
+@pytest.mark.parametrize("bad_stop", [True, "50000.0", 10**400])
 def test_gate_fails_closed_on_invalid_stop_loss(bad_stop):
     ticket = _ticket(
         order_type="market",
@@ -844,7 +963,7 @@ def test_gate_fails_closed_on_invalid_stop_loss(bad_stop):
     json.dumps(g.to_dict(), allow_nan=False)
 
 
-@pytest.mark.parametrize("bad_tp", [True, 10**400])
+@pytest.mark.parametrize("bad_tp", [True, "1.0", 10**400])
 def test_gate_fails_closed_on_invalid_take_profit(bad_tp):
     ticket = _ticket(price=0.5, entry=0.5, stop_loss=0.4, take_profit=1.0)
     object.__setattr__(ticket, "take_profit", bad_tp)
@@ -859,8 +978,57 @@ def test_gate_fails_closed_on_invalid_take_profit(bad_tp):
     json.dumps(g.to_dict(), allow_nan=False)
 
 
+@pytest.mark.parametrize("take_profit", [0.0, -1.0])
+def test_gate_rejects_nonpositive_explicit_take_profit(take_profit):
+    gate = validate_order(
+        _ticket(take_profit=take_profit),
+        _contract(),
+        10_000.0,
+        _settings(strict_rrr=False),
+        last_price=100_000.0,
+    )
+
+    assert gate.ok is False
+    assert any("take_profit must be > 0" in error for error in gate.errors)
+
+
 @pytest.mark.parametrize(
-    "bad_equity", [float("nan"), float("inf"), float("-inf"), True, 10**400]
+    ("side", "take_profit", "message"),
+    [
+        ("long", 99_000.0, "long take_profit must be above entry"),
+        ("short", 101_000.0, "short take_profit must be below entry"),
+    ],
+)
+def test_gate_rejects_wrong_side_tp_without_stop(side, take_profit, message):
+    gate = validate_order(
+        _ticket(side=side, stop_loss=None, take_profit=take_profit),
+        _contract(),
+        10_000.0,
+        _settings(allow_unprotected_entry=True, strict_rrr=False),
+        last_price=100_000.0,
+    )
+
+    assert gate.ok is False
+    assert message in gate.errors
+
+
+def test_gate_rejects_take_profit_that_rounds_to_zero_without_stop():
+    gate = validate_order(
+        _ticket(stop_loss=None, take_profit=0.4),
+        _contract(price_unit=1.0),
+        10_000.0,
+        _settings(allow_unprotected_entry=True, strict_rrr=False),
+        last_price=100_000.0,
+    )
+
+    assert gate.ok is False
+    assert "rounded take_profit is invalid" in gate.errors
+    assert gate.rounded_tp is None
+
+
+@pytest.mark.parametrize(
+    "bad_equity",
+    [float("nan"), float("inf"), float("-inf"), True, "10000.0", 10**400],
 )
 def test_gate_fails_closed_on_nonfinite_equity(bad_equity):
     g = validate_order(
@@ -961,6 +1129,14 @@ def test_close_position_request_rejects_boolean_amounts(field):
         ClosePositionRequest(symbol="BTC_USDT", side="long", **{field: True})
 
 
+@pytest.mark.parametrize("field", ["vol", "fraction"])
+def test_close_position_request_rejects_numeric_string_amounts(field):
+    from app.models import ClosePositionRequest
+
+    with pytest.raises(ValidationError):
+        ClosePositionRequest(symbol="BTC_USDT", side="long", **{field: "0.5"})
+
+
 @pytest.mark.parametrize("field", ["order_id", "orderId"])
 def test_cancel_request_rejects_boolean_order_ids(field):
     from app.models import CancelRequest
@@ -1038,7 +1214,7 @@ def test_market_order_without_last_price_blocks_on_confirm():
     assert any("reference price" in e.lower() for e in g.errors)
 
 
-@pytest.mark.parametrize("bad_last_price", [True, 10**400])
+@pytest.mark.parametrize("bad_last_price", [True, "1.0", 10**400])
 def test_market_order_rejects_invalid_server_reference_price(bad_last_price):
     g = validate_order(
         _ticket(
@@ -1173,9 +1349,8 @@ def test_limit_order_without_last_price_still_validates():
     assert g.entry_for_risk == 100_000.0
 
 
-def test_confirm_warns_when_preview_baseline_price_missing():
-    """Drift can't be checked when the preview captured no baseline price — the
-    gate must SURFACE that as a warning (not silently skip), and must not error."""
+def test_confirm_blocks_when_preview_baseline_price_missing():
+    """A missing drift baseline is unknown financial state and must block."""
     g = validate_order(
         _ticket(),
         _contract(),
@@ -1185,14 +1360,14 @@ def test_confirm_warns_when_preview_baseline_price_missing():
         for_confirm=True,
         preview_last_price=None,
     )
-    assert any("Price drift cannot be checked" in w for w in g.warnings)
-    assert not any("drift" in e.lower() for e in g.errors)
+    assert any("Price drift cannot be checked" in e for e in g.errors)
+    assert g.ok is False
 
 
 @pytest.mark.parametrize(
-    "bad_preview_price", [float("nan"), float("inf"), True, 10**400]
+    "bad_preview_price", [float("nan"), float("inf"), True, "100000.0", 10**400]
 )
-def test_confirm_warns_when_preview_baseline_price_is_invalid(bad_preview_price):
+def test_confirm_blocks_when_preview_baseline_price_is_invalid(bad_preview_price):
     g = validate_order(
         _ticket(),
         _contract(),
@@ -1203,8 +1378,8 @@ def test_confirm_warns_when_preview_baseline_price_is_invalid(bad_preview_price)
         preview_last_price=bad_preview_price,
     )
 
-    assert any("Price drift cannot be checked" in w for w in g.warnings)
-    assert not any("drift" in e.lower() for e in g.errors)
+    assert any("Price drift cannot be checked" in e for e in g.errors)
+    assert g.ok is False
     json.dumps(g.to_dict(), allow_nan=False)
 
 

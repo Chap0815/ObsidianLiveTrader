@@ -411,9 +411,10 @@ class OrderTicket(BaseModel):
     )
     risk_pct: float | None = Field(
         None,
+        gt=0,
         description=(
             "Requested risk percent for /api/sizing/suggest; server caps it at "
-            "settings.max_risk_pct and falls back to that cap if omitted/invalid."
+            "settings.max_risk_pct and uses that cap when omitted."
         ),
     )
 
@@ -432,8 +433,12 @@ class OrderTicket(BaseModel):
         mode="before",
     )
     @classmethod
-    def _reject_boolean_numbers(cls, v: Any) -> Any:
-        return _reject_bool_numeric(v)
+    def _reject_untyped_numbers(cls, v: Any) -> Any:
+        if v is not None and (
+            isinstance(v, bool) or not isinstance(v, (int, float))
+        ):
+            raise ValueError("ticket numeric fields must be numbers")
+        return v
 
     @field_validator(
         "vol",
@@ -487,8 +492,12 @@ class ClosePositionRequest(BaseModel):
 
     @field_validator("vol", "fraction", mode="before")
     @classmethod
-    def _reject_boolean_numbers(cls, v: Any) -> Any:
-        return _reject_bool_numeric(v)
+    def _reject_untyped_amounts(cls, v: Any) -> Any:
+        if v is not None and (
+            isinstance(v, bool) or not isinstance(v, (int, float))
+        ):
+            raise ValueError("close amount must be a number")
+        return v
 
     @field_validator("vol", "fraction")
     @classmethod
@@ -541,8 +550,10 @@ class ModifySLRequest(BaseModel):
 
     @field_validator("new_sl", mode="before")
     @classmethod
-    def _reject_boolean_price(cls, v: Any) -> Any:
-        return _reject_bool_numeric(v)
+    def _reject_untyped_price(cls, v: Any) -> Any:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("new_sl must be a number")
+        return v
 
     @field_validator("new_sl")
     @classmethod
@@ -559,9 +570,10 @@ class ArmRequest(BaseModel):
     """Arm autonomous management rules for ONE live position (spec §3.1/§4).
 
     This ENABLES autonomous stop moves, but the endpoint itself never moves a
-    stop or places an order — it only writes the mgmt DB record; the server-side
-    monitor is the sole actor. `side` is validated to long/short by OrderSide;
-    the endpoint additionally whitelists the rule NAMES (v1: only `auto_be`).
+    stop or places an order — it atomically patches the mgmt DB record; the
+    server-side monitor is the sole actor. Omitted rules retain their current
+    value. `side` is validated to long/short by OrderSide; the endpoint
+    additionally whitelists the rule names.
     """
 
     model_config = ConfigDict(extra="forbid")

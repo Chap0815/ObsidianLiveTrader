@@ -15,12 +15,15 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
+from app.config import MEXC_ALLOWED_HOSTS, MEXC_API_BASE_URL, MEXC_LEGACY_HOST
 from app.mexc.errors import MexcError
 from app.models import Candle, ContractMeta, FundingRate, Ticker
 
@@ -54,6 +57,87 @@ _MAX_MARKET_FUTURE_SKEW_MS = 5 * 60 * 1000
 # public contract definitions do not need to be downloaded on every 30-second
 # account poll. Money-path contract checks intentionally do not use this cache.
 _ACCOUNT_CONTRACT_SIZE_TTL_S = 600.0
+_MEXC_CONTRACT_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,32}_[A-Z0-9]{2,16}$")
+_MEXC_EXTERNAL_OID_RE = re.compile(r"^[A-Za-z0-9:_-]{1,64}$")
+_MAX_KLINE_LIMIT_HINT = 1500
+_MAX_USER_FILLS_LIMIT = 500
+
+
+def _validated_mexc_base_url(value: Any) -> str:
+    """Return only the canonical credential-safe MEXC futures endpoint."""
+    if not isinstance(value, str):
+        raise MexcError("MEXC base URL is invalid")
+    raw = value.strip().rstrip("/")
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise MexcError("MEXC base URL is invalid") from exc
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path
+        or port not in (None, 443)
+        or host not in MEXC_ALLOWED_HOSTS | {MEXC_LEGACY_HOST}
+    ):
+        raise MexcError("MEXC base URL is invalid or not canonical")
+    if host == MEXC_LEGACY_HOST:
+        return MEXC_API_BASE_URL
+    return raw
+
+
+def _required_contract_symbol(
+    value: Any, *, error_message: str = "open position identity is invalid"
+) -> str:
+    symbol = value.strip().upper() if isinstance(value, str) else ""
+    if _MEXC_CONTRACT_SYMBOL_RE.fullmatch(symbol) is None:
+        raise MexcError(error_message)
+    return symbol
+
+
+def _required_external_oid(value: Any) -> str:
+    if not isinstance(value, str) or _MEXC_EXTERNAL_OID_RE.fullmatch(value) is None:
+        raise MexcError("externalOid is invalid")
+    return value
+
+
+def _contains_explicit_error_marker(value: Any) -> bool:
+    """Return True when any response object explicitly declares ``error``."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if isinstance(key, str) and key.strip().lower() == "error":
+                    return True
+                pending.append(child)
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def _contains_mutation_failure_marker(value: Any) -> bool:
+    """Fail closed on status markers anywhere in a mutation response tree."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                normalized = key.strip().lower() if isinstance(key, str) else ""
+                if normalized == "success" and child is not True:
+                    return True
+                if normalized in {"code", "errorcode", "error_code"} and not (
+                    _mexc_zero_code(child)
+                ):
+                    return True
+                pending.append(child)
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
 
 
 def sign_payload(
@@ -184,7 +268,9 @@ def _to_ms(ts: int | float) -> int:
     return t if t >= 1_000_000_000_000 else t * 1000
 
 
-def normalize_klines(data: dict[str, Any]) -> list[Candle]:
+def normalize_klines(
+    data: dict[str, Any], *, max_rows: int | None = None
+) -> list[Candle]:
     """Convert MEXC parallel-array kline payload to list[Candle]."""
     names = ("time", "open", "high", "low", "close", "vol", "amount")
     arrays = {name: data.get(name) for name in names}
@@ -200,6 +286,8 @@ def normalize_klines(data: dict[str, Any]) -> list[Candle]:
     n = len(times)
     if any(len(arrays[name]) != n for name in names[1:]):
         raise MexcError("kline payload arrays have different lengths", raw=data)
+    if max_rows is not None and n > max_rows:
+        raise MexcError("kline response exceeds requested limit")
     candles: list[Candle] = []
     latest_candle_time = int(time.time() * 1000) + _MAX_MARKET_FUTURE_SKEW_MS
     for i in range(n):
@@ -288,7 +376,7 @@ class MexcClient:
     exchange_id = "mexc"
 
     def __init__(self, base_url: str, api_key: str = "", api_secret: str = ""):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validated_mexc_base_url(base_url)
         # Match setup and readiness semantics: surrounding whitespace is never
         # part of a MEXC credential and must not make an empty key look usable.
         self.api_key = (api_key or "").strip()
@@ -362,8 +450,8 @@ class MexcClient:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise MexcError(
-                f"HTTP {e.response.status_code}: {e.response.text[:300]}",
-                raw={"status": e.response.status_code, "body": e.response.text},
+                f"HTTP {e.response.status_code}",
+                raw={"status": e.response.status_code, "body": e.response.text[:300]},
             ) from e
         except httpx.HTTPError as e:
             raise MexcError(f"HTTP error: {e}") from e
@@ -379,6 +467,11 @@ class MexcClient:
                 f"invalid JSON in 2xx response body: {e}",
                 raw={"status": r.status_code, "body": r.text[:300]},
             ) from e
+        if _contains_explicit_error_marker(data):
+            raise MexcError(
+                "MEXC response contains an explicit error marker",
+                raw=data,
+            )
         if isinstance(data, dict) and "success" in data:
             success = data.get("success")
             if success is False:
@@ -426,7 +519,14 @@ class MexcClient:
     async def contract_detail(
         self, symbol: str | None = None
     ) -> dict[str, Any] | list[dict[str, Any]]:
-        params = {"symbol": symbol} if symbol else None
+        validated_symbol = (
+            _required_contract_symbol(
+                symbol, error_message="contract detail symbol is invalid"
+            )
+            if symbol is not None
+            else None
+        )
+        params = {"symbol": validated_symbol} if validated_symbol else None
         data = await self._request("GET", "/api/v1/contract/detail", params=params)
         if isinstance(data, dict):
             return data
@@ -531,6 +631,9 @@ class MexcClient:
         return rows[: max(1, int(limit))]
 
     async def contract_meta(self, symbol: str) -> ContractMeta:
+        symbol = _required_contract_symbol(
+            symbol, error_message="contract metadata symbol is invalid"
+        )
         data = await self.contract_detail(symbol)
         if isinstance(data, list):
             row = next(
@@ -552,31 +655,44 @@ class MexcClient:
         # scanner passes it uniformly); MEXC has no HL-style read-rate budget, so
         # it's a no-op here (its fan-out is bounded by the scanner's semaphore).
         _ = paced
-        mexc_interval = INTERVAL_MAP.get(interval, interval)
+        symbol = _required_contract_symbol(
+            symbol, error_message="kline symbol is invalid"
+        )
+        if not isinstance(interval, str) or interval not in INTERVAL_MAP:
+            raise MexcError("kline interval is invalid")
+        if (
+            isinstance(limit_hint, bool)
+            or not isinstance(limit_hint, int)
+            or not 1 <= limit_hint <= _MAX_KLINE_LIMIT_HINT
+        ):
+            raise MexcError("kline limit_hint is invalid")
+        mexc_interval = INTERVAL_MAP[interval]
         params: dict[str, Any] = {"interval": mexc_interval}
-        sec = _INTERVAL_SECONDS.get(interval) or _INTERVAL_SECONDS.get(mexc_interval)
-        if sec and limit_hint > 0:
-            # start is seconds; cap window so we roughly get limit_hint bars
-            end = int(time.time())
-            start = end - sec * int(limit_hint)
-            params["start"] = start
-            params["end"] = end
+        sec = _INTERVAL_SECONDS[mexc_interval]
+        # start is seconds; cap window so we roughly get limit_hint bars
+        end = int(time.time())
+        start = end - sec * limit_hint
+        params["start"] = start
+        params["end"] = end
         data = await self._request(
             "GET", f"/api/v1/contract/kline/{symbol}", params=params
         )
         if not isinstance(data, dict):
             raise MexcError("Unexpected kline payload", raw=data)
-        candles = normalize_klines(data)
+        candles = normalize_klines(data, max_rows=limit_hint + 1)
         if sec and any(
             first.time // (sec * 1000) == second.time // (sec * 1000)
             for first, second in zip(candles, candles[1:])
         ):
             raise MexcError("duplicate kline interval")
-        if limit_hint > 0 and len(candles) > limit_hint:
+        if len(candles) > limit_hint:
             candles = candles[-limit_hint:]
         return candles
 
     async def ticker(self, symbol: str) -> Ticker:
+        symbol = _required_contract_symbol(
+            symbol, error_message="ticker symbol is invalid"
+        )
         data = await self._request(
             "GET", "/api/v1/contract/ticker", params={"symbol": symbol}
         )
@@ -620,6 +736,9 @@ class MexcClient:
         )
 
     async def funding_rate(self, symbol: str) -> FundingRate:
+        symbol = _required_contract_symbol(
+            symbol, error_message="funding-rate symbol is invalid"
+        )
         data = await self._request(
             "GET", f"/api/v1/contract/funding_rate/{symbol}"
         )
@@ -678,19 +797,14 @@ class MexcClient:
             raise MexcError("unrecognized open-positions response shape", raw=data)
         rows = data
         if symbol:
-            wanted_symbol = str(symbol).strip().upper()
+            wanted_symbol = _required_contract_symbol(symbol)
             scoped_rows = []
             for row in rows:
                 if not isinstance(row, dict):
                     scoped_rows.append(row)
                     continue
-                symbol_raw = row.get("symbol")
-                row_symbol = (
-                    symbol_raw.strip().upper()
-                    if isinstance(symbol_raw, str)
-                    else ""
-                )
-                if not row_symbol or row_symbol == wanted_symbol:
+                row_symbol = _required_contract_symbol(row.get("symbol"))
+                if row_symbol == wanted_symbol:
                     scoped_rows.append(row)
             rows = scoped_rows
         for row in rows:
@@ -701,11 +815,10 @@ class MexcClient:
             entry = mapped.get("entry_price")
             position_symbol = mapped.get("symbol")
             if (
-                not isinstance(position_symbol, str)
-                or not position_symbol.strip()
-                or mapped.get("side") not in ("long", "short")
+                mapped.get("side") not in ("long", "short")
             ):
                 raise MexcError("open position identity is invalid")
+            _required_contract_symbol(position_symbol)
             if mapped.get("open_type") not in ("isolated", "cross"):
                 raise MexcError("open position openType is invalid")
             if hold is None or hold <= 0:
@@ -810,16 +923,13 @@ class MexcClient:
             or position_type not in (1, 2)
         ):
             raise MexcError("positionType must be 1 (long) or 2 (short)")
-        if position_id is None and (
-            not isinstance(symbol, str) or not symbol.strip()
-        ):
-            raise MexcError("symbol is required without positionId")
-
         body: dict[str, Any] = {"leverage": leverage}
         if position_id is not None:
             body["positionId"] = int(position_id)
         else:
-            body["symbol"] = symbol
+            body["symbol"] = _required_contract_symbol(
+                symbol, error_message="leverage symbol is invalid"
+            )
             body["openType"] = open_type
             if position_type is not None:
                 body["positionType"] = position_type
@@ -829,6 +939,8 @@ class MexcClient:
             json_body=body,
             private=True,
         )
+        if _contains_mutation_failure_marker(data):
+            raise MexcError("uncertain set-leverage response: failure marker", raw=data)
         # The official endpoint documents only the public response parameters
         # (``success: true`` on success). A 2xx body whose data was null, a
         # scalar, a list, or an arbitrary object is therefore not evidence that
@@ -856,9 +968,13 @@ class MexcClient:
         type: 1 limit, 5 market (see MEXC docs)
         openType: 1 isolated, 2 cross
         """
-        symbol = body.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            raise MexcError("order symbol must be a non-empty string")
+        symbol = _required_contract_symbol(
+            body.get("symbol"), error_message="order symbol is invalid"
+        )
+        body = dict(body)
+        body["symbol"] = symbol
+        if "externalOid" in body:
+            body["externalOid"] = _required_external_oid(body.get("externalOid"))
         volume_raw = body.get("vol")
         if isinstance(volume_raw, bool) or not isinstance(volume_raw, (int, float)):
             raise MexcError("order volume must be a positive finite number")
@@ -913,6 +1029,8 @@ class MexcClient:
             private=True,
         )
 
+        if _contains_mutation_failure_marker(data):
+            raise MexcError("uncertain order-create response: failure marker", raw=data)
         if isinstance(data, dict):
             if "success" in data and data.get("success") is not True:
                 raise MexcError(
@@ -977,6 +1095,8 @@ class MexcClient:
             json_body=body,
             private=True,
         )
+        if _contains_mutation_failure_marker(data):
+            raise MexcError("cancel rejected: nested failure marker", raw=data)
         if (
             not isinstance(data, list)
             or not data
@@ -1023,14 +1143,39 @@ class MexcClient:
 
     async def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """GET all open orders within the bounded MEXC paging window."""
+        wanted_symbol = (
+            _required_contract_symbol(
+                symbol, error_message="open-orders symbol is invalid"
+            )
+            if symbol is not None
+            else ""
+        )
+
+        def _scoped(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            scoped_rows = []
+            for row in rows:
+                symbol_raw = row.get("symbol")
+                if symbol_raw is None:
+                    scoped_rows.append(row)
+                    continue
+                row_symbol = _required_contract_symbol(
+                    symbol_raw,
+                    error_message=(
+                        "open-orders response contains an invalid symbol identity"
+                    ),
+                )
+                if not wanted_symbol or row_symbol == wanted_symbol:
+                    scoped_rows.append(row)
+            return scoped_rows
+
         rows: list[dict[str, Any]] = []
         for page_num in range(1, self._OPEN_ORDERS_MAX_PAGES + 1):
             params: dict[str, Any] = {
                 "page_num": page_num,
                 "page_size": self._OPEN_ORDERS_PAGE_SIZE,
             }
-            if symbol:
-                params["symbol"] = symbol
+            if wanted_symbol:
+                params["symbol"] = wanted_symbol
             data = await self._request(
                 "GET",
                 "/api/v1/private/order/list/open_orders",
@@ -1043,27 +1188,17 @@ class MexcClient:
                 page_rows = data
             else:
                 raise MexcError("unrecognized open-orders response shape", raw=data)
+            if len(page_rows) > self._OPEN_ORDERS_PAGE_SIZE:
+                raise MexcError(
+                    "open-orders response exceeds requested page size", raw=data
+                )
             if not all(isinstance(row, dict) for row in page_rows):
                 raise MexcError(
                     "open-orders response contains a non-object row", raw=data
                 )
             rows.extend(page_rows)
             if len(page_rows) < self._OPEN_ORDERS_PAGE_SIZE:
-                if not symbol:
-                    return rows
-                wanted_symbol = str(symbol).strip().upper()
-                scoped_rows = []
-                for row in rows:
-                    symbol_raw = row.get("symbol")
-                    if symbol_raw is not None and not isinstance(symbol_raw, str):
-                        raise MexcError(
-                            "open-orders response contains an invalid symbol identity",
-                            raw=row,
-                        )
-                    row_symbol = (symbol_raw or "").strip().upper()
-                    if not row_symbol or row_symbol == wanted_symbol:
-                        scoped_rows.append(row)
-                return scoped_rows
+                return _scoped(rows)
         raise MexcError("open-orders pagination exceeded safe page cap", raw=rows)
 
     # C3-01: page size / page cap for user_fills paging (mirrors the
@@ -1073,7 +1208,7 @@ class MexcClient:
     _FILLS_MAX_PAGES = 5
 
     async def user_fills(
-        self, symbol: str | None = None, limit: int = 100
+        self, symbol: str | None = None, limit: int = 100, *, fresh: bool = False
     ) -> list[dict[str, Any]]:
         """Recent executions (deals) for the account, newest first.
 
@@ -1084,15 +1219,28 @@ class MexcClient:
         closed_pnl, oid, fee. Paged like history_orders (widen only as far
         as `limit` needs, capped at _FILLS_MAX_PAGES pages).
         """
-        requested_limit = max(int(limit), 1)
+        _ = fresh  # interface parity; MEXC does not cache fill-history reads
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_USER_FILLS_LIMIT
+        ):
+            raise MexcError("user_fills limit is invalid")
+        requested_limit = limit
         page_size = min(requested_limit, self._FILLS_PAGE_SIZE)
         raw_rows: list[Any] = []
         out: list[dict[str, Any]] = []
-        wanted_symbol = str(symbol or "").strip().upper()
+        wanted_symbol = (
+            _required_contract_symbol(
+                symbol, error_message="user-fills symbol is invalid"
+            )
+            if symbol is not None
+            else ""
+        )
         for page_num in range(1, self._FILLS_MAX_PAGES + 1):
             params: dict[str, Any] = {"page_num": page_num, "page_size": page_size}
-            if symbol:
-                params["symbol"] = symbol
+            if wanted_symbol:
+                params["symbol"] = wanted_symbol
             data = await self._request(
                 "GET",
                 "/api/v1/private/order/list/order_deals",
@@ -1105,16 +1253,29 @@ class MexcClient:
                 page_rows = data
             else:
                 raise MexcError("unrecognized user-fills response shape", raw=data)
+            if len(page_rows) > page_size:
+                raise MexcError(
+                    "user-fills response exceeds requested page size", raw=data
+                )
             raw_rows.extend(page_rows)
             for row in page_rows:
                 if not isinstance(row, dict):
+                    raise MexcError(
+                        "user-fills response contains a non-object row", raw=data
+                    )
+                row_symbol = _required_contract_symbol(
+                    row.get("symbol"),
+                    error_message="user-fills response contains an invalid symbol identity",
+                )
+                if wanted_symbol and row_symbol != wanted_symbol:
                     continue
                 try:
                     normalized = normalize_mexc_fill(row)
-                except (TypeError, ValueError):
-                    continue  # graceful degrade: skip, never fabricate a fill
-                if wanted_symbol and normalized["symbol"] != wanted_symbol:
-                    continue
+                except (TypeError, ValueError) as exc:
+                    raise MexcError(
+                        "user-fills response contains an invalid fill row", raw=row
+                    ) from exc
+                normalized["symbol"] = row_symbol
                 out.append(normalized)
             if len(out) >= requested_limit or len(page_rows) < page_size:
                 break
@@ -1152,31 +1313,45 @@ class MexcClient:
         as UNKNOWN, never MISSING.
         """
         last_err: MexcError | None = None
-        wanted_symbol = str(symbol or "").strip().upper()
+        wanted_symbol = (
+            _required_contract_symbol(
+                symbol, error_message="open stop-orders symbol is invalid"
+            )
+            if symbol is not None
+            else ""
+        )
 
         def _active(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             active = []
+            seen_order_ids: set[str] = set()
             for row in rows:
                 state = _required_int(row.get("state"), "stop-order state")
                 if state not in (1, 2, 3, 4, 5):
                     raise MexcError("stop-order state is outside the documented range")
                 if state == 1:
+                    order_id = _mexc_consistent_stop_order_id(row)
+                    if order_id is None or order_id in seen_order_ids:
+                        raise MexcError(
+                            "active stop-order response has an invalid or duplicate ID"
+                        )
+                    seen_order_ids.add(order_id)
                     active.append(row)
             return active
 
         def _scoped(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            if not wanted_symbol:
-                return rows
             scoped = []
             for row in rows:
                 symbol_raw = row.get("symbol")
-                if symbol_raw is not None and not isinstance(symbol_raw, str):
-                    raise MexcError(
-                        "stop-order response contains an invalid symbol identity",
-                        raw=row,
-                    )
-                row_symbol = (symbol_raw or "").strip().upper()
-                if not row_symbol or row_symbol == wanted_symbol:
+                if symbol_raw is None:
+                    scoped.append(row)
+                    continue
+                row_symbol = _required_contract_symbol(
+                    symbol_raw,
+                    error_message=(
+                        "stop-order response contains an invalid symbol identity"
+                    ),
+                )
+                if not wanted_symbol or row_symbol == wanted_symbol:
                     scoped.append(row)
             return scoped
 
@@ -1193,8 +1368,8 @@ class MexcClient:
                     "page_size": self._STOP_ORDERS_PAGE_SIZE,
                 }
             )
-            if symbol:
-                params["symbol"] = symbol
+            if wanted_symbol:
+                params["symbol"] = wanted_symbol
             try:
                 data = await self._request("GET", path, params=params, private=True)
             except MexcError as e:
@@ -1214,6 +1389,14 @@ class MexcClient:
                     f"unrecognized stop-order response shape from {path}", raw=data
                 )
                 continue
+            if (
+                not is_current_open_endpoint
+                and len(first_page) > self._STOP_ORDERS_PAGE_SIZE
+            ):
+                raise MexcError(
+                    f"stop-order response exceeds requested page size from {path}",
+                    raw=data,
+                )
 
             # A recognized first page selects the authoritative candidate for
             # this read. Any later failure must propagate: falling back to an
@@ -1234,6 +1417,11 @@ class MexcClient:
                 else:
                     raise MexcError(
                         f"unrecognized stop-order response shape from {path}", raw=data
+                    )
+                if len(page_rows) > self._STOP_ORDERS_PAGE_SIZE:
+                    raise MexcError(
+                        f"stop-order response exceeds requested page size from {path}",
+                        raw=data,
                     )
                 if not all(isinstance(row, dict) for row in page_rows):
                     raise MexcError(
@@ -1265,8 +1453,9 @@ class MexcClient:
         a transport timeout during a close can be recovered/looked-up
         unambiguously via ``order_by_external_oid`` instead of guessing.
         """
-        if not isinstance(symbol, str) or not symbol.strip():
-            raise MexcError("close symbol is required")
+        symbol = _required_contract_symbol(
+            symbol, error_message="close symbol is invalid"
+        )
         if (
             isinstance(open_type, bool)
             or not isinstance(open_type, int)
@@ -1288,8 +1477,9 @@ class MexcClient:
             "type": 5,
             "openType": open_type,
         }
-        if external_oid:
-            body["externalOid"] = f"close:{external_oid}"
+        if external_oid is not None:
+            external_oid = _required_external_oid(external_oid)
+            body["externalOid"] = _required_external_oid(f"close:{external_oid}")
         return await self.place_order(body)
 
     # O-09: history fallback window — widened from the old page_size=20 and
@@ -1308,9 +1498,13 @@ class MexcClient:
     async def _history_row_by_external_oid(
         self, symbol: str, external_oid: str
     ) -> dict[str, Any] | None:
-        """Page through history_orders looking for external_oid. Fail-closed:
-        any request error just stops the scan (never raises) — the caller
-        still has the open_orders fallback."""
+        """Page through history_orders looking for one unique external_oid.
+
+        A request error before any match leaves the open-orders fallback
+        available. Once a match exists, the bounded history scan must complete
+        so a second order identity cannot remain hidden on a later page.
+        """
+        scanned_rows: list[dict[str, Any]] = []
         for page_num in range(1, self._HISTORY_MAX_PAGES + 1):
             try:
                 data = await self._request(
@@ -1324,18 +1518,49 @@ class MexcClient:
                     private=True,
                 )
             except MexcError:
-                break
+                if _mexc_unique_recovery_match(
+                    scanned_rows, symbol, external_oid
+                ) is not None:
+                    raise MexcError(
+                        "history recovery scan became incomplete after a match"
+                    )
+                return None
             if isinstance(data, dict) and isinstance(data.get("resultList"), list):
                 rows = data["resultList"]
             elif isinstance(data, list):
                 rows = data
             else:
-                break
-            for r in rows:
-                if _mexc_recovery_identity_matches(r, symbol, external_oid):
-                    return r
+                if _mexc_unique_recovery_match(
+                    scanned_rows, symbol, external_oid
+                ) is not None:
+                    raise MexcError(
+                        "history recovery scan became incomplete after a match"
+                    )
+                return None
+            page_rows = [row for row in rows if isinstance(row, dict)]
+            if len(page_rows) != len(rows):
+                if _mexc_unique_recovery_match(
+                    [*scanned_rows, *page_rows], symbol, external_oid
+                ) is not None:
+                    raise MexcError(
+                        "history recovery scan became incomplete after a match"
+                    )
+                return None
+            if len(page_rows) > self._HISTORY_PAGE_SIZE:
+                if _mexc_unique_recovery_match(
+                    [*scanned_rows, *page_rows], symbol, external_oid
+                ) is not None:
+                    raise MexcError(
+                        "history recovery scan became incomplete after a match"
+                    )
+                return None
+            scanned_rows.extend(page_rows)
             if len(rows) < self._HISTORY_PAGE_SIZE:
-                break  # short page — no more data to page through
+                return _mexc_unique_recovery_match(
+                    scanned_rows, symbol, external_oid
+                )
+        if _mexc_unique_recovery_match(scanned_rows, symbol, external_oid) is not None:
+            raise MexcError("history recovery pagination cap reached after a match")
         return None
 
     async def order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
@@ -1367,6 +1592,10 @@ class MexcClient:
         match; history/open use the same exact field comparison.)
         No live match anywhere -> `{}` (fail-closed: never a fabricated match).
         """
+        symbol = _required_contract_symbol(
+            symbol, error_message="recovery symbol is invalid"
+        )
+        external_oid = _required_external_oid(external_oid)
         try:
             direct = await self._request(
                 "GET",
@@ -1379,7 +1608,14 @@ class MexcClient:
         # Trust only an exact oid field, never a substring in unrelated
         # diagnostic text. The wrapper below injects the oid, so a false match
         # here would otherwise look like a recovered live order to the caller.
-        if _mexc_recovery_identity_matches(direct, symbol, external_oid):
+        direct_matches = _mexc_recovery_identity_matches(
+            direct, symbol, external_oid
+        )
+        if _mexc_external_oid_mentions(direct, external_oid) and not direct_matches:
+            raise MexcError(
+                "recovery response contains an inconsistent matching identity"
+            )
+        if direct_matches:
             if _mexc_state_is_dead(direct):
                 return {}  # X2-04: cancelled/invalid — not live
             return {"match": "direct", "externalOid": external_oid, "order": direct}
@@ -1401,11 +1637,17 @@ class MexcClient:
                 open_rows = await self.open_orders(symbol)
             except MexcError:
                 open_rows = []
-            for r in open_rows:
-                if _mexc_recovery_identity_matches(r, symbol, external_oid):
-                    if _mexc_state_is_dead(r):
-                        return {}  # X2-04
-                    return {"match": "open", "externalOid": external_oid, "order": r}
+            open_row = _mexc_unique_recovery_match(
+                open_rows, symbol, external_oid
+            )
+            if open_row is not None:
+                if _mexc_state_is_dead(open_row):
+                    return {}  # X2-04
+                return {
+                    "match": "open",
+                    "externalOid": external_oid,
+                    "order": open_row,
+                }
 
             # Not found in either list yet — wait for the index to catch up,
             # unless this was the last attempt.
@@ -1487,6 +1729,23 @@ def _mexc_consistent_order_id(row: Any) -> str | None:
     return values[0]
 
 
+def _mexc_consistent_stop_order_id(row: Any) -> str | None:
+    """Canonical positive stop ID, including MEXC's documented ``id`` alias."""
+    if not isinstance(row, dict):
+        return None
+    values: list[str] = []
+    for key in ("orderId", "order_id", "oid", "id"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if not _mexc_positive_order_id(value):
+            return None
+        values.append(str(int(value)))
+    if not values or len(set(values)) != 1:
+        return None
+    return values[0]
+
+
 def _mexc_external_oid_matches(row: Any, external_oid: str) -> bool:
     """Require every present client-ID alias to match the requested string."""
     if not isinstance(row, dict) or not isinstance(external_oid, str) or not external_oid:
@@ -1502,6 +1761,17 @@ def _mexc_external_oid_matches(row: Any, external_oid: str) -> bool:
     return bool(values) and all(value == external_oid for value in values)
 
 
+def _mexc_external_oid_mentions(row: Any, external_oid: str) -> bool:
+    """True when any client-ID alias explicitly names the requested ID."""
+    if not isinstance(row, dict) or not isinstance(external_oid, str) or not external_oid:
+        return False
+    return any(
+        row.get(key) == external_oid
+        for key in ("externalOid", "external_oid")
+        if key in row
+    )
+
+
 def _mexc_recovery_identity_matches(
     row: Any, symbol: str, external_oid: str
 ) -> bool:
@@ -1514,6 +1784,32 @@ def _mexc_recovery_identity_matches(
         return False
     row_symbol = row.get("symbol")
     return row_symbol is None or str(row_symbol).upper() == str(symbol).upper()
+
+
+def _mexc_unique_recovery_match(
+    rows: list[dict[str, Any]], symbol: str, external_oid: str
+) -> dict[str, Any] | None:
+    """Return one order ID; reject every inconsistent exact-ID candidate."""
+    matches: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        identity_matches = _mexc_recovery_identity_matches(
+            row, symbol, external_oid
+        )
+        if _mexc_external_oid_mentions(row, external_oid) and not identity_matches:
+            raise MexcError(
+                "recovery response contains an inconsistent matching identity"
+            )
+        if not identity_matches:
+            continue
+        order_id = _mexc_consistent_order_id(row)
+        if order_id is None:
+            continue
+        matches.setdefault(order_id, row)
+        if len(matches) > 1:
+            raise MexcError(
+                "recovery response contains multiple matching order identities"
+            )
+    return next(iter(matches.values()), None)
 
 
 def _opt_float(v: Any) -> float | None:
@@ -1607,16 +1903,16 @@ def normalize_mexc_fill(row: dict[str, Any]) -> dict[str, Any]:
     """Map one MEXC order_deals row to the SAME normalized fill shape
     Hyperliquid's user_fills produces (see hyperliquid/client.py): symbol,
     px, sz, side, time(ms), dir, closed_pnl, oid, fee. Raises
-    TypeError/ValueError if px/sz/time can't be resolved — callers must skip
-    that row rather than fabricate a fill.
+    TypeError/ValueError if px/sz/time can't be resolved — callers must reject
+    the enclosing history response rather than fabricate or silently omit a fill.
     """
     px = _first_float(row, ("price", "dealPrice", "avgPrice"))
     sz = _first_float(row, ("vol", "dealVol", "dealVolume"))
     t = _first_float(row, ("timestamp", "dealTime", "createTime", "time"))
     symbol_raw = row.get("symbol")
-    symbol = symbol_raw.strip() if isinstance(symbol_raw, str) else ""
+    symbol = symbol_raw.strip().upper() if isinstance(symbol_raw, str) else ""
     if (
-        not symbol
+        _MEXC_CONTRACT_SYMBOL_RE.fullmatch(symbol) is None
         or px is None
         or px <= 0
         or sz is None

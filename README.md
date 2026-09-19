@@ -89,8 +89,10 @@ Auto break-even and trailing rules require a separate per-position opt-in.
 - Stop replacement places and verifies the new stop before removing the old.
 - Hyperliquid limit entries remain disabled without a persistent fill watcher.
 - MEXC pending same-side entries block additional unaggregated exposure.
-- Account data is sent to an external AI only with
-  `INCLUDE_ACCOUNT_IN_LLM=true`.
+- Account and position data is sent to an external AI only with
+  `INCLUDE_ACCOUNT_IN_LLM=true`; external position reevaluation is blocked
+  until that opt-in is enabled. Local Ollama can use the reduced position
+  context without external disclosure.
 - The server and Ollama are loopback-only; armed trading requires a local API
   token. The application is designed for one process and one worker.
 
@@ -103,9 +105,33 @@ validation.
 
 For terminal-only setup, run `setup.bat`. To switch to real funds, first stop
 the server and back up `.env` and `data/`, keep `TRADING_ENABLED=false`, verify
-a trade-only key and the target account, then run a minimal read/place/cancel
-probe. Hyperliquid Mainnet additionally requires `HL_TESTNET=false` and
-`MAINNET_ACK=true`. Restart after changing `.env`.
+a trade-only key and the target account, and complete the applicable read-only
+connectivity checks. Hyperliquid Mainnet additionally requires
+`HL_TESTNET=false` and `MAINNET_ACK=true`. Restart after changing `.env`.
+
+For a read-only Hyperliquid Testnet check, run
+`python scripts/hl_spike.py`; the tool refuses Mainnet before creating a client.
+The default client receives no account credentials. Add `--with-account` only
+when the configured Testnet account should also be read; a missing private key
+or malformed account identity is rejected before client creation or network
+access. The constructed client must still prove its Testnet flag and canonical
+HTTPS endpoint before the first public or private request. MEXC has no futures
+Testnet, so `python scripts/mexc_spike.py` is strictly
+read-only. Add `--with-account` only when authenticated MEXC asset and position
+reads are explicitly intended. Before any request, the constructed client must
+still target the canonical HTTPS MEXC endpoint without embedded credentials.
+All trading mutations remain behind the app's authoritative Preview and Confirm
+flow.
+
+For the Hyperliquid order-lifecycle diagnostic, run
+`python scripts/hl_smoke_trade.py`. Its default is a credential-free public
+Testnet preflight. Add `--with-account` for private, non-mutating Preview checks;
+only the exact `--confirm TESTNET` acknowledgement may place and clean up the
+bounded Testnet probe order. Both
+account-backed modes require a valid private key and optional account address
+before client creation. The constructed client is then checked against the
+canonical HTTPS Testnet endpoint before any exchange read, in addition to the
+instance lock, clean-account baseline, audit DB and trading gates.
 
 ## Development checks
 
@@ -113,7 +139,11 @@ All tests are offline or mock-based and must never submit real orders or call a
 real AI provider.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install --require-virtualenv -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install --require-virtualenv pip==26.2.1
+.\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps -r requirements.lock -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m pip_audit --strict --no-deps --disable-pip --progress-spinner off --vulnerability-service osv -r requirements.lock
+.\.venv\Scripts\python.exe -m pip_audit --strict --local --progress-spinner off --vulnerability-service osv
 .\.venv\Scripts\python.exe -m pytest tests/ -q
 .\.venv\Scripts\ruff.exe check .
 node --check app/static/app.js

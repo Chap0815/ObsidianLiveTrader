@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   -- for fresh DBs; on EXISTING DBs it is backfilled by the idempotent ALTER
   -- migration in Database.init() (CREATE TABLE IF NOT EXISTS never adds
   -- columns). Advisory-only label, never used in a gate/sizing/decision.
-  regime        TEXT
+  regime        TEXT,
+  snapshot_version INTEGER NOT NULL DEFAULT 1  -- optimistic resolver snapshot token
 );
 
 CREATE INDEX IF NOT EXISTS idx_journal_created ON journal_entries(created_at DESC);

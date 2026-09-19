@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,12 +25,14 @@ from app.llm.client import (
     _call_claude_reevaluate,
     _call_xai,
     _call_xai_reevaluate,
+    _log_llm_metrics,
     _strictify_schema,
     annotate_proposal,
     parse_proposal,
     parse_reevaluation,
+    reevaluate_with_llm,
 )
-from app.models import TradeProposal
+from app.models import ReevaluateProposal, TradeProposal
 
 
 def _directional_proposal(recommended_leverage: str) -> TradeProposal:
@@ -173,6 +176,291 @@ def _settings(**kw):
     return Settings(**base)
 
 
+def test_provider_response_json_object_redacts_non_json_body():
+    marker = "SYNTHETIC_SECRET_MARKER"
+
+    class Response:
+        text = marker
+
+        @staticmethod
+        def json():
+            raise ValueError(marker)
+
+    with pytest.raises(LlmError) as exc_info:
+        client_mod._provider_response_json_object(
+            Response(), provider_label="Synthetic"
+        )
+
+    assert str(exc_info.value) == "Synthetic returned invalid response"
+    assert marker not in str(exc_info.value)
+    assert exc_info.value.raw == marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport_name", "provider_label"),
+    [
+        ("claude_analyze", "Claude"),
+        ("xai_analyze", "xAI"),
+        ("openai_analyze", "OpenAI"),
+        ("claude_reevaluate", "Claude"),
+        ("xai_reevaluate", "xAI"),
+        ("openai_reevaluate", "OpenAI"),
+    ],
+)
+async def test_provider_transports_reject_non_object_success_payload(
+    monkeypatch, transport_name, provider_label
+):
+    marker = "SYNTHETIC_SECRET_MARKER"
+    fake = _FakeClient(200, [marker])
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+    context = {"symbol": "BTC"}
+    settings = _settings()
+
+    calls = {
+        "claude_analyze": lambda: client_mod._call_claude(context, settings),
+        "xai_analyze": lambda: client_mod._call_xai(context, settings),
+        "openai_analyze": lambda: client_mod._call_openai_compat(
+            context,
+            base_url="https://synthetic.invalid/v1",
+            api_key="synthetic-key",
+            model="synthetic-model",
+            provider_label="OpenAI",
+        ),
+        "claude_reevaluate": lambda: client_mod._call_claude_reevaluate(
+            context, settings
+        ),
+        "xai_reevaluate": lambda: client_mod._call_xai_reevaluate(context, settings),
+        "openai_reevaluate": lambda: client_mod._call_openai_compat_reevaluate(
+            context,
+            base_url="https://synthetic.invalid/v1",
+            api_key="synthetic-key",
+            model="synthetic-model",
+            provider_label="OpenAI",
+        ),
+    }
+
+    with pytest.raises(LlmError) as exc_info:
+        await calls[transport_name]()
+
+    assert str(exc_info.value) == f"{provider_label} returned invalid response"
+    assert marker not in str(exc_info.value)
+    assert exc_info.value.raw == [marker]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "transport_name"),
+    (
+        ("claude", "_call_claude"),
+        ("anthropic", "_call_claude"),
+        ("xai", "_call_xai"),
+        ("grok", "_call_xai"),
+        ("openai", "_call_openai"),
+        ("codex", "_call_openai"),
+        ("ollama", "_call_ollama"),
+        ("local", "_call_ollama"),
+    ),
+)
+async def test_analyze_dispatch_strips_private_context_without_opt_in(
+    monkeypatch, provider, transport_name
+):
+    expected = object()
+    transport = AsyncMock(return_value=expected)
+    monkeypatch.setattr(client_mod, transport_name, transport)
+    context = {
+        "symbol": "BTC_USDT",
+        "market": {"open_interest": 123.0},
+        "account": {
+            "equity_usdt": 5000.0,
+            "positions": [{"hold_vol": 1.0}],
+        },
+        "remaining_risk_budget_pct": 2.5,
+        "position": {"unrealized_pnl": 100.0},
+        "unexpected_private_block": {"wallet": "secret"},
+    }
+
+    result = await client_mod.analyze_with_llm(
+        context,
+        _settings(llm_provider=provider, include_account_in_llm=False),
+    )
+
+    assert result is expected
+    sent = transport.await_args.args[0]
+    assert sent["symbol"] == "BTC_USDT"
+    assert sent["market"] == {"open_interest": 123.0}
+    assert sent["account"] == {
+        "omitted": True,
+        "reason": "INCLUDE_ACCOUNT_IN_LLM=false",
+    }
+    assert "remaining_risk_budget_pct" not in sent
+    assert "position" not in sent
+    assert "unexpected_private_block" not in sent
+    assert context["account"]["equity_usdt"] == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_analyze_dispatch_recursively_strips_private_context_without_opt_in(
+    monkeypatch,
+):
+    marker = "SYNTHETIC_NESTED_PRIVATE_MARKER"
+    expected = object()
+    transport = AsyncMock(return_value=expected)
+    monkeypatch.setattr(client_mod, "_call_claude", transport)
+    context = {
+        "symbol": "BTC_USDT",
+        "market": {
+            "open_interest": 123.0,
+            "nested": {
+                "public_signal": "stable",
+                "account": {"equity_usdt": marker},
+                "position": {"hold_vol": marker},
+                "private_diagnostic": marker,
+                "api_key": marker,
+            },
+        },
+        "risk_policy": {"max_notional_pct_of_equity": 25.0},
+    }
+
+    result = await client_mod.analyze_with_llm(
+        context,
+        _settings(llm_provider="claude", include_account_in_llm=False),
+    )
+
+    assert result is expected
+    sent = transport.await_args.args[0]
+    assert sent["market"] == {
+        "open_interest": 123.0,
+        "nested": {"public_signal": "stable"},
+    }
+    assert sent["risk_policy"] == {"max_notional_pct_of_equity": 25.0}
+    assert marker not in str(sent)
+    assert context["market"]["nested"]["account"]["equity_usdt"] == marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "private_key",
+    [
+        "accountData",
+        "user-account-balance",
+        "positionData",
+        "openPositions",
+        "walletAddress",
+        "apiKey",
+        "accessToken",
+        "privateKey",
+        "authCredential",
+        "sessionCookie",
+        "userPassword",
+    ],
+)
+async def test_analyze_dispatch_strips_private_key_variants_without_opt_in(
+    monkeypatch, private_key
+):
+    marker = "SYNTHETIC_PRIVATE_KEY_VARIANT_MARKER"
+    transport = AsyncMock(return_value=object())
+    monkeypatch.setattr(client_mod, "_call_claude", transport)
+
+    await client_mod.analyze_with_llm(
+        {
+            "symbol": "BTC_USDT",
+            "market": {
+                "nested": {"public_signal": "stable", private_key: marker}
+            },
+        },
+        _settings(llm_provider="claude", include_account_in_llm=False),
+    )
+
+    sent = transport.await_args.args[0]
+    assert sent["market"] == {"nested": {"public_signal": "stable"}}
+    assert marker not in str(sent)
+
+
+@pytest.mark.asyncio
+async def test_analyze_dispatch_preserves_private_context_with_explicit_opt_in(
+    monkeypatch,
+):
+    expected = object()
+    transport = AsyncMock(return_value=expected)
+    monkeypatch.setattr(client_mod, "_call_claude", transport)
+    context = {
+        "symbol": "BTC_USDT",
+        "account": {"equity_usdt": 5000.0, "positions": []},
+        "remaining_risk_budget_pct": 2.5,
+    }
+    settings = _settings(llm_provider="claude", include_account_in_llm=True)
+
+    result = await client_mod.analyze_with_llm(context, settings)
+
+    assert result is expected
+    transport.assert_awaited_once_with(context, settings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider", ("claude", "anthropic", "xai", "grok", "openai", "codex")
+)
+async def test_reevaluate_dispatch_blocks_external_provider_without_opt_in(
+    monkeypatch, provider
+):
+    transports = {
+        name: AsyncMock()
+        for name in (
+            "_call_claude_reevaluate",
+            "_call_xai_reevaluate",
+            "_call_openai_reevaluate",
+        )
+    }
+    for name, transport in transports.items():
+        monkeypatch.setattr(client_mod, name, transport)
+
+    with pytest.raises(LlmError, match="INCLUDE_ACCOUNT_IN_LLM=true"):
+        await reevaluate_with_llm(
+            {"position": {"hold_vol": 1.0}},
+            _settings(llm_provider=provider, include_account_in_llm=False),
+        )
+
+    for transport in transports.values():
+        transport.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reevaluate_dispatch_allows_external_provider_with_opt_in(monkeypatch):
+    expected = ReevaluateProposal(
+        action="HOLD", confidence="medium", reason="synthetic", risk_notes=""
+    )
+    transport = AsyncMock(return_value=expected)
+    monkeypatch.setattr(client_mod, "_call_claude_reevaluate", transport)
+
+    result = await reevaluate_with_llm(
+        {"position": {"hold_vol": 1.0}},
+        _settings(llm_provider="claude", include_account_in_llm=True),
+    )
+
+    assert result is expected
+    transport.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reevaluate_dispatch_allows_local_ollama_without_external_opt_in(
+    monkeypatch,
+):
+    expected = ReevaluateProposal(
+        action="HOLD", confidence="medium", reason="synthetic", risk_notes=""
+    )
+    transport = AsyncMock(return_value=expected)
+    monkeypatch.setattr(client_mod, "_call_ollama_reevaluate", transport)
+
+    result = await reevaluate_with_llm(
+        {"position": {"account_fields_omitted": True}},
+        _settings(llm_provider="ollama", include_account_in_llm=False),
+    )
+
+    assert result is expected
+    transport.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_xai_call_logs_usage_and_reasoning_tokens(monkeypatch, caplog):
     """The xAI (Grok) call site logs one LLM_METRICS line carrying the
@@ -213,6 +501,43 @@ async def test_xai_call_logs_usage_and_reasoning_tokens(monkeypatch, caplog):
     assert "prompt_tokens=1200" in msg
     assert "completion_tokens=300" in msg
     assert "finish_reason=stop" in msg
+
+
+def test_llm_metrics_do_not_log_untrusted_provider_values(caplog):
+    marker = "SYNTHETIC_SECRET_MARKER"
+    payload = {
+        "stop_reason": marker,
+        "choices": [{"finish_reason": marker}],
+        "usage": {
+            "input_tokens": marker,
+            "output_tokens": marker,
+            "prompt_tokens": marker,
+            "completion_tokens": marker,
+            "cache_read_input_tokens": marker,
+            "cache_creation_input_tokens": marker,
+            "completion_tokens_details": {"reasoning_tokens": marker},
+            "prompt_tokens_details": {"cached_tokens": marker},
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="app.llm.client"):
+        _log_llm_metrics(
+            provider="synthetic",
+            model="synthetic-model",
+            route="test",
+            elapsed_ms=1.0,
+            payload=payload,
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "LLM_METRICS" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert marker not in messages[0]
+    assert "finish_reason=None" in messages[0]
+    assert "stop_reason=None" in messages[0]
 
 
 def test_salvage_path_emits_warning(caplog):

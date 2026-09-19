@@ -103,11 +103,57 @@ def _created_dt(created_at: str | datetime) -> datetime:
     return dt
 
 
-def _field(candle: Any, name: str) -> float:
+def _field(candle: Any, name: str) -> Any:
     """Read high/low/time from a Candle model OR a plain dict."""
     if isinstance(candle, dict):
         return candle[name]
     return getattr(candle, name)
+
+
+def _observed_candles(
+    candles: Iterable[Any], now_ms: int
+) -> list[dict[str, int | float]] | None:
+    """Return trustworthy observed candle geometry, or None if it is incomplete."""
+    observed: list[dict[str, int | float]] = []
+    seen_times: set[int] = set()
+    for candle in candles:
+        try:
+            candle_time = _field(candle, "time")
+        except (KeyError, TypeError, AttributeError):
+            return None
+        if (
+            isinstance(candle_time, bool)
+            or not isinstance(candle_time, int)
+            or candle_time <= 0
+        ):
+            return None
+        if candle_time > now_ms:
+            continue
+
+        try:
+            raw_high = _field(candle, "high")
+            raw_low = _field(candle, "low")
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in (raw_high, raw_low)
+            ):
+                return None
+            high = float(raw_high)
+            low = float(raw_low)
+        except (KeyError, TypeError, AttributeError, OverflowError, ValueError):
+            return None
+        if (
+            not math.isfinite(high)
+            or not math.isfinite(low)
+            or high <= 0
+            or low <= 0
+            or high < low
+            or candle_time in seen_times
+        ):
+            return None
+        seen_times.add(candle_time)
+        observed.append({"time": candle_time, "high": high, "low": low})
+    return observed
 
 
 def geometry_ok(
@@ -239,9 +285,9 @@ def resolve_entry(
     all_candles = list(candles)
     now_dt = _created_dt(now)
     now_ms = int(now_dt.timestamp() * 1000)
-    observed_candles = [
-        candle for candle in all_candles if _field(candle, "time") <= now_ms
-    ]
+    observed_candles = _observed_candles(all_candles, now_ms)
+    if observed_candles is None:
+        return Outcome(status=PENDING)
 
     t0_ms = _parse_iso_ms(created_at)
     deadline_ms = t0_ms + int(max(0.0, float(window_s)) * 1000)
@@ -262,6 +308,7 @@ def resolve_entry(
 
     interval_ms: int | None = None
     coverage_end_ms = latest
+    deadline_partial: Any | None = None
     if candle_interval_s is not None:
         try:
             interval_value = float(candle_interval_s)
@@ -274,10 +321,41 @@ def resolve_entry(
         ):
             return Outcome(status=PENDING)
         interval_ms = int(interval_value * 1000)
+        ordered_times = sorted(candle_times)
+        if any(
+            second < first + interval_ms
+            for first, second in zip(ordered_times, ordered_times[1:])
+        ):
+            return Outcome(status=PENDING)
         covering_starts = [value for value in candle_times if value <= t0_ms]
-        coverage_end_ms = max(covering_starts) + interval_ms
+        covering_start = max(covering_starts)
+        coverage_end_ms = covering_start + interval_ms
         if coverage_end_ms <= t0_ms:
             return Outcome(status=PENDING)
+
+        # Exchange timestamps identify candle opens. When t0 falls inside a
+        # candle, its OHLC mixes price action from before and after the proposal
+        # and cannot prove which side of t0 touched a level. Skip only genuinely
+        # ambiguous observations; a boundary candle that touched no relevant
+        # level safely establishes coverage until the next full candle.
+        if covering_start < t0_ms:
+            covering_candle = next(
+                candle
+                for candle in observed_candles
+                if _field(candle, "time") == covering_start
+            )
+            if order_type == "market":
+                tp_hit, sl_hit = _touches(
+                    direction, covering_candle, stop_loss, tp1
+                )
+                if tp_hit or sl_hit:
+                    return Outcome(status=SKIPPED)
+            elif (
+                _field(covering_candle, "low")
+                <= entry_price
+                <= _field(covering_candle, "high")
+            ):
+                return Outcome(status=SKIPPED)
 
     # Scan only the contractual resolution window. Candles after the deadline
     # must never retroactively turn an expired setup into a WIN or LOSS.
@@ -296,8 +374,15 @@ def resolve_entry(
             candle_time = _field(candle, "time")
             if candle_time > coverage_end_ms:
                 break
-            contiguous.append(candle)
             coverage_end_ms = max(coverage_end_ms, candle_time + interval_ms)
+            if candle_time + interval_ms <= deadline_ms:
+                contiguous.append(candle)
+            else:
+                # This candle straddles the resolution deadline. Its full OHLC
+                # may contain post-window movement, so it is coverage evidence
+                # but cannot be scanned as if every touch occurred in-window.
+                deadline_partial = candle
+                break
         ordered = contiguous
 
     # F2-02: find the fill bar; only scan TP/SL from there. Intrabar ambiguity
@@ -335,6 +420,26 @@ def resolve_entry(
                         -1.0, entry_price, risk, taker_fee, slippage_frac
                     ),
                 )
+
+    # A deadline-straddling candle is symmetric with the t0 candle: a relevant
+    # touch cannot be placed before or after the contractual cutoff from OHLC
+    # alone. Exclude that observation from outcome statistics instead of
+    # fabricating a terminal result. If no relevant level was touched, the
+    # candle safely proves coverage through the deadline.
+    if deadline_partial is not None:
+        entry_filled = order_type == "market" or fill_index is not None
+        if entry_filled:
+            tp_hit, sl_hit = _touches(
+                direction, deadline_partial, stop_loss, tp1
+            )
+            if tp_hit or sl_hit:
+                return Outcome(status=SKIPPED)
+        elif (
+            _field(deadline_partial, "low")
+            <= entry_price
+            <= _field(deadline_partial, "high")
+        ):
+            return Outcome(status=SKIPPED)
 
     # No terminal candle found. Expiring / NO_FILL is only safe once (a) the
     # window has genuinely elapsed AND (b) the fetched candle history spans the
@@ -430,7 +535,11 @@ async def resolve_pending_once(
             log.warning("journal resolver: klines failed for %s %s", symbol, tf)
             for row in grp:
                 try:
-                    await db.touch_journal_checked(row["id"])
+                    await db.touch_journal_checked(
+                        row["id"],
+                        expected_created_at=row["created_at"],
+                        expected_snapshot_version=row["snapshot_version"],
+                    )
                 except Exception:
                     pass
             continue
@@ -488,13 +597,19 @@ async def resolve_pending_once(
                     await db.update_journal_outcome(
                         row["id"],
                         status=outcome.status,
+                        expected_created_at=row["created_at"],
+                        expected_snapshot_version=row["snapshot_version"],
                         resolved_price=outcome.resolved_price,
                         realized_r=outcome.realized_r,
                         ambiguous=outcome.ambiguous,
                         realized_r_net=outcome.realized_r_net,
                     )
                 else:
-                    await db.touch_journal_checked(row["id"])
+                    await db.touch_journal_checked(
+                        row["id"],
+                        expected_created_at=row["created_at"],
+                        expected_snapshot_version=row["snapshot_version"],
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -530,6 +645,9 @@ async def run_resolver_loop(app: Any) -> None:
                 await resolve_pending_once(db, client, window_s=window_s)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.warning("journal resolver cycle failed", exc_info=True)
+        except Exception as exc:
+            log.warning(
+                "journal resolver cycle failed type=%s",
+                type(exc).__name__,
+            )
         await asyncio.sleep(interval)

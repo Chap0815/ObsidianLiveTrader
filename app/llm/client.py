@@ -965,11 +965,58 @@ def _sanitize_scanner_verdict(raw: Any) -> dict[str, Any] | None:
 # model, so the LLM copy keeps just these three (O1). The full dict still flows
 # to the UI via snapshot_to_api_dict — this trims only the LLM context.
 _LLM_FUNDING_KEYS = ("fundingRate", "fundingAnnualized", "fundingExtreme")
+_LLM_ACCOUNT_POSITION_NUMERIC_KEYS = (
+    "hold_vol",
+    "entry_price",
+    "leverage",
+    "unrealized_pnl",
+    "realised",
+    "liquidate_price",
+    "im",
+    "margin_ratio",
+    "contract_size",
+)
+_LLM_ACCOUNT_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,32}(?:_[A-Z0-9]{2,16})?$")
 
 
 def _compact_funding_for_llm(funding: dict[str, Any] | None) -> dict[str, Any]:
     src = funding or {}
     return {k: src[k] for k in _LLM_FUNDING_KEYS if k in src}
+
+
+def _compact_account_positions_for_llm(value: Any) -> list[dict[str, Any]]:
+    """Keep only normalized scalar position data needed by the advisory model."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        side = row.get("side")
+        hold_vol = _positive_float(row.get("hold_vol"))
+        entry_price = _positive_float(row.get("entry_price"))
+        if (
+            not isinstance(symbol, str)
+            or _LLM_ACCOUNT_SYMBOL_RE.fullmatch(symbol) is None
+            or side not in ("long", "short")
+            or hold_vol is None
+            or entry_price is None
+        ):
+            continue
+        compact: dict[str, Any] = {"symbol": symbol, "side": side}
+        open_type = row.get("open_type")
+        if open_type in ("isolated", "cross"):
+            compact["open_type"] = open_type
+        for key in _LLM_ACCOUNT_POSITION_NUMERIC_KEYS:
+            item = row.get(key)
+            if item is None:
+                if key in row:
+                    compact[key] = None
+            elif (parsed := _finite_float(item)) is not None:
+                compact[key] = parsed
+        out.append(compact)
+    return out
 
 
 def _remaining_risk_budget_pct(
@@ -986,12 +1033,11 @@ def _remaining_risk_budget_pct(
     if not positions:
         return None
     symbol = market_api.get("symbol")
-    equity = account.get("equity_usdt")
-    if not symbol or not isinstance(equity, (int, float)) or equity <= 0:
+    equity = _positive_float(account.get("equity_usdt"))
+    if not symbol or equity is None:
         return None
     contract = market_api.get("contract") or {}
-    csize = contract.get("contractSize")
-    csize = float(csize) if isinstance(csize, (int, float)) and csize > 0 else 1.0
+    csize = _positive_float(contract.get("contractSize")) or 1.0
     # Local import: keeps the LLM module free of an order-service import at
     # module load (and avoids any import-cycle surprise).
     from app.orders.service import estimate_same_side_risk_usdt
@@ -1077,11 +1123,14 @@ def build_llm_context(
         else {},
     }
     if include_acct:
+        account_error = account.get("error")
         ctx["account"] = {
-            "equity_usdt": account.get("equity_usdt"),
-            "available_usdt": account.get("available_usdt"),
-            "positions": account.get("positions") or [],
-            "error": account.get("error"),
+            "equity_usdt": _finite_float(account.get("equity_usdt")),
+            "available_usdt": _finite_float(account.get("available_usdt")),
+            "positions": _compact_account_positions_for_llm(
+                account.get("positions")
+            ),
+            "error": None if account_error is None else "Account data unavailable",
         }
         # R2-04: when an open same-side position exists on this symbol, surface
         # the aggregate risk head-room so an add-on stays inside MAX_RISK_PCT.
@@ -1170,12 +1219,29 @@ class LlmError(Exception):
 GrokError = LlmError
 
 
+def _provider_response_json_object(
+    response: httpx.Response, *, provider_label: str
+) -> dict[str, Any]:
+    """Decode a successful untrusted provider response as a JSON object."""
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as e:
+        raise LlmError(
+            f"{provider_label} returned invalid response",
+            raw=getattr(response, "text", None),
+        ) from e
+    if not isinstance(payload, dict):
+        raise LlmError(f"{provider_label} returned invalid response", raw=payload)
+    return payload
+
+
 # --- Provider HTTP error categorization (credit/rate-limit UX) ---
 # Applied on every provider HTTP-error path below (analyze AND reevaluate,
 # all providers) so the frontend can show a clean, actionable German message
-# instead of a raw "Claude HTTP 403: {...}" dump. Only the response BODY is
-# ever inspected here — request headers (which carry the API key) never are,
-# so a raw key/secret can't leak into the message.
+# instead of a raw "Claude HTTP 403: {...}" dump. The response body is
+# untrusted too: inspect it only for the bounded categories below and never
+# include it in the returned message, because a provider or proxy may echo
+# submitted data or credentials.
 # Tightened (not a bare "credit") so an unrelated substring like "credential"
 # doesn't false-positive; still matches the real credits/billing phrasing
 # providers actually send.
@@ -1205,8 +1271,7 @@ def _categorize_provider_http_error(
 ) -> str:
     """Turn a provider HTTP error response into a clean German LlmError
     message when it looks like an auth, credits/limit, or rate-limit
-    condition; otherwise keep the existing detailed
-    "{Provider} HTTP {code}: {detail}" message unchanged.
+    condition; otherwise return a generic provider/status message.
 
     401 (auth: bad/missing key) is intentionally split from 403 (billing):
     conflating them would tell a trader with a broken key to "top up
@@ -1245,7 +1310,7 @@ def _categorize_provider_http_error(
         )
     if status_code == 429 or any(k in low for k in _RATE_LIMIT_KEYWORDS):
         return f"⚠ {provider_label}: rate limit reached — wait briefly or switch AI provider."
-    return f"{provider_label} HTTP {status_code}: {detail}"
+    return f"{provider_label}: provider request failed (HTTP {status_code})."
 
 
 def _parse_content_to_proposal(
@@ -1258,9 +1323,7 @@ def _parse_content_to_proposal(
     except json.JSONDecodeError as e:
         raise LlmError(f"{provider} output is not valid JSON: {e}", raw=content) from e
     except ValidationError as e:
-        raise LlmError(
-            f"{provider} JSON failed schema validation: {e}", raw=content
-        ) from e
+        raise LlmError(f"{provider} JSON failed schema validation", raw=content) from e
     return annotate_proposal(proposal, context)
 
 
@@ -1274,9 +1337,7 @@ def _parse_content_to_reevaluation(
     except json.JSONDecodeError as e:
         raise LlmError(f"{provider} output is not valid JSON: {e}", raw=content) from e
     except ValidationError as e:
-        raise LlmError(
-            f"{provider} JSON failed schema validation: {e}", raw=content
-        ) from e
+        raise LlmError(f"{provider} JSON failed schema validation", raw=content) from e
     # Finding 2: light geometry/ATR plausibility cap on new_sl/new_tp (advisory
     # display only; the apply path re-validates via ModifySLRequest + Money gates).
     return annotate_reevaluation(proposal, context)
@@ -1291,6 +1352,30 @@ def _parse_content_to_reevaluation(
 # bounded time instead of silently doubling the caller's timeout budget.
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 _RETRY_BACKOFF_SECONDS = 0.5
+_KNOWN_FINISH_REASONS = frozenset(
+    {"stop", "length", "content_filter", "tool_calls", "function_call"}
+)
+_KNOWN_STOP_REASONS = frozenset(
+    {
+        "end_turn",
+        "max_tokens",
+        "stop_sequence",
+        "tool_use",
+        "pause_turn",
+        "refusal",
+        "model_context_window_exceeded",
+    }
+)
+
+
+def _llm_metric_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= 1_000_000_000_000 else None
+
+
+def _llm_metric_reason(value: Any, allowed: frozenset[str]) -> str | None:
+    return value if isinstance(value, str) and value in allowed else None
 
 
 def _log_llm_metrics(
@@ -1316,27 +1401,38 @@ def _log_llm_metrics(
     """
     try:
         payload = payload or {}
-        usage = payload.get("usage") or {}
+        usage_raw = payload.get("usage")
+        usage = usage_raw if isinstance(usage_raw, dict) else {}
 
         # Anthropic shape
-        stop_reason = payload.get("stop_reason")
-        input_tokens = usage.get("input_tokens")
-        output_tokens = usage.get("output_tokens")
-        cache_read_tokens = usage.get("cache_read_input_tokens")
-        cache_creation_tokens = usage.get("cache_creation_input_tokens")
+        stop_reason = _llm_metric_reason(
+            payload.get("stop_reason"), _KNOWN_STOP_REASONS
+        )
+        input_tokens = _llm_metric_count(usage.get("input_tokens"))
+        output_tokens = _llm_metric_count(usage.get("output_tokens"))
+        cache_read_tokens = _llm_metric_count(usage.get("cache_read_input_tokens"))
+        cache_creation_tokens = _llm_metric_count(
+            usage.get("cache_creation_input_tokens")
+        )
 
         # OpenAI-shaped (xai/openai/ollama)
         finish_reason = None
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
             choice0 = choices[0] if isinstance(choices[0], dict) else {}
-            finish_reason = choice0.get("finish_reason")
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        completion_details = usage.get("completion_tokens_details") or {}
-        reasoning_tokens = completion_details.get("reasoning_tokens")
-        prompt_details = usage.get("prompt_tokens_details") or {}
-        cached_tokens = prompt_details.get("cached_tokens")
+            finish_reason = _llm_metric_reason(
+                choice0.get("finish_reason"), _KNOWN_FINISH_REASONS
+            )
+        prompt_tokens = _llm_metric_count(usage.get("prompt_tokens"))
+        completion_tokens = _llm_metric_count(usage.get("completion_tokens"))
+        completion_details_raw = usage.get("completion_tokens_details")
+        completion_details = (
+            completion_details_raw if isinstance(completion_details_raw, dict) else {}
+        )
+        reasoning_tokens = _llm_metric_count(completion_details.get("reasoning_tokens"))
+        prompt_details_raw = usage.get("prompt_tokens_details")
+        prompt_details = prompt_details_raw if isinstance(prompt_details_raw, dict) else {}
+        cached_tokens = _llm_metric_count(prompt_details.get("cached_tokens"))
 
         log.info(
             "LLM_METRICS provider=%s model=%s route=%s elapsed_ms=%.0f "
@@ -1359,9 +1455,9 @@ def _log_llm_metrics(
             finish_reason,
             stop_reason,
         )
-    except Exception:
+    except Exception as exc:
         # Metrics logging must never break an advisory LLM call.
-        log.debug("LLM_METRICS logging failed", exc_info=True)
+        log.debug("LLM_METRICS logging failed type=%s", type(exc).__name__)
 
 
 async def _post_with_retry(
@@ -1453,7 +1549,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
     try:
         r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
-        raise LlmError(f"Claude request failed: {e}") from e
+        raise LlmError("Claude request failed") from e
 
     # Defensive fallback: if this API version/account/model combination
     # rejects the thinking/output_config request shape (e.g. a pinned older
@@ -1475,7 +1571,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             try:
                 r = await _post_with_retry(lambda: _post(fallback_body))
             except httpx.HTTPError as e:
-                raise LlmError(f"Claude request failed: {e}") from e
+                raise LlmError("Claude request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:800]
@@ -1485,10 +1581,7 @@ async def _call_claude(context: dict[str, Any], settings: Settings) -> TradeProp
             pass
         raise LlmError(_categorize_provider_http_error("Claude", r.status_code, detail), raw=detail)
 
-    try:
-        payload = r.json()
-    except json.JSONDecodeError as e:
-        raise LlmError("Claude returned non-JSON response") from e
+    payload = _provider_response_json_object(r, provider_label="Claude")
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
@@ -1606,7 +1699,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
     try:
         r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
-        raise LlmError(f"xAI request failed: {e}") from e
+        raise LlmError("xAI request failed") from e
 
     # O2-13: json_schema/strict is the primary path, but stays a safety-
     # netted addition. If this account/model/proxy combination rejects the
@@ -1619,7 +1712,7 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
         try:
             r = await _post_with_retry(lambda: _post(fallback_body))
         except httpx.HTTPError as e:
-            raise LlmError(f"xAI request failed: {e}") from e
+            raise LlmError("xAI request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -1629,11 +1722,11 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
             pass
         raise LlmError(_categorize_provider_http_error("xAI", r.status_code, detail), raw=detail)
 
+    payload = _provider_response_json_object(r, provider_label="xAI")
     try:
-        payload = r.json()
         choice0 = payload["choices"][0]
         content = choice0["message"]["content"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+    except (KeyError, IndexError, TypeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
 
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -1698,7 +1791,7 @@ async def _call_openai_compat(
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
-        raise LlmError(f"{provider_label} request failed: {e}") from e
+        raise LlmError(f"{provider_label} request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -1708,10 +1801,10 @@ async def _call_openai_compat(
             pass
         raise LlmError(_categorize_provider_http_error(provider_label, r.status_code, detail), raw=detail)
 
+    payload = _provider_response_json_object(r, provider_label=provider_label)
     try:
-        payload = r.json()
         content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+    except (KeyError, IndexError, TypeError) as e:
         raise LlmError(
             f"{provider_label} response missing choices content",
             raw=getattr(r, "text", None),
@@ -1755,8 +1848,147 @@ async def _call_ollama(context: dict[str, Any], settings: Settings) -> TradeProp
     )
 
 
+_PUBLIC_ANALYZE_CONTEXT_FIELDS = frozenset(
+    {
+        "symbol",
+        "last_price",
+        "funding",
+        "market",
+        "daily",
+        "htf",
+        "ltf",
+        "coherence",
+        "risk_policy",
+        "contract",
+        "scanner_verdict",
+        "market_regime",
+        "track_record",
+    }
+)
+_PRIVATE_ANALYZE_CONTEXT_KEY_MARKERS = frozenset(
+    {
+        "account",
+        "apikey",
+        "authorization",
+        "cookie",
+        "credential",
+        "passphrase",
+        "password",
+        "position",
+        "private",
+        "secret",
+        "signature",
+        "token",
+        "wallet",
+    }
+)
+_PRIVATE_ANALYZE_CONTEXT_EXACT_KEYS = frozenset(
+    {
+        "available",
+        "availablebalance",
+        "availableusdt",
+        "balance",
+        "balances",
+        "entryprice",
+        "equity",
+        "equityusdt",
+        "holdvol",
+        "liquidateprice",
+        "marginratio",
+        "positionid",
+        "realised",
+        "unrealizedpnl",
+    }
+)
+_PRIVATE_ANALYZE_CONTEXT_DROP = object()
+_MAX_ANALYZE_CONTEXT_DEPTH = 12
+
+
+def _private_analyze_context_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", value.strip().lower())
+    if normalized in _PRIVATE_ANALYZE_CONTEXT_EXACT_KEYS:
+        return True
+    return any(
+        marker in normalized
+        for marker in _PRIVATE_ANALYZE_CONTEXT_KEY_MARKERS
+    )
+
+
+def _strip_private_analyze_context(
+    value: Any, *, depth: int = 0, seen: set[int] | None = None
+) -> Any:
+    """Copy nested public context while removing private account-shaped fields."""
+    if depth > _MAX_ANALYZE_CONTEXT_DEPTH:
+        return _PRIVATE_ANALYZE_CONTEXT_DROP
+    if seen is None:
+        seen = set()
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in seen:
+            return _PRIVATE_ANALYZE_CONTEXT_DROP
+        seen.add(identity)
+        try:
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str) or _private_analyze_context_key(key):
+                    continue
+                cleaned = _strip_private_analyze_context(
+                    item, depth=depth + 1, seen=seen
+                )
+                if cleaned is not _PRIVATE_ANALYZE_CONTEXT_DROP:
+                    out[key] = cleaned
+            return out
+        finally:
+            seen.remove(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            return _PRIVATE_ANALYZE_CONTEXT_DROP
+        seen.add(identity)
+        try:
+            out = []
+            for item in value:
+                cleaned = _strip_private_analyze_context(
+                    item, depth=depth + 1, seen=seen
+                )
+                if cleaned is not _PRIVATE_ANALYZE_CONTEXT_DROP:
+                    out.append(cleaned)
+            return out
+        finally:
+            seen.remove(identity)
+    return value
+
+
+def _analyze_context_for_transport(
+    context: dict[str, Any], settings: Settings
+) -> dict[str, Any]:
+    """Enforce account opt-in again at the provider transport boundary.
+
+    ``build_llm_context`` is the normal producer and already omits account data,
+    but provider calls serialize the entire mapping they receive. Keep a second
+    fail-closed layer so a direct or future caller cannot leak account/position
+    fields by bypassing that builder. Public blocks are copied recursively so
+    nested account, position, credential or secret-shaped fields are removed too.
+    """
+    if getattr(settings, "include_account_in_llm", False) is True:
+        return context
+    safe: dict[str, Any] = {}
+    for key, value in context.items():
+        if key not in _PUBLIC_ANALYZE_CONTEXT_FIELDS:
+            continue
+        cleaned = _strip_private_analyze_context(value)
+        if cleaned is not _PRIVATE_ANALYZE_CONTEXT_DROP:
+            safe[key] = cleaned
+    safe["account"] = {
+        "omitted": True,
+        "reason": "INCLUDE_ACCOUNT_IN_LLM=false",
+    }
+    return safe
+
+
 async def analyze_with_llm(context: dict[str, Any], settings: Settings) -> TradeProposal:
     """Dispatch by LLM_PROVIDER: claude | xai | openai (Codex) | ollama."""
+    context = _analyze_context_for_transport(context, settings)
     provider = (settings.llm_provider or "claude").strip().lower()
     if provider in ("claude", "anthropic"):
         return await _call_claude(context, settings)
@@ -1821,7 +2053,7 @@ async def _call_claude_reevaluate(
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
-        raise LlmError(f"Claude request failed: {e}") from e
+        raise LlmError("Claude request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:800]
@@ -1831,10 +2063,7 @@ async def _call_claude_reevaluate(
             pass
         raise LlmError(_categorize_provider_http_error("Claude", r.status_code, detail), raw=detail)
 
-    try:
-        payload = r.json()
-    except json.JSONDecodeError as e:
-        raise LlmError("Claude returned non-JSON response") from e
+    payload = _provider_response_json_object(r, provider_label="Claude")
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
@@ -1907,7 +2136,7 @@ async def _call_xai_reevaluate(
     try:
         r = await _post_with_retry(lambda: _post(body))
     except httpx.HTTPError as e:
-        raise LlmError(f"xAI request failed: {e}") from e
+        raise LlmError("xAI request failed") from e
 
     # O2-13: same 400-fallback wiring as _call_xai above — json_schema is
     # the primary path, json_object stays the safety net.
@@ -1917,7 +2146,7 @@ async def _call_xai_reevaluate(
         try:
             r = await _post_with_retry(lambda: _post(fallback_body))
         except httpx.HTTPError as e:
-            raise LlmError(f"xAI request failed: {e}") from e
+            raise LlmError("xAI request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -1927,11 +2156,11 @@ async def _call_xai_reevaluate(
             pass
         raise LlmError(_categorize_provider_http_error("xAI", r.status_code, detail), raw=detail)
 
+    payload = _provider_response_json_object(r, provider_label="xAI")
     try:
-        payload = r.json()
         choice0 = payload["choices"][0]
         content = choice0["message"]["content"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+    except (KeyError, IndexError, TypeError) as e:
         raise LlmError("xAI response missing choices content", raw=getattr(r, "text", None)) from e
 
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -1994,7 +2223,7 @@ async def _call_openai_compat_reevaluate(
     try:
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
-        raise LlmError(f"{provider_label} request failed: {e}") from e
+        raise LlmError(f"{provider_label} request failed") from e
 
     if r.status_code >= 400:
         detail: Any = r.text[:500]
@@ -2004,10 +2233,10 @@ async def _call_openai_compat_reevaluate(
             pass
         raise LlmError(_categorize_provider_http_error(provider_label, r.status_code, detail), raw=detail)
 
+    payload = _provider_response_json_object(r, provider_label=provider_label)
     try:
-        payload = r.json()
         content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+    except (KeyError, IndexError, TypeError) as e:
         raise LlmError(
             f"{provider_label} response missing choices content",
             raw=getattr(r, "text", None),
@@ -2064,6 +2293,15 @@ async def reevaluate_with_llm(
     closes anything itself.
     """
     provider = (settings.llm_provider or "claude").strip().lower()
+    external_providers = {"claude", "anthropic", "xai", "grok", "openai", "codex"}
+    if (
+        provider in external_providers
+        and settings.include_account_in_llm is not True
+    ):
+        raise LlmError(
+            "External position reevaluation requires "
+            "INCLUDE_ACCOUNT_IN_LLM=true"
+        )
     if provider in ("claude", "anthropic"):
         return await _call_claude_reevaluate(context, settings)
     if provider in ("xai", "grok"):

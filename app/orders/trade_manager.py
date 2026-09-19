@@ -71,6 +71,14 @@ class Alert:
 Action = MoveSlToBe | Alert
 
 
+def _finite_real_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 def evaluate_rules(
     *,
     side: str,
@@ -90,6 +98,17 @@ def evaluate_rules(
     actions: list[Action] = []
     if side not in ("long", "short"):
         return actions  # unknown/mislabeled side → do nothing (fail-safe, never guess)
+    if (
+        not _finite_real_number(entry)
+        or entry <= 0
+        or not _finite_real_number(mark)
+        or mark <= 0
+        or (
+            current_sl is not None
+            and (not _finite_real_number(current_sl) or current_sl <= 0)
+        )
+    ):
+        return actions
     direction = 1 if side == "long" else -1
 
     # Defensive: a corrupt JSON column could deserialize to a non-dict; coerce so
@@ -101,7 +120,7 @@ def evaluate_rules(
     # R is only available with a finite, strictly positive r1. Otherwise all
     # R-based signals (auto-BE, time-stop-R gate) are unavailable — no crash.
     r1 = mgmt.r1
-    r_available = isinstance(r1, (int, float)) and math.isfinite(r1) and r1 > 0
+    r_available = _finite_real_number(r1) and r1 > 0
     unreal_r = (mark - entry) * direction / r1 if r_available else None
 
     # ── Auto-BE (autonomous) ────────────────────────────────────────────────
@@ -126,15 +145,15 @@ def evaluate_rules(
     # protective guard. No be_done latch — the trail fires repeatedly, but every
     # emitted move is monotonically tightening, so it can never loosen a stop.
     high_water = mgmt.high_water
-    hw_ok = isinstance(high_water, (int, float)) and math.isfinite(high_water)
-    atr_ok = isinstance(atr, (int, float)) and math.isfinite(atr) and atr > 0
+    hw_ok = _finite_real_number(high_water) and high_water > 0
+    atr_ok = _finite_real_number(atr) and atr > 0
     # F4: a manual SL move parks the then-current high-water here. The trail stays
     # silent until the high-water advances PAST that level, so the user's chosen
     # (looser) stop is respected instead of being restored every cycle. A tighten
     # is unaffected: its own _is_more_protective guard already blocks the trail
     # until a new high, exactly as the override does.
     uo = mgmt.user_override_hw
-    uo_active = isinstance(uo, (int, float)) and math.isfinite(uo)
+    uo_active = _finite_real_number(uo) and uo > 0
     if (
         armed.get("auto_trail") is True
         and unreal_r is not None
@@ -172,7 +191,11 @@ def evaluate_rules(
 
     # ── Thesis-invalidation alarm (advisory, R-independent) ──────────────────
     inval = mgmt.invalidation_price
-    if inval is not None and not alert_state.get("thesis"):
+    if (
+        _finite_real_number(inval)
+        and inval > 0
+        and not alert_state.get("thesis")
+    ):
         crossed = mark <= inval if direction == 1 else mark >= inval
         if crossed:
             actions.append(
@@ -189,6 +212,7 @@ def evaluate_rules(
     time_ms = settings.tm_time_stop_hours * 3_600_000
     if (
         not alert_state.get("time_stop")
+        and type(mgmt.opened_at_ms) is int
         and (now_ms - mgmt.opened_at_ms) >= time_ms
         and unreal_r is not None
         and unreal_r < settings.tm_time_stop_min_r

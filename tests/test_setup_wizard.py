@@ -44,6 +44,133 @@ def test_full_env_roundtrips_through_settings(tmp_path, monkeypatch):
     assert s.setup_complete is True
 
 
+@pytest.mark.asyncio
+async def test_setup_generated_settings_error_never_echoes_secret(
+    tmp_path, monkeypatch
+):
+    import app.env_builder as env_builder
+    import app.main as main
+
+    marker = "SYNTHETIC_SETUP_SECRET_MARKER"
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env_path)
+    monkeypatch.setattr(main, "_setup_needed", lambda: True)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+
+    def invalid_settings(*args, **kwargs):
+        raise ValueError(f"input_value={marker}")
+
+    monkeypatch.setattr(main, "Settings", invalid_settings)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.setup_save(
+            SimpleNamespace(),
+            _payload(llm_api_key=marker),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Generated configuration failed validation."
+    assert marker not in str(exc.value.detail)
+    assert not env_path.exists()
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_setup_acl_failure_does_not_publish_or_construct_client(
+    tmp_path, monkeypatch
+):
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env_path)
+    monkeypatch.setattr(main, "_setup_needed", lambda: True)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: False)
+    create_client = MagicMock(side_effect=AssertionError("must not construct"))
+    monkeypatch.setattr(main, "create_exchange_client", create_client)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.setup_save(SimpleNamespace(), _payload())
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Local configuration permissions could not be secured."
+    create_client.assert_not_called()
+    assert not env_path.exists()
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+def test_cli_setup_acl_failure_does_not_publish_configuration(tmp_path, monkeypatch):
+    import scripts.setup_wizard as wizard
+
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(wizard, "ENV_PATH", env_path)
+    monkeypatch.setattr(wizard, "restrict_env_permissions", lambda path: False)
+
+    with pytest.raises(PermissionError, match="permissions"):
+        wizard._write_full_env("SYNTHETIC_SECRET=value\n")
+
+    assert not env_path.exists()
+    assert list(tmp_path.glob(".env.setup-*.tmp")) == []
+
+
+def test_ensure_env_acl_failure_preserves_existing_configuration(
+    tmp_path, monkeypatch
+):
+    import app.env_builder as env_builder
+    import scripts.ensure_env as ensure
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    original = "SETUP_COMPLETE=true\nLOCAL_API_TOKEN=synthetic-existing\n"
+    env_path.write_text(original, encoding="utf-8")
+    example_path.write_text(
+        "SETUP_COMPLETE=true\nLOCAL_API_TOKEN=\nNEW_SETTING=safe-default\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ensure, "ENV_PATH", env_path)
+    monkeypatch.setattr(ensure, "EXAMPLE_PATH", example_path)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: False)
+
+    with pytest.raises(PermissionError, match="permissions"):
+        ensure.ensure_env(merge=True, auto_token=True)
+
+    assert env_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+def test_ensure_env_atomically_merges_and_generates_local_token(
+    tmp_path, monkeypatch
+):
+    import app.env_builder as env_builder
+    import scripts.ensure_env as ensure
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text(
+        "SETUP_COMPLETE=true\nLOCAL_API_TOKEN=\n",
+        encoding="utf-8",
+    )
+    example_path.write_text(
+        "SETUP_COMPLETE=true\nLOCAL_API_TOKEN=\nNEW_SETTING=safe-default\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ensure, "ENV_PATH", env_path)
+    monkeypatch.setattr(ensure, "EXAMPLE_PATH", example_path)
+    monkeypatch.setitem(
+        ensure.AUTO_FILL_EMPTY,
+        "LOCAL_API_TOKEN",
+        lambda: "synthetic-local-token",
+    )
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+
+    result = ensure.ensure_env(merge=True, auto_token=True)
+
+    assert result["SETUP_COMPLETE"] == "true"
+    assert result["LOCAL_API_TOKEN"] == "synthetic-local-token"
+    assert result["NEW_SETTING"] == "safe-default"
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
 def test_bootstrap_env_does_not_overwrite_file_created_during_publish(
     tmp_path, monkeypatch
 ):
@@ -75,6 +202,19 @@ def test_bootstrap_env_publish_failure_leaves_no_partial_target(tmp_path, monkey
     monkeypatch.setattr(bootstrap.os, "link", fail_publish)
 
     with pytest.raises(OSError, match="synthetic publish failure"):
+        bootstrap.write_bootstrap_env(target, port=8787)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+def test_bootstrap_env_acl_failure_leaves_no_configuration(tmp_path, monkeypatch):
+    import scripts.write_bootstrap_env as bootstrap
+
+    target = tmp_path / ".env"
+    monkeypatch.setattr(bootstrap, "restrict_env_permissions", lambda path: False)
+
+    with pytest.raises(PermissionError, match="permissions"):
         bootstrap.write_bootstrap_env(target, port=8787)
 
     assert not target.exists()
@@ -244,7 +384,7 @@ async def test_setup_hot_apply_invalidates_exchange_dependent_caches(
     env = tmp_path / ".env"
     monkeypatch.setattr(main, "ENV_PATH", env)
     monkeypatch.setattr(main, "_setup_needed", lambda: True)
-    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: None)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
 
     settings = SimpleNamespace(exchange="hyperliquid", llm_provider="claude")
     settings_getter = MagicMock(return_value=settings)
@@ -280,6 +420,272 @@ async def test_setup_hot_apply_invalidates_exchange_dependent_caches(
 
 
 @pytest.mark.asyncio
+async def test_setup_hot_swap_waits_for_trade_lock(tmp_path, monkeypatch):
+    import asyncio
+
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env)
+    monkeypatch.setattr(main, "_setup_needed", lambda: True)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+
+    settings = SimpleNamespace(exchange="hyperliquid", llm_provider="claude")
+    settings_getter = MagicMock(return_value=settings)
+    settings_getter.cache_clear = MagicMock()
+    monkeypatch.setattr(main, "get_settings", settings_getter)
+
+    old_client = SimpleNamespace(aclose=AsyncMock())
+    new_client = object()
+    monkeypatch.setattr(main, "create_exchange_client", lambda _: new_client)
+    replace_spy = MagicMock(side_effect=lambda source, target: source.replace(target))
+    monkeypatch.setattr(env_builder, "replace_with_retry", replace_spy)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class GateLock:
+        async def __aenter__(self):
+            entered.set()
+            await release.wait()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        _owned_exchange_client=old_client,
+        trade_lock=GateLock(),
+        symbols_cache=None,
+        market_cache={},
+        mini_cache={},
+        analyze_cache={},
+        tm_atr_cache={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    task = asyncio.create_task(main.setup_save(request, _payload()))
+    await entered.wait()
+
+    replace_spy.assert_not_called()
+    assert state.exchange is old_client
+    assert not env.exists()
+
+    release.set()
+    response = await task
+
+    assert response["ok"] is True
+    replace_spy.assert_called_once()
+    assert state.exchange is new_client
+    old_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_old_client_cleanup_does_not_hold_trade_lock(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env)
+    monkeypatch.setattr(main, "_setup_needed", lambda: True)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+
+    settings_getter = MagicMock()
+    settings_getter.cache_clear = MagicMock()
+    monkeypatch.setattr(main, "get_settings", settings_getter)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def blocked_close():
+        close_started.set()
+        await release_close.wait()
+
+    old_client = SimpleNamespace(aclose=AsyncMock(side_effect=blocked_close))
+    new_client = object()
+    monkeypatch.setattr(main, "create_exchange_client", lambda _: new_client)
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        _owned_exchange_client=old_client,
+        trade_lock=asyncio.Lock(),
+        symbols_cache=None,
+        market_cache={},
+        mini_cache={},
+        analyze_cache={},
+        tm_atr_cache={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    setup_task = asyncio.create_task(main.setup_save(request, _payload()))
+    await close_started.wait()
+
+    assert state.exchange is new_client
+    lock_acquired = asyncio.Event()
+
+    async def acquire_trade_lock():
+        async with state.trade_lock:
+            lock_acquired.set()
+
+    contender = asyncio.create_task(acquire_trade_lock())
+    await asyncio.wait_for(lock_acquired.wait(), timeout=1.0)
+
+    release_close.set()
+    await setup_task
+    await contender
+    old_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_cancellation_finishes_detached_client_cleanup(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env)
+    monkeypatch.setattr(main, "_setup_needed", lambda: True)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+
+    settings = SimpleNamespace(exchange="hyperliquid", llm_provider="claude")
+    settings_getter = MagicMock(return_value=settings)
+    settings_getter.cache_clear = MagicMock()
+    monkeypatch.setattr(main, "get_settings", settings_getter)
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_completed = asyncio.Event()
+    close_interrupted = asyncio.Event()
+
+    async def blocked_close():
+        close_started.set()
+        try:
+            await release_close.wait()
+        except asyncio.CancelledError:
+            close_interrupted.set()
+            raise
+        close_completed.set()
+
+    old_client = SimpleNamespace(aclose=AsyncMock(side_effect=blocked_close))
+    new_client = object()
+    monkeypatch.setattr(main, "create_exchange_client", lambda _: new_client)
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        _owned_exchange_client=old_client,
+        trade_lock=asyncio.Lock(),
+        symbols_cache=None,
+        market_cache={},
+        mini_cache={},
+        analyze_cache={},
+        tm_atr_cache={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    setup_task = asyncio.create_task(main.setup_save(request, _payload()))
+    await close_started.wait()
+    assert state.exchange is new_client
+
+    setup_task.cancel()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await setup_task
+
+    assert close_completed.is_set()
+    assert not close_interrupted.is_set()
+    old_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_setup_saves_publish_only_one_candidate(tmp_path, monkeypatch):
+    import asyncio
+
+    import app.env_builder as env_builder
+    import app.main as main
+
+    env = tmp_path / ".env"
+    monkeypatch.setattr(main, "ENV_PATH", env)
+    monkeypatch.setattr(main, "_setup_needed", lambda: not env.exists())
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
+    settings_getter = MagicMock()
+    settings_getter.cache_clear = MagicMock()
+    monkeypatch.setattr(main, "get_settings", settings_getter)
+
+    candidates = [
+        SimpleNamespace(aclose=AsyncMock()),
+        SimpleNamespace(aclose=AsyncMock()),
+    ]
+    created = []
+
+    def create_candidate(_settings):
+        candidate = candidates[len(created)]
+        created.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(main, "create_exchange_client", create_candidate)
+    both_waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    class SerialGateLock:
+        def __init__(self):
+            self.waiter_count = 0
+            self.serial = asyncio.Lock()
+
+        async def __aenter__(self):
+            self.waiter_count += 1
+            if self.waiter_count == 2:
+                both_waiting.set()
+            await release.wait()
+            await self.serial.acquire()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            self.serial.release()
+            return False
+
+    old_client = SimpleNamespace(aclose=AsyncMock())
+    state = SimpleNamespace(
+        mexc=old_client,
+        exchange=old_client,
+        _owned_exchange_client=old_client,
+        trade_lock=SerialGateLock(),
+        symbols_cache=None,
+        market_cache={},
+        mini_cache={},
+        analyze_cache={},
+        tm_atr_cache={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    saves = [
+        asyncio.create_task(main.setup_save(request, _payload())),
+        asyncio.create_task(main.setup_save(request, _payload())),
+    ]
+    await both_waiting.wait()
+    assert len(created) == 2
+
+    release.set()
+    results = await asyncio.gather(*saves, return_exceptions=True)
+
+    successes = [result for result in results if isinstance(result, dict)]
+    conflicts = [
+        result for result in results if isinstance(result, main.HTTPException)
+    ]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].status_code == 403
+    winner = state.exchange
+    loser = candidates[1] if winner is candidates[0] else candidates[0]
+    winner.aclose.assert_not_awaited()
+    loser.aclose.assert_awaited_once()
+    old_client.aclose.assert_awaited_once()
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+@pytest.mark.asyncio
 async def test_setup_client_creation_failure_does_not_commit_configuration(
     tmp_path, monkeypatch
 ):
@@ -289,7 +695,7 @@ async def test_setup_client_creation_failure_does_not_commit_configuration(
     env = tmp_path / ".env"
     monkeypatch.setattr(main, "ENV_PATH", env)
     monkeypatch.setattr(main, "_setup_needed", lambda: True)
-    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: None)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
 
     settings = SimpleNamespace(exchange="hyperliquid", llm_provider="claude")
     settings_getter = MagicMock(return_value=settings)
@@ -323,7 +729,7 @@ async def test_setup_replace_failure_closes_uninstalled_client(tmp_path, monkeyp
     env = tmp_path / ".env"
     monkeypatch.setattr(main, "ENV_PATH", env)
     monkeypatch.setattr(main, "_setup_needed", lambda: True)
-    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: None)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: True)
     monkeypatch.setattr(
         env_builder,
         "replace_with_retry",

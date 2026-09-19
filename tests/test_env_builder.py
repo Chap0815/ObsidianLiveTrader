@@ -251,6 +251,28 @@ def test_build_full_env_port_is_answer_port_not_8788(tmp_path, monkeypatch):
     assert s.trading_enabled is False
 
 
+def test_build_full_env_mainnet_keeps_runtime_ack_and_trading_disabled(
+    tmp_path, monkeypatch
+):
+    for key in ("EXCHANGE", "HL_TESTNET", "MAINNET_ACK", "TRADING_ENABLED"):
+        monkeypatch.delenv(key, raising=False)
+    content = build_full_env(
+        normalize_answers(
+            _payload(exchange="hl-mainnet", mainnet_confirm="MAINNET")
+        )
+    )
+
+    assert "HL_TESTNET=false" in content
+    assert "MAINNET_ACK=false" in content
+    assert "TRADING_ENABLED=false" in content
+    env_path = tmp_path / ".env"
+    env_path.write_text(content, encoding="utf-8")
+    settings = Settings(_env_file=str(env_path))
+    assert settings.hl_testnet is False
+    assert settings.mainnet_ack is False
+    assert settings.trading_enabled is False
+
+
 def test_build_full_env_preset_omits_max_lines(tmp_path, monkeypatch):
     monkeypatch.delenv("EXCHANGE", raising=False)
     monkeypatch.delenv("HL_TESTNET", raising=False)
@@ -555,4 +577,23 @@ def test_patch_env_gives_up_after_persistent_permission_error(tmp_path, monkeypa
     # fail-safe: the original .env must remain untouched, and the tmp file
     # must not be left behind.
     assert p.read_text(encoding="utf-8") == "XAI_API_KEY=\n"
+    assert list(tmp_path.glob(".env.*.tmp")) == []
+
+
+def test_patch_env_does_not_publish_when_permissions_cannot_be_hardened(
+    tmp_path, monkeypatch
+):
+    p = tmp_path / ".env"
+    original = "XAI_API_KEY=old-value\n"
+    p.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: False)
+
+    with pytest.raises(PermissionError, match="permissions"):
+        patch_env_vars(
+            p,
+            {"XAI_API_KEY": "new-secret"},
+            allowed=set(SETTINGS_LLM_WRITABLE),
+        )
+
+    assert p.read_text(encoding="utf-8") == original
     assert list(tmp_path.glob(".env.*.tmp")) == []

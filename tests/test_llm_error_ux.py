@@ -20,10 +20,44 @@ import pytest
 
 import app.llm.client as client_mod
 from app.config import Settings, get_settings
-from app.llm.client import LlmError, _call_claude, _call_xai, _categorize_provider_http_error
+from app.llm.client import (
+    LlmError,
+    _call_claude,
+    _call_xai,
+    _categorize_provider_http_error,
+    _parse_content_to_proposal,
+    _parse_content_to_reevaluation,
+)
 
 
 # --- Pure helper -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("parser", "payload"),
+    [
+        (
+            _parse_content_to_proposal,
+            {
+                "htf_trend": "bullish",
+                "ltf_trend": "bullish",
+                "action": "SYNTHETIC_SECRET_MARKER",
+            },
+        ),
+        (
+            _parse_content_to_reevaluation,
+            {"action": "SYNTHETIC_SECRET_MARKER", "reason": "synthetic"},
+        ),
+    ],
+)
+def test_schema_validation_error_does_not_reflect_provider_content(parser, payload):
+    raw = json.dumps(payload)
+
+    with pytest.raises(LlmError) as exc_info:
+        parser(raw, provider="test")
+
+    assert str(exc_info.value) == "test JSON failed schema validation"
+    assert "SYNTHETIC_SECRET_MARKER" not in str(exc_info.value)
 
 
 def test_categorize_401_is_invalid_key_message():
@@ -81,10 +115,10 @@ def test_categorize_rate_limit_keyword_in_body_without_429():
     assert "rate limit" in msg
 
 
-def test_categorize_other_error_keeps_existing_message():
+def test_categorize_other_error_returns_generic_message():
     msg = _categorize_provider_http_error("Claude", 500, {"error": "internal server error"})
     assert not msg.startswith("⚠")
-    assert "Claude HTTP 500" in msg
+    assert msg == "Claude: provider request failed (HTTP 500)."
 
 
 def test_categorize_bare_credit_substring_is_not_a_false_positive():
@@ -95,7 +129,7 @@ def test_categorize_bare_credit_substring_is_not_a_false_positive():
         "Claude", 500, {"error": "database credential rotation failed"}
     )
     assert not msg.startswith("⚠")
-    assert "Claude HTTP 500" in msg
+    assert msg == "Claude: provider request failed (HTTP 500)."
 
 
 def test_categorize_used_all_credits_phrase_is_credits_message():
@@ -106,14 +140,17 @@ def test_categorize_used_all_credits_phrase_is_credits_message():
     assert "credits exhausted" in msg
 
 
-def test_categorize_never_leaks_api_key():
-    """Only the response BODY is inspected — an API key passed in as part of
-    a (contrived) detail payload key name must not appear verbatim unless it
-    was actually IN the body; this asserts the helper doesn't echo back
-    anything beyond the given detail object."""
+def test_categorize_never_leaks_secret_echoed_in_provider_body():
     secret = "sk-ant-super-secret-key-content"
-    msg = _categorize_provider_http_error("Claude", 403, {"error": "forbidden"})
+    msg = _categorize_provider_http_error(
+        "Claude",
+        500,
+        {"error": {"message": f"upstream echoed Authorization: Bearer {secret}"}},
+    )
+
     assert secret not in msg
+    assert "Authorization" not in msg
+    assert msg == "Claude: provider request failed (HTTP 500)."
 
 
 # --- Per-provider HTTP call sites (fake transport, no network) ---------
@@ -157,6 +194,25 @@ class _FakeErrorClient:
         return None
 
 
+class _FailingTransportClient:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, *args, **kwargs):
+        import httpx
+
+        raise httpx.ConnectError(self.marker)
+
+
 def _settings(**kw):
     base = dict(anthropic_api_key="k", xai_api_key="k", include_account_in_llm=False)
     base.update(kw)
@@ -197,6 +253,26 @@ async def test_call_xai_429_rate_limit_raises_categorized_error(monkeypatch):
         await _call_xai({"symbol": "BTC"}, _settings())
     assert str(ei.value).startswith("⚠ xAI:")
     assert "rate limit" in str(ei.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [(_call_claude, "Claude request failed"), (_call_xai, "xAI request failed")],
+)
+async def test_provider_transport_error_does_not_reflect_diagnostics(
+    monkeypatch, call, expected
+):
+    marker = "SYNTHETIC_PRIVATE_PROVIDER_TRANSPORT_ERROR"
+    monkeypatch.setattr(
+        client_mod.httpx, "AsyncClient", _FailingTransportClient(marker)
+    )
+
+    with pytest.raises(LlmError) as exc_info:
+        await call({"symbol": "BTC"}, _settings())
+
+    assert str(exc_info.value) == expected
+    assert marker not in str(exc_info.value)
 
 
 # --- L-09: single retry on transient provider failure -------------------

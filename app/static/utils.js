@@ -86,6 +86,40 @@ function fmtPct(rate) {
   return (Number(rate) * 100).toFixed(4) + "%";
 }
 
+/** Safety-facing label derived from the server's authoritative health state. */
+function tradingStatusLabel(health) {
+  const h = health && typeof health === "object" && !Array.isArray(health) ? health : {};
+  if (h.trading_enabled !== true) return "DISARMED";
+  if (h.exchange_configured !== true) return "ARMED · EXCHANGE NOT READY";
+  const testnet = h.exchange === "hyperliquid" && h.hl_testnet === true;
+  if (testnet && h.live_trading === false) return "ARMED · TESTNET";
+  if (!testnet && h.live_trading === true) return "ARMED · REAL FUNDS";
+  return "ARMED · VERIFY NETWORK";
+}
+
+/** Explicit venue/network label; ambiguous health data stays visibly unknown. */
+function exchangeNetworkLabel(health) {
+  const h = health && typeof health === "object" && !Array.isArray(health) ? health : {};
+  const exchange = typeof h.exchange === "string" ? h.exchange.trim().toLowerCase() : "";
+  if (!exchange) return "—";
+  if (exchange === "hyperliquid") {
+    if (h.hl_testnet === true) return "HYPERLIQUID · TESTNET";
+    if (h.hl_testnet === false) return "HYPERLIQUID · MAINNET";
+    return "HYPERLIQUID · NETWORK UNKNOWN";
+  }
+  if (exchange === "mexc") return "MEXC · LIVE VENUE";
+  return exchange.toUpperCase() + " · NETWORK UNKNOWN";
+}
+
+function canReviewPosition(health) {
+  return Boolean(
+    health
+    && typeof health === "object"
+    && !Array.isArray(health)
+    && health.position_reevaluation_allowed === true
+  );
+}
+
 /** MEXC candle time is ms; Lightweight Charts wants seconds. */
 function toChartTime(ms) {
   const t = Number(ms);
@@ -123,6 +157,69 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function safeExternalNewsUrl(value) {
+  if (typeof value !== "string") return "";
+  const raw = value.trim();
+  if (!raw || raw.length > 2048 || /[\s\u0000-\u001f]/.test(raw)) return "";
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_err) {
+    return "";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  if (parsed.username || parsed.password) return "";
+  if (
+    (parsed.protocol === "http:" && parsed.port && parsed.port !== "80") ||
+    (parsed.protocol === "https:" && parsed.port && parsed.port !== "443")
+  ) return "";
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  if (
+    !host ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.includes(":") ||
+    /^\d+(?:\.\d+){3}$/.test(host)
+  ) return "";
+  const labels = host.split(".");
+  if (
+    labels.length < 2 ||
+    labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+  ) return "";
+  return parsed.href;
+}
+
+function previewTtlSeconds(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 3600
+    ? value
+    : null;
+}
+
+function isValidPreviewResponse(data) {
+  const objectValue = (value) =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  const stringList = (value) =>
+    Array.isArray(value) && value.every((item) => typeof item === "string");
+  if (!objectValue(data) || typeof data.ok !== "boolean") return false;
+  if (!objectValue(data.summary) || !objectValue(data.gate)) return false;
+  if (!stringList(data.errors) || !stringList(data.warnings)) return false;
+  if (data.ok === false) return data.token == null;
+  return (
+    typeof data.token === "string" &&
+    data.token.trim().length > 0 &&
+    previewTtlSeconds(data.expires_in_seconds) !== null
+  );
+}
+
+function isValidFillsResponse(data) {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return false;
+  if (typeof data.supported !== "boolean" || !Array.isArray(data.fills)) return false;
+  if (data.error !== null && typeof data.error !== "string") return false;
+  return data.supported || data.fills.length === 0;
 }
 
 function relTime(iso) {

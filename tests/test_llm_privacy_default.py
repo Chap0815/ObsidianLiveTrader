@@ -29,7 +29,14 @@ MARKET = {
 ACCOUNT = {
     "equity_usdt": 12345.0,
     "available_usdt": 6789.0,
-    "positions": [{"symbol": "BTC_USDT", "side": "long", "hold_vol": 5}],
+    "positions": [
+        {
+            "symbol": "BTC_USDT",
+            "side": "long",
+            "hold_vol": 5,
+            "entry_price": 100.0,
+        }
+    ],
     "error": None,
 }
 
@@ -70,11 +77,61 @@ def test_llm_context_requires_literal_true_for_account_opt_in():
 
 
 def test_llm_context_includes_account_when_explicitly_enabled():
-    """Setting INCLUDE_ACCOUNT_IN_LLM=true keeps full existing behavior —
-    no functional change for users who opt in."""
+    """Explicit opt-in includes the normalized public account fields."""
     settings = Settings(_env_file=None, include_account_in_llm=True)
     ctx = build_llm_context(MARKET, ACCOUNT, settings)
 
     assert ctx["account"]["equity_usdt"] == 12345.0
     assert ctx["account"]["available_usdt"] == 6789.0
     assert ctx["account"]["positions"] == ACCOUNT["positions"]
+
+
+def test_llm_context_drops_unexpected_position_fields_with_explicit_opt_in():
+    marker = "SYNTHETIC_PRIVATE_POSITION_DIAGNOSTIC"
+    account = {
+        **ACCOUNT,
+        "positions": [
+            {
+                **ACCOUNT["positions"][0],
+                "position_id": marker,
+                "margin_ratio": {"raw": marker},
+                "private_diagnostic": {"raw": marker},
+            }
+        ],
+    }
+
+    ctx = build_llm_context(
+        MARKET,
+        account,
+        Settings(_env_file=None, include_account_in_llm=True),
+    )
+
+    assert ctx["account"]["positions"] == ACCOUNT["positions"]
+    assert marker not in str(ctx)
+    assert account["positions"][0]["private_diagnostic"] == {"raw": marker}
+
+
+def test_llm_context_sanitizes_account_envelope_with_explicit_opt_in():
+    marker = "SYNTHETIC_PRIVATE_ACCOUNT_DIAGNOSTIC"
+    account = {
+        **ACCOUNT,
+        "equity_usdt": {"raw": marker},
+        "available_usdt": marker,
+        "error": marker,
+    }
+
+    ctx = build_llm_context(
+        MARKET,
+        account,
+        Settings(_env_file=None, include_account_in_llm=True),
+    )
+
+    assert ctx["account"] == {
+        "equity_usdt": None,
+        "available_usdt": None,
+        "positions": ACCOUNT["positions"],
+        "error": "Account data unavailable",
+    }
+    assert "remaining_risk_budget_pct" not in ctx
+    assert marker not in str(ctx)
+    assert account["equity_usdt"] == {"raw": marker}

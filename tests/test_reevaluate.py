@@ -50,7 +50,7 @@ def _env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-claude")
     monkeypatch.setenv("MEXC_API_KEY", "k")
     monkeypatch.setenv("MEXC_API_SECRET", "s")
-    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "false")
+    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "true")
     get_settings.cache_clear()
 
 
@@ -115,9 +115,7 @@ async def test_reevaluate_rejects_result_after_configuration_change(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_reevaluate_hold_result(monkeypatch):
-    """Happy path: open position found, LLM (mocked) returns HOLD, response
-    is the structured advisory result — and the position context (entry,
-    side, pnl, current SL) actually reached the LLM call."""
+    """Explicit opt-in sends the open-position context to the mocked LLM."""
     _env(monkeypatch)
 
     from fastapi.testclient import TestClient
@@ -179,46 +177,127 @@ async def test_reevaluate_hold_result(monkeypatch):
         assert body["position"]["unrealized_pnl"] == 500.0
         assert body["position"]["stop_loss"] == 98_000.0
 
-        # ...while private financial fields do NOT reach the external LLM
-        # without the explicit INCLUDE_ACCOUNT_IN_LLM opt-in.
+        # ...and explicit opt-in sends the complete position context.
         pos_ctx = captured_context.get("position")
         assert pos_ctx is not None
         assert pos_ctx["entry_price"] == 100_000.0
         assert pos_ctx["side"] == "long"
         assert pos_ctx["stop_loss"] == 98_000.0
-        assert pos_ctx["account_fields_omitted"] is True
-        for private_key in (
-            "hold_vol",
-            "unrealized_pnl",
-            "roe_pct",
-            "liquidate_price",
-            "im",
-            "margin_ratio",
-        ):
-            assert private_key not in pos_ctx
+        assert pos_ctx["unrealized_pnl"] == 500.0
+        assert pos_ctx["liquidate_price"] == 90_000.0
         # Market snapshot context also present (same shape as /api/analyze).
         assert "htf" in captured_context
         assert "ltf" in captured_context
 
-    # Explicit opt-in restores the full financial position context.
-    monkeypatch.setenv("INCLUDE_ACCOUNT_IN_LLM", "true")
     get_settings.cache_clear()
-    captured_context.clear()
+
+
+def test_reevaluate_account_error_does_not_reflect_diagnostics(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.mexc.errors import MexcError
+
+    _env(monkeypatch)
+    marker = "SYNTHETIC_PRIVATE_REEVALUATE_ACCOUNT_ERROR"
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(side_effect=MexcError(marker))
+
     with TestClient(app) as tc:
         tc.app.state.mexc = client
-        with (
-            patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock())),
-            patch("app.main.snapshot_to_api_dict", return_value=_mock_snap()),
-            patch("app.main.reevaluate_with_llm", new=fake_reevaluate_with_llm),
-        ):
-            r = tc.post(
-                "/api/reevaluate",
-                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
-            )
-    assert r.status_code == 200, r.text
-    assert captured_context["position"]["unrealized_pnl"] == 500.0
-    assert captured_context["position"]["liquidate_price"] == 90_000.0
+        tc.app.state.exchange = client
+        tc.app.state.analyze_cache = {}
+        response = tc.post(
+            "/api/reevaluate",
+            json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+        )
 
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exchange account data unavailable"
+    assert marker not in response.text
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_reevaluate_resolves_thesis_against_current_position_epoch(monkeypatch):
+    """A same-entry reopen must resolve against the live position identity."""
+    _env(monkeypatch)
+
+    from types import SimpleNamespace
+
+    import app.main as main
+    from app.models import ReevaluateRequest
+
+    position = _mock_position()
+    position["position_id"] = 222
+    client = SimpleNamespace(
+        exchange_id="mexc",
+        account_snapshot=AsyncMock(return_value={"positions": [position]}),
+        open_stop_orders=AsyncMock(return_value=[]),
+    )
+    db = SimpleNamespace(
+        proposal_for_open_position=AsyncMock(
+            return_value={
+                "created_at": "2026-09-13T12:00:00+00:00",
+                "proposal": {
+                    "action": "BUY",
+                    "entry_price": 100_000.0,
+                    "stop_loss": 98_000.0,
+                    "tp1": 104_000.0,
+                    "rationale": "fresh trade epoch",
+                    "invalidation_price": 98_000.0,
+                },
+            }
+        )
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                mexc=client,
+                exchange=client,
+                db=db,
+                analyze_cache={},
+                llm_override=None,
+            )
+        )
+    )
+    captured_context: dict = {}
+
+    async def fake_reevaluate(context, _settings):
+        captured_context.update(context)
+        return ReevaluateProposal(
+            action="HOLD", confidence="medium", reason="epoch checked"
+        )
+
+    with (
+        patch("app.main.build_market_snapshot", new=AsyncMock(return_value=MagicMock())),
+        patch("app.main.snapshot_to_api_dict", return_value=_mock_snap()),
+        patch("app.main.reevaluate_with_llm", new=fake_reevaluate),
+        patch(
+            "app.orders.monitor.open_position_signature",
+            new=AsyncMock(return_value=222),
+        ),
+        patch("app.main._time.time", return_value=2_000.0),
+    ):
+        result = await main.reevaluate(
+            request,
+            ReevaluateRequest(symbol="BTC_USDT", side="long"),
+            None,
+        )
+
+    assert result["reevaluation"]["action"] == "HOLD"
+    db.proposal_for_open_position.assert_awaited_once_with(
+        "BTC_USDT",
+        "long",
+        observed_entry=100_000.0,
+        observed_open_sig=222,
+        observed_opened_at=None,
+        reopen_opened_at=2_000_000,
+    )
+    assert captured_context["original_thesis"]["rationale"] == "fresh trade epoch"
+    assert captured_context["original_thesis"]["proposed_at"] == (
+        "2026-09-13T12:00:00+00:00"
+    )
     get_settings.cache_clear()
 
 
@@ -240,12 +319,57 @@ def test_reevaluate_requires_literal_true_for_private_position_context(monkeypat
         }
     )
     client.open_stop_orders = AsyncMock(return_value=[])
-    captured_context: dict = {}
+    market = AsyncMock(return_value=MagicMock())
+    llm = AsyncMock()
 
-    async def fake_reevaluate_with_llm(context, _settings):
+    with TestClient(main.app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        with (
+            patch("app.main.get_settings", return_value=settings),
+            patch("app.main.build_market_snapshot", new=market),
+            patch("app.main.reevaluate_with_llm", new=llm),
+        ):
+            response = tc.post(
+                "/api/reevaluate",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+
+    assert response.status_code == 403
+    assert "explicit account-data opt-in" in response.json()["detail"]
+    client.account_snapshot.assert_not_awaited()
+    market.assert_not_awaited()
+    llm.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+def test_local_ollama_reevaluate_keeps_reduced_context_without_external_opt_in(
+    monkeypatch
+):
+    _env(monkeypatch)
+
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    settings = get_settings().model_copy(
+        update={"llm_provider": "ollama", "include_account_in_llm": False}
+    )
+    client = MagicMock()
+    client.account_snapshot = AsyncMock(
+        return_value={
+            "equity_usdt": 5000.0,
+            "available_usdt": 4000.0,
+            "positions": [_mock_position()],
+        }
+    )
+    client.open_stop_orders = AsyncMock(return_value=[])
+    captured_context = {}
+
+    async def fake_reevaluate(context, _settings):
         captured_context.update(context)
         return ReevaluateProposal(
-            action="HOLD", confidence="medium", reason="test", risk_notes=""
+            action="HOLD", confidence="medium", reason="local test", risk_notes=""
         )
 
     with TestClient(main.app) as tc:
@@ -258,7 +382,7 @@ def test_reevaluate_requires_literal_true_for_private_position_context(monkeypat
                 new=AsyncMock(return_value=MagicMock()),
             ),
             patch("app.main.snapshot_to_api_dict", return_value=_mock_snap()),
-            patch("app.main.reevaluate_with_llm", new=fake_reevaluate_with_llm),
+            patch("app.main.reevaluate_with_llm", new=fake_reevaluate),
         ):
             response = tc.post(
                 "/api/reevaluate",
@@ -268,6 +392,7 @@ def test_reevaluate_requires_literal_true_for_private_position_context(monkeypat
     assert response.status_code == 200, response.text
     assert captured_context["account"]["omitted"] is True
     assert captured_context["position"]["account_fields_omitted"] is True
+    assert captured_context["position"]["entry_price"] == 100_000.0
     assert "unrealized_pnl" not in captured_context["position"]
     get_settings.cache_clear()
 

@@ -16,8 +16,11 @@ this maintenance policy does not restrict rights independently granted by it.
 
 - Read the operating and security documentation and inspect the worktree before editing.
 - Use small patches with evidence and relevant regression coverage.
-- Run the offline tests, Ruff, JavaScript syntax checks and publication check.
-  UI changes also require `scripts/ui_smoke.py`.
+- Install both `requirements.lock` and `requirements-dev.lock` with `--no-deps`,
+  after installing the pinned pip version from the documented command, then run
+  `pip check`, both dependency audits, the offline tests, Ruff, JavaScript
+  syntax checks and the publication check. UI changes also require
+  `scripts/ui_smoke.py`.
 - Use synthetic credentials and isolated data. Never send real orders,
   cancellations or provider LLM requests in automated tests.
 - Review every staged file. Keep keys, `.env`, account data, logs, backups and

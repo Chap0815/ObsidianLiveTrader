@@ -17,6 +17,8 @@ JS reference (app/static/trade-math.js):
 """
 import math
 
+import pytest
+
 from app.orders.be_math import break_even_price
 
 
@@ -74,3 +76,16 @@ def test_non_finite_or_non_positive_entry_returns_none():
     assert break_even_price(float("-inf"), is_short=True) is None
     assert break_even_price(0.0, is_short=False) is None
     assert break_even_price(-100.0, is_short=True) is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "is_short", "fee_rt"),
+    [
+        (True, False, 0.0006),
+        (100.0, "short", 0.0006),
+        (100.0, False, True),
+        (100.0, False, "0.0006"),
+    ],
+)
+def test_boolean_or_untyped_inputs_return_none(entry, is_short, fee_rt):
+    assert break_even_price(entry, is_short=is_short, fee_rt=fee_rt) is None

@@ -7,23 +7,32 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import math
 import re
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 from app.config import Settings
 from app.hyperliquid.errors import HyperliquidError
 from app.mexc.client import MexcClient, map_position, usdt_balances
 from app.mexc.errors import MexcError
 from app.models import ContractMeta, OrderTicket
-from app.orders.protection import classify_order_label, classify_protection
+from app.orders.protection import (
+    classify_order_label_fields,
+    classify_position_side_fields,
+    classify_protection,
+    classify_reduce_only_fields,
+)
 from app.orders.tokens import PreviewStore, TokenError
 from app.risk.gates import GateResult, validate_order
 from app.risk.sizing import round_down_to_unit, round_trigger_to_unit
+from app.security import valid_normalized_position_symbol
 
 ExchangeError = (MexcError, HyperliquidError)
+log = logging.getLogger(__name__)
 
 # MEXC futures order enums (official create docs / common practice):
 # side: 1 open long, 2 close short, 3 open short, 4 close long
@@ -34,6 +43,247 @@ MEXC_SIDE_OPEN_SHORT = 3
 MEXC_TYPE_LIMIT = 1
 MEXC_TYPE_MARKET = 5
 _PREVIEW_EXTERNAL_OID_RE = re.compile(r"^mlt-[0-9a-f]{20}$")
+_AUDIT_MAX_DEPTH = 8
+_AUDIT_MAX_ITEMS = 100
+_AUDIT_MAX_STRING = 2_000
+_POSITION_IDENTITY_UNSET: Any = object()
+_MAX_FILL_FUTURE_SKEW_MS = 5 * 60 * 1000
+_AUDIT_SECRET_LABEL_RE = re.compile(
+    r"(?i)\b([a-z0-9_-]*(?:token|secret|credential|cookie)[a-z0-9_-]*|"
+    r"api[ _-]?key|signature|authorization|private[ _-]?key|password|"
+    r"passphrase)\b(\s*[:=]\s*)([^\r\n,;}\]]+)"
+)
+
+
+def _identity_finite_real_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _hl_fill_matches_position_symbol(fill: dict[str, Any], symbol: str) -> bool:
+    observed = fill.get("symbol")
+    if not valid_normalized_position_symbol(observed, exchange="hyperliquid"):
+        return False
+    requested = symbol.strip().upper().replace("-", "_").split("_", 1)[0]
+    return observed == requested
+
+
+def hl_flat_open_epoch(
+    fill: dict[str, Any], symbol: str, side: str
+) -> int | None:
+    """Return one exact, symbol-bound Flat-to-Open epoch from a normalized fill."""
+    if not _hl_fill_matches_position_symbol(fill, symbol):
+        return None
+    direction = fill.get("dir")
+    if not isinstance(direction, str) or direction.lower() != f"open {side}":
+        return None
+    start_position = fill.get("start_position")
+    timestamp = fill.get("time")
+    if isinstance(start_position, bool) or isinstance(timestamp, bool):
+        return None
+    try:
+        start = float(start_position)
+        epoch = int(timestamp or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(start) or start != 0.0 or epoch <= 0:
+        return None
+    return epoch
+
+
+def _valid_normalized_hl_fill_evidence(fill: object, symbol: str) -> bool:
+    if not isinstance(fill, dict) or not _hl_fill_matches_position_symbol(
+        fill, symbol
+    ):
+        return False
+    if not isinstance(fill.get("dir"), str):
+        return False
+    timestamp = fill.get("time")
+    latest_fill_time = int(time.time() * 1000) + _MAX_FILL_FUTURE_SKEW_MS
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or timestamp <= 0
+        or timestamp > latest_fill_time
+    ):
+        return False
+    start_position = fill.get("start_position")
+    return start_position is None or _identity_finite_real_number(start_position)
+
+
+async def safe_user_fills(
+    client: Any, symbol: str
+) -> list[dict[str, Any]] | None:
+    """Return a fresh, fully validated Hyperliquid fill window or ``None``."""
+    if not hasattr(client, "user_fills"):
+        return None
+    try:
+        fills = await client.user_fills(symbol, fresh=True)
+    except Exception:
+        return None
+    if not isinstance(fills, list) or not all(
+        _valid_normalized_hl_fill_evidence(fill, symbol) for fill in fills
+    ):
+        return None
+    return fills
+
+
+def position_id_signature(pos: Any) -> int | None:
+    """Return a positive stable snapshot position ID, if present."""
+    if not isinstance(pos, dict):
+        return None
+    pid = pos.get("position_id")
+    if isinstance(pid, bool):
+        return None
+    if isinstance(pid, int):
+        return pid if pid > 0 else None
+    if isinstance(pid, str):
+        text = pid.strip()
+        if text.isdigit():
+            try:
+                parsed = int(text)
+            except ValueError:
+                return None
+            return parsed if parsed > 0 else None
+    return None
+
+
+def client_uses_hyperliquid_semantics(client: Any) -> bool:
+    """Honor a declared venue before considering legacy adapter capability."""
+    exchange_id = getattr(client, "exchange_id", None)
+    if isinstance(exchange_id, str):
+        return exchange_id == "hyperliquid"
+    return hasattr(client, "place_stop_order")
+
+
+async def hl_epoch_signature(
+    client: Any,
+    symbol: str,
+    side: str,
+    *,
+    fills: Any = _POSITION_IDENTITY_UNSET,
+) -> int | None:
+    """Return the newest validated Hyperliquid Flat-to-Open fill timestamp."""
+    if fills is _POSITION_IDENTITY_UNSET:
+        fills = await safe_user_fills(client, symbol)
+    if not isinstance(fills, list):
+        return None
+    epochs = [
+        epoch
+        for fill in fills
+        if isinstance(fill, dict)
+        and (epoch := hl_flat_open_epoch(fill, symbol, side)) is not None
+    ]
+    return max(epochs) if epochs else None
+
+
+async def open_position_signature(
+    client: Any,
+    pos: Any,
+    symbol: str,
+    side: str,
+    *,
+    fills: Any = _POSITION_IDENTITY_UNSET,
+) -> int | None:
+    """Return the stable identity of the current position epoch, if provable."""
+    if client_uses_hyperliquid_semantics(client):
+        return await hl_epoch_signature(client, symbol, side, fills=fills)
+    return position_id_signature(pos)
+
+
+def _audit_sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "apisecret",
+            "privatekey",
+            "signature",
+            "authorization",
+            "token",
+            "secret",
+            "credential",
+            "cookie",
+            "password",
+            "passphrase",
+        )
+    ) or normalized in {"body", "headers"}
+
+
+def _audit_safe_value(
+    value: Any,
+    *,
+    secret_values: tuple[str, ...],
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> Any:
+    """Return bounded JSON-safe audit data with credentials removed."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "[non-finite]"
+    if isinstance(value, str):
+        text = value
+        for secret in secret_values:
+            text = text.replace(secret, "[redacted]")
+        text = _AUDIT_SECRET_LABEL_RE.sub(
+            lambda match: match.group(1) + match.group(2) + "[redacted]", text
+        )
+        if len(text) > _AUDIT_MAX_STRING:
+            text = text[:_AUDIT_MAX_STRING] + "…[truncated]"
+        return text
+    if depth >= _AUDIT_MAX_DEPTH:
+        return "[max-depth]"
+
+    seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return "[cycle]"
+    if isinstance(value, dict):
+        seen.add(identity)
+        try:
+            result: dict[str, Any] = {}
+            for index, (key, child) in enumerate(value.items()):
+                if index >= _AUDIT_MAX_ITEMS:
+                    result["__truncated__"] = True
+                    break
+                name = str(key)
+                result[name] = (
+                    "[redacted]"
+                    if _audit_sensitive_key(name)
+                    else _audit_safe_value(
+                        child,
+                        secret_values=secret_values,
+                        depth=depth + 1,
+                        seen=seen,
+                    )
+                )
+            return result
+        finally:
+            seen.remove(identity)
+    if isinstance(value, (list, tuple)):
+        seen.add(identity)
+        try:
+            result = [
+                _audit_safe_value(
+                    child,
+                    secret_values=secret_values,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+                for child in value[:_AUDIT_MAX_ITEMS]
+            ]
+            if len(value) > _AUDIT_MAX_ITEMS:
+                result.append("[truncated]")
+            return result
+        finally:
+            seen.remove(identity)
+    return f"[{type(value).__name__}]"
 
 
 class OrderError(Exception):
@@ -42,6 +292,18 @@ class OrderError(Exception):
     def __init__(self, message: str, *, errors: list[str] | None = None):
         super().__init__(message)
         self.errors = errors or [message]
+
+
+class OrderRejectedByExchange(OrderError):
+    """Definite provider rejection whose diagnostic text is not API-safe."""
+
+
+class OrderOutcomeUnknown(OrderError):
+    """The exchange mutation may have completed despite a lost response.
+
+    API callers must map this separately from an ordinary rejected request so
+    clients reconcile exchange state and block blind retries.
+    """
 
 
 def ticket_to_mexc_body(
@@ -133,6 +395,29 @@ def _symbols_match(
     )
 
 
+def _valid_normalized_position_side(value: object) -> bool:
+    """Whether an adapter position side is already in canonical model form."""
+    return isinstance(value, str) and value in ("long", "short")
+
+
+def _normalized_position_open_type(value: object) -> int | None:
+    """Map a canonical adapter margin mode to its exchange enum.
+
+    ``0`` represents an absent mode; callers that require the mode already
+    reject it.  Any present non-canonical value is invalid at this model
+    boundary rather than being reinterpreted as a raw exchange enum.
+    """
+    if value is None:
+        return 0
+    if not isinstance(value, str):
+        return None
+    if value == "isolated":
+        return 1
+    if value == "cross":
+        return 2
+    return None
+
+
 def _position_sl_price(p: dict[str, Any]) -> float | None:
     """Own stop-loss of an open position, if it carries one (R-01).
 
@@ -140,7 +425,7 @@ def _position_sl_price(p: dict[str, Any]) -> float | None:
     different keys; take the first finite, positive value.
     """
     for key in ("stop_loss", "sl_price", "sl", "stopLossPrice", "stop_price"):
-        v = _coerce_float(p.get(key))
+        v = _normalized_float(p.get(key))
         if v is not None and math.isfinite(v) and v > 0:
             return v
     return None
@@ -156,11 +441,14 @@ def estimate_same_side_risk_usdt(
 ) -> tuple[float, list[str]]:
     """Open same-side risk (USDT) from a known stop or liquidation price.
 
-    Per position, prefer the loss to its OWN stop-loss when present
-    (``abs(entry - sl) * contract_size * vol``). Without an SL, use the full
-    known liquidation distance. Missing liquidation data blocks: a percentage
-    of entry notional is not a conservative upper bound for an unprotected
-    position and could understate aggregate MAX_RISK_PCT.
+    Per position, prefer the loss to its OWN stop-loss when it is on the
+    protective side of entry (long: at/below entry, short: at/above entry).
+    A wrong-side stop is not credited because its distance could understate an
+    unprotected position's risk; use the full known liquidation distance
+    instead. The liquidation price must also be below entry for a long or above
+    entry for a short. Missing or contradictory liquidation data blocks: a
+    percentage of entry notional is not a conservative upper bound for an
+    unprotected position and could understate aggregate MAX_RISK_PCT.
 
     Returns ``(total_risk_usdt, warnings)``; the stable tuple shape is retained
     for callers, although the fail-closed calculation currently emits no
@@ -168,6 +456,10 @@ def estimate_same_side_risk_usdt(
     """
     if not isinstance(positions, list):
         raise ValueError("open position data is unavailable or invalid")
+    contract_size_value = _normalized_float(contract_size)
+    if contract_size_value is None or contract_size_value <= 0:
+        raise ValueError("contract_size is unavailable or invalid")
+    exchange = "hyperliquid" if allow_base_symbol_alias else "mexc"
     total = 0.0
     warnings: list[str] = []
     for raw in positions:
@@ -175,7 +467,9 @@ def estimate_same_side_risk_usdt(
             raise ValueError("open position row is invalid")
         p = raw if "hold_vol" in raw else map_position(raw)
         symbol_raw = p.get("symbol")
-        if not isinstance(symbol_raw, str) or not symbol_raw.strip():
+        if not valid_normalized_position_symbol(
+            symbol_raw, exchange=exchange
+        ):
             raise ValueError("open position has invalid symbol/side identity")
         symbol_matches = _symbols_match(
             symbol_raw,
@@ -185,42 +479,53 @@ def estimate_same_side_risk_usdt(
         if not symbol_matches:
             continue
         side_raw = p.get("side")
-        position_side = (
-            side_raw.strip().lower() if isinstance(side_raw, str) else ""
-        )
-        if position_side not in ("long", "short"):
+        if not _valid_normalized_position_side(side_raw):
             raise ValueError("open position has invalid symbol/side identity")
-        if position_side != side.lower():
+        if side_raw != side:
             continue
-        vol = _coerce_float(p.get("hold_vol"))
-        if vol is None or vol < 0:
+        vol = _normalized_float(p.get("hold_vol"))
+        if vol is None or vol <= 0:
             raise ValueError(f"open {side} position on {symbol} has invalid hold_vol")
-        if vol == 0:
-            continue
-        entry = _coerce_float(p.get("entry_price"))
+        entry = _normalized_float(p.get("entry_price"))
         if entry is None or entry <= 0:
             raise ValueError(f"open {side} position on {symbol} has invalid entry_price")
-        if contract_size <= 0:
-            continue
         sl = _position_sl_price(p)
-        if sl is not None:
+        sl_is_protective = sl is not None and (
+            (side == "long" and sl <= entry) or (side == "short" and sl >= entry)
+        )
+        if sl_is_protective:
             # Loss to this position's own stop — the realistic exposure.
-            total += abs(entry - sl) * contract_size * vol
-            continue
-        liq = _coerce_float(p.get("liquidate_price"))
-        if liq is None or liq <= 0:
+            dist = abs(entry - sl)
+        else:
+            liq = _normalized_float(p.get("liquidate_price"))
+            if liq is None or liq <= 0:
+                raise ValueError(
+                    f"open {side} position on {symbol} has invalid or missing "
+                    "liquidate_price — "
+                    "cannot enforce aggregate MAX_RISK_PCT (close or wait for liq data)"
+                )
+            dist = entry - liq if side == "long" else liq - entry
+            if dist == 0:
+                raise ValueError(
+                    f"open {side} position on {symbol} has invalid liquidate_price — "
+                    "liquidation distance is zero"
+                )
+            if dist < 0:
+                raise ValueError(
+                    f"open {side} position on {symbol} has invalid liquidate_price — "
+                    "liquidation price is on the wrong side of entry"
+                )
+        position_risk = dist * contract_size_value * vol
+        if not math.isfinite(position_risk):
             raise ValueError(
-                f"open {side} position on {symbol} has invalid or missing "
-                "liquidate_price — "
-                "cannot enforce aggregate MAX_RISK_PCT (close or wait for liq data)"
+                f"open {side} position on {symbol} calculated risk is non-finite"
             )
-        dist = abs(entry - liq)
-        if dist == 0:
+        next_total = total + position_risk
+        if not math.isfinite(next_total):
             raise ValueError(
-                f"open {side} position on {symbol} has invalid liquidate_price — "
-                "liquidation distance is zero"
+                f"open {side} positions on {symbol} aggregate risk is non-finite"
             )
-        total += dist * contract_size * vol
+        total = next_total
     return total, warnings
 
 
@@ -242,17 +547,33 @@ def _coerce_float(v: Any) -> float | None:
     return None
 
 
+def _normalized_float(v: Any) -> float | None:
+    """Return a finite number only from an already-normalized model field.
+
+    Raw exchange payloads may legitimately encode numbers as strings and use
+    ``_coerce_float``. Money-path model boundaries retain their typed contract
+    so a malformed or replaced adapter cannot silently regain trust.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        value = float(v)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _validated_close_amount(
     value: Any, *, field: str, maximum: float | None = None
 ) -> float | None:
     """Normalize one explicit close amount without falling back to full close."""
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise OrderError(f"{field} must be numeric, not boolean")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OrderError(f"{field} must be numeric")
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except OverflowError as exc:
         raise OrderError(f"{field} must be numeric") from exc
     if not math.isfinite(parsed):
         raise OrderError(f"{field} must be finite")
@@ -263,13 +584,74 @@ def _validated_close_amount(
     return parsed
 
 
-def _extract_filled_vol(resp: Any) -> float | None:
-    """Filled quantity of THIS order from the exchange place response.
+_FILL_VOLUME_ALIASES = (
+    "dealVol",
+    "deal_vol",
+    "dealVolume",
+    "filledVol",
+    "filled_vol",
+    "filledQty",
+    "filled_qty",
+    "filled",
+    "cumQty",
+    "filledSz",
+)
 
-    Returns the exchange-reported fill (contracts/coins) for our order, or None
-    when the response does not carry it. Used to bound auto-flatten to our OWN
-    fill so a concurrent external bot that adds same-side volume in the same
-    window is never partially closed by us.
+
+def _consistent_nonnegative_aliases(
+    row: Any, aliases: tuple[str, ...]
+) -> tuple[float | None, bool]:
+    """Return one finite non-negative value only when all present aliases agree."""
+    if not isinstance(row, dict):
+        return None, False
+    values: list[float] = []
+    found = False
+    for key in aliases:
+        if key not in row:
+            continue
+        found = True
+        value = _coerce_float(row.get(key))
+        if value is None or value < 0:
+            return None, True
+        values.append(value)
+    if not found:
+        return None, False
+    if len(set(values)) != 1:
+        return None, True
+    return values[0], True
+
+
+def _classify_trigger_errors(value: Any) -> tuple[bool, bool]:
+    """Return (SL failure, TP/other failure) without exposing provider detail."""
+    if value is None or value == []:
+        return False, False
+    if not isinstance(value, list):
+        return True, True
+    sl_failure = False
+    other_failure = False
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            sl_failure = True
+            other_failure = True
+            continue
+        label = item.strip().lower()
+        if label.startswith("sl:"):
+            sl_failure = True
+        elif label.startswith(("tp:", "tp2:")):
+            other_failure = True
+        else:
+            sl_failure = True
+            other_failure = True
+    return sl_failure, other_failure
+
+
+def _reported_fill_vol(resp: Any) -> tuple[float | None, bool]:
+    """Return (valid fill, fill evidence present) for THIS placed order.
+
+    Keeping presence separate from validity prevents an invalid or contradictory
+    exchange report from being treated as if no report existed. Only true
+    absence may fall back to a position delta; malformed explicit evidence must
+    leave the outcome unknown.
 
     A key that is present but 0 is trusted as "reported unfilled" (returns 0.0)
     — that is the fail-closed choice: we would rather cancel a resting entry
@@ -277,53 +659,152 @@ def _extract_filled_vol(resp: Any) -> float | None:
     and returns None; it must never be normalized into zero-fill evidence.
     """
     if not isinstance(resp, dict):
-        return None
-    # Flat quantity keys seen across MEXC revisions / internal adapters.
-    for key in (
-        "dealVol",
-        "deal_vol",
-        "dealVolume",
-        "filledVol",
-        "filled_vol",
-        "filledQty",
-        "filled_qty",
-        "filled",
-        "cumQty",
-        "filledSz",
-    ):
-        if key in resp:
-            f = _coerce_float(resp.get(key))
-            if f is not None:
-                return f if f >= 0 else None
+        return None, False
+    reported_values: list[float] = []
+    evidence_present = False
+
+    entry_fill_present = "entryFilledSz" in resp
+    entry_fill = (
+        _normalized_float(resp.get("entryFilledSz")) if entry_fill_present else None
+    )
+    if entry_fill_present and (entry_fill is None or entry_fill < 0):
+        return None, True
+    if entry_fill_present and entry_fill is not None:
+        evidence_present = True
+        reported_values.append(entry_fill)
+
+    # Flat quantity keys seen across MEXC revisions / internal adapters. Every
+    # present alias must be usable and agree; choosing the first one could turn
+    # a contradictory exchange response into false fill evidence.
+    fill, fill_fields = _consistent_nonnegative_aliases(resp, _FILL_VOLUME_ALIASES)
+    if fill_fields and fill is None:
+        return None, True
+    if fill_fields and fill is not None:
+        evidence_present = True
+        reported_values.append(fill)
+
+    if "unfilled" in resp:
+        evidence_present = True
+        unfilled = resp.get("unfilled")
+        if not isinstance(unfilled, bool):
+            return None, True
+        if unfilled is True:
+            if not entry_fill_present:
+                return None, True
+            reported_values.append(0.0)
+
     recovered_order = resp.get("order")
     if isinstance(recovered_order, dict):
-        recovered_fill = _extract_filled_vol(recovered_order)
-        if recovered_fill is not None:
-            return recovered_fill
+        recovered_fill, recovered_fields = _reported_fill_vol(recovered_order)
+        if recovered_fields:
+            evidence_present = True
+            if recovered_fill is None:
+                return None, True
+            reported_values.append(recovered_fill)
+
     # Hyperliquid nested SDK shape: response.data.statuses[].filled.totalSz
-    for container in (resp.get("response"), resp):
+    seen_status_lists: set[int] = set()
+    for container in (resp, resp.get("response")):
         if not isinstance(container, dict):
             continue
-        try:
-            statuses = (
-                container.get("response", {}).get("data", {}).get("statuses", [])
-            )
-        except AttributeError:
-            statuses = []
+        nested_response = container.get("response")
+        data = (
+            nested_response.get("data")
+            if isinstance(nested_response, dict)
+            else container.get("data")
+        )
+        if not isinstance(data, dict) or "statuses" not in data:
+            continue
+        statuses = data.get("statuses")
+        if not isinstance(statuses, list):
+            return None, True
+        status_list_id = id(statuses)
+        if status_list_id in seen_status_lists:
+            continue
+        seen_status_lists.add(status_list_id)
         total = 0.0
         found = False
-        for st in statuses or []:
-            if isinstance(st, dict) and isinstance(st.get("filled"), dict):
-                fv = _coerce_float(st["filled"].get("totalSz"))
-                if fv is not None:
-                    if fv < 0:
-                        return None
-                    total += fv
-                    if not math.isfinite(total):
-                        return None
-                    found = True
+        for st in statuses:
+            if not isinstance(st, dict) or "filled" not in st:
+                continue
+            found = True
+            filled = st.get("filled")
+            if not isinstance(filled, dict) or "totalSz" not in filled:
+                return None, True
+            fv = _coerce_float(filled.get("totalSz"))
+            if fv is None or fv < 0:
+                return None, True
+            total += fv
+            if not math.isfinite(total):
+                return None, True
         if found:
-            return total
+            evidence_present = True
+            reported_values.append(total)
+
+    entry_order_id, entry_identity_present = _reported_entry_order_id(resp)
+    if entry_identity_present and entry_order_id is None:
+        return None, True
+    if not evidence_present:
+        return None, False
+    if not reported_values or len(set(reported_values)) != 1:
+        return None, True
+    return reported_values[0], True
+
+
+def _reported_mexc_fill_vol(resp: Any) -> tuple[float | None, bool]:
+    """Return only MEXC-shaped fill evidence from an order response."""
+    if not isinstance(resp, dict):
+        return None, False
+    reported_values: list[float] = []
+    evidence_present = False
+
+    fill, fill_fields = _consistent_nonnegative_aliases(resp, _FILL_VOLUME_ALIASES)
+    if fill_fields:
+        evidence_present = True
+        if fill is None:
+            return None, True
+        reported_values.append(fill)
+
+    recovered_order = resp.get("order")
+    if isinstance(recovered_order, dict):
+        recovered_fill, recovered_fields = _reported_mexc_fill_vol(recovered_order)
+        if recovered_fields:
+            evidence_present = True
+            if recovered_fill is None:
+                return None, True
+            reported_values.append(recovered_fill)
+
+    entry_order_id, entry_identity_present = _reported_entry_order_id(resp)
+    if entry_identity_present and entry_order_id is None:
+        return None, True
+    if not evidence_present:
+        return None, False
+    if not reported_values or len(set(reported_values)) != 1:
+        return None, True
+    return reported_values[0], True
+
+
+def _extract_filled_vol(resp: Any) -> float | None:
+    """Filled quantity of this order, or None when absent or invalid."""
+    return _reported_fill_vol(resp)[0]
+
+
+def _explicit_response_error(value: Any) -> str | None:
+    """Return the first explicit ``error`` marker anywhere in a response tree."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and key.strip().lower() == "error":
+                if isinstance(child, str):
+                    return child.strip() or "unknown exchange error"
+                return "exchange returned an explicit error marker"
+            nested = _explicit_response_error(child)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _explicit_response_error(child)
+            if nested:
+                return nested
     return None
 
 
@@ -346,6 +827,9 @@ def _close_response_error(resp: Any) -> str | None:
         return None
     if not isinstance(resp, dict):
         return "unrecognized exchange response"
+    explicit_error = _explicit_response_error(resp)
+    if explicit_error:
+        return explicit_error
     # MEXC-shaped markers. Absence is compatible, but every marker that is
     # present must have the adapter's exact success type/value. In particular,
     # Python booleans and floats must not pass as integer zero (False == 0 and
@@ -387,23 +871,357 @@ def _close_response_error(resp: Any) -> str | None:
     return None
 
 
-def _recovery_is_match(recovered: Any, external_oid: str) -> bool:
+def _cancel_response_identity_error(response: Any, expected_order_id: int) -> str | None:
+    """Reject contradictory MEXC cancel identities at the Money-Path boundary."""
+    if isinstance(response, list):
+        if len(response) != 1 or not isinstance(response[0], dict):
+            return "cancel response does not uniquely identify the requested order"
+        returned_id = _consistent_positive_order_id(response[0])
+        if returned_id != expected_order_id:
+            return "cancel response does not identify the requested order"
+        return None
+    if isinstance(response, dict) and any(
+        key in response for key in ("orderId", "order_id", "oid")
+    ):
+        returned_id = _consistent_positive_order_id(response)
+        if returned_id != expected_order_id:
+            return "cancel response does not identify the requested order"
+    return None
+
+
+def _cancel_response_error(
+    response: Any, *, expected_order_id: int, is_hyperliquid: bool
+) -> str | None:
+    error = _close_response_error(response)
+    if error is None and not is_hyperliquid:
+        error = _cancel_response_identity_error(response, expected_order_id)
+    return error
+
+
+def _recovery_symbol_identity_matches(
+    value: Any,
+    expected_symbol: str,
+    *,
+    allow_bare_base_alias: bool = False,
+    _seen: set[int] | None = None,
+) -> bool:
+    """Reject every explicit symbol/coin that belongs to another contract."""
+    if not isinstance(value, (dict, list)):
+        return True
+    if _seen is None:
+        _seen = set()
+    value_id = id(value)
+    if value_id in _seen:
+        return False
+    _seen.add(value_id)
+    try:
+        if isinstance(value, list):
+            return all(
+                _recovery_symbol_identity_matches(
+                    item,
+                    expected_symbol,
+                    allow_bare_base_alias=allow_bare_base_alias,
+                    _seen=_seen,
+                )
+                for item in value
+                if isinstance(item, (dict, list))
+            )
+        for key in ("symbol", "coin"):
+            if key in value and not _symbols_match(
+                value.get(key),
+                expected_symbol,
+                allow_bare_base_alias=allow_bare_base_alias,
+            ):
+                return False
+        for key in ("order", "raw"):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)) and not _recovery_symbol_identity_matches(
+                nested,
+                expected_symbol,
+                allow_bare_base_alias=allow_bare_base_alias,
+                _seen=_seen,
+            ):
+                return False
+        return True
+    finally:
+        _seen.remove(value_id)
+
+
+def _explicit_integer_aliases_match(
+    row: dict[str, Any], aliases: tuple[str, ...], expected: int
+) -> bool:
+    values: list[int] = []
+    for key in aliases:
+        if key not in row:
+            continue
+        parsed = _coerce_float(row.get(key))
+        if parsed is None or not parsed.is_integer():
+            return False
+        values.append(int(parsed))
+    return not values or len(set(values)) == 1 and values[0] == expected
+
+
+def _explicit_positive_price_aliases_match(
+    row: dict[str, Any], aliases: tuple[str, ...], expected: float
+) -> bool:
+    reported, present = _consistent_nonnegative_aliases(row, aliases)
+    return not present or (
+        reported is not None
+        and reported > 0
+        and math.isclose(reported, expected, rel_tol=1e-9, abs_tol=1e-12)
+    )
+
+
+def _mexc_recovery_matches_request(
+    value: Any,
+    *,
+    expected_side: int,
+    expected_vol: float,
+    expected_type: int,
+    expected_open_type: int,
+    expected_price: float | None,
+    expected_leverage: int | None,
+    expected_stop_loss: float | None,
+    expected_take_profit: float | None,
+    _seen: set[int] | None = None,
+) -> bool:
+    """Reject explicit MEXC order terms that conflict with the exact send."""
+    if (
+        expected_side not in (1, 2, 3, 4)
+        or expected_vol <= 0
+        or not math.isfinite(expected_vol)
+        or expected_type not in (1, 2, 3, 4, 5)
+        or expected_open_type not in (1, 2)
+        or expected_price is not None
+        and (expected_price <= 0 or not math.isfinite(expected_price))
+        or expected_leverage is not None
+        and expected_leverage <= 0
+        or expected_stop_loss is not None
+        and (expected_stop_loss <= 0 or not math.isfinite(expected_stop_loss))
+        or expected_take_profit is not None
+        and (expected_take_profit <= 0 or not math.isfinite(expected_take_profit))
+    ):
+        return False
+    if not isinstance(value, (dict, list)):
+        return True
+    if _seen is None:
+        _seen = set()
+    value_id = id(value)
+    if value_id in _seen:
+        return False
+    _seen.add(value_id)
+    try:
+        if isinstance(value, list):
+            return all(
+                _mexc_recovery_matches_request(
+                    item,
+                    expected_side=expected_side,
+                    expected_vol=expected_vol,
+                    expected_type=expected_type,
+                    expected_open_type=expected_open_type,
+                    expected_price=expected_price,
+                    expected_leverage=expected_leverage,
+                    expected_stop_loss=expected_stop_loss,
+                    expected_take_profit=expected_take_profit,
+                    _seen=_seen,
+                )
+                for item in value
+                if isinstance(item, (dict, list))
+            )
+        if not _explicit_integer_aliases_match(value, ("side",), expected_side):
+            return False
+        reported_vol, vol_present = _consistent_nonnegative_aliases(
+            value, ("vol", "orderVol", "order_vol")
+        )
+        if vol_present and (
+            reported_vol is None
+            or reported_vol <= 0
+            or not math.isclose(
+                reported_vol, expected_vol, rel_tol=1e-9, abs_tol=1e-12
+            )
+        ):
+            return False
+        if not _explicit_integer_aliases_match(
+            value, ("type", "order_type"), expected_type
+        ):
+            return False
+        if not _explicit_integer_aliases_match(
+            value, ("openType", "open_type"), expected_open_type
+        ):
+            return False
+        if expected_leverage is not None and not _explicit_integer_aliases_match(
+            value, ("leverage",), expected_leverage
+        ):
+            return False
+        if expected_stop_loss is not None and not _explicit_positive_price_aliases_match(
+            value,
+            ("stopLossPrice", "stop_loss_price"),
+            expected_stop_loss,
+        ):
+            return False
+        if expected_take_profit is not None and not _explicit_positive_price_aliases_match(
+            value,
+            ("takeProfitPrice", "take_profit_price"),
+            expected_take_profit,
+        ):
+            return False
+        reported_price, price_present = _consistent_nonnegative_aliases(
+            value, ("price", "orderPrice", "order_price")
+        )
+        if price_present and (
+            reported_price is None
+            or expected_price is not None
+            and not math.isclose(
+                reported_price, expected_price, rel_tol=1e-9, abs_tol=1e-12
+            )
+        ):
+            return False
+        for key in ("order", "raw"):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)) and not _mexc_recovery_matches_request(
+                nested,
+                expected_side=expected_side,
+                expected_vol=expected_vol,
+                expected_type=expected_type,
+                expected_open_type=expected_open_type,
+                expected_price=expected_price,
+                expected_leverage=expected_leverage,
+                expected_stop_loss=expected_stop_loss,
+                expected_take_profit=expected_take_profit,
+                _seen=_seen,
+            ):
+                return False
+        return True
+    finally:
+        _seen.remove(value_id)
+
+
+def _hl_recovery_matches_request(
+    value: Any,
+    *,
+    expected_side: str,
+    expected_vol: float,
+    expected_reduce_only: bool,
+    _seen: set[int] | None = None,
+) -> bool:
+    """Reject explicit Hyperliquid economics that conflict with the exact send."""
+    if (
+        expected_side not in ("A", "B")
+        or expected_vol <= 0
+        or not math.isfinite(expected_vol)
+        or not isinstance(expected_reduce_only, bool)
+    ):
+        return False
+    if not isinstance(value, (dict, list)):
+        return True
+    if _seen is None:
+        _seen = set()
+    value_id = id(value)
+    if value_id in _seen:
+        return False
+    _seen.add(value_id)
+    try:
+        if isinstance(value, list):
+            return all(
+                _hl_recovery_matches_request(
+                    item,
+                    expected_side=expected_side,
+                    expected_vol=expected_vol,
+                    expected_reduce_only=expected_reduce_only,
+                    _seen=_seen,
+                )
+                for item in value
+                if isinstance(item, (dict, list))
+            )
+        if "side" in value and value.get("side") != expected_side:
+            return False
+        reduce_only_values: list[bool] = []
+        for key in ("reduceOnly", "reduce_only"):
+            if key not in value:
+                continue
+            reduce_only = value.get(key)
+            if not isinstance(reduce_only, bool):
+                return False
+            reduce_only_values.append(reduce_only)
+        if reduce_only_values and (
+            len(set(reduce_only_values)) != 1
+            or reduce_only_values[0] is not expected_reduce_only
+        ):
+            return False
+        original_vol, original_present = _consistent_nonnegative_aliases(
+            value, ("origSz", "orig_sz", "origVol", "orig_vol")
+        )
+        if original_present and (
+            original_vol is None
+            or original_vol <= 0
+            or not math.isclose(
+                original_vol, expected_vol, rel_tol=1e-9, abs_tol=1e-12
+            )
+        ):
+            return False
+        remaining_vol, remaining_present = _consistent_nonnegative_aliases(
+            value, ("sz", "vol")
+        )
+        if remaining_present and (
+            remaining_vol is None
+            or remaining_vol > expected_vol + max(1e-12, expected_vol * 1e-9)
+        ):
+            return False
+        for key in ("order", "raw"):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)) and not _hl_recovery_matches_request(
+                nested,
+                expected_side=expected_side,
+                expected_vol=expected_vol,
+                expected_reduce_only=expected_reduce_only,
+                _seen=_seen,
+            ):
+                return False
+        return True
+    finally:
+        _seen.remove(value_id)
+
+
+def _recovery_is_match(
+    recovered: Any,
+    external_oid: str,
+    *,
+    expected_symbol: str | None = None,
+    allow_bare_base_alias: bool = False,
+) -> bool:
     """True if `recovered` is trustworthy evidence our order is already live.
 
-    O-05: accepts either an exchange-client MATCH MARKER — a dict carrying a
-    truthy ``match`` field, which the client sets only after matching OUR
+    O-05: accepts either an exchange-client MATCH MARKER — a dict carrying an
+    allowed string ``match`` field, which the client sets only after matching OUR
     oid/cloid (MEXC ``history``/``open`` and HL ``cloid`` are field-filtered) —
     or, lacking a marker, an exact external-oid field on a dict/list row (the HL
-    list-of-hits fallback). Free-text substring matches are not evidence: a
+    list-of-hits fallback). Every list row must identify that same external oid
+    and a concrete order. Marker fields inside that raw-row list and explicit
+    error fields anywhere in the evidence are rejected. Free-text substring
+    matches are not evidence: a
     diagnostic like ``<oid> not found`` must remain a failed recovery.
     """
     if not recovered:
         return False
-    if isinstance(recovered, dict) and recovered.get("match"):
-        marker = str(recovered.get("match") or "").lower()
+    if _explicit_response_error(recovered):
+        return False
+    if isinstance(recovered, dict) and "match" in recovered:
+        marker_value = recovered.get("match")
+        if not isinstance(marker_value, str):
+            return False
+        marker = marker_value.lower()
         if marker not in {"direct", "history", "open", "cloid"}:
             return False
         if not _has_exact_external_oid(recovered, external_oid):
+            return False
+        if expected_symbol is not None and not _recovery_symbol_identity_matches(
+            recovered,
+            expected_symbol,
+            allow_bare_base_alias=allow_bare_base_alias,
+        ):
+            return False
+        recovered_order_id, identity_present = _reported_entry_order_id(recovered)
+        if not identity_present or recovered_order_id is None:
             return False
         order_wrapper = recovered.get("order")
         if not isinstance(order_wrapper, dict):
@@ -414,16 +1232,29 @@ def _recovery_is_match(recovered: Any, external_oid: str) -> bool:
             _has_exact_external_oid(order_wrapper, external_oid)
             and _has_consistent_positive_order_id(order_wrapper)
         )
+    if isinstance(recovered, list):
+        if not all(isinstance(row, dict) for row in recovered):
+            return False
+        if any("match" in row for row in recovered):
+            return False
     rows = recovered if isinstance(recovered, list) else [recovered]
+    matched_order_ids: set[int] = set()
     for row in rows:
         if not isinstance(row, dict):
-            continue
-        if (
-            _has_exact_external_oid(row, external_oid)
-            and _has_consistent_positive_order_id(row)
+            return False
+        if not _has_exact_external_oid(row, external_oid):
+            return False
+        if expected_symbol is not None and not _recovery_symbol_identity_matches(
+            row,
+            expected_symbol,
+            allow_bare_base_alias=allow_bare_base_alias,
         ):
-            return True
-    return False
+            return False
+        order_id = _consistent_positive_order_id(row)
+        if order_id is None:
+            return False
+        matched_order_ids.add(order_id)
+    return len(matched_order_ids) == 1
 
 
 def _has_exact_external_oid(row: Any, external_oid: str) -> bool:
@@ -440,27 +1271,115 @@ def _has_exact_external_oid(row: Any, external_oid: str) -> bool:
     return bool(values) and all(value == external_oid for value in values)
 
 
-def _has_consistent_positive_order_id(row: Any) -> bool:
+def _consistent_positive_order_id(row: Any) -> int | None:
     if not isinstance(row, dict):
-        return False
-    values: list[str] = []
+        return None
+    values: list[int] = []
     for key in ("orderId", "order_id", "oid"):
         if key not in row:
             continue
         value = row.get(key)
         if isinstance(value, bool):
-            return False
-        text = str(value)
+            return None
+        try:
+            text = str(value)
+        except (ValueError, OverflowError):
+            return None
         if not text.isdigit():
-            return False
+            return None
         try:
             parsed = int(text)
-        except ValueError:
-            return False
+        except (ValueError, OverflowError):
+            return None
         if parsed <= 0:
-            return False
-        values.append(str(parsed))
-    return bool(values) and len(set(values)) == 1
+            return None
+        values.append(parsed)
+    if not values or len(set(values)) != 1:
+        return None
+    return values[0]
+
+
+def _has_consistent_positive_order_id(row: Any) -> bool:
+    return _consistent_positive_order_id(row) is not None
+
+
+def _reported_entry_order_id(
+    response: Any, _seen: set[int] | None = None
+) -> tuple[int | None, bool]:
+    """Return (consistent entry-order ID, identity evidence present)."""
+    if not isinstance(response, dict):
+        return None, False
+    if _seen is None:
+        _seen = set()
+    response_id = id(response)
+    if response_id in _seen:
+        return None, True
+    _seen.add(response_id)
+
+    values: list[int] = []
+    evidence_present = False
+    if any(key in response for key in ("orderId", "order_id", "oid")):
+        evidence_present = True
+        normalized_id = _consistent_positive_order_id(response)
+        if normalized_id is None:
+            return None, True
+        values.append(normalized_id)
+
+    recovered_order = response.get("order")
+    if isinstance(recovered_order, dict):
+        nested_id, nested_present = _reported_entry_order_id(recovered_order, _seen)
+        if nested_present:
+            evidence_present = True
+            if nested_id is None:
+                return None, True
+            values.append(nested_id)
+
+    # Hyperliquid's raw entry result is retained under ``response`` and carries
+    # the actual order ID in response.data.statuses[].filled/resting. The
+    # normalized top-level ID must agree before it is safe to cancel or expose.
+    seen_status_lists: set[int] = set()
+    for container in (response, response.get("response")):
+        if not isinstance(container, dict):
+            continue
+        nested_response = container.get("response")
+        data = (
+            nested_response.get("data")
+            if isinstance(nested_response, dict)
+            else container.get("data")
+        )
+        if not isinstance(data, dict) or "statuses" not in data:
+            continue
+        statuses = data.get("statuses")
+        if not isinstance(statuses, list):
+            return None, True
+        status_list_id = id(statuses)
+        if status_list_id in seen_status_lists:
+            continue
+        seen_status_lists.add(status_list_id)
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            variants = [key for key in ("filled", "resting") if key in status]
+            if not variants:
+                continue
+            evidence_present = True
+            if len(variants) != 1 or not isinstance(status.get(variants[0]), dict):
+                return None, True
+            embedded_id = _consistent_positive_order_id(status[variants[0]])
+            if embedded_id is None:
+                return None, True
+            values.append(embedded_id)
+
+    if not evidence_present:
+        return None, False
+    if not values or len(set(values)) != 1:
+        return None, True
+    return values[0], True
+
+
+def _consistent_entry_order_id(response: Any) -> int | None:
+    """Return one entry-order ID across normalized and embedded evidence."""
+    return _reported_entry_order_id(response)[0]
 
 
 def _consistent_stop_order_id(row: Any) -> int | None:
@@ -471,7 +1390,7 @@ def _consistent_stop_order_id(row: Any) -> int | None:
     sources = (row, raw) if isinstance(raw, dict) else (row,)
     values: list[int] = []
     for source in sources:
-        for key in ("orderId", "oid"):
+        for key in ("orderId", "order_id", "oid", "id"):
             if key not in source:
                 continue
             value = source.get(key)
@@ -492,7 +1411,39 @@ def _consistent_stop_order_id(row: Any) -> int | None:
     return values[0]
 
 
+def _public_order_ack(
+    response: Any,
+    *,
+    order_id: int | None = None,
+    recovered: bool = False,
+    include_trigger_ids: bool = False,
+) -> dict[str, Any]:
+    """Return the small allowlisted mutation receipt exposed by the API."""
+    result: dict[str, Any] = {"accepted": True}
+    if order_id is not None:
+        result["orderId"] = order_id
+    if isinstance(response, dict):
+        if order_id is None:
+            response_order_id = _consistent_entry_order_id(response)
+            if response_order_id is not None:
+                result["orderId"] = response_order_id
+        if include_trigger_ids:
+            for key in ("slTriggerOid", "tpTriggerOid", "tpTriggerOid2"):
+                value = response.get(key)
+                parsed = _consistent_stop_order_id({"orderId": value})
+                if parsed is not None:
+                    result[key] = parsed
+    if recovered:
+        result["recovered"] = True
+    return result
+
+
 def _is_uncertain_order_error(exc: Exception) -> bool:
+    raw = getattr(exc, "raw", None)
+    status = raw.get("status") if isinstance(raw, dict) else None
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status == 408 or status >= 500:
+            return True
     text = str(exc).lower()
     return any(
         token in text
@@ -503,6 +1454,7 @@ def _is_uncertain_order_error(exc: Exception) -> bool:
             "network",
             "invalid json",
             "uncertain order-create response",
+            "uncertain cancel response",
             "uncertain close response",
         )
     )
@@ -561,44 +1513,29 @@ def scale_out_errors(
     if getattr(client, "exchange_id", "") != "hyperliquid":
         return ["Scale-out is only available on Hyperliquid"]
     errs: list[str] = []
-    tp1 = ticket.take_profit
+    tp1 = _normalized_float(ticket.take_profit)
     tp2 = ticket.tp2
-    if tp1 is None or float(tp1) <= 0:
+    if tp1 is None or tp1 <= 0:
         errs.append("scale-out requires TP1 (take_profit)")
-    tp2_f: float | None = None
-    if tp2 is not None:
-        try:
-            if isinstance(tp2, bool):
-                raise ValueError
-            tp2_f = float(tp2)
-            if not math.isfinite(tp2_f) or tp2_f <= 0:
-                raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            tp2_f = None
-    if tp2_f is None:
+    tp2_f = _normalized_float(tp2)
+    if tp2_f is None or tp2_f <= 0:
         errs.append("scale-out requires a positive finite TP2 (tp2)")
-    try:
-        raw_share = getattr(ticket, "tp1_share", 0.5)
-        if isinstance(raw_share, bool):
-            raise ValueError
-        share = float(raw_share)
-    except (TypeError, ValueError, OverflowError):
-        share = float("nan")
-    if not math.isfinite(share) or not (0.0 < share < 1.0):
+    share = _normalized_float(getattr(ticket, "tp1_share", None))
+    if share is None or not (0.0 < share < 1.0):
         errs.append("tp1_share must be between 0 and 1")
     if errs:
         return errs
     side = (ticket.side or "").lower()
     e = float(entry) if entry else None
     if side == "long":
-        if not (tp2_f > float(tp1)):
+        if not (tp2_f > tp1):
             errs.append("long scale-out: TP2 must be above TP1")
-        if e is not None and not (float(tp1) > e):
+        if e is not None and not (tp1 > e):
             errs.append("long scale-out: TP1 must be above entry")
     elif side == "short":
-        if not (tp2_f < float(tp1)):
+        if not (tp2_f < tp1):
             errs.append("short scale-out: TP2 must be below TP1")
-        if e is not None and not (float(tp1) < e):
+        if e is not None and not (tp1 < e):
             errs.append("short scale-out: TP1 must be below entry")
     return errs
 
@@ -611,11 +1548,13 @@ class OrderService:
         store: PreviewStore,
         db: Any | None = None,
         trade_lock: "asyncio.Lock | None" = None,
+        client_is_active: Callable[[Any], bool] | None = None,
     ):
         self.client = client
         self.settings = settings
         self.store = store
         self.db = db
+        self._client_is_active = client_is_active
         # Serialize confirm/close so parallel places cannot both see risk=0.
         # MUST be shared across requests: a new OrderService is built per
         # request, so a per-instance lock would serialize nothing. The caller
@@ -623,14 +1562,61 @@ class OrderService:
         # unit tests.
         self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
 
+    def _require_active_client(self) -> None:
+        """Fail closed if the caller reports a replaced runtime context."""
+        if self._client_is_active is None:
+            return
+        try:
+            active = self._client_is_active(self.client)
+        except Exception as exc:
+            raise OrderError(
+                "Exchange configuration changed. Retry the request."
+            ) from exc
+        if active is not True:
+            raise OrderError("Exchange configuration changed. Retry the request.")
+
+    @staticmethod
+    def _ticker_price(
+        ticker: Any,
+        symbol: str,
+        *,
+        allow_bare_base_alias: bool = False,
+    ) -> float:
+        """Return a price only when the ticker belongs to the requested symbol."""
+        ticker_symbol = getattr(ticker, "symbol", None)
+        if not _symbols_match(
+            ticker_symbol,
+            symbol,
+            allow_bare_base_alias=allow_bare_base_alias,
+        ):
+            raise OrderError("ticker symbol does not match requested order symbol")
+        last_price = _normalized_float(getattr(ticker, "last_price", None))
+        if last_price is None or last_price <= 0:
+            raise OrderError("ticker price unavailable or invalid")
+        return last_price
+
     async def _audit_order_best_effort(self, **fields: Any) -> str | None:
-        """Persist an order audit without obscuring the exchange outcome."""
+        """Persist a bounded, credential-free audit without hiding the outcome."""
         if self.db is None:
             return None
+        secret_values = tuple(
+            value
+            for name in (
+                "mexc_api_key",
+                "mexc_api_secret",
+                "hl_private_key",
+                "local_api_token",
+                "anthropic_api_key",
+                "xai_api_key",
+                "openai_api_key",
+            )
+            if len(value := str(getattr(self.settings, name, "") or "").strip()) >= 4
+        )
+        safe_fields = _audit_safe_value(fields, secret_values=secret_values)
         try:
-            await self.db.insert_order(**fields)
-        except Exception as exc:  # noqa: BLE001 — exchange result stays authoritative
-            return f"audit log failed: {exc}"
+            await self.db.insert_order(**safe_fields)
+        except Exception:  # noqa: BLE001 — exchange result stays authoritative
+            return "audit log failed"
         return None
 
     async def _read_account_state(
@@ -795,6 +1781,11 @@ class OrderService:
 
     async def preview(self, ticket: OrderTicket) -> dict[str, Any]:
         """Run gates, optionally issue one-time token + persist preview hash."""
+        self._require_active_client()
+        try:
+            ticket = OrderTicket.model_validate(ticket.model_dump(warnings=False))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise OrderError("preview has invalid ticket") from exc
         symbol = ticket.symbol.upper().strip()
         ticket = ticket.model_copy(update={"symbol": symbol})
 
@@ -838,6 +1829,10 @@ class OrderService:
             self._ensure_no_pending_same_side_entry(symbol, ticket.side),
             return_exceptions=True,
         )
+        # Setup may replace the exchange while the independent reads are in
+        # flight. Never derive confirm authority from a detached client or old
+        # settings, even though Confirm would run fresh gates later.
+        self._require_active_client()
 
         if isinstance(contract_r, BaseException):
             if isinstance(contract_r, ExchangeError):
@@ -850,9 +1845,7 @@ class OrderService:
             if isinstance(ticker_r, ExchangeError):
                 raise OrderError(f"ticker failed: {ticker_r}") from ticker_r
             raise ticker_r
-        last_price = _coerce_float(ticker_r.last_price)
-        if last_price is None or last_price <= 0:
-            raise OrderError("ticker price unavailable or invalid")
+        last_price = self._ticker_price(ticker_r, symbol)
 
         # Account read + its mappings share the fail-closed dict the old separate
         # _balances / _existing_risk failures returned (Preview shows gate errors,
@@ -861,7 +1854,10 @@ class OrderService:
         try:
             if isinstance(account_r, BaseException):
                 if isinstance(account_r, ExchangeError):
-                    raise OrderError(f"equity unavailable: {account_r}") from account_r
+                    raise OrderError(
+                        "equity unavailable; positions unavailable — exchange "
+                        "account data could not be read"
+                    ) from account_r
                 raise account_r
             assets, positions = account_r
             equity, available = self._map_balances(assets)
@@ -942,23 +1938,29 @@ class OrderService:
         token = self.store.create(payload, ttl)
         token_hash = PreviewStore.hash_token(token)
 
-        if self.db is not None:
-            # Mirror PreviewStore.create()'s clamp (app/orders/tokens.py) so the
-            # DB-preview row's expiry never diverges from the in-memory token's
-            # for ttl<=0 (both must agree on when a preview is actually gone).
-            expires = datetime.now(timezone.utc).timestamp() + max(1, int(ttl))
-            try:
+        try:
+            if self.db is not None:
+                # Mirror PreviewStore.create()'s clamp (app/orders/tokens.py) so the
+                # DB-preview row's expiry never diverges from the in-memory token's
+                # for ttl<=0 (both must agree on when a preview is actually gone).
+                expires = datetime.now(timezone.utc).timestamp() + max(1, int(ttl))
                 await self.db.insert_preview(
                     token_hash=token_hash,
                     payload_json=payload,
                     expires_at=_utc_now_iso_from_ts(expires),
                 )
-            except BaseException:
-                # The response never disclosed this token. Do not leave hidden
-                # confirm authority behind, but preserve any newer single-slot
-                # token that a concurrent preview may already have created.
-                self.store.discard(token)
-                raise
+            # The local audit write above yields control. Recheck the generation
+            # immediately before the token can leave the service.
+            self._require_active_client()
+            remaining_ttl = self.store.remaining_seconds(token)
+            if remaining_ttl is None:
+                raise OrderError("Preview was superseded or expired. Retry preview.")
+        except BaseException:
+            # The response never disclosed this token. Do not leave hidden
+            # confirm authority behind, but preserve any newer single-slot
+            # token that a concurrent preview may already have created.
+            self.store.discard(token)
+            raise
 
         return {
             "ok": True,
@@ -967,7 +1969,7 @@ class OrderService:
             "warnings": gate.warnings,
             "gate": gate.to_dict(),
             "summary": summary,
-            "expires_in_seconds": ttl,
+            "expires_in_seconds": remaining_ttl,
             "external_oid": external_oid,
         }
 
@@ -1031,6 +2033,8 @@ class OrderService:
         delay_s = max(0.0, float(getattr(self.settings, "sl_verify_delay_s", 0.7)))
         for attempt in range(attempts):
             ambiguous_price_match = False
+            stop_match_detail: str | None = None
+            seen_stop_ids: set[int] = set()
 
             # 1) Stop / plan orders — the authoritative SL source.
             try:
@@ -1046,19 +2050,38 @@ class OrderService:
                 else:
                     stops_ever_ok = True
                 for s in stops:
+                    stop_id = _consistent_stop_order_id(s)
+                    if stop_id is None or stop_id in seen_stop_ids:
+                        invalid_stop_evidence = True
+                        last_detail = (
+                            "stop order has an invalid or duplicate identity"
+                        )
+                        continue
+                    seen_stop_ids.add(stop_id)
                     if not _symbols_match(
                         s.get("symbol"), symbol, allow_bare_base_alias=is_hl
                     ):
+                        invalid_stop_evidence = True
+                        last_detail = "stop order has an invalid symbol identity"
                         continue
-                    kind = str(
-                        s.get("orderType") or s.get("tpsl") or s.get("type") or ""
-                    ).lower()
-                    # Shared backend classifier (Q-05): the SAME SL/TP label rule
-                    # the reevaluate extractor uses, so the two money-path sites
-                    # cannot drift. `classify_order_label` returns 'tp' only on an
-                    # unambiguous take-profit marker (never bare "tpsl"), keeping
-                    # this verifier bit-identical to its prior inline rule.
-                    label = classify_order_label(kind)
+                    reduce_only, reduce_only_valid = classify_reduce_only_fields(s)
+                    if not reduce_only_valid or reduce_only is False:
+                        invalid_stop_evidence = True
+                        last_detail = (
+                            "stop order has invalid reduce-only geometry"
+                        )
+                        continue
+                    position_side, position_side_valid = (
+                        classify_position_side_fields(s)
+                    )
+                    if not position_side_valid:
+                        invalid_stop_evidence = True
+                        last_detail = (
+                            "stop order has an invalid position-side identity"
+                        )
+                        continue
+                    if position_side is not None and position_side != side.lower():
+                        continue
                     explicit_price, explicit_fields = (
                         _consistent_positive_price_aliases(
                             s, ("stopLossPrice", "stop_loss_price")
@@ -1083,7 +2106,17 @@ class OrderService:
                                     "counted as verified"
                                 )
                                 continue
-                            return True, "explicit stop-loss field matched", True
+                            stop_match_detail = "explicit stop-loss field matched"
+                        continue
+                    # Shared backend classifier (Q-05): evaluate every label
+                    # alias and reject an ambiguous SL/TP identity. Explicit SL
+                    # fields above retain their documented priority.
+                    label, labels_valid = classify_order_label_fields(s)
+                    if not labels_valid:
+                        invalid_stop_evidence = True
+                        last_detail = (
+                            "stop order labels were invalid or conflicting"
+                        )
                         continue
                     if label == "tp":
                         continue
@@ -1115,7 +2148,7 @@ class OrderService:
                         # A bare triggerPrice can be a TP; only accept it as SL
                         # proof when the order kind is SL-ish (or unmarked/plan).
                         if key.startswith("trigger") and not (
-                            label == "sl" or kind in ("", "plan")
+                            label == "sl" or label is None
                         ):
                             continue
                         # A stop object that actually carries an SL-ish field is
@@ -1142,14 +2175,24 @@ class OrderService:
                                     "counted as verified"
                                 )
                                 continue
-                            return True, f"stop order field {key} matched", True
-            except ExchangeError as e:
-                last_detail = str(e)
+                            stop_match_detail = f"stop order field {key} matched"
+            except ExchangeError:
+                last_detail = "open stop orders lookup failed"
+
+            # A matching row is trustworthy only after the complete snapshot
+            # has been checked for contradictory stop evidence.
+            if stop_match_detail is not None and not invalid_stop_evidence:
+                return True, stop_match_detail, True
 
             # 2) Position row fields — ADDITIONAL positive evidence only. Their
             # absence never proves the SL is missing, so it must not set checked.
+            position_match_detail: str | None = None
+            matching_position_rows = 0
             try:
-                positions = await self.client.positions(symbol)
+                # Post-placement protection evidence must bypass the adapter's
+                # short display cache. A pre-submit row can carry an old
+                # same-price SL and must never verify this new entry.
+                positions = await self.client.positions(symbol, fresh=True)
                 if not isinstance(positions, list) or not all(
                     isinstance(position, dict) for position in positions
                 ):
@@ -1160,10 +2203,31 @@ class OrderService:
                     positions = []
                 for raw in positions:
                     p = map_position(raw) if "hold_vol" not in raw else raw
-                    if str(p.get("symbol") or "").upper() != symbol.upper():
+                    if not _symbols_match(
+                        p.get("symbol"), symbol, allow_bare_base_alias=is_hl
+                    ):
+                        invalid_position_evidence = True
+                        last_detail = "position has an invalid symbol identity"
                         continue
-                    if str(p.get("side") or "").lower() != side.lower():
+                    side_raw = p.get("side")
+                    position_side = (
+                        side_raw.strip().lower()
+                        if isinstance(side_raw, str)
+                        else ""
+                    )
+                    hold_vol = _normalized_float(p.get("hold_vol"))
+                    if position_side not in ("long", "short") or (
+                        hold_vol is None or hold_vol <= 0
+                    ):
+                        invalid_position_evidence = True
+                        last_detail = "position has an invalid identity or volume"
                         continue
+                    if position_side != side.lower():
+                        continue
+                    matching_position_rows += 1
+                    if matching_position_rows > 1:
+                        invalid_position_evidence = True
+                        last_detail = "position snapshot has duplicate matching rows"
                     sl_evidence: dict[str, Any] = {}
                     for key in sl_keys:
                         if key in raw:
@@ -1190,9 +2254,16 @@ class OrderService:
                                 "verified"
                             )
                             continue
-                        return True, "position SL field matched", True
-            except ExchangeError as e:
-                last_detail = last_detail or str(e)
+                        position_match_detail = "position SL field matched"
+            except ExchangeError:
+                last_detail = last_detail or "positions lookup failed"
+
+            if (
+                position_match_detail is not None
+                and not invalid_stop_evidence
+                and not invalid_position_evidence
+            ):
+                return True, position_match_detail, True
 
             if ambiguous_price_match:
                 # Do not resolve to MISSING either (that could wrongly trip
@@ -1253,44 +2324,61 @@ class OrderService:
 
     async def _mexc_order_fill_confirmed(
         self, symbol: str, external_oid: str, rounded_vol: float, vol_eps: float
-    ) -> bool:
+    ) -> float | None:
         """Order-own fill evidence for a MEXC LIMIT without a reported fill (X2-01).
 
         A hold-delta can be an EXTERNAL same-side bump on a still-resting limit, so
         it must NEVER verify a limit (that is exactly the class of unprotected order
         the positive verify was built to guard). Instead ask the exchange about OUR
-        order by ``externalOid``: only a ``dealVol`` at/above the ordered size — or a
+        order by ``externalOid``: only a ``dealVol`` within the ordered size — or a
         smaller dealVol paired with an explicit fully-filled state — counts as OUR
-        fill. Any lookup failure / ambiguity returns False → the caller keeps UNKNOWN
-        (loud), never a silent verify and never a new flatten path.
+        fill. Any lookup failure or ambiguity returns no fill, so the caller keeps
+        UNKNOWN (loud), never a silent verify and never a new flatten path.
         """
         try:
             found = await self.client.order_by_external_oid(symbol, external_oid)
         except Exception:  # noqa: BLE001 — any lookup failure → UNKNOWN, fail-closed
-            return False
+            return None
         if not isinstance(found, dict) or not found:
-            return False
+            return None
+        if not _recovery_is_match(
+            found, external_oid, expected_symbol=symbol
+        ):
+            return None
         order = found.get("order")
         if not isinstance(order, dict):
-            return False
-        deal = _coerce_float(
-            order.get("dealVol")
-            if order.get("dealVol") is not None
-            else order.get("deal_vol")
-            if order.get("deal_vol") is not None
-            else order.get("dealVolume")
+            return None
+        if "symbol" in order and not _symbols_match(order.get("symbol"), symbol):
+            return None
+        deal, deal_fields = _consistent_nonnegative_aliases(
+            order, ("dealVol", "deal_vol", "dealVolume")
         )
-        if deal is None:
-            return False
+        if not deal_fields or deal is None:
+            return None
+        if deal > rounded_vol + vol_eps:
+            return None
+        states: list[str] = []
+        for key in ("state", "orderState"):
+            if key not in order:
+                continue
+            raw_state = order.get(key)
+            if isinstance(raw_state, bool):
+                return None
+            normalized_state = str(raw_state).strip().lower()
+            if not normalized_state:
+                return None
+            states.append(normalized_state)
+        if len(set(states)) > 1:
+            return None
         # Primary signal: our order filled at/above the ordered size.
         if deal >= rounded_vol - vol_eps:
-            return True
+            return deal
         # Corroborated signal: a partial dealVol PLUS an explicit fully-filled
         # state (MEXC futures state 3 = completed/filled).
-        state = str(order.get("state") or order.get("orderState") or "").lower()
+        state = states[0] if states else ""
         if deal > vol_eps and state in ("3", "filled", "completed", "done"):
-            return True
-        return False
+            return deal
+        return None
 
     async def _same_side_hold_vol_ok(
         self, symbol: str, side: str, *, fresh: bool = False
@@ -1321,37 +2409,32 @@ class OrderService:
         if not isinstance(positions, list):
             return 0.0, 1, False
         is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
+        exchange = "hyperliquid" if is_hl else "mexc"
         matched: tuple[float, int] | None = None
         for raw in positions:
             if not isinstance(raw, dict):
                 return 0.0, 1, False
             p = map_position(raw) if "hold_vol" not in raw else raw
             symbol_raw = p.get("symbol")
-            if not isinstance(symbol_raw, str) or not symbol_raw.strip():
+            if not valid_normalized_position_symbol(
+                symbol_raw, exchange=exchange
+            ):
                 return 0.0, 1, False
             if not _symbols_match(
                 symbol_raw, symbol, allow_bare_base_alias=is_hl
             ):
                 continue
             side_raw = p.get("side")
-            position_side = (
-                side_raw.strip().lower() if isinstance(side_raw, str) else ""
-            )
-            if position_side not in ("long", "short"):
+            if not _valid_normalized_position_side(side_raw):
                 return 0.0, 1, False
-            if position_side != side.lower():
+            if side_raw != side:
                 continue
-            hv = _coerce_float(p.get("hold_vol"))
+            hv = _normalized_float(p.get("hold_vol"))
             ot_raw = p.get("open_type")
-            if isinstance(ot_raw, bool):
-                ot = 0
-            elif ot_raw in (2, "2", "cross"):
-                ot = 2
-            elif ot_raw in (1, "1", "isolated"):
-                ot = 1
-            else:
-                ot = 0
-            if hv is None or hv < 0:
+            ot = _normalized_position_open_type(ot_raw)
+            if ot is None:
+                return 0.0, 0, False
+            if hv is None or hv <= 0:
                 return 0.0, ot, False
             if matched is not None:
                 return 0.0, 0, False
@@ -1396,24 +2479,31 @@ class OrderService:
                 positions = await self.client.positions(symbol)
             except ExchangeError:
                 return (0.0, 1, False), None
+        if not isinstance(positions, list) or any(
+            not isinstance(raw, dict) for raw in positions
+        ):
+            return (0.0, 1, False), None
         matched: tuple[tuple[float, int, bool], int | None] | None = None
-        for raw in positions or []:
+        for raw in positions:
             p = map_position(raw) if "hold_vol" not in raw else raw
-            if str(p.get("symbol") or "").upper() != symbol.upper():
+            position_symbol = p.get("symbol")
+            if not valid_normalized_position_symbol(
+                position_symbol, exchange="mexc"
+            ):
+                return (0.0, 1, False), None
+            if position_symbol != symbol:
                 continue
-            if str(p.get("side") or "").lower() != side.lower():
+            position_side = p.get("side")
+            if not _valid_normalized_position_side(position_side):
+                return (0.0, 1, False), None
+            if position_side != side:
                 continue
-            hv_raw = _coerce_float(p.get("hold_vol"))
+            hv_raw = _normalized_float(p.get("hold_vol"))
             ot_raw = p.get("open_type")
-            if isinstance(ot_raw, bool):
-                ot = 0
-            elif ot_raw in (2, "2", "cross"):
-                ot = 2
-            elif ot_raw in (1, "1", "isolated"):
-                ot = 1
-            else:
-                ot = 0
-            if hv_raw is None or hv_raw < 0:
+            ot = _normalized_position_open_type(ot_raw)
+            if ot is None:
+                return (0.0, 0, False), None
+            if hv_raw is None or hv_raw <= 0:
                 return (0.0, ot, False), None
             raw_pid = p.get("position_id")
             if isinstance(raw_pid, bool):
@@ -1438,12 +2528,71 @@ class OrderService:
             return matched
         return (0.0, 1, True), None
 
+    @staticmethod
+    async def _drain_task_after_cancellation(task: asyncio.Task[Any]) -> None:
+        """Wait for a shielded task despite repeated caller cancellation."""
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if not task.cancelled():
+            try:
+                task.result()
+            except BaseException:
+                pass
+
+    async def _await_pre_submit_mutation(
+        self, operation: Coroutine[Any, Any, Any]
+    ) -> Any:
+        """Finish a started setup mutation, then propagate caller cancellation."""
+        operation_task = asyncio.create_task(operation)
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            await self._drain_task_after_cancellation(operation_task)
+            raise
+
+    async def _run_locked_mutation(
+        self,
+        operation: Coroutine[Any, Any, dict[str, Any]],
+        *,
+        mutation_started: asyncio.Event,
+    ) -> dict[str, Any]:
+        """Defer caller cancellation after the first exchange mutation starts."""
+        operation_task = asyncio.create_task(operation)
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            if not mutation_started.is_set():
+                # No exchange mutation has started, so cancellation is still
+                # safe. Stop the internal task before it can cross that line.
+                operation_task.cancel()
+
+            # Once the workflow's primary mutation starts, its exchange outcome
+            # is uncertain even if the request task is cancelled: a worker thread
+            # or remote transport may still complete it. Keep the trade lock and
+            # let the internal operation finish reconciliation, verification and
+            # audit before propagating cancellation. Repeated cancellation
+            # requests must not interrupt that safety work.
+            await self._drain_task_after_cancellation(operation_task)
+            raise
+
     async def confirm(self, token: str) -> dict[str, Any]:
         """Consume token, re-check arming + gates, set leverage, place order."""
         async with self._trade_lock:
-            return await self._confirm_locked(token)
+            self._require_active_client()
+            mutation_started = asyncio.Event()
+            return await self._run_locked_mutation(
+                self._confirm_locked(token, mutation_started=mutation_started),
+                mutation_started=mutation_started,
+            )
 
-    async def _confirm_locked(self, token: str) -> dict[str, Any]:
+    async def _confirm_locked(
+        self, token: str, *, mutation_started: asyncio.Event | None = None
+    ) -> dict[str, Any]:
         if not self.settings.trading_enabled:
             # Consume token so it cannot be reused after arming without re-preview
             try:
@@ -1474,14 +2623,9 @@ class OrderService:
             external_oid
         ):
             raise OrderError("preview payload has no valid bound external_oid")
-        preview_last = payload.get("last_price")
-        if preview_last is not None:
-            try:
-                preview_last = float(preview_last)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise OrderError("preview payload has invalid last_price") from exc
-            if not math.isfinite(preview_last) or preview_last <= 0:
-                raise OrderError("preview payload has invalid last_price")
+        preview_last = _normalized_float(payload.get("last_price"))
+        if preview_last is None or preview_last <= 0:
+            raise OrderError("preview payload has invalid or missing last_price")
 
         # Contract meta, ticker, combined account state and the MEXC pending-entry
         # guard run concurrently. The account positions are reused for pre_hold /
@@ -1506,9 +2650,7 @@ class OrderService:
             if isinstance(ticker_r, ExchangeError):
                 raise OrderError(f"ticker failed on confirm: {ticker_r}") from ticker_r
             raise ticker_r
-        last_price = _coerce_float(ticker_r.last_price)
-        if last_price is None or last_price <= 0:
-            raise OrderError("ticker price unavailable or invalid on confirm")
+        last_price = self._ticker_price(ticker_r, symbol)
 
         if isinstance(account_r, BaseException):
             if isinstance(account_r, ExchangeError):
@@ -1661,12 +2803,14 @@ class OrderService:
                 "order blocked"
             )
         try:
-            await self.client.set_leverage(
-                symbol,
-                int(ticket.leverage),
-                open_type,
-                position_type=position_type,
-                position_id=position_id,
+            await self._await_pre_submit_mutation(
+                self.client.set_leverage(
+                    symbol,
+                    int(ticket.leverage),
+                    open_type,
+                    position_type=position_type,
+                    position_id=position_id,
+                )
             )
         except ExchangeError as e:
             raise OrderError(f"set_leverage failed — order blocked: {e}") from e
@@ -1677,7 +2821,8 @@ class OrderService:
         # On MEXC this reuses the read taken above (no duplicate positions call).
 
         recovered_from_timeout = False
-        transport_err: str | None = None
+        if mutation_started is not None:
+            mutation_started.set()
         try:
             resp = await self.client.place_order(body)
         except ExchangeError as e:
@@ -1686,7 +2831,8 @@ class OrderService:
             # uncertain as a timeout — the order may already be live — so it must
             # go through the same reconciliation path, not a hard failure.
             recovered = None
-            if _is_uncertain_order_error(e):
+            outcome_unknown = _is_uncertain_order_error(e)
+            if outcome_unknown:
                 try:
                     recovered = await self.client.order_by_external_oid(
                         symbol, external_oid
@@ -1699,7 +2845,54 @@ class OrderService:
                 # the normalized wrapper. Absent a marker, fall back to an exact
                 # ID plus concrete order-ID check;
                 # a falsy result ({} / None) stays fail-closed (hard error below).
-                if not _recovery_is_match(recovered, external_oid):
+                recovery_matches = _recovery_is_match(
+                    recovered,
+                    external_oid,
+                    expected_symbol=symbol,
+                    allow_bare_base_alias=(
+                        getattr(self.client, "exchange_id", "") == "hyperliquid"
+                    ),
+                )
+                if (
+                    recovery_matches
+                    and getattr(self.client, "exchange_id", "") != "hyperliquid"
+                    and not _mexc_recovery_matches_request(
+                        recovered,
+                        expected_side=int(body["side"]),
+                        expected_vol=float(body["vol"]),
+                        expected_type=int(body["type"]),
+                        expected_open_type=int(body["openType"]),
+                        expected_price=(
+                            float(body["price"])
+                            if int(body["type"]) == MEXC_TYPE_LIMIT
+                            else None
+                        ),
+                        expected_leverage=int(body["leverage"]),
+                        expected_stop_loss=(
+                            float(body["stopLossPrice"])
+                            if "stopLossPrice" in body
+                            else None
+                        ),
+                        expected_take_profit=(
+                            float(body["takeProfitPrice"])
+                            if "takeProfitPrice" in body
+                            else None
+                        ),
+                    )
+                ):
+                    recovery_matches = False
+                if (
+                    recovery_matches
+                    and getattr(self.client, "exchange_id", "") == "hyperliquid"
+                    and not _hl_recovery_matches_request(
+                        recovered,
+                        expected_side="B" if ticket.side == "long" else "A",
+                        expected_vol=float(body["vol"]),
+                        expected_reduce_only=False,
+                    )
+                ):
+                    recovery_matches = False
+                if not recovery_matches:
                     recovered = None
             if not recovered:
                 audit_error = await self._audit_order_best_effort(
@@ -1713,15 +2906,16 @@ class OrderService:
                     status="error",
                     error=str(e),
                 )
+                if outcome_unknown:
+                    raise OrderOutcomeUnknown(
+                        "Order submission outcome is unknown for "
+                        f"externalOid={external_oid}. The order may be live; reconcile "
+                        "positions and open orders before another preview."
+                    ) from e
                 audit_suffix = f" ({audit_error})" if audit_error else ""
-                raise OrderError(
-                    f"place_order failed: {e}. "
-                    f"If timeout, check the exchange for externalOid={external_oid} "
-                    f"before retry (do not blind re-preview).{audit_suffix}"
-                ) from e
+                raise OrderError(f"place_order failed: {e}{audit_suffix}") from e
             # Order is (likely) live — fall through to SL verify/flatten (not early-return)
             recovered_from_timeout = True
-            transport_err = str(e)
             resp = (
                 recovered
                 if isinstance(recovered, dict)
@@ -1737,7 +2931,7 @@ class OrderService:
             warnings.append(
                 "place_order transport error but order recovered "
                 f"(order found by externalOid={external_oid}). DO NOT re-preview — "
-                f"verify on the exchange. Detail: {transport_err}"
+                "verify on the exchange."
             )
         sl_verified: bool = True
         sl_checked: bool = True
@@ -1748,6 +2942,7 @@ class OrderService:
         # (F-02), so a resting remainder that fills later is unprotected even
         # though the placed SL is real.
         sl_fully_verified: bool = True
+        sl_coverage_unknown: bool = False
         sl_detail = "no SL required"
         flatten_result: dict[str, Any] | None = None
         post_errors: list[str] = []
@@ -1770,6 +2965,10 @@ class OrderService:
                     "You must manage partial exits yourself."
                 )
 
+        exchange_id = getattr(self.client, "exchange_id", "")
+        is_mexc = exchange_id == "mexc"
+        is_hl = exchange_id == "hyperliquid"
+
         # A non-marketable LIMIT entry that Hyperliquid RESTS carries no filled
         # position to protect: the HL adapter places NO SL by design (F-02) and
         # returns unfilled=True / entryFilledSz=0. That is NOT an SL failure — we
@@ -1777,7 +2976,22 @@ class OrderService:
         # auto-flatten/cancel a perfectly valid resting order. (Regression fix:
         # before F-02 the SL trigger rested unconditionally with an oid, so this
         # path never mislabelled a resting limit as "SL nicht verifiziert".)
-        unfilled_resting = isinstance(resp, dict) and resp.get("unfilled") is True
+        response_fill, response_fill_present = (
+            (None, False) if is_mexc else _reported_fill_vol(resp)
+        )
+        entry_fill = (
+            _normalized_float(resp.get("entryFilledSz"))
+            if isinstance(resp, dict) and "entryFilledSz" in resp
+            else None
+        )
+        unfilled_resting = (
+            not is_mexc
+            and isinstance(resp, dict)
+            and resp.get("unfilled") is True
+            and entry_fill == 0.0
+            and response_fill_present
+            and response_fill == 0.0
+        )
 
         # ── MEXC fill evidence (O-01 positive verify + O-02 resting) ──────────
         # MEXC never returns an slTriggerOid and the SL is position-bound in the
@@ -1787,23 +3001,34 @@ class OrderService:
         # accepts the create body with stopLossPrice atomically (fill ⟹ SL
         # accepted). We derive the fill from the response, else from the hold
         # delta against the reliable pre-trade quantity.
-        is_mexc = getattr(self.client, "exchange_id", "") == "mexc"
         entry_order_type = (getattr(ticket, "order_type", "") or "").lower()
         mexc_new_fill: float | None = None
         mexc_fill_known = False
+        mexc_fill_for_coverage: float | None = None
         # Provenance of the fill evidence. `reported` comes from the order
         # response and is bot-safe (counts ONLY this order's volume). The hold
         # delta is NOT: a concurrent same-side position increase by another bot
         # can inflate it, so hold-delta evidence needs the attribution guard in
         # the positive-verify block below before it may fully verify.
         mexc_fill_from_report = False
+        mexc_fill_report_present = False
         if is_mexc and not manual_sltp and not unfilled_resting:
-            reported = _extract_filled_vol(resp)
+            reported, fill_reported = _reported_mexc_fill_vol(resp)
+            mexc_fill_report_present = fill_reported
             fill_eps = max(float(gate.rounded_vol) * 1e-4, 1e-9)
-            if reported is not None:
+            if (
+                reported is not None
+                and reported <= float(gate.rounded_vol) + fill_eps
+            ):
                 mexc_new_fill = reported
                 mexc_fill_known = True
                 mexc_fill_from_report = True
+                mexc_fill_for_coverage = reported
+            elif fill_reported:
+                # Explicit but invalid/contradictory fill evidence is UNKNOWN.
+                # Do not reinterpret a concurrent same-side hold increase as
+                # this order's market fill.
+                pass
             elif entry_order_type == "market" and pre_hold_ok:
                 # X2-02: a fast MARKET fill can beat a slow positions endpoint;
                 # a single-shot read then misreports it as resting. Retry with
@@ -1852,15 +3077,38 @@ class OrderService:
                 # Trust only explicit exchange evidence: a real trigger-order id
                 # from the adapter (HL) or a stop order found on the exchange.
                 # Request echoes are never proof.
+                raw_sl_trigger_oid = (
+                    resp.get("slTriggerOid")
+                    if is_hl and isinstance(resp, dict)
+                    else None
+                )
                 sl_trigger_oid = (
-                    resp.get("slTriggerOid") if isinstance(resp, dict) else None
+                    _consistent_stop_order_id({"orderId": raw_sl_trigger_oid})
+                    if raw_sl_trigger_oid is not None
+                    else None
+                )
+                invalid_sl_trigger_oid = (
+                    raw_sl_trigger_oid is not None and sl_trigger_oid is None
                 )
                 trigger_errors = (
-                    resp.get("triggerErrors") if isinstance(resp, dict) else None
-                ) or []
-                if sl_trigger_oid is not None:
+                    resp.get("triggerErrors")
+                    if is_hl and isinstance(resp, dict)
+                    else None
+                )
+                sl_trigger_failed, other_trigger_failed = _classify_trigger_errors(
+                    trigger_errors
+                )
+                if sl_trigger_oid is not None and not sl_trigger_failed:
                     sl_verified = True
                     sl_detail = f"exchange accepted SL trigger (oid={sl_trigger_oid})"
+                elif sl_trigger_oid is not None:
+                    sl_verified, sl_detail, sl_checked = await self._verify_sl_oid(
+                        symbol,
+                        sl_trigger_oid,
+                        float(sl),
+                        float(gate.rounded_vol),
+                        side=ticket.side,
+                    )
                 else:
                     sl_verified, sl_detail, sl_checked = await self._verify_sl_attached(
                         symbol=symbol,
@@ -1868,10 +3116,13 @@ class OrderService:
                         side=ticket.side,
                         pre_existing_same_side=bool(pre_hold_ok and pre_hold > 0),
                     )
-                    if trigger_errors:
-                        sl_detail += (
-                            f"; trigger errors: {'; '.join(map(str, trigger_errors))}"
-                        )
+                if sl_trigger_failed or invalid_sl_trigger_oid:
+                    sl_detail += "; exchange reported an SL trigger error"
+                if other_trigger_failed:
+                    warnings.append(
+                        "One or more exchange take-profit triggers were not accepted. "
+                        "Review the position and add the missing take-profit protection."
+                    )
 
                 # AUFLAGE — positive MEXC verify. The stop-order lookup is UNKNOWN
                 # on a normal MEXC trade (position-bound SL, empty plan list). Do
@@ -1906,9 +3157,11 @@ class OrderService:
                     #    (order_by_external_oid → dealVol/state); any ambiguity → False.
                     # When in doubt → keep UNKNOWN (loud), never silently verify.
                     fill_desc = ""
-                    if mexc_fill_from_report:
+                    if mexc_fill_report_present:
                         fill_is_ours = (
-                            mexc_new_fill is not None and mexc_new_fill > vol_eps
+                            mexc_fill_from_report
+                            and mexc_new_fill is not None
+                            and vol_eps < mexc_new_fill <= rounded_vol + vol_eps
                         )
                         if mexc_new_fill is not None:
                             fill_desc = f"fill≈{mexc_new_fill:g}"
@@ -1916,14 +3169,18 @@ class OrderService:
                         fill_is_ours = (
                             mexc_new_fill is not None
                             and mexc_new_fill >= rounded_vol - vol_eps
+                            and mexc_new_fill <= rounded_vol + vol_eps
                         )
                         if mexc_new_fill is not None:
                             fill_desc = f"fill≈{mexc_new_fill:g}"
                     else:
                         # LIMIT: order-own evidence only — never the hold delta.
-                        fill_is_ours = await self._mexc_order_fill_confirmed(
+                        confirmed_fill = await self._mexc_order_fill_confirmed(
                             symbol, external_oid, rounded_vol, vol_eps
                         )
+                        fill_is_ours = confirmed_fill is not None
+                        if confirmed_fill is not None:
+                            mexc_fill_for_coverage = confirmed_fill
                         fill_desc = "order fill confirmed by externalOid"
                     if body_had_sl and fill_is_ours:
                         sl_verified = True
@@ -1950,8 +3207,8 @@ class OrderService:
                         f"CRITICAL: SL not verified after place ({sl_detail}). "
                         "Position may be unprotected."
                     )
-        except Exception as e:  # noqa: BLE001 — order is live, must not bubble
-            post_errors.append(f"post-place SL verify failed: {e}")
+        except Exception:  # noqa: BLE001 — order is live, must not bubble
+            post_errors.append("post-place SL verification failed")
             sl_verified = False
             sl_checked = False
             warnings.append(
@@ -1959,39 +3216,61 @@ class OrderService:
                 "Check the SL and position on the exchange now."
             )
 
-        # M1: a partially-filled resting GTC limit is only protected up to the
-        # ACTUAL fill. The HL adapter sizes the reduce-only SL to entryFilledSz
-        # (F-02), so the resting remainder is UNPROTECTED if it fills later. We
-        # do NOT watch the fill (no fill-watcher by design) and must NOT flatten
-        # the already-protected filled portion — instead we report honestly:
-        # the position is not fully SL-verified and the trader is warned to
-        # manage the resting remainder. Market orders are IOC (no resting
-        # remainder) and are unaffected.
+        # M1: a partially-filled resting GTC limit has verified protection only
+        # for the current fill. We do not watch later fills, so future coverage
+        # of the resting remainder cannot be claimed. Market orders are IOC and
+        # are unaffected.
         order_type = (getattr(ticket, "order_type", "") or "").lower()
         if (
             not manual_sltp
+            and not unfilled_resting
             and order_type == "limit"
             and sl is not None
             and float(sl) > 0
             and not self.settings.allow_unprotected_entry
             and isinstance(resp, dict)
         ):
-            filled = resp.get("entryFilledSz")
             requested = float(gate.rounded_vol)
             eps = max(requested * 1e-4, 1e-9)
-            if (
-                filled is not None
-                and float(filled) > 0
-                and float(filled) + eps < requested
+            if is_mexc and mexc_fill_for_coverage is not None:
+                filled_present = True
+                filled = mexc_fill_for_coverage
+            else:
+                filled_present = "entryFilledSz" in resp
+                filled = (
+                    _normalized_float(resp.get("entryFilledSz"))
+                    if filled_present
+                    else None
+                )
+            if filled_present and (
+                filled is None or filled <= 0 or filled > requested + eps
             ):
                 sl_fully_verified = False
+                sl_coverage_unknown = True
                 warnings.append(
-                    "PARTIALLY FILLED: Limit order filled only partially "
-                    f"({float(filled):g} of {requested:g}). The exchange-side SL "
-                    "covers ONLY the filled part; the resting remainder is "
-                    "UNPROTECTED if it fills later. Monitor and protect the "
-                    "remainder manually, or cancel the resting order."
+                    "FILL COVERAGE UNKNOWN: The exchange returned an invalid or "
+                    "inconsistent entry fill size. The accepted SL may not cover "
+                    "the intended position; verify the entry and stop on the "
+                    "exchange NOW."
                 )
+            elif filled is not None and filled + eps < requested:
+                sl_fully_verified = False
+                if is_mexc:
+                    warnings.append(
+                        "PARTIALLY FILLED: Limit order filled only partially "
+                        f"({filled:g} of {requested:g}). The position-bound SL "
+                        "is verified for the current fill, but protection after "
+                        "a later remainder fill is UNKNOWN. Monitor and verify "
+                        "the final position protection, or cancel the remainder."
+                    )
+                else:
+                    warnings.append(
+                        "PARTIALLY FILLED: Limit order filled only partially "
+                        f"({filled:g} of {requested:g}). The exchange-side SL "
+                        "covers ONLY the filled part; the resting remainder is "
+                        "UNPROTECTED if it fills later. Monitor and protect the "
+                        "remainder manually, or cancel the resting order."
+                    )
 
         # Flatten/cancel is separate so its failures never wipe SL flags.
         # Never auto-flatten a manual-mode order — that IS the point of manual.
@@ -2013,12 +3292,26 @@ class OrderService:
                 # the order response — that is bot-safe: it counts only this
                 # order's volume, so a concurrent external bot adding same-side
                 # size in this window cannot inflate what we close.
-                reported_fill = _extract_filled_vol(resp)
+                if is_mexc:
+                    reported_fill, fill_reported = _reported_mexc_fill_vol(resp)
+                else:
+                    reported_fill, fill_reported = _reported_fill_vol(resp)
                 new_fill: float | None
                 fill_source = ""
                 if reported_fill is not None:
                     new_fill = min(float(gate.rounded_vol), reported_fill)
                     fill_source = "order response"
+                elif fill_reported:
+                    new_fill = None
+                    flatten_result = {
+                        "action": "skipped_invalid_fill_report",
+                        "error": "exchange fill report is invalid or contradictory",
+                    }
+                    warnings.append(
+                        "AUTO_FLATTEN skipped: the exchange fill report is invalid "
+                        "or contradictory, so NOTHING will be closed or cancelled. "
+                        "Check the position, entry order and SL on the exchange NOW."
+                    )
                 elif not pre_hold_ok:
                     # FAIL-CLOSED: no reported fill AND the pre-trade quantity
                     # was never reliably read. The hold difference would then be
@@ -2071,12 +3364,10 @@ class OrderService:
                     pass  # fail-closed above — no close/cancel action taken
                 elif new_fill <= 1e-12:
                     # Unfilled resting entry: cancel it, do not close old pos
-                    cancel_ids: list[Any] = []
-                    if isinstance(resp, dict):
-                        for k in ("orderId", "order_id", "oid"):
-                            if resp.get(k) is not None:
-                                cancel_ids.append(resp.get(k))
-                                break
+                    entry_order_id = _consistent_entry_order_id(resp)
+                    cancel_ids: list[int] = (
+                        [entry_order_id] if entry_order_id is not None else []
+                    )
                     is_hl = (
                         getattr(self.client, "exchange_id", "") == "hyperliquid"
                     )
@@ -2090,12 +3381,16 @@ class OrderService:
                                 )
                             else:
                                 cancel_response = await self.client.cancel_order([coid])
-                            cancel_error = _close_response_error(cancel_response)
+                            cancel_error = _cancel_response_error(
+                                cancel_response,
+                                expected_order_id=coid,
+                                is_hyperliquid=is_hl,
+                            )
                             if cancel_error:
                                 raise OrderError(cancel_error)
                             cancelled.append(coid)
-                        except Exception as ce:  # noqa: BLE001
-                            cancel_errors.append(f"{coid}: {ce}")
+                        except Exception:  # noqa: BLE001
+                            cancel_errors.append(f"{coid}: cancellation failed")
                     flatten_result = {
                         "action": "cancel_resting",
                         "cancelled": cancelled,
@@ -2119,8 +3414,8 @@ class OrderService:
                         )
                     else:
                         warnings.append(
-                            "AUTO_FLATTEN: no fill and no orderId to cancel "
-                            "— check exchange for resting entry"
+                            "AUTO_FLATTEN: no fill and no unambiguous orderId to "
+                            "cancel — check exchange for resting entry"
                         )
                 else:
                     vol = min(float(gate.rounded_vol), new_fill)
@@ -2146,7 +3441,47 @@ class OrderService:
                                 )
                             except ExchangeError:
                                 recovered = None
-                        if not _recovery_is_match(recovered, recovery_oid):
+                        recovery_matches = _recovery_is_match(
+                            recovered,
+                            recovery_oid,
+                            expected_symbol=symbol,
+                            allow_bare_base_alias=(
+                                getattr(self.client, "exchange_id", "")
+                                == "hyperliquid"
+                            ),
+                        )
+                        if (
+                            recovery_matches
+                            and getattr(self.client, "exchange_id", "")
+                            != "hyperliquid"
+                            and not _mexc_recovery_matches_request(
+                                recovered,
+                                expected_side=4 if ticket.side == "long" else 2,
+                                expected_vol=vol,
+                                expected_type=MEXC_TYPE_MARKET,
+                                expected_open_type=pos_open_type or open_type,
+                                expected_price=None,
+                                expected_leverage=None,
+                                expected_stop_loss=None,
+                                expected_take_profit=None,
+                            )
+                        ):
+                            recovery_matches = False
+                        if (
+                            recovery_matches
+                            and getattr(self.client, "exchange_id", "")
+                            == "hyperliquid"
+                            and not _hl_recovery_matches_request(
+                                recovered,
+                                expected_side=(
+                                    "A" if ticket.side == "long" else "B"
+                                ),
+                                expected_vol=vol,
+                                expected_reduce_only=True,
+                            )
+                        ):
+                            recovery_matches = False
+                        if not recovery_matches:
                             raise
                         flatten_result = recovered
                         flatten_recovery_warning = (
@@ -2155,6 +3490,19 @@ class OrderService:
                             f"{recovery_oid}. Do not close again; the live "
                             "position will be verified."
                         )
+                    flatten_error = (
+                        _close_response_error(flatten_result)
+                        if flatten_recovery_warning is None
+                        else None
+                    )
+                    if flatten_error:
+                        raise OrderRejectedByExchange(
+                            "automatic close was rejected by the exchange"
+                        )
+                    flatten_result = _public_order_ack(
+                        flatten_result,
+                        recovered=flatten_recovery_warning is not None,
+                    )
                     warnings.append(
                         f"AUTO_FLATTEN: market close vol={vol} "
                         f"(new_fill={new_fill} via {fill_source}, "
@@ -2223,11 +3571,11 @@ class OrderService:
                                 "residual_vol": None,
                                 "unverified": True,
                             }
-            except Exception as fe:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 warnings.append(
-                    f"AUTO_FLATTEN failed: {fe} — close manually on the exchange"
+                    "AUTO_FLATTEN failed — close manually on the exchange"
                 )
-                flatten_result = {"error": str(fe)}
+                flatten_result = {"error": "automatic close failed"}
 
         status = "recovered_placed" if recovered_from_timeout else "placed"
         if manual_sltp:
@@ -2255,12 +3603,12 @@ class OrderService:
                     isinstance(flatten_result, dict) and flatten_result.get("error")
                 ):
                     status = status + "_flatten_sent"
-        # M1: mark a partially-filled limit whose placed SL only covers the fill.
-        # (sl_verified is True here — the trigger IS real — so the block above is
-        # skipped; append the honest partial marker so the status is not a clean
-        # "placed".)
+        # M1: mark incomplete or unverifiable SL coverage. `sl_verified` means
+        # the trigger is real; it does not prove coverage of the intended size.
         if sl_verified and not sl_fully_verified:
-            status = status + "_partial_fill"
+            status = status + (
+                "_coverage_unknown" if sl_coverage_unknown else "_partial_fill"
+            )
 
         audit_error = await self._audit_order_best_effort(
             symbol=symbol,
@@ -2285,7 +3633,11 @@ class OrderService:
             "ok": True,
             "external_oid": external_oid,
             "request": body,
-            "response": resp,
+            "response": _public_order_ack(
+                resp,
+                recovered=recovered_from_timeout,
+                include_trigger_ids=is_hl,
+            ),
             "gate": gate.to_dict(),
             "sl_verified": sl_verified,
             "sl_fully_verified": sl_fully_verified,
@@ -2311,8 +3663,17 @@ class OrderService:
         the amount is never based on a stale UI value). vol still supported.
         """
         async with self._trade_lock:
-            return await self._close_position_locked(
-                symbol=symbol, side=side, vol=vol, fraction=fraction
+            self._require_active_client()
+            mutation_started = asyncio.Event()
+            return await self._run_locked_mutation(
+                self._close_position_locked(
+                    symbol=symbol,
+                    side=side,
+                    vol=vol,
+                    fraction=fraction,
+                    mutation_started=mutation_started,
+                ),
+                mutation_started=mutation_started,
             )
 
     async def _close_position_locked(
@@ -2322,6 +3683,7 @@ class OrderService:
         side: str,
         vol: float | None = None,
         fraction: float | None = None,
+        mutation_started: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         if not self.settings.trading_enabled:
             raise OrderError(
@@ -2359,7 +3721,7 @@ class OrderService:
                 p.get("symbol"), symbol, allow_bare_base_alias=is_hl
             )
             if sym_match and str(p.get("side") or "").lower() == side:
-                parsed_hold = _coerce_float(p.get("hold_vol"))
+                parsed_hold = _normalized_float(p.get("hold_vol"))
                 if parsed_hold is None or parsed_hold < 0:
                     raise OrderError(
                         "invalid hold_vol in live position response — close blocked"
@@ -2385,23 +3747,33 @@ class OrderService:
         contract_problem: str | None = None
         try:
             contract = await self.client.contract_meta(symbol)
-            parsed_vol_unit = _coerce_float(contract.vol_unit)
-            parsed_min_vol = _coerce_float(contract.min_vol)
+            parsed_vol_unit = _normalized_float(contract.vol_unit)
+            parsed_min_vol = _normalized_float(contract.min_vol)
         except ExchangeError:
             contract_known = False
             vol_unit = 0.0
             min_vol = 0.0
             contract_problem = "contract metadata unavailable"
         else:
+            contract_symbol_matches = _symbols_match(
+                getattr(contract, "symbol", None),
+                symbol,
+                allow_bare_base_alias=is_hl,
+            )
             contract_known = (
-                parsed_vol_unit is not None
+                contract_symbol_matches
+                and parsed_vol_unit is not None
                 and parsed_vol_unit > 0
                 and parsed_min_vol is not None
                 and parsed_min_vol > 0
             )
             vol_unit = parsed_vol_unit or 0.0
             min_vol = parsed_min_vol or 0.0
-            if not contract_known:
+            if not contract_symbol_matches:
+                contract_problem = (
+                    "contract metadata symbol does not match close symbol"
+                )
+            elif not contract_known:
                 contract_problem = "contract sizing metadata is invalid"
         # Never round a full close down (would leave dust); only partials.
         is_full = close_vol >= hold - 1e-12
@@ -2476,6 +3848,8 @@ class OrderService:
         # send can be recovered via order_by_external_oid instead of guessing.
         close_oid = f"mlt-close-{uuid.uuid4().hex[:20]}"
         close_recovery_warning: str | None = None
+        if mutation_started is not None:
+            mutation_started.set()
         try:
             resp = await self.client.close_position_market(
                 symbol,
@@ -2487,14 +3861,48 @@ class OrderService:
         except ExchangeError as e:
             recovery_oid = f"close:{close_oid}"
             recovered = None
-            if _is_uncertain_order_error(e):
+            outcome_unknown = _is_uncertain_order_error(e)
+            if outcome_unknown:
                 try:
                     recovered = await self.client.order_by_external_oid(
                         symbol, recovery_oid
                     )
                 except ExchangeError:
                     recovered = None
-            if _recovery_is_match(recovered, recovery_oid):
+            recovery_matches = _recovery_is_match(
+                recovered,
+                recovery_oid,
+                expected_symbol=symbol,
+                allow_bare_base_alias=is_hl,
+            )
+            if (
+                recovery_matches
+                and not is_hl
+                and not _mexc_recovery_matches_request(
+                    recovered,
+                    expected_side=4 if side == "long" else 2,
+                    expected_vol=close_vol,
+                    expected_type=MEXC_TYPE_MARKET,
+                    expected_open_type=open_type,
+                    expected_price=None,
+                    expected_leverage=None,
+                    expected_stop_loss=None,
+                    expected_take_profit=None,
+                )
+            ):
+                recovery_matches = False
+            if (
+                recovery_matches
+                and is_hl
+                and not _hl_recovery_matches_request(
+                    recovered,
+                    expected_side="A" if side == "long" else "B",
+                    expected_vol=close_vol,
+                    expected_reduce_only=True,
+                )
+            ):
+                recovery_matches = False
+            if recovery_matches:
                 resp = recovered
                 close_recovery_warning = (
                     "Close transport response was uncertain, but the close order "
@@ -2510,6 +3918,11 @@ class OrderService:
                     status="close_error",
                     error=str(e),
                 )
+                if outcome_unknown:
+                    raise OrderOutcomeUnknown(
+                        "Close outcome is unknown. The position may already have "
+                        "changed; reconcile positions and open orders before retrying."
+                    ) from e
                 audit_suffix = f" ({audit_error})" if audit_error else ""
                 raise OrderError(f"close failed: {e}{audit_suffix}") from e
 
@@ -2527,10 +3940,13 @@ class OrderService:
                 error=close_err,
             )
             audit_suffix = f" ({audit_error})" if audit_error else ""
-            raise OrderError(
+            raise OrderRejectedByExchange(
                 f"close rejected by exchange: {close_err} — position may still be "
                 f"open; verify on the exchange{audit_suffix}"
             )
+        public_response = _public_order_ack(
+            resp, recovered=close_recovery_warning is not None
+        )
 
         # F-03 FOLLOW-UP: the inner-error check above only proves the exchange
         # ACCEPTED the close — a marketable IOC can still PARTIALLY fill (a
@@ -2595,7 +4011,7 @@ class OrderService:
                 "hold_vol": verification_hold,
                 "residual_vol": None,
                 "verified": False,
-                "response": resp,
+                "response": public_response,
                 "warnings": result_warnings,
             }
 
@@ -2629,7 +4045,7 @@ class OrderService:
                 "hold_vol": verification_hold,
                 "residual_vol": residual,
                 "verified": False,
-                "response": resp,
+                "response": public_response,
                 "warnings": result_warnings,
             }
 
@@ -2665,7 +4081,7 @@ class OrderService:
                 "hold_vol": verification_hold,
                 "residual_vol": residual,
                 "verified": False,
-                "response": resp,
+                "response": public_response,
                 "warnings": result_warnings,
             }
 
@@ -2684,7 +4100,7 @@ class OrderService:
             "hold_vol": verification_hold,
             "residual_vol": residual,
             "verified": True,
-            "response": resp,
+            "response": public_response,
         }
         result_warnings = []
         if close_recovery_warning:
@@ -2702,13 +4118,23 @@ class OrderService:
         symbol: str | None = None,
     ) -> dict[str, Any]:
         async with self._trade_lock:
-            return await self._cancel_locked(order_id=order_id, symbol=symbol)
+            self._require_active_client()
+            mutation_started = asyncio.Event()
+            return await self._run_locked_mutation(
+                self._cancel_locked(
+                    order_id=order_id,
+                    symbol=symbol,
+                    mutation_started=mutation_started,
+                ),
+                mutation_started=mutation_started,
+            )
 
     async def _cancel_locked(
         self,
         *,
         order_id: str | int | None = None,
         symbol: str | None = None,
+        mutation_started: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         """Cancel via official POST /api/v1/private/order/cancel.
 
@@ -2742,23 +4168,29 @@ class OrderService:
         ):
             raise OrderError("open orders response is invalid — cancel blocked")
 
-        matched = False
+        validated_rows: list[tuple[dict[str, Any], int]] = []
+        seen_order_ids: set[int] = set()
         for r in open_rows:
-            id_keys = [
+            if not _has_consistent_positive_order_id(r):
+                raise OrderError(
+                    "open orders response contains an invalid order identity "
+                    "— cancel blocked"
+                )
+            id_key = next(
                 key for key in ("orderId", "order_id", "oid") if key in r
-            ]
-            if not id_keys:
-                continue
-            if len(id_keys) > 1:
-                if not _has_consistent_positive_order_id(r):
-                    raise OrderError(
-                        "open orders response contains an invalid order identity "
-                        "— cancel blocked"
-                    )
-                rid = str(int(str(r.get(id_keys[0]))))
-            else:
-                rid = r.get(id_keys[0])
-            if str(rid) != str(oid):
+            )
+            rid = int(str(r.get(id_key)))
+            if rid in seen_order_ids:
+                raise OrderError(
+                    "open orders response contains an invalid order identity "
+                    "— cancel blocked"
+                )
+            seen_order_ids.add(rid)
+            validated_rows.append((r, rid))
+
+        matched = False
+        for r, rid in validated_rows:
+            if rid != oid:
                 continue
             if symbol and not _symbols_match(
                 r.get("symbol"), symbol, allow_bare_base_alias=is_hl
@@ -2773,6 +4205,8 @@ class OrderService:
                 + " — cancel blocked"
             )
 
+        if mutation_started is not None:
+            mutation_started.set()
         try:
             if is_hl:
                 resp = await self.client.cancel_order(
@@ -2789,6 +4223,11 @@ class OrderService:
                 status="cancel_error",
                 error=str(e),
             )
+            if _is_uncertain_order_error(e):
+                raise OrderOutcomeUnknown(
+                    "Cancel outcome is unknown. The order may already be cancelled or "
+                    "filled; reconcile open orders before retrying."
+                ) from e
             audit_suffix = f" ({audit_error})" if audit_error else ""
             raise OrderError(f"cancel failed: {e}{audit_suffix}") from e
 
@@ -2798,9 +4237,11 @@ class OrderService:
         if not isinstance(resp, (dict, list)) or not resp:
             response_error = "unrecognized cancel response"
         else:
-            response_error = _close_response_error(resp)
+            response_error = _cancel_response_error(
+                resp, expected_order_id=oid, is_hyperliquid=is_hl
+            )
         cancel_ok = response_error is None
-        detail = resp
+        detail = _public_order_ack(resp, order_id=oid)
 
         audit_error = await self._audit_order_best_effort(
             symbol=symbol or "",
@@ -2812,7 +4253,7 @@ class OrderService:
         )
         if not cancel_ok:
             audit_suffix = f" ({audit_error})" if audit_error else ""
-            raise OrderError(
+            raise OrderRejectedByExchange(
                 f"cancel rejected by exchange: {response_error}{audit_suffix}"
             )
         result = {"ok": True, "response": detail}
@@ -2909,9 +4350,60 @@ class OrderService:
                     )
                     stops = []
                 else:
-                    checked = True
-            except ExchangeError as e:
-                last_detail = str(e)
+                    seen_stop_ids: set[int] = set()
+                    identities_valid = True
+                    for stop in stops:
+                        stop_id = _consistent_stop_order_id(stop)
+                        trigger_price, trigger_fields = (
+                            _consistent_positive_price_aliases(
+                                stop, ("triggerPrice", "trigger_price")
+                            )
+                        )
+                        reduce_only, reduce_only_valid = (
+                            classify_reduce_only_fields(stop)
+                        )
+                        position_side, position_side_valid = (
+                            classify_position_side_fields(stop)
+                        )
+                        explicit_price, explicit_fields = (
+                            _consistent_positive_price_aliases(
+                                stop, ("stopLossPrice", "stop_loss_price")
+                            )
+                        )
+                        _label, labels_valid = classify_order_label_fields(stop)
+                        stop_kind_valid = (
+                            explicit_price is not None
+                            if explicit_fields
+                            else labels_valid
+                        )
+                        if (
+                            stop_id is None
+                            or stop_id in seen_stop_ids
+                            or not _symbols_match(
+                                stop.get("symbol"),
+                                symbol,
+                                allow_bare_base_alias=is_hl,
+                            )
+                            or not trigger_fields
+                            or trigger_price is None
+                            or not reduce_only_valid
+                            or reduce_only is False
+                            or not position_side_valid
+                            or not stop_kind_valid
+                        ):
+                            identities_valid = False
+                            break
+                        seen_stop_ids.add(stop_id)
+                    if identities_valid:
+                        checked = True
+                    else:
+                        last_detail = (
+                            "open stop orders contained an invalid identity or "
+                            "trigger geometry"
+                        )
+                        stops = []
+            except ExchangeError:
+                last_detail = "open stop orders lookup failed"
                 stops = None
             for s in stops or []:
                 if not _symbols_match(
@@ -2995,14 +4487,65 @@ class OrderService:
         side: str,
         new_sl: float,
         required_armed_rule: str | None = None,
+        expected_position_signature: int | None = None,
+        record_user_override: bool = False,
     ) -> dict[str, Any]:
         async with self._trade_lock:
-            return await self._modify_stop_loss_locked(
-                symbol=symbol,
-                side=side,
-                new_sl=new_sl,
-                required_armed_rule=required_armed_rule,
+            self._require_active_client()
+            mutation_started = asyncio.Event()
+            return await self._run_locked_mutation(
+                self._modify_stop_loss_and_record_locked(
+                    symbol=symbol,
+                    side=side,
+                    new_sl=new_sl,
+                    required_armed_rule=required_armed_rule,
+                    expected_position_signature=expected_position_signature,
+                    record_user_override=record_user_override,
+                    mutation_started=mutation_started,
+                ),
+                mutation_started=mutation_started,
             )
+
+    async def _modify_stop_loss_and_record_locked(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        new_sl: float,
+        required_armed_rule: str | None,
+        expected_position_signature: int | None,
+        record_user_override: bool,
+        mutation_started: asyncio.Event,
+    ) -> dict[str, Any]:
+        result = await self._modify_stop_loss_locked(
+            symbol=symbol,
+            side=side,
+            new_sl=new_sl,
+            required_armed_rule=required_armed_rule,
+            expected_position_signature=expected_position_signature,
+            mutation_started=mutation_started,
+        )
+        if (
+            record_user_override
+            and result.get("verified") is True
+            and self.db is not None
+        ):
+            try:
+                await self.db.set_user_override_hw(symbol, side)
+            except Exception as exc:
+                log.warning(
+                    "modify-sl: set_user_override_hw failed type=%s",
+                    type(exc).__name__,
+                )
+                warnings = result.get("warnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                    result["warnings"] = warnings
+                warnings.append(
+                    "Stop moved, but the manual override marker could not be "
+                    "saved; automatic trailing may move it again."
+                )
+        return result
 
     async def _modify_stop_loss_locked(
         self,
@@ -3011,16 +4554,22 @@ class OrderService:
         side: str,
         new_sl: float,
         required_armed_rule: str | None = None,
+        expected_position_signature: int | None = None,
+        mutation_started: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         if not self.settings.trading_enabled:
             raise OrderError(
                 "DISARMED: TRADING_ENABLED=false — modify-SL blocked. "
                 "Set TRADING_ENABLED=true in .env to arm live trading."
             )
-        if not hasattr(self.client, "place_stop_order"):
+        if (
+            getattr(self.client, "exchange_id", "") != "hyperliquid"
+            or not hasattr(self.client, "place_stop_order")
+        ):
             raise OrderError("Moving the SL is only available on Hyperliquid")
         symbol = symbol.upper().strip()
         side = (side or "").lower()
+        is_hl = getattr(self.client, "exchange_id", "") == "hyperliquid"
         if side not in ("long", "short"):
             raise OrderError("side must be 'long' or 'short'")
         if required_armed_rule is not None:
@@ -3035,11 +4584,54 @@ class OrderService:
                     f"{required_armed_rule} is no longer armed — autonomous "
                     "modify-SL cancelled"
                 )
-        if isinstance(new_sl, bool):
-            raise OrderError("new_sl must be numeric, not boolean")
+            if required_armed_rule == "auto_trail":
+                raw_override = (row or {}).get("user_override_hw")
+                if raw_override is not None:
+                    override = _coerce_float(raw_override)
+                    high_water = _coerce_float((row or {}).get("high_water"))
+                    if (
+                        override is None
+                        or override <= 0
+                        or high_water is None
+                        or high_water <= 0
+                    ):
+                        raise OrderError(
+                            "auto_trail manual override state is invalid — "
+                            "autonomous modify-SL blocked"
+                        )
+                    override_active = (
+                        high_water <= override
+                        if side == "long"
+                        else high_water >= override
+                    )
+                    if override_active:
+                        raise OrderError(
+                            "auto_trail is paused by a manual stop override — "
+                            "autonomous modify-SL cancelled"
+                        )
+            if (
+                type(expected_position_signature) is not int
+                or expected_position_signature <= 0
+            ):
+                raise OrderError(
+                    "current position identity is unavailable — autonomous "
+                    "modify-SL blocked"
+                )
+            stored_signature = (row or {}).get("open_sig")
+            if (
+                type(stored_signature) is not int
+                or stored_signature <= 0
+                or stored_signature != expected_position_signature
+            ):
+                raise OrderError(
+                    "position identity changed in local state — autonomous "
+                    "modify-SL cancelled"
+                )
+        if isinstance(new_sl, bool) or not isinstance(new_sl, (int, float)):
+            raise OrderError("new_sl must be numeric")
         try:
             new_sl = float(new_sl)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except OverflowError as exc:
             raise OrderError("new_sl must be numeric") from exc
         if not math.isfinite(new_sl):
             raise OrderError("new_sl must be finite")
@@ -3069,13 +4661,24 @@ class OrderService:
         # Mark price for side geometry.
         try:
             ticker = await self.client.ticker(symbol)
-            mark = _coerce_float(ticker.last_price)
         except ExchangeError as e:
             raise OrderError(f"ticker failed — modify-SL blocked: {e}") from e
-        if mark is None or not math.isfinite(mark) or mark <= 0:
+        if not _symbols_match(
+            getattr(ticker, "symbol", None),
+            symbol,
+            allow_bare_base_alias=is_hl,
+        ):
+            raise OrderError("ticker symbol does not match requested order symbol")
+        try:
+            mark = self._ticker_price(
+                ticker,
+                symbol,
+                allow_bare_base_alias=is_hl,
+            )
+        except OrderError as e:
             raise OrderError(
                 "mark price unavailable — modify-SL blocked (cannot validate geometry)"
-            )
+            ) from e
 
         # Side geometry: long SL below mark, short SL above.
         if side == "long" and not (new_sl < mark):
@@ -3090,7 +4693,15 @@ class OrderService:
         except ExchangeError:
             price_unit = 0.0
         else:
-            price_unit = _coerce_float(contract.price_unit)
+            if not _symbols_match(
+                getattr(contract, "symbol", None),
+                symbol,
+                allow_bare_base_alias=is_hl,
+            ):
+                raise OrderError(
+                    "contract metadata symbol does not match requested stop symbol"
+                )
+            price_unit = _normalized_float(contract.price_unit)
             if price_unit is None or price_unit < 0:
                 raise OrderError("contract price unit is invalid — modify-SL blocked")
         rounded_sl = (
@@ -3157,11 +4768,22 @@ class OrderService:
             raise OrderError(
                 f"latest ticker failed — modify-SL blocked; old SL left in place: {e}"
             ) from e
-        latest_mark = _coerce_float(latest_ticker.last_price)
-        if latest_mark is None or latest_mark <= 0:
+        if not _symbols_match(
+            getattr(latest_ticker, "symbol", None),
+            symbol,
+            allow_bare_base_alias=is_hl,
+        ):
+            raise OrderError("ticker symbol does not match requested order symbol")
+        try:
+            latest_mark = self._ticker_price(
+                latest_ticker,
+                symbol,
+                allow_bare_base_alias=is_hl,
+            )
+        except OrderError as e:
             raise OrderError(
                 "latest mark unavailable — modify-SL blocked; old SL left in place"
-            )
+            ) from e
         if side == "long" and not (rounded_sl < latest_mark):
             raise OrderError(
                 f"rounded long SL {rounded_sl} not below latest mark {latest_mark}"
@@ -3171,7 +4793,26 @@ class OrderService:
                 f"rounded short SL {rounded_sl} not above latest mark {latest_mark}"
             )
 
+        # Recheck the exact trade epoch immediately before the first mutation.
+        # A close+reopen can retain the same symbol, side and entry while this
+        # request waits on the shared lock; applying the old baseline's stop to
+        # that fresh position would be an unauthorized autonomous action.
+        if required_armed_rule is not None:
+            live_signature = await hl_epoch_signature(self.client, symbol, side)
+            if live_signature is None:
+                raise OrderError(
+                    "current position identity could not be verified — "
+                    "autonomous modify-SL blocked"
+                )
+            if live_signature != expected_position_signature:
+                raise OrderError(
+                    "position changed while waiting — autonomous modify-SL "
+                    "cancelled"
+                )
+
         # ── FAIL-SAFE STEP 1: place the NEW stop BEFORE removing the old one ──
+        if mutation_started is not None:
+            mutation_started.set()
         try:
             placed = await self.client.place_stop_order(
                 symbol,
@@ -3182,25 +4823,41 @@ class OrderService:
                 reduce_only=True,
             )
         except ExchangeError as e:
+            failure_detail = "exchange request failed"
             await self._audit_modify(
-                symbol, side, rounded_sl, {"error": str(e)},
-                "modify_sl_place_failed", str(e),
+                symbol,
+                side,
+                rounded_sl,
+                {"error": failure_detail},
+                "modify_sl_place_failed",
+                failure_detail,
             )
+            if _is_uncertain_order_error(e):
+                raise OrderOutcomeUnknown(
+                    "New stop placement outcome is unknown. The old stop was not "
+                    "removed; reconcile the position and stop orders before retrying."
+                ) from e
             raise OrderError(
-                f"new SL placement failed — old SL left in place (still protected): {e}"
+                "new SL placement failed — old SL left in place (still protected)"
             ) from e
 
         new_oid = _consistent_stop_order_id(placed)
         place_err = placed.get("error") if isinstance(placed, dict) else "unknown"
         if new_oid is None or place_err is not None:
             rejection_detail = (
-                str(place_err) if place_err is not None else "invalid response"
+                "exchange rejected the replacement stop"
+                if place_err is not None
+                else "invalid response"
             )
             await self._audit_modify(
-                symbol, side, rounded_sl, placed,
-                "modify_sl_place_rejected", rejection_detail,
+                symbol,
+                side,
+                rounded_sl,
+                {"orderId": new_oid, "error": rejection_detail},
+                "modify_sl_place_rejected",
+                rejection_detail,
             )
-            raise OrderError(
+            raise OrderRejectedByExchange(
                 "new SL rejected or returned an invalid response — old SL left "
                 f"in place (still protected): {rejection_detail}"
             )
@@ -3240,14 +4897,18 @@ class OrderService:
                         )
                     else:
                         cancel_response = await self.client.cancel_order([oid])
-                    cancel_error = _close_response_error(cancel_response)
+                    cancel_error = _cancel_response_error(
+                        cancel_response,
+                        expected_order_id=oid,
+                        is_hyperliquid=is_hl,
+                    )
                     if cancel_error:
                         raise OrderError(cancel_error)
                     cancelled.append(oid)
-                except Exception as e:  # noqa: BLE001 — new stop is live; must not bubble
+                except Exception:  # noqa: BLE001 — new stop is live; must not bubble
                     failed.append(oid)
                     warnings.append(
-                        f"Old SL {oid} could not be cancelled ({e}) and remains "
+                        f"Old SL {oid} could not be cancelled and remains "
                         "active. The position is OVER-protected (two stops), not "
                         "unprotected; remove the old stop manually on the exchange."
                     )

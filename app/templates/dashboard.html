@@ -39,7 +39,7 @@
     <span id="arm-status" class="arm-status{% if trading_enabled %} armed{% endif %}"
           data-tip="Whether orders can be submitted. DISARMED means the TRADING_ENABLED safety switch is off in .env.">
       <span class="arm-dot" aria-hidden="true"></span>
-      <span class="arm-text">{% if trading_enabled %}LIVE{% else %}DISARMED{% endif %}</span>
+      <span class="arm-text">{% if not trading_enabled %}DISARMED{% elif exchange == 'hyperliquid' and hl_testnet %}ARMED · TESTNET{% else %}ARMED · REAL FUNDS{% endif %}</span>
     </span>
     {# W3-01: lauter roter Echtgeld-Chip. Sichtbar nur wenn scharf UND Mainnet
        (health.live_trading). JS toggelt das hidden-Attribut in loadHealth(). #}
@@ -51,7 +51,7 @@
     <div class="health" title="API status">
       <span class="health-item">
         <span id="dot-exchange" class="status-dot unknown"></span>
-        <span id="exchange-label">{{ exchange|default('EXCHANGE')|upper }}</span>
+        <span id="exchange-label" data-exchange="{{ exchange|default('')|lower }}">{% if exchange == 'hyperliquid' %}HYPERLIQUID · {% if hl_testnet %}TESTNET{% else %}MAINNET{% endif %}{% elif exchange == 'mexc' %}MEXC · LIVE VENUE{% else %}{{ exchange|default('EXCHANGE')|upper }} · NETWORK UNKNOWN{% endif %}</span>
       </span>
       <span class="health-item">
         <span id="dot-xai" class="status-dot unknown"></span>
@@ -97,8 +97,8 @@
       <h2>Chart</h2>
       <div class="panel-head-right">
         <span id="chart-meta" class="muted"></span>
-        <button type="button" id="btn-toggle-zones" class="btn-ai-lines active" title="Show or hide trade zones (SL/TP areas)">Zones</button>
-        <button type="button" id="btn-toggle-ai-lines" class="btn-ai-lines active" title="Show or hide AI levels on the chart">AI levels</button>
+        <button type="button" id="btn-toggle-zones" class="btn-ai-lines active" aria-pressed="true" title="Show or hide trade zones (SL/TP areas)">Zones</button>
+        <button type="button" id="btn-toggle-ai-lines" class="btn-ai-lines active" aria-pressed="true" title="Show or hide AI levels on the chart">AI levels</button>
         <span id="rt-badge" class="rt-badge" title="Realtime WebSocket">RT</span>
       </div>
     </div>
@@ -158,9 +158,9 @@
           ◎ Scan market
         </button>
         <select id="llm-select" class="llm-select" aria-label="AI provider" title="Switch AI provider immediately">
-          <option value="claude">Claude Opus</option>
+          <option value="claude">Claude</option>
           <option value="xai">Grok</option>
-          <option value="openai">Codex</option>
+          <option value="openai">OpenAI</option>
           <option value="ollama">Ollama (local)</option>
         </select>
         <button type="button" id="btn-ki-keys" class="btn btn-ghost" title="Manage AI keys">AI keys</button>
@@ -219,6 +219,7 @@
           id="btn-killswitch"
           class="btn btn-ghost btn-killswitch data-act hidden"
           data-for="positions"
+          aria-busy="false"
           title="Disable every active automation rule immediately for all open positions. Existing stops remain unchanged."
         >
           ⏻ Disable all automation
@@ -259,8 +260,8 @@
     <form id="order-form" class="ticket-form" autocomplete="off">
 
       <div class="side-seg" role="group" aria-label="Side">
-        <button type="button" class="side-btn side-btn-long active" data-side="long">Long</button>
-        <button type="button" class="side-btn side-btn-short" data-side="short">Short</button>
+        <button type="button" class="side-btn side-btn-long active" data-side="long" aria-pressed="true">Long</button>
+        <button type="button" class="side-btn side-btn-short" data-side="short" aria-pressed="false">Short</button>
       </div>
       <select id="ticket-side" name="side" class="visually-hidden" tabindex="-1" aria-hidden="true">
         <option value="long" selected>Long</option>
@@ -268,8 +269,8 @@
       </select>
 
       <div class="type-seg" role="group" aria-label="Order type">
-        <button type="button" class="type-btn active" data-type="market">Market</button>
-        <button type="button" class="type-btn" data-type="limit">Limit</button>
+        <button type="button" class="type-btn active" data-type="market" aria-pressed="true">Market</button>
+        <button type="button" class="type-btn" data-type="limit" aria-pressed="false">Limit</button>
       </div>
       <select id="ticket-type" name="order_type" class="visually-hidden" tabindex="-1" aria-hidden="true">
         <option value="market" selected>Market</option>
@@ -279,8 +280,8 @@
       <div class="size-mode-row">
         <span class="sltp-mode-label">Size entered as</span>
         <div class="size-mode-seg" role="group" aria-label="Position size mode">
-          <button type="button" class="size-mode-btn active" data-size-mode="position">Position</button>
-          <button type="button" class="size-mode-btn" data-size-mode="margin">Margin</button>
+          <button type="button" class="size-mode-btn active" data-size-mode="position" aria-pressed="true">Position</button>
+          <button type="button" class="size-mode-btn" data-size-mode="margin" aria-pressed="false">Margin</button>
         </div>
       </div>
       <div class="row">
@@ -319,8 +320,8 @@
       <div class="sltp-mode-row">
         <span class="sltp-mode-label">SL / TP entered as</span>
         <div class="sltp-mode-seg" role="group" aria-label="SL/TP input mode">
-          <button type="button" class="sltp-mode-btn active" data-mode="price">Price</button>
-          <button type="button" class="sltp-mode-btn" data-mode="pct">%</button>
+          <button type="button" class="sltp-mode-btn active" data-mode="price" aria-pressed="true">Price</button>
+          <button type="button" class="sltp-mode-btn" data-mode="pct" aria-pressed="false">%</button>
         </div>
       </div>
 
@@ -357,8 +358,8 @@
       <div class="sltp-mode-row">
         <span class="sltp-mode-label" data-tip="Exchange: place SL/TP as exchange trigger orders (recommended). Manual: no exchange SL/TP; you must close the position yourself, and browser closure removes monitoring.">SL/TP execution<i class="tip-cue">i</i></span>
         <div class="sltp-mode-seg" role="group" aria-label="SL/TP execution">
-          <button type="button" class="trigger-mode-btn active" data-trigger="auto">Exchange</button>
-          <button type="button" class="trigger-mode-btn" data-trigger="manual">Manual</button>
+          <button type="button" class="trigger-mode-btn active" data-trigger="auto" aria-pressed="true">Exchange</button>
+          <button type="button" class="trigger-mode-btn" data-trigger="manual" aria-pressed="false">Manual</button>
         </div>
       </div>
       <p id="trigger-mode-warn" class="ticket-danger hidden" role="alert">
@@ -456,9 +457,9 @@
         <label>
           <span>Provider</span>
           <select id="ki-provider">
-            <option value="claude">Claude Opus</option>
+            <option value="claude">Claude</option>
             <option value="xai">Grok</option>
-            <option value="openai">Codex</option>
+            <option value="openai">OpenAI</option>
             <option value="ollama">Ollama (local)</option>
           </select>
         </label>

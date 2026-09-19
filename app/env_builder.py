@@ -39,6 +39,10 @@ log = logging.getLogger(__name__)
 _REPLACE_RETRY_DELAYS = (0.1, 0.3)  # seconds; len(...) + 1 == total attempts
 
 
+class EnvPermissionHardeningError(PermissionError):
+    """A secret-bearing env file could not be restricted to its owner."""
+
+
 def replace_with_retry(tmp: Path, dst: Path) -> None:
     """os.replace with short retries on a transient Windows file lock.
 
@@ -301,6 +305,8 @@ def build_full_env(answers: dict) -> str:
         "",
         f"EXCHANGE={'mexc' if is_mexc else 'hyperliquid'}",
         f"HL_TESTNET={'true' if hl_testnet else 'false'}",
+        "# Keep false until the separate armed-Mainnet checklist is complete.",
+        "MAINNET_ACK=false",
         f"HL_PRIVATE_KEY={a.get('hl_private_key', '')}",
         f"HL_ACCOUNT_ADDRESS={a.get('hl_account_address', '')}",
         f"MEXC_API_KEY={a.get('mexc_api_key', '')}",
@@ -367,19 +373,18 @@ def build_full_env(answers: dict) -> str:
 
 
 # ── File-permission hardening (B-08) ────────────────────────────────────────
-def restrict_env_permissions(path: Path) -> None:
-    """Best-effort: lock a just-written ``.env`` down to the current user.
+def restrict_env_permissions(path: Path) -> bool:
+    """Lock a just-written ``.env`` down to the current user.
 
     ``.env`` holds exchange API secrets and the local auth token, so it must
     not be group-/world-readable. POSIX: ``chmod 0600`` (owner read/write
     only). Windows replaces the access ACL with a protected, current-user-only
     grant, removing both inherited and explicit entries for other principals.
 
-    Both branches are deliberately best-effort: any failure (unsupported
-    filesystem, unavailable PowerShell, insufficient privilege to change ACLs,
-    ...) is swallowed. The ``.env`` content has already been written
-    correctly at this point — a permission-tightening failure must never be
-    reported as (or turn into) a failed config write.
+    Returns whether hardening succeeded. The low-level operation remains
+    non-raising so callers that re-assert permissions on an existing file can
+    log and continue. Every path about to publish a new secret-bearing file
+    must require ``True`` and fail closed otherwise.
     """
     p = Path(path)
     try:
@@ -412,10 +417,17 @@ def restrict_env_permissions(path: Path) -> None:
                     p,
                     result.returncode,
                 )
+                return False
         else:
             os.chmod(p, 0o600)
-    except Exception:
-        log.warning("Permission hardening failed for %s", p, exc_info=True)
+        return True
+    except Exception as exc:
+        log.warning(
+            "Permission hardening failed for %s type=%s",
+            p,
+            type(exc).__name__,
+        )
+        return False
 
 
 # ── Atomic patcher (post-setup key writes) ──────────────────────────────────
@@ -482,7 +494,10 @@ def patch_env_vars(
         # replace would leave a window where the new .env briefly carries the
         # broad, inherited permissions of the directory while already holding
         # secrets.
-        restrict_env_permissions(tmp)
+        if restrict_env_permissions(tmp) is not True:
+            raise EnvPermissionHardeningError(
+                "Local configuration permissions could not be secured."
+            )
         replace_with_retry(tmp, env_path)
     except Exception:
         tmp.unlink(missing_ok=True)

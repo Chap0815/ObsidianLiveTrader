@@ -60,6 +60,22 @@ async def test_mexc_poll_backs_off_on_error():
 
 
 @pytest.mark.asyncio
+async def test_mexc_poll_error_log_does_not_reflect_diagnostics(caplog):
+    marker = "SYNTHETIC_PRIVATE_TICKER_LOG_DETAIL"
+
+    class Client:
+        async def ticker(self, symbol):
+            raise RuntimeError(marker)
+
+    ws = _FakeWS(max_sends=1)
+
+    await _mexc_poll_fallback(ws, Client(), "BTC")
+
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_mexc_poll_resets_delay_after_success():
     class _FlakyClient:
         def __init__(self):

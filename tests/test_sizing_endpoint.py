@@ -50,6 +50,7 @@ def _mock_client(*, available: float = AVAILABLE, positions: list | None = None)
             "equity_usdt": EQUITY,
             "available_usdt": available,
             "positions": positions or [],
+            "error": None,
         }
     )
     return mock
@@ -146,11 +147,192 @@ def test_sizing_suggest_rejects_overflowed_ticker_before_account_read(monkeypatc
     mock.account_snapshot.assert_not_awaited()
 
 
-def test_sizing_suggest_rejects_boolean_ticker_before_account_read(monkeypatch):
+@pytest.mark.parametrize("last_price", [True, "100000.0"])
+def test_sizing_suggest_rejects_untyped_ticker_before_account_read(
+    monkeypatch, last_price
+):
     mock = _mock_client()
-    mock.ticker = AsyncMock(return_value=MagicMock(last_price=True))
+    mock.ticker = AsyncMock(return_value=MagicMock(last_price=last_price))
 
     r = _post(monkeypatch, {}, mock=mock)
+
+    assert r.status_code == 502
+    assert "ticker price" in r.text.lower()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "field", ["contract_size", "vol_unit", "min_vol", "max_vol"]
+)
+def test_sizing_suggest_rejects_untyped_contract_meta_before_account_read(
+    monkeypatch, field
+):
+    contract = _contract_meta()
+    object.__setattr__(contract, field, "1.0")
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(return_value=contract)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Invalid contract sizing metadata"
+    mock.account_snapshot.assert_not_awaited()
+
+
+def test_sizing_suggest_clamps_to_contract_max_vol(monkeypatch):
+    contract = _contract_meta()
+    contract.max_vol = 25.0
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(return_value=contract)
+
+    response = _post(
+        monkeypatch,
+        {"risk_pct": 10.0},
+        max_risk_pct=10.0,
+        mock=mock,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["vol"] == 25.0
+
+
+def test_sizing_suggest_limit_uses_order_price_instead_of_advisory_entry(monkeypatch):
+    response = _post(
+        monkeypatch,
+        {
+            "order_type": "limit",
+            "price": ENTRY,
+            "entry": STOP + 100.0,
+            "stop_loss": STOP,
+            "risk_pct": 1.0,
+        },
+        max_risk_pct=10.0,
+    )
+
+    assert response.status_code == 200, response.text
+    expected = suggest_vol(
+        EQUITY,
+        1.0,
+        CONTRACT_SIZE,
+        ENTRY,
+        STOP,
+        VOL_UNIT,
+        MIN_VOL,
+        side="long",
+        slippage_pct=_settings(10.0).risk_slippage_pct,
+        available_usdt=AVAILABLE,
+        leverage=5,
+        max_notional_pct_of_equity=_settings(10.0).max_notional_pct_of_equity,
+        max_vol=_contract_meta().max_vol,
+    )
+    assert response.json()["vol"] == expected
+    assert response.json()["entry"] == ENTRY
+
+
+def test_sizing_suggest_rejects_leverage_above_settings_before_exchange_reads(
+    monkeypatch,
+):
+    mock = _mock_client()
+
+    response = _post(
+        monkeypatch,
+        {"leverage": 11},
+        mock=mock,
+        settings_kwargs={"max_leverage": 10},
+    )
+
+    assert response.status_code == 400
+    assert "MAX_LEVERAGE" in response.text
+    mock.contract_meta.assert_not_awaited()
+    mock.ticker.assert_not_awaited()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("field", "bound", "leverage"),
+    [
+        ("max_leverage", 4, 5),
+        ("min_leverage", 6, 5),
+    ],
+)
+def test_sizing_suggest_rejects_leverage_outside_contract_before_account_read(
+    monkeypatch, field, bound, leverage
+):
+    contract = _contract_meta()
+    setattr(contract, field, bound)
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(return_value=contract)
+
+    response = _post(monkeypatch, {"leverage": leverage}, mock=mock)
+
+    assert response.status_code == 400
+    assert "contract" in response.text.lower()
+    assert "leverage" in response.text.lower()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.parametrize("field", ["min_leverage", "max_leverage"])
+def test_sizing_suggest_rejects_untyped_contract_leverage_before_account_read(
+    monkeypatch, field
+):
+    contract = _contract_meta()
+    object.__setattr__(contract, field, "5")
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(return_value=contract)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Invalid contract leverage metadata"
+    mock.account_snapshot.assert_not_awaited()
+
+
+def test_sizing_suggest_rejects_inverted_contract_leverage_bounds(monkeypatch):
+    contract = _contract_meta()
+    contract.min_leverage = 10
+    contract.max_leverage = 5
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(return_value=contract)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Invalid contract leverage metadata"
+    mock.account_snapshot.assert_not_awaited()
+
+
+def test_sizing_exchange_error_does_not_reflect_diagnostics(monkeypatch):
+    from app.mexc.errors import MexcError
+
+    marker = "SYNTHETIC_PRIVATE_SIZING_ERROR"
+    mock = _mock_client()
+    mock.contract_meta = AsyncMock(side_effect=MexcError(marker))
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Exchange contract or ticker data unavailable"
+    )
+    assert marker not in response.text
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "last_price",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+)
+def test_sizing_suggest_rejects_nonpositive_or_nonfinite_ticker_before_account_read(
+    monkeypatch, last_price
+):
+    mock = _mock_client()
+    mock.ticker = AsyncMock(return_value=MagicMock(last_price=last_price))
+
+    r = _post(
+        monkeypatch,
+        {"order_type": "limit", "price": ENTRY, "entry": ENTRY},
+        mock=mock,
+    )
 
     assert r.status_code == 502
     assert "ticker price" in r.text.lower()
@@ -173,6 +355,7 @@ async def test_sizing_suggest_hot_swap_rejects_old_account_snapshot(monkeypatch)
             "equity_usdt": EQUITY,
             "available_usdt": AVAILABLE,
             "positions": [],
+            "error": None,
         }
 
     old_client = SimpleNamespace(
@@ -232,6 +415,53 @@ def test_sizing_suggest_rejects_boolean_account_numbers(monkeypatch):
 
         assert r.status_code == 400
         assert expected_detail in r.text.lower()
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_detail"),
+    (
+        ("equity_usdt", "equity unavailable"),
+        ("available_usdt", "available margin unavailable"),
+    ),
+)
+def test_sizing_suggest_rejects_numeric_string_account_numbers(
+    monkeypatch, field, expected_detail
+):
+    mock = _mock_client()
+    snapshot = dict(mock.account_snapshot.return_value)
+    snapshot[field] = str(snapshot[field])
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 400
+    assert expected_detail in response.text.lower()
+
+
+def test_sizing_suggest_rejects_explicit_account_error(monkeypatch):
+    marker = "SYNTHETIC_PRIVATE_SIZING_ACCOUNT_ERROR"
+    mock = _mock_client()
+    snapshot = dict(mock.account_snapshot.return_value)
+    snapshot["error"] = marker
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Account data unavailable for sizing"
+    assert marker not in response.text
+
+
+def test_sizing_suggest_rejects_missing_account_status(monkeypatch):
+    mock = _mock_client()
+    snapshot = dict(mock.account_snapshot.return_value)
+    snapshot.pop("error")
+    mock.account_snapshot = AsyncMock(return_value=snapshot)
+
+    response = _post(monkeypatch, {}, mock=mock)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Account data unavailable for sizing"
 
 
 def test_sizing_suggest_does_not_treat_missing_positions_as_flat(monkeypatch):
@@ -358,12 +588,88 @@ def test_sizing_suggest_defaults_to_max_risk_pct_when_missing(monkeypatch):
     assert body["risk_pct"] == 10.0
 
 
-def test_sizing_suggest_treats_non_positive_risk_pct_as_missing(monkeypatch):
-    """risk_pct=0 (or negative) is invalid input -> falls back to max_risk_pct."""
-    r = _post(monkeypatch, {"risk_pct": 0.0}, max_risk_pct=10.0)
-    assert r.status_code == 200
-    body = r.json()
-    assert body["risk_pct"] == 10.0
+@pytest.mark.parametrize("risk_pct", [0.0, -1.0])
+def test_sizing_suggest_rejects_non_positive_requested_risk_before_exchange_reads(
+    monkeypatch, risk_pct
+):
+    mock = _mock_client()
+
+    r = _post(
+        monkeypatch,
+        {"risk_pct": risk_pct},
+        max_risk_pct=10.0,
+        mock=mock,
+    )
+
+    assert r.status_code == 422
+    assert "risk_pct" in r.text
+    mock.contract_meta.assert_not_awaited()
+    mock.ticker.assert_not_awaited()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_risk", [0.0, True, "1.0"])
+async def test_sizing_suggest_internal_invalid_risk_fails_before_exchange_reads(
+    monkeypatch, bad_risk
+):
+    import app.main as main
+    from app.models import OrderTicket
+
+    monkeypatch.setattr(main, "get_settings", lambda: _settings(10.0))
+    mock = _mock_client()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(mexc=mock, exchange=mock))
+    )
+    ticket = OrderTicket(
+        symbol="BTC_USDT",
+        side="long",
+        vol=1,
+        stop_loss=STOP,
+        risk_pct=1.0,
+    )
+    object.__setattr__(ticket, "risk_pct", bad_risk)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.sizing_suggest(request, ticket, None)
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "risk_pct must be greater than 0"
+    mock.contract_meta.assert_not_awaited()
+    mock.ticker.assert_not_awaited()
+    mock.account_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_leverage", [True, 5.5, "5"])
+async def test_sizing_suggest_internal_invalid_leverage_fails_before_exchange_reads(
+    monkeypatch, bad_leverage
+):
+    import app.main as main
+    from app.models import OrderTicket
+
+    monkeypatch.setattr(main, "get_settings", lambda: _settings(10.0))
+    mock = _mock_client()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(mexc=mock, exchange=mock))
+    )
+    ticket = OrderTicket(
+        symbol="BTC_USDT",
+        side="long",
+        vol=1,
+        stop_loss=STOP,
+        leverage=5,
+    )
+    object.__setattr__(ticket, "leverage", bad_leverage)
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.sizing_suggest(request, ticket, None)
+
+    assert exc.value.status_code == 400
+    assert "leverage" in exc.value.detail.lower()
+    mock.contract_meta.assert_not_awaited()
+    mock.ticker.assert_not_awaited()
+    mock.account_snapshot.assert_not_awaited()
 
 
 def test_sizing_suggest_clamped_by_available_margin(monkeypatch):

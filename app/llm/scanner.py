@@ -33,6 +33,7 @@ from app.llm.client import (
     _log_llm_metrics,
     _oi_read_label,
     _post_with_retry,
+    _strip_private_analyze_context,
     compact_daily_for_llm,
     compact_tf_for_llm,
     extract_json_object,
@@ -231,6 +232,28 @@ def _salvage_result_objects(text: str) -> list[dict]:
 # actually buying any deployment-time flexibility.
 SCANNER_MIN_SCORE = 5.0
 
+_KNOWN_FINISH_REASONS = frozenset(
+    {"stop", "length", "content_filter", "tool_calls", "function_call"}
+)
+
+
+def _scanner_response_json(response: httpx.Response) -> dict[str, Any]:
+    """Decode an untrusted successful provider response into an object.
+
+    Provider response text stays available on ``LlmError.raw`` for internal
+    diagnostics, but the public exception message never reflects it.
+    """
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as e:
+        raise LlmError(
+            "Scanner provider returned invalid response",
+            raw=getattr(response, "text", None),
+        ) from e
+    if not isinstance(payload, dict):
+        raise LlmError("Scanner provider returned invalid response", raw=payload)
+    return payload
+
 
 def parse_scan_results(
     text: str,
@@ -372,8 +395,8 @@ async def build_scan_contexts(
                     client.klines(sym, htf, limit_hint=kline_limit, paced=True),
                     _fetch_daily_candles(client, sym, daily, kline_limit, paced=True),
                 )
-            except Exception as e:  # exchange hiccup on one coin must not kill the scan
-                errors.append(f"{sym}: {e}")
+            except Exception:  # exchange hiccup on one coin must not kill the scan
+                errors.append(f"{sym}: market data unavailable")
                 return None
         if not ltf_candles:
             errors.append(f"{sym}: no candles")
@@ -419,6 +442,40 @@ async def build_scan_contexts(
 
     results = await asyncio.gather(*(_one(r) for r in overview))
     return [r for r in results if r is not None], errors
+
+
+_SCANNER_CONTEXT_FIELDS = frozenset(
+    {
+        "symbol",
+        "last_price",
+        "volume24_usd",
+        "daily_stack",
+        "htf",
+        "ltf",
+        "funding_extreme",
+        "funding_annualized",
+        "oi_read",
+    }
+)
+
+
+def _scanner_contexts_for_transport(
+    contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy only scanner market fields and recursively remove private data."""
+    safe: list[dict[str, Any]] = []
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        public = {
+            key: value
+            for key, value in context.items()
+            if key in _SCANNER_CONTEXT_FIELDS
+        }
+        cleaned = _strip_private_analyze_context(public)
+        if isinstance(cleaned, dict):
+            safe.append(cleaned)
+    return safe
 
 
 def _scan_user_prompt(contexts: list[dict[str, Any]]) -> str:
@@ -778,12 +835,19 @@ async def _anthropic_text(
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
+
+    async def _post() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            return await c.post(url, headers=headers, json=body)
+
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.post(url, headers=headers, json=body)
+        # Scanner calls are advisory and idempotent. Use the same single
+        # bounded retry as every other provider transport so one transient
+        # 429/502/503/504 or timeout does not discard the whole scan.
+        r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
-        raise LlmError(f"Scanner ({provider_label}) request failed: {e}") from e
+        raise LlmError(f"Scanner ({provider_label}) request failed") from e
     if r.status_code >= 400:
         detail: Any = r.text[:400]
         try:
@@ -794,7 +858,7 @@ async def _anthropic_text(
             _categorize_provider_http_error(provider_label, r.status_code, detail),
             raw=detail,
         )
-    payload = r.json()
+    payload = _scanner_response_json(r)
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
         provider=provider_label,
@@ -803,13 +867,21 @@ async def _anthropic_text(
         elapsed_ms=elapsed_ms,
         payload=payload,
     )
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        raise LlmError("Scanner response missing content", raw=payload)
     parts = [
-        str(b.get("text") or "")
-        for b in payload.get("content") or []
-        if isinstance(b, dict) and b.get("type") == "text"
+        b.get("text")
+        for b in blocks
+        if isinstance(b, dict)
+        and b.get("type") == "text"
+        and isinstance(b.get("text"), str)
     ]
     # extract_json_object() strips any prose/fences the model adds around JSON
-    return "\n".join(parts).strip()
+    content = "\n".join(parts).strip()
+    if not content:
+        raise LlmError("Scanner response missing content", raw=payload)
+    return content
 
 
 async def _openai_compat_text(
@@ -853,7 +925,7 @@ async def _openai_compat_text(
         # gets one retry instead of failing the whole scan.
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
-        raise LlmError(f"Scanner ({provider_label}) request failed: {e}") from e
+        raise LlmError(f"Scanner ({provider_label}) request failed") from e
     if r.status_code >= 400:
         detail: Any = r.text[:400]
         try:
@@ -864,12 +936,16 @@ async def _openai_compat_text(
             _categorize_provider_http_error(provider_label, r.status_code, detail),
             raw=detail,
         )
+    payload = _scanner_response_json(r)
     try:
-        payload = r.json()
-        choice = payload["choices"][0]
-        content = str(choice["message"].get("content") or "")
+        choices = payload["choices"]
+        choice = choices[0]
+        message = choice["message"]
+        content = message["content"]
     except (KeyError, IndexError, TypeError) as e:
-        raise LlmError("Scanner response missing content") from e
+        raise LlmError("Scanner response missing content", raw=payload) from e
+    if not isinstance(choice, dict) or not isinstance(message, dict) or not isinstance(content, str):
+        raise LlmError("Scanner response missing content", raw=payload)
     elapsed_ms = (time.monotonic() - t0) * 1000
     _log_llm_metrics(
         provider=provider_label,
@@ -879,7 +955,8 @@ async def _openai_compat_text(
         payload=payload,
     )
     if not content.strip():
-        finish = choice.get("finish_reason") or "?"
+        finish_raw = choice.get("finish_reason")
+        finish = finish_raw if finish_raw in _KNOWN_FINISH_REASONS else "unknown"
         raise LlmError(
             f"Scanner ({provider_label}, {model}) returned EMPTY content "
             f"(finish_reason={finish}). For a reasoning model this usually means "
@@ -933,12 +1010,7 @@ def _parse_scan_or_raise(
             text, allowed_symbols=allowed, min_score=SCANNER_MIN_SCORE
         )
     except json.JSONDecodeError as e:
-        preview = (text or "")[:200].replace("\n", " ")
-        raise LlmError(
-            f"Scanner response is not valid JSON ({e}). Model {model} returned: "
-            f"{preview!r}",
-            raw=text,
-        ) from e
+        raise LlmError("Scanner response is not valid JSON", raw=text) from e
 
 
 async def scan_with_llm(
@@ -952,6 +1024,7 @@ async def scan_with_llm(
     into two balanced chunks, each screened separately, and the results merged
     (S2-02). Task 22's grounded rubric makes per-chunk scores absolute, so a
     cross-chunk merge stays calibrated."""
+    contexts = _scanner_contexts_for_transport(contexts)
     if not contexts:
         return [], "none"
 

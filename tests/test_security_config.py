@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -557,15 +558,25 @@ def test_llm_base_urls_allow_explicit_default_https_port():
     assert settings.openai_base_url == "https://api.openai.com:443/v1"
 
 
-def test_symbol_regex():
+def test_symbol_regex(monkeypatch):
     from app.security import SYMBOL_RE_HL, SYMBOL_RE_MEXC
+
+    monkeypatch.setattr(
+        "app.security.get_settings",
+        lambda: SimpleNamespace(exchange="hyperliquid"),
+    )
 
     assert SYMBOL_RE_MEXC.match("BTC_USDT")
     assert SYMBOL_RE_HL.match("BTC")
     assert SYMBOL_RE_HL.match("BTC_USDT")
+    assert SYMBOL_RE_HL.match("BTC_USDC")
+    assert not SYMBOL_RE_HL.match("BTC_PRIVATE")
+    assert not SYMBOL_RE_HL.match("BTC_USDT_EXTRA")
     assert not SYMBOL_RE_HL.match("../evil")
     with pytest.raises(HTTPException):
         normalize_symbol("not a symbol!!!")
+    with pytest.raises(HTTPException):
+        normalize_symbol("BTC_PRIVATE")
     # Active EXCHANGE from settings (default hyperliquid) → bare coin
     assert normalize_symbol("btc_usdt") in ("BTC", "BTC_USDT")
 
@@ -637,6 +648,68 @@ def test_csrf_cross_origin_mutating_blocked(monkeypatch):
     assert "cross-origin" in r.json()["detail"].lower()
     assert malformed.status_code == 403
     assert "cross-origin" in malformed.json()["detail"].lower()
+
+
+def test_every_mutating_api_route_requires_local_auth_except_first_setup():
+    from fastapi.routing import APIRoute
+
+    from app.main import app
+    from app.security import require_local_token
+
+    mutating_methods = {"POST", "PUT", "PATCH", "DELETE"}
+    first_setup_routes = {
+        ("/api/setup", "POST"),
+        ("/api/setup/test-provider", "POST"),
+    }
+    seen_setup_routes = set()
+    missing_auth = []
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/api/"):
+            continue
+        for method in route.methods & mutating_methods:
+            route_key = (route.path, method)
+            if route_key in first_setup_routes:
+                seen_setup_routes.add(route_key)
+                continue
+            dependencies = {dependency.call for dependency in route.dependant.dependencies}
+            if require_local_token not in dependencies:
+                missing_auth.append(route_key)
+
+    assert seen_setup_routes == first_setup_routes
+    assert missing_auth == []
+
+
+def test_every_sensitive_read_route_requires_local_auth():
+    from fastapi.routing import APIRoute
+
+    from app.main import app
+    from app.security import require_local_token
+
+    sensitive_reads = {
+        "/api/llm",
+        "/api/settings/llm",
+        "/api/account",
+        "/api/fills",
+        "/api/history",
+        "/api/journal",
+        "/api/journal/stats",
+        "/api/positions/alerts",
+        "/api/orders/open",
+    }
+    registered = {}
+    for route in app.routes:
+        if (
+            isinstance(route, APIRoute)
+            and route.path in sensitive_reads
+            and "GET" in route.methods
+        ):
+            registered[route.path] = {
+                dependency.call for dependency in route.dependant.dependencies
+            }
+
+    assert set(registered) == sensitive_reads
+    assert all(require_local_token in dependencies for dependencies in registered.values())
 
 
 def test_csrf_same_origin_and_no_origin_pass(monkeypatch):
@@ -735,6 +808,80 @@ async def test_private_api_fails_closed_for_unknown_or_non_ip_client(
 
     assert response.status_code == 403
     call_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_does_not_issue_auth_cookie_to_non_loopback_client(monkeypatch):
+    """A public dashboard GET must never bootstrap an off-loopback caller."""
+    import app.main as main
+
+    settings = SimpleNamespace(
+        default_symbol="BTC_USDT",
+        trading_enabled=False,
+        max_leverage=5,
+        exchange="mexc",
+        hl_testnet=False,
+        local_api_token="synthetic-local-token",
+    )
+    monkeypatch.setattr(main, "_setup_needed", lambda: False)
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/",
+            "raw_path": b"/",
+            "query_string": b"",
+            "headers": [(b"host", b"localhost:8787")],
+            "client": ("192.0.2.10", 12345),
+            "server": ("localhost", 8787),
+        }
+    )
+
+    response = await main.index(request)
+
+    cookie = response.headers.get("set-cookie", "")
+    assert "synthetic-local-token" not in cookie
+
+
+@pytest.mark.asyncio
+async def test_dashboard_still_issues_auth_cookie_to_loopback_client(monkeypatch):
+    """The normal local browser flow retains its HttpOnly credential cookie."""
+    import app.main as main
+
+    settings = SimpleNamespace(
+        default_symbol="BTC_USDT",
+        trading_enabled=False,
+        max_leverage=5,
+        exchange="mexc",
+        hl_testnet=False,
+        local_api_token="synthetic-local-token",
+    )
+    monkeypatch.setattr(main, "_setup_needed", lambda: False)
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/",
+            "raw_path": b"/",
+            "query_string": b"",
+            "headers": [(b"host", b"localhost:8787")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("localhost", 8787),
+        }
+    )
+
+    response = await main.index(request)
+
+    cookie = response.headers.get("set-cookie", "")
+    assert "local_auth=synthetic-local-token" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=strict" in cookie
 
 
 def test_resolved_llm_provider_falls_back_to_a_configured_one():
@@ -922,7 +1069,7 @@ def test_windows_env_acl_removes_explicit_grants_and_handles_literal_paths(tmp_p
         return run(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", without_modules)
-    restrict_env_permissions(p)
+    assert restrict_env_permissions(p) is True
     script = (
         "$ErrorActionPreference = 'Stop'; "
         "$acl = [System.IO.File]::GetAccessControl($env:TEST_ACL_PATH); "
@@ -958,7 +1105,7 @@ def test_windows_env_acl_failure_is_reported_without_raw_output(tmp_path, monkey
         builder.subprocess, "run",
         lambda *a, **kw: SimpleNamespace(returncode=1, stderr=b"untrusted-output"),
     )
-    builder.restrict_env_permissions(p)
+    assert builder.restrict_env_permissions(p) is False
     assert "Could not harden permissions" in caplog.text
     assert "rc=1" in caplog.text
     assert "untrusted-output" not in caplog.text

@@ -16,11 +16,23 @@
     return document.getElementById(id);
   }
 
+  /** Find an exact data-attribute value without interpolating untrusted values
+   *  into a CSS selector. Exchange symbols are data, not selector syntax. */
+  function findByDataValue(root, selector, attribute, value) {
+    const expected = String(value);
+    return Array.from(root.querySelectorAll(selector)).find(function (node) {
+      return node.getAttribute(attribute) === expected;
+    }) || null;
+  }
+
   let activeDialog = null;
   let dialogReturnFocus = null;
   let pendingDialogFocus = null;
   let dialogBackground = [];
   let confirmSubmitting = false;
+  let sizingRequestSeq = 0;
+  let llmSwitching = false;
+  let llmSwitchGeneration = 0;
 
   function dialogFocusables(modal) {
     return Array.from(modal.querySelectorAll(
@@ -84,6 +96,7 @@
   function confirmActionLabel() {
     const health = state.health || {};
     if (health.trading_enabled !== true) return "Trading is locked";
+    if (health.exchange_configured !== true) return "Exchange not ready";
     return health.exchange === "hyperliquid" && health.hl_testnet === true
       ? "Submit to testnet" : "Submit live order";
   }
@@ -95,17 +108,329 @@
   // `state.localToken` fallback is now api.js's module-level `_localToken`
   // (the former field was always "" at runtime, never assigned, now removed).
 
+  function cancelActionBusy() {
+    return Boolean(state._cancelBusy && Object.keys(state._cancelBusy).length);
+  }
+
+  function armActionBusy() {
+    return Boolean(
+      state.armBusy && Object.keys(state.armBusy).some(function (key) {
+        return state.armBusy[key] === true;
+      })
+    );
+  }
+
+  function automationActionBusy() {
+    return state.killswitchBusy || armActionBusy();
+  }
+
+  function moneyActionBusy() {
+    return state.orderBusy || state.closeBusy || state.slBusy ||
+      cancelActionBusy() || automationActionBusy();
+  }
+
+  function mutationOutcomeBlocksEntry() {
+    const unknown = state.mutationOutcomeUnknown;
+    return Boolean(
+      unknown && (
+        unknown.close || unknown.sl ||
+        (unknown.cancels && Object.keys(unknown.cancels).length)
+      )
+    );
+  }
+
+  function mutationHttpOutcomeUnknown(response) {
+    return Boolean(
+      response && (response.status === 408 || response.status >= 500)
+    );
+  }
+
+  function newUnknownOutcomeId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+  }
+
+  function readPersistedUnknownOutcomes(rawValue) {
+    try {
+      const raw = rawValue === undefined
+        ? localStorage.getItem(PERSIST.UNKNOWN_OUTCOMES) : rawValue;
+      if (!raw) return { version: 1, confirm: null, close: null, sl: null, cancels: {} };
+      const data = JSON.parse(raw);
+      if (!data || data.version !== 1 || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("invalid unknown-outcome schema");
+      }
+      const validId = function (value) {
+        return typeof value === "string" && value.length > 0 && value.length <= 100;
+      };
+      const cancels = {};
+      if (data.cancels && typeof data.cancels === "object" && !Array.isArray(data.cancels)) {
+        Object.keys(data.cancels).slice(0, 100).forEach(function (orderId) {
+          if (/^[1-9][0-9]*$/.test(orderId) && validId(data.cancels[orderId])) {
+            cancels[orderId] = data.cancels[orderId];
+          }
+        });
+      }
+      return {
+        version: 1,
+        confirm: validId(data.confirm) ? data.confirm : null,
+        close: validId(data.close) ? data.close : null,
+        sl: validId(data.sl) ? data.sl : null,
+        cancels: cancels,
+      };
+    } catch (_) {
+      return { version: 1, confirm: null, close: null, sl: null, cancels: {} };
+    }
+  }
+
+  function writePersistedUnknownOutcomes(data) {
+    try {
+      if (!data.confirm && !data.close && !data.sl && !Object.keys(data.cancels).length) {
+        localStorage.removeItem(PERSIST.UNKNOWN_OUTCOMES);
+      } else {
+        localStorage.setItem(PERSIST.UNKNOWN_OUTCOMES, JSON.stringify(data));
+      }
+    } catch (_) {}
+  }
+
+  function persistUnknownOutcome(kind, outcomeId, orderId) {
+    const data = readPersistedUnknownOutcomes();
+    if (kind === "cancel") data.cancels[String(orderId)] = outcomeId;
+    else data[kind] = outcomeId;
+    writePersistedUnknownOutcomes(data);
+  }
+
+  function clearPersistedUnknownOutcome(kind, outcomeId, orderId) {
+    const data = readPersistedUnknownOutcomes();
+    if (kind === "cancel") {
+      const key = String(orderId);
+      if (data.cancels[key] === outcomeId) delete data.cancels[key];
+    } else if (data[kind] === outcomeId) {
+      data[kind] = null;
+    }
+    writePersistedUnknownOutcomes(data);
+  }
+
+  function applyPersistedUnknownOutcomes(rawValue) {
+    const data = readPersistedUnknownOutcomes(rawValue);
+    let changed = false;
+    if (data.confirm && data.confirm !== state._confirmUnknownId) {
+      state.confirmOutcomeUnknown = true;
+      state._confirmUnknownId = data.confirm;
+      state._confirmUnknownAccountAfter = state._accountSeq || 0;
+      state._confirmUnknownOrdersAfter = state._ordersSeq || 0;
+      state._confirmUnknownAccountReady = false;
+      state._confirmUnknownOrdersReady = false;
+      changed = true;
+    }
+    ["close", "sl"].forEach(function (kind) {
+      const current = state.mutationOutcomeUnknown[kind];
+      if (!data[kind] || (current && current.id === data[kind])) return;
+      state.mutationOutcomeUnknown[kind] = {
+        id: data[kind],
+        accountAfter: state._accountSeq || 0,
+        ordersAfter: state._ordersSeq || 0,
+        accountReady: false,
+        ordersReady: false,
+      };
+      changed = true;
+    });
+    Object.keys(data.cancels).forEach(function (orderId) {
+      const current = state.mutationOutcomeUnknown.cancels[orderId];
+      if (current && current.id === data.cancels[orderId]) return;
+      state.mutationOutcomeUnknown.cancels[orderId] = {
+        id: data.cancels[orderId],
+        ordersAfter: state._ordersSeq || 0,
+      };
+      changed = true;
+    });
+    if (changed) refreshMoneyActionControls();
+    return changed;
+  }
+
+  function updateCancelOrderControls() {
+    const busy = moneyActionBusy();
+    document.querySelectorAll(".btn-cancel-order").forEach(function (button) {
+      const orderId = button.getAttribute("data-oid");
+      const ownBusy = Boolean(orderId && state._cancelBusy && state._cancelBusy[orderId]);
+      const ownUnknown = Boolean(
+        orderId && state.mutationOutcomeUnknown.cancels[orderId]
+      );
+      button.disabled = busy || ownUnknown;
+      button.setAttribute("aria-busy", ownBusy ? "true" : "false");
+      button.textContent = ownBusy ? "Cancelling…" : "Cancel";
+      if (ownUnknown) {
+        button.title = "Previous cancel outcome is unknown — waiting for open-order reconciliation";
+      } else {
+        button.removeAttribute("title");
+      }
+    });
+  }
+
   function updateOrderButtonsEnabled() {
     const btn = $("btn-send-order");
     if (!btn) return;
     const blocked = state.apiAllowed === false;
     const loading = !state.market;
-    btn.disabled = blocked || loading || state.orderBusy;
+    const exchangeNotReady = state.health &&
+      state.health.exchange_configured !== true;
+    const confirmationUnknown = state.confirmOutcomeUnknown === true;
+    const mutationUnknown = mutationOutcomeBlocksEntry();
+    const unknownOutcome = confirmationUnknown || mutationUnknown;
+    const otherMoneyActionBusy = state.closeBusy || state.slBusy ||
+      cancelActionBusy() || automationActionBusy();
+    btn.disabled = blocked || loading || exchangeNotReady || unknownOutcome ||
+      state.orderBusy || otherMoneyActionBusy;
     btn.title = loading ? "Market data for this symbol is required"
       : blocked
       ? "apiAllowed=false — API orders are disabled for this symbol"
+      : exchangeNotReady
+      ? "Exchange credentials are incomplete; order preview is unavailable"
+      : confirmationUnknown
+      ? "Previous confirmation outcome is unknown — waiting for account and order reconciliation"
+      : mutationUnknown
+      ? "Previous trade outcome is unknown — waiting for exchange-state reconciliation"
+      : otherMoneyActionBusy
+      ? "Another order or position action is in progress"
       : "Preview → Confirm";
     restoreDialogFocus();
+  }
+
+  function updateKillswitchControl() {
+    const button = $("btn-killswitch");
+    if (!button) return;
+    button.disabled = moneyActionBusy();
+    button.setAttribute("aria-busy", state.killswitchBusy ? "true" : "false");
+    button.textContent = state.killswitchBusy
+      ? "Disabling automation…" : "⏻ Disable all automation";
+  }
+
+  function refreshMoneyActionControls() {
+    updateOrderButtonsEnabled();
+    try {
+      if (state.account) renderPositions(state.account);
+    } catch (_) { /* best-effort UI */ }
+    updateCancelOrderControls();
+    updateKillswitchControl();
+  }
+
+  function markConfirmationOutcomeUnknown() {
+    const outcomeId = newUnknownOutcomeId();
+    state.confirmOutcomeUnknown = true;
+    state._confirmUnknownId = outcomeId;
+    state._confirmUnknownAccountAfter = state._accountSeq || 0;
+    state._confirmUnknownOrdersAfter = state._ordersSeq || 0;
+    state._confirmUnknownAccountReady = false;
+    state._confirmUnknownOrdersReady = false;
+    persistUnknownOutcome("confirm", outcomeId);
+    refreshMoneyActionControls();
+    void loadAccount();
+    void loadOpenOrders();
+    void loadHistory();
+  }
+
+  function markMutationOutcomeUnknown(kind, orderId) {
+    const unknown = state.mutationOutcomeUnknown;
+    const outcomeId = newUnknownOutcomeId();
+    if (kind === "cancel") {
+      unknown.cancels[String(orderId)] = {
+        id: outcomeId,
+        ordersAfter: state._ordersSeq || 0,
+      };
+    } else {
+      unknown[kind] = {
+        id: outcomeId,
+        accountAfter: state._accountSeq || 0,
+        ordersAfter: state._ordersSeq || 0,
+        accountReady: false,
+        ordersReady: false,
+      };
+    }
+    persistUnknownOutcome(kind, outcomeId, orderId);
+    refreshMoneyActionControls();
+    if (kind !== "cancel") void loadAccount();
+    void loadOpenOrders();
+    void loadHistory();
+  }
+
+  function accountReconciliationValid(data) {
+    return Boolean(
+      data && typeof data === "object" && !Array.isArray(data) &&
+      !data.error && Array.isArray(data.positions)
+    );
+  }
+
+  function ordersReconciliationValid(data) {
+    return Boolean(
+      data && typeof data === "object" && !Array.isArray(data) &&
+      !data.error && !data.stops_error &&
+      Array.isArray(data.orders) && Array.isArray(data.stop_orders)
+    );
+  }
+
+  function noteMutationReconciliation(resource, requestSeq, data) {
+    const unknown = state.mutationOutcomeUnknown;
+    const accountValid = resource === "account" && accountReconciliationValid(data);
+    const ordersValid = resource === "orders" && ordersReconciliationValid(data);
+    let cleared = false;
+    ["close", "sl"].forEach(function (kind) {
+      const item = unknown[kind];
+      if (!item) return;
+      if (accountValid && requestSeq > item.accountAfter) item.accountReady = true;
+      if (ordersValid && requestSeq > item.ordersAfter) item.ordersReady = true;
+      if (item.accountReady && item.ordersReady) {
+        clearPersistedUnknownOutcome(kind, item.id);
+        unknown[kind] = null;
+        cleared = true;
+      }
+    });
+    if (ordersValid) {
+      Object.keys(unknown.cancels).forEach(function (orderId) {
+        if (requestSeq > unknown.cancels[orderId].ordersAfter) {
+          clearPersistedUnknownOutcome(
+            "cancel", unknown.cancels[orderId].id, orderId
+          );
+          delete unknown.cancels[orderId];
+          cleared = true;
+        }
+      });
+    }
+    if (cleared) {
+      refreshMoneyActionControls();
+    }
+  }
+
+  function noteConfirmationReconciliation(resource, requestSeq, data) {
+    noteMutationReconciliation(resource, requestSeq, data);
+    if (state.confirmOutcomeUnknown !== true) return;
+    if (resource === "account") {
+      if (
+        requestSeq > state._confirmUnknownAccountAfter &&
+        accountReconciliationValid(data)
+      ) {
+        state._confirmUnknownAccountReady = true;
+      }
+    } else if (resource === "orders") {
+      if (
+        requestSeq > state._confirmUnknownOrdersAfter &&
+        ordersReconciliationValid(data)
+      ) {
+        state._confirmUnknownOrdersReady = true;
+      }
+    }
+    if (
+      state._confirmUnknownAccountReady && state._confirmUnknownOrdersReady
+    ) {
+      clearPersistedUnknownOutcome("confirm", state._confirmUnknownId);
+      state.confirmOutcomeUnknown = false;
+      state._confirmUnknownId = null;
+      refreshMoneyActionControls();
+      showToast(
+        "Exchange state refreshed — review positions and open orders before creating another order.",
+        "warn"
+      );
+    }
   }
 
   // A3-01: fmt, fmtPct, toChartTime moved to utils.js (pure format helpers,
@@ -809,6 +1134,18 @@
     });
   }
 
+  function currentExchangeId() {
+    const healthExchange = state.health && state.health.exchange;
+    if (typeof healthExchange === "string" && healthExchange.trim()) {
+      return healthExchange.trim().toLowerCase();
+    }
+    const label = $("exchange-label");
+    const renderedExchange = label && label.dataset
+      ? label.dataset.exchange : "";
+    return typeof renderedExchange === "string"
+      ? renderedExchange.trim().toLowerCase() : "";
+  }
+
   /** Symbol equality. On Hyperliquid, positions/orders/WS ticks carry a bare
    *  base coin ("BTC") while state.symbol may be the full pair ("BTC_USDC"),
    *  so HL compares base-coin-only (ca.split("_")[0]).
@@ -825,14 +1162,7 @@
     const na = String(a || "").toUpperCase();
     const nb = String(b || "").toUpperCase();
     if (na === "" || nb === "") return false;
-    let ex = state.health && state.health.exchange;
-    if (!ex) {
-      // /api/health not loaded yet: seed the exchange from the server-rendered
-      // label so HL positions (bare base-coin symbols like "BTC") aren't
-      // transiently hidden by the full-string fallback on first paint (audit F4).
-      const lbl = $("exchange-label");
-      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
-    }
+    const ex = currentExchangeId();
     const isHyperliquid = ex === "hyperliquid";
     return symbolsMatch(na, nb, isHyperliquid);
   }
@@ -841,12 +1171,7 @@
    *  round-trip folding of fills is HL-only for now (MEXC stays Stufe 2/out
    *  of scope per the task brief), gated on this instead of hardcoding. */
   function isHlExchange() {
-    let ex = state.health && state.health.exchange;
-    if (!ex) {
-      const lbl = $("exchange-label");
-      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
-    }
-    return ex === "hyperliquid";
+    return currentExchangeId() === "hyperliquid";
   }
 
   /** Canonical key for state.tradeMarkers (A3-01). MUST resolve to the same
@@ -860,12 +1185,7 @@
   function markerKey(sym) {
     const s = String(sym || "").toUpperCase().trim();
     if (!s) return "";
-    let ex = state.health && state.health.exchange;
-    if (!ex) {
-      // /api/health not loaded yet: same DOM fallback as symMatch (audit F4).
-      const lbl = $("exchange-label");
-      ex = lbl ? lbl.textContent.trim().toLowerCase() : "";
-    }
+    const ex = currentExchangeId();
     return ex === "hyperliquid" ? s.split("_")[0] : s;
   }
 
@@ -1286,9 +1606,8 @@
             " — close the position now. Monitoring works only while the browser is open.",
           "err"
         );
-        const banner = document.querySelector(
-          '.pos-cockpit[data-sym="' + key + '"] .cp-sl-status'
-        );
+        const card = findByDataValue(document, ".pos-cockpit", "data-sym", key);
+        const banner = card ? card.querySelector(".cp-sl-status") : null;
         if (banner) banner.classList.add("cp-sl-alarm");
         // E3-06 reconciliation: a touch may mean the exchange SL (or the trader
         // on another device) just closed the position. Pull a fresh account
@@ -1302,9 +1621,8 @@
         }
       } else if (!touched) {
         state.slAlarm[key] = false;
-        const banner = document.querySelector(
-          '.pos-cockpit[data-sym="' + key + '"] .cp-sl-status'
-        );
+        const card = findByDataValue(document, ".pos-cockpit", "data-sym", key);
+        const banner = card ? card.querySelector(".cp-sl-status") : null;
         if (banner) banner.classList.remove("cp-sl-alarm");
       }
     });
@@ -1916,6 +2234,7 @@
       if (!res.ok) throw new Error("health " + res.status);
       const h = await res.json();
       state.health = h;
+      updateOrderButtonsEnabled();
       // Health is the authoritative exchange identity. Re-sync once it lands
       // so a server-rendered/default LIMIT cannot remain selectable on HL.
       try { syncTicketSegments(); } catch (_) {}
@@ -1924,21 +2243,28 @@
       if (arm) {
         arm.classList.toggle("armed", h.trading_enabled === true);
         const t = arm.querySelector(".arm-text");
-        if (t) t.textContent = h.trading_enabled ? "LIVE" : "DISARMED";
+        if (t) t.textContent = tradingStatusLabel(h);
       }
       // W3-01: red MAINNET · ECHTGELD chip — visible only when armed AND on
       // mainnet (live_trading = trading_enabled && not testnet, from health).
       const mainnetChip = $("mainnet-chip");
       if (mainnetChip) mainnetChip.hidden = h.live_trading !== true;
       try { renderInstrumentRail(); } catch (_) {}
+      document.querySelectorAll(".cp-reeval-btn").forEach(function (button) {
+        const allowed = canReviewPosition(h);
+        const key = button.getAttribute("data-reeval-key") || "";
+        button.disabled = Boolean(key && state.reevalBusy[key]);
+        button.setAttribute("aria-disabled", allowed ? "false" : "true");
+        button.title = allowed
+          ? "Request an advisory AI review of this open position"
+          : "External position review requires INCLUDE_ACCOUNT_IN_LLM=true; alternatively select local Ollama";
+      });
 
       // Active-exchange LED + label (works for hyperliquid AND mexc)
       setDot($("dot-exchange"), !!h.exchange_configured);
       const exLabel = $("exchange-label");
       if (exLabel) {
-        exLabel.textContent =
-          String(h.exchange || "?").toUpperCase() +
-          (h.hl_testnet ? " (TESTNET)" : "");
+        exLabel.textContent = exchangeNetworkLabel(h);
       }
       const llmOk = !!(h.llm_configured || h.claude_configured || h.xai_configured);
       setDot($("dot-xai"), llmOk);
@@ -2240,6 +2566,31 @@
     return String(symbol || "").toUpperCase() + "|" + String(side || "").toLowerCase();
   }
 
+  function _knownArmedRules(key) {
+    if (state.positionMgmtKnown !== true) return null;
+    const mgmt = state.positionMgmt[key];
+    if (!mgmt || !mgmt.armed_rules || typeof mgmt.armed_rules !== "object" ||
+        Array.isArray(mgmt.armed_rules)) return null;
+    const rules = mgmt.armed_rules;
+    const keys = Object.keys(rules);
+    if (keys.some(function (name) {
+      return (name !== "auto_be" && name !== "auto_trail") ||
+        typeof rules[name] !== "boolean";
+    })) return null;
+    return {
+      auto_be: rules.auto_be === true,
+      auto_trail: rules.auto_trail === true,
+    };
+  }
+
+  function _unknownArmButton(label) {
+    return (
+      '<button type="button" class="cp-arm-btn cp-arm-disabled" disabled ' +
+      'aria-busy="false" title="Automation status is unavailable; wait for a successful refresh">' +
+      "⚡ " + label + ": Unknown</button>"
+    );
+  }
+
   /** Task 7: ⚡ Auto-BE arming toggle for ONE position — HL-only (auto-BE is
    *  an autonomous stop-move the server only ever executes on Hyperliquid,
    *  mirroring modify_stop_loss's own HL gate). On any other exchange the
@@ -2261,15 +2612,18 @@
       );
     }
     const key = _mgmtKey(symbol, sideVal);
-    const mgmt = state.positionMgmt[key];
-    const armed = !!(mgmt && mgmt.armed_rules && mgmt.armed_rules.auto_be);
-    const busy = !!state.armBusy[key];
+    const rules = _knownArmedRules(key);
+    if (!rules) return _unknownArmButton("Auto-BE");
+    const armed = rules.auto_be;
+    const ownBusy = state.armBusy[key] === true;
+    const busy = ownBusy || state.killswitchBusy || moneyActionBusy();
     return (
       '<button type="button" class="cp-arm-btn' + (armed ? " cp-arm-active" : "") + '"' +
       ' data-action="arm-be" data-armed="' + (armed ? "1" : "0") + '"' +
+      ' aria-busy="' + (ownBusy ? "true" : "false") + '"' +
       (busy ? " disabled" : "") +
       ' title="Auto break-even moves the stop to break-even after the position reaches +1R. The server performs the action; this switch only enables or disables it.">' +
-      "⚡ Auto-BE: " + (armed ? "On" : "Off") +
+      (ownBusy ? "Updating Auto-BE…" : "⚡ Auto-BE: " + (armed ? "On" : "Off")) +
       "</button>"
     );
   }
@@ -2291,15 +2645,18 @@
       );
     }
     const key = _mgmtKey(symbol, sideVal);
-    const mgmt = state.positionMgmt[key];
-    const armed = !!(mgmt && mgmt.armed_rules && mgmt.armed_rules.auto_trail);
-    const busy = !!state.armBusy[key];
+    const rules = _knownArmedRules(key);
+    if (!rules) return _unknownArmButton("Trail");
+    const armed = rules.auto_trail;
+    const ownBusy = state.armBusy[key] === true;
+    const busy = ownBusy || state.killswitchBusy || moneyActionBusy();
     return (
       '<button type="button" class="cp-arm-btn cp-arm-trail-btn' + (armed ? " cp-arm-trail-active" : "") + '"' +
       ' data-action="arm-trail" data-armed="' + (armed ? "1" : "0") + '"' +
+      ' aria-busy="' + (ownBusy ? "true" : "false") + '"' +
       (busy ? " disabled" : "") +
       ' title="Auto-trailing follows an ATR chandelier after the activation R is reached. The server performs the action; this switch only enables or disables it.">' +
-      "⚡ Trail: " + (armed ? "On" : "Off") +
+      (ownBusy ? "Updating Trail…" : "⚡ Trail: " + (armed ? "On" : "Off")) +
       "</button>"
     );
   }
@@ -2343,9 +2700,8 @@
     // an enlarged position (add-on: hold_vol=20, old stop vol=10) no longer
     // reads as "voll geschützt". Units are consistent per exchange: MEXC's
     // hold_vol and stop `vol` are BOTH contracts; HL's hold_vol is coins and its
-    // trigger rows carry NO top-level vol/sz/quantity → the sum stays
-    // unreadable and the conservative fallback keeps the prior "protected"
-    // display (never a false partial-coverage alarm).
+    // trigger rows may carry no top-level vol/sz/quantity. That is UNKNOWN
+    // coverage and must stay visually distinct from both full and partial.
     let slVol = 0;
     let slVolAllReadable = true;
     let sawSlOrder = false;
@@ -2373,14 +2729,15 @@
     let manual = false;
     if (sl == null && mk.sl != null) { sl = mk.sl; manual = mk.manual; }
     if (tp == null && mk.tp != null) tp = mk.tp;
-    // Coverage verdict — CONSERVATIVE: only assert under-coverage when the SL
-    // came from exchange orders whose sizes were ALL readable. A manual-marker
-    // SL (no exchange size), an unreadable size, or an unknown hold_vol all fall
-    // through to slCovered=true (keep the prior "protected" behavior — no new
-    // false alarm), while never falsely GUARANTEEING full coverage.
+    // Tri-state coverage: true=full, false=proven partial, null=unknown.
+    // An existing stop without comparable positive sizes is still real, but it
+    // must never receive the green full-coverage treatment.
     const holdVol = Number(p.hold_vol);
-    let slCovered = true;
-    if (sawSlOrder && slVolAllReadable) {
+    let slCovered = null;
+    if (
+      sawSlOrder && slVolAllReadable &&
+      Number.isFinite(holdVol) && holdVol > 0
+    ) {
       slCovered = slCoverageCovered(slVol, holdVol);
     }
     return {
@@ -2439,6 +2796,13 @@
           " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
         );
       }
+      if (prot.slCovered !== true) {
+        return (
+          '<div class="cp-sl-status cp-sl-unknown cp-sl-coverage-unknown">⚠ SL COVERAGE UNKNOWN · SL ' +
+          fmt(prot.sl, 4) +
+          " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
+        );
+      }
       return (
         '<div class="cp-sl-status cp-sl-ok">🛡 Stop-Loss ' + fmt(prot.sl, 4) +
         " (" + (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)" + tp + "</div>"
@@ -2473,8 +2837,7 @@
     }
     const exEl = $("ir-exchange");
     if (exEl) {
-      exEl.textContent =
-        String(h.exchange || "—").toUpperCase() + (h.hl_testnet ? " · TESTNET" : "");
+      exEl.textContent = exchangeNetworkLabel(h);
     }
     const acct = state.account || {};
     const eqEl = $("ir-equity");
@@ -2525,6 +2888,11 @@
     let protHtml;
     if (prot.sl != null && prot.manual) {
       protHtml = '<span class="ir-shield warn">SL MANUAL ' + fmt(prot.sl, 4) + "</span>";
+    } else if (prot.sl != null && prot.slCovered === false) {
+      protHtml = '<span class="ir-shield danger">⚠ PARTIAL SL ' +
+        fmt(prot.slVol, 4) + "/" + fmt(prot.holdVol, 4) + "</span>";
+    } else if (prot.sl != null && prot.slCovered !== true) {
+      protHtml = '<span class="ir-shield warn">⚠ SL COVERAGE UNKNOWN</span>';
     } else if (prot.sl != null) {
       protHtml = '<span class="ir-shield ok">🛡 SL ' + fmt(prot.sl, 4) + "</span>";
     } else if (!prot.ordersKnown) {
@@ -2877,6 +3245,7 @@
     const slHtml = slStatusBanner(p);
     const reevalHtml = reevalResultHtml(p.symbol, sideVal);
     const reevalKey = _reevalKey(p.symbol, sideVal);
+    const reevalAllowed = canReviewPosition(state.health);
     // Task 7: ⚡ Auto-BE arming toggle — computed once, reused for BOTH the
     // HTML and the fingerprint (same discipline as slHtml/reevalHtml above)
     // so the button can never drift from what the fp hashed.
@@ -2884,25 +3253,38 @@
     // TML v2 (Task V5): ⚡ Auto-Trail arming toggle — same "compute once, reuse
     // for HTML + fp" discipline as armHtml right above.
     const armTrailHtml = _armTrailToggleHtml(p.symbol, sideVal);
+    const positionActionBusy = moneyActionBusy();
+    const stopOutcomeUnknown = Boolean(state.mutationOutcomeUnknown.sl);
+    const closeOutcomeUnknown = Boolean(state.mutationOutcomeUnknown.close);
+    const stopActionDisabled = positionActionBusy || stopOutcomeUnknown
+      ? " disabled" : "";
+    const closeActionDisabled = positionActionBusy || closeOutcomeUnknown
+      ? " disabled" : "";
+    const stopActionTitle = stopOutcomeUnknown
+      ? "Previous stop outcome is unknown; waiting for position and order reconciliation"
+      : "Move stop-loss to a new price";
+    const closeActionTitle = closeOutcomeUnknown
+      ? "Previous close outcome is unknown; waiting for position and order reconciliation"
+      : "Close this share of the position";
     // N3-09: the actions row always carries the inline SL-editor (✎ SL) so a
     // stop can be dragged to ANY price from the card; the BE button rides
     // along only when a break-even price is computable. data-be is included
     // only when present (the fp above still folds bePrice in either way).
     const beBtn =
       bePrice != null
-        ? '<button type="button" class="cp-be-btn" data-action="be" title="Move stop-loss to fee-adjusted break-even; replaces the existing stop">SL → Break-even</button>'
+        ? '<button type="button" class="cp-be-btn" data-action="be"' + stopActionDisabled + ' title="Move stop-loss to fee-adjusted break-even; replaces the existing stop">SL → Break-even</button>'
         : "";
     const beRow =
-      '<div class="cp-actions"' + _posDataAttrs(p, sideVal, posCs) +
+      '<div class="cp-actions" aria-busy="' + (state.slBusy ? "true" : "false") + '"' + _posDataAttrs(p, sideVal, posCs) +
       (bePrice != null ? ' data-be="' + escapeHtml(String(bePrice)) + '"' : "") + ">" +
-      '<span class="cp-actions-label">Stop</span>' +
+      '<span class="cp-actions-label">' + (state.slBusy ? "Updating stop…" : "Stop") + "</span>" +
       beBtn +
-      '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit" title="Move stop-loss to a new price">✎ SL</button>' +
+      '<button type="button" class="cp-sl-edit-btn" data-action="sl-edit"' + stopActionDisabled + ' title="' + stopActionTitle + '">✎ SL</button>' +
       armHtml +
       armTrailHtml +
       '<span class="cp-sl-edit hidden">' +
-      '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL price" aria-label="New stop-loss price" />' +
-      '<button type="button" class="cp-sl-set-btn" data-action="sl-set">Set</button>' +
+      '<input type="number" class="cp-sl-input" step="any" inputmode="decimal" placeholder="SL price" aria-label="New stop-loss price"' + stopActionDisabled + " />" +
+      '<button type="button" class="cp-sl-set-btn" data-action="sl-set"' + stopActionDisabled + ">Set</button>" +
       '<button type="button" class="cp-sl-cancel-btn" data-action="sl-edit-cancel" title="Cancel" aria-label="Cancel">✕</button>' +
       "</span>" +
       "</div>";
@@ -2921,7 +3303,12 @@
         fmt(p.liquidate_price, 6),
         String(posCs), notional != null ? fmt(notional, 0) : "-",
         bePrice != null ? String(bePrice) : "-",
-        slHtml, reevalHtml, armHtml, armTrailHtml, isActive ? "A" : "-",
+        slHtml, reevalHtml, armHtml, armTrailHtml,
+        reevalAllowed ? "R" : "-", isActive ? "A" : "-",
+        state.orderBusy ? "O" : "-", state.closeBusy ? "C" : "-",
+        state.slBusy ? "S" : "-", cancelActionBusy() ? "X" : "-",
+        automationActionBusy() ? "M" : "-",
+        closeOutcomeUnknown ? "UC" : "-", stopOutcomeUnknown ? "US" : "-",
       ].join("")
     );
     const html =
@@ -2958,15 +3345,20 @@
       _cpCell("Margin", p.im != null ? fmt(p.im, 2) + " " + ccy() : "—") +
       "</div>" +
       beRow +
-      '<div class="cp-close" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
-      '<span class="cp-close-label">Close</span>' +
-      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.25">25%</button>' +
-      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.5">50%</button>' +
-      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.75">75%</button>' +
-      '<button type="button" class="cp-close-btn cp-close-full" data-action="close-frac" data-frac="1">100%</button>' +
+      '<div class="cp-close" aria-busy="' + (state.closeBusy ? "true" : "false") + '" ' + _posDataAttrs(p, sideVal, posCs) + ">" +
+      '<span class="cp-close-label">' + (state.closeBusy ? "Closing…" : "Close") + "</span>" +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.25"' + closeActionDisabled + ' title="' + closeActionTitle + '">25%</button>' +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.5"' + closeActionDisabled + ' title="' + closeActionTitle + '">50%</button>' +
+      '<button type="button" class="cp-close-btn" data-action="close-frac" data-frac="0.75"' + closeActionDisabled + ' title="' + closeActionTitle + '">75%</button>' +
+      '<button type="button" class="cp-close-btn cp-close-full" data-action="close-frac" data-frac="1"' + closeActionDisabled + ' title="' + closeActionTitle + '">100%</button>' +
       "</div>" +
       '<div class="cp-reeval">' +
-      '<button type="button" class="cp-reeval-btn" data-action="reeval" data-sym="' +
+      '<button type="button" class="cp-reeval-btn"' +
+      ' aria-disabled="' + (reevalAllowed ? "false" : "true") + '"' +
+      ' title="' + (reevalAllowed
+        ? "Request an advisory AI review of this open position"
+        : "External position review requires INCLUDE_ACCOUNT_IN_LLM=true; alternatively select local Ollama") +
+      '" data-action="reeval" data-sym="' +
       escapeHtml(String(p.symbol || "")) + '" data-side="' + sideVal +
       '" data-reeval-key="' + reevalKey + '">AI: Review position</button>' +
       '<div class="cp-reeval-result" data-reeval-key="' + reevalKey + '">' +
@@ -3216,6 +3608,18 @@
     }
   }
 
+  /** CSS class for the server-validated action. Keep the DOM boundary closed
+   *  even if a proxy/test double returns a value outside ReevaluateAction. */
+  function _reevalActionClass(action) {
+    switch (String(action || "").toUpperCase()) {
+      case "HOLD": return "reeval-action-hold";
+      case "MOVE_SL_BE": return "reeval-action-move_sl_be";
+      case "PARTIAL_CLOSE": return "reeval-action-partial_close";
+      case "CLOSE": return "reeval-action-close";
+      default: return "reeval-action-unknown";
+    }
+  }
+
   function _reevalConfCls(conf) {
     const c = String(conf || "").toLowerCase();
     return c === "high" ? "conf-high" : c === "medium" ? "conf-med" : "conf-low";
@@ -3303,7 +3707,7 @@
       return '<div class="cp-reeval-out cp-reeval-error">' + escapeHtml(text) + "</div>";
     }
     const r = entry.reevaluation || {};
-    const actionCls = "reeval-action-" + String(r.action || "").toLowerCase();
+    const actionCls = _reevalActionClass(r.action);
     let html =
       '<div class="cp-reeval-out">' +
       '<div class="cp-reeval-head">' +
@@ -3344,6 +3748,13 @@
    *  Advisory only — never places, moves or closes anything itself. Guards
    *  against double-click/race per position via state.reevalBusy. */
   async function runReevaluate(sym, side) {
+    if (!canReviewPosition(state.health)) {
+      showToast(
+        "Position review requires INCLUDE_ACCOUNT_IN_LLM=true for external AI, or local Ollama.",
+        "warn"
+      );
+      return;
+    }
     const symbolKey = String(sym || "").toUpperCase().trim();
     const sideKey = String(side || "").toLowerCase().trim();
     const key = _reevalKey(symbolKey, sideKey);
@@ -3363,8 +3774,12 @@
       return true;
     }
 
-    const btn = document.querySelector('.cp-reeval-btn[data-reeval-key="' + key + '"]');
-    const out = document.querySelector('.cp-reeval-result[data-reeval-key="' + key + '"]');
+    const btn = findByDataValue(
+      document, ".cp-reeval-btn", "data-reeval-key", key
+    );
+    const out = findByDataValue(
+      document, ".cp-reeval-result", "data-reeval-key", key
+    );
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Reviewing…";
@@ -3406,16 +3821,24 @@
       state.reevalBusy[key] = false;
       // Re-render just this card's result block; a full renderPositions()
       // would be fine too, but this avoids reshuffling the whole panel.
-      const out2 = document.querySelector('.cp-reeval-result[data-reeval-key="' + key + '"]');
+      const out2 = findByDataValue(
+        document, ".cp-reeval-result", "data-reeval-key", key
+      );
       if (out2) {
         // The card's "KI wechseln" button (if this result is a provider error)
         // is handled by the #positions-body delegated listener — no per-element
         // wiring needed here anymore (T34).
         out2.innerHTML = reevalResultHtml(symbolKey, sideKey);
       }
-      const btn2 = document.querySelector('.cp-reeval-btn[data-reeval-key="' + key + '"]');
+      const btn2 = findByDataValue(
+        document, ".cp-reeval-btn", "data-reeval-key", key
+      );
       if (btn2) {
         btn2.disabled = false;
+        btn2.setAttribute(
+          "aria-disabled",
+          canReviewPosition(state.health) ? "false" : "true"
+        );
         btn2.textContent = "AI: Review position";
       }
     }
@@ -3519,12 +3942,14 @@
         return data;
       }
       state.openOrders = data;
+      noteConfirmationReconciliation("orders", reqSeq, data);
       drawOrderLines(); // these already filter to the active symbol internally
       drawTradeZones();
       // Refresh the position cockpit so its SL-status chip reflects the freshly
       // loaded trigger orders (protected vs. unprotected).
       if (state.account) {
         try { renderPositions(state.account); } catch (_) {}
+        try { renderInstrumentRail(); } catch (_) {}
       }
       if (!el) return data;
       const allOrders = data.orders || [];
@@ -3644,6 +4069,7 @@
         ? '<p class="muted">Protective orders are currently unavailable · status unknown</p>'
         : "";
       el.innerHTML = stopsWarning + ordersHtml + stopsHtml + otherHtml;
+      updateCancelOrderControls();
       el.querySelectorAll(".btn-cancel-order:not(.btn-cancel-trigger)").forEach(function (btn) {
         btn.addEventListener("click", function () {
           cancelOrder(btn.getAttribute("data-oid"));
@@ -3674,11 +4100,20 @@
 
   async function cancelOrder(orderId) {
     if (!orderId) return;
-    // Per-order double-submit guard: a double-click must not fire two cancels
-    // for the same order (F6). Keyed by id so distinct orders still cancel.
+    if (state.mutationOutcomeUnknown.cancels[String(orderId)]) {
+      showToast(
+        "Previous cancel outcome is unknown. Wait for fresh open-order data before retrying.",
+        "err"
+      );
+      return;
+    }
+    // All explicit exchange mutations are mutually exclusive in the client.
+    // The server trade lock remains authoritative; this guard prevents the UI
+    // from silently queuing another money action behind it.
     if (!state._cancelBusy) state._cancelBusy = {};
-    if (state._cancelBusy[orderId]) return;
+    if (moneyActionBusy()) return;
     state._cancelBusy[orderId] = true;
+    refreshMoneyActionControls();
     try {
       const res = await apiFetch("/api/orders/cancel", {
         method: "POST",
@@ -3691,18 +4126,59 @@
       const data = await res.json().catch(function () {
         return {};
       });
+      if (mutationHttpOutcomeUnknown(res)) {
+        showToast(
+          "⚠ Cancel outcome unknown after server error — the order may already be cancelled. " +
+            "Check open orders on the exchange; do not retry blindly.",
+          "err"
+        );
+        markMutationOutcomeUnknown("cancel", orderId);
+        return;
+      }
       if (!res.ok) {
         showToast(detailToText(data.detail || data), "err");
         return;
       }
-      showToast("Cancel request sent", data.ok === false ? "err" : "ok");
+      const response = data && data.response;
+      const responseValid = Array.isArray(response)
+        ? response.length > 0
+        : Boolean(response && typeof response === "object" && Object.keys(response).length);
+      const warningsValid = data && (
+        data.warnings === undefined ||
+        (Array.isArray(data.warnings) && data.warnings.every(function (item) {
+          return typeof item === "string";
+        }))
+      );
+      if (!data || data.ok !== true || !responseValid || !warningsValid) {
+        showToast(
+          "⚠ Cancel outcome unknown — check open orders on the exchange before " +
+            "acting again. Do not retry blindly.",
+          "err"
+        );
+        markMutationOutcomeUnknown("cancel", orderId);
+        return;
+      }
+      const warnings = data.warnings || [];
+      showToast(
+        warnings.length
+          ? "ORDER CANCELLED, BUT LOCAL RECORDING IS INCOMPLETE. Verify open " +
+            "orders on the exchange before acting again."
+          : "Order cancelled",
+        warnings.length ? "err" : "ok"
+      );
       loadOpenOrders();
       loadAccount();
       loadHistory();
     } catch (err) {
-      showToast("Cancel failed: " + (err && err.message), "err");
+      showToast(
+        "⚠ Response lost — the order may already be cancelled. Check open orders " +
+          "on the exchange; do not retry blindly.",
+        "err"
+      );
+      markMutationOutcomeUnknown("cancel", orderId);
     } finally {
       delete state._cancelBusy[orderId];
+      refreshMoneyActionControls();
     }
   }
 
@@ -3712,6 +4188,7 @@
    *  UNPROTECTED. There is no send without this confirm. */
   function cancelTriggerOrder(orderId, isSl) {
     if (!orderId) return;
+    if (moneyActionBusy()) return;
     const text = isSl
       ? "Cancel stop-loss #" + orderId + "?\n\n" +
         "This will leave the position UNPROTECTED. Continue?"
@@ -3799,6 +4276,8 @@
   }
 
   async function _loadAccountOnce() {
+    const reqSeq = (state._accountSeq || 0) + 1;
+    state._accountSeq = reqSeq;
     let data;
     try {
       const res = await apiFetch("/api/account");
@@ -3858,6 +4337,7 @@
     } catch (e) {
       console.error("account draw", e);
     }
+    noteConfirmationReconciliation("account", reqSeq, data);
     return data;
   }
 
@@ -3887,6 +4367,11 @@
       }
       const data = await res.json();
       if (reqSeq !== state._fillsSeq) return null; // superseded by a newer call
+      if (!isValidFillsResponse(data)) {
+        console.warn("invalid fills response, keeping last history");
+        warnFillsStale();
+        return data;
+      }
       if (data.error) {
         console.warn("fills soft-error, keeping last history:", data.error);
         warnFillsStale();
@@ -3903,7 +4388,7 @@
       // invalid numeric fields could poison VWAP/round-trip totals with 0/NaN/
       // Infinity. Drop the whole row when its trade identity is not provable.
       const fillsNow = Date.now();
-      state.fills = data.supported && Array.isArray(data.fills)
+      state.fills = data.supported
         ? data.fills.map(function (fill) {
           return normalizeFillRecord(fill, fillsNow);
         }).filter(function (fill) { return fill != null; })
@@ -4481,19 +4966,26 @@
     });
   }
 
+  /** Keep visual and assistive state aligned for ticket segmented controls. */
+  function syncSegmentButtons(selector, attribute, selected) {
+    document.querySelectorAll(selector).forEach(function (button) {
+      const active = button.getAttribute(attribute) === selected;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+  }
+
   function setSltpMode(mode) {
     const prevMode = sltpMode();
     const nextMode = mode === "pct" ? "pct" : "price";
     convertSltpFieldsOnModeSwitch(prevMode, nextMode);
     state.sltpMode = nextMode;
-    document.querySelectorAll(".sltp-mode-btn").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-mode") === state.sltpMode);
-    });
+    syncSegmentButtons(".sltp-mode-btn", "data-mode", state.sltpMode);
     const sl = $("ticket-sl");
     const tp = $("ticket-tp1");
     if (state.sltpMode === "pct") {
-      if (sl) sl.placeholder = "Abstand in %";
-      if (tp) tp.placeholder = "Abstand in %";
+      if (sl) sl.placeholder = "Distance in %";
+      if (tp) tp.placeholder = "Distance in %";
     } else {
       if (sl) sl.placeholder = "Price";
       if (tp) tp.placeholder = "Price";
@@ -4551,9 +5043,7 @@
     }
     state.sizeMode = next;
     try { localStorage.setItem(PERSIST.SIZE_MODE, next); } catch (_) {}
-    document.querySelectorAll(".size-mode-btn").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-size-mode") === next);
-    });
+    syncSegmentButtons(".size-mode-btn", "data-size-mode", next);
     const lbl = $("size-mode-label");
     if (lbl) lbl.textContent = (next === "margin" ? "Margin (" : "Size (") + ccy() + ")";
     updateRiskReadout();
@@ -4888,7 +5378,21 @@
     }
   }
 
+  function sizingRequestFingerprint(ticket, riskPct, mode) {
+    return JSON.stringify({
+      ticket: Object.assign({}, ticket, { risk_pct: riskPct }),
+      size_mode: mode,
+    });
+  }
+
+  function sizingRequestIsCurrent(sequence, fingerprint) {
+    return sequence === sizingRequestSeq && fingerprint === sizingRequestFingerprint(
+      readTicket(), maxRiskPct(), sizeMode()
+    );
+  }
+
   async function suggestVol() {
+    const requestSeq = ++sizingRequestSeq;
     setTicketError("");
     const ticket = readTicket();
     // Symbol at request time; compared against the active symbol when the
@@ -4910,11 +5414,14 @@
       }
     }
     const rp = maxRiskPct();
+    const requestMode = sizeMode();
+    const requestFingerprint = sizingRequestFingerprint(ticket, rp, requestMode);
+    const requestPayload = Object.assign({}, ticket, { risk_pct: rp });
     try {
       const res = await apiFetch("/api/sizing/suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({}, ticket, { risk_pct: rp })),
+        body: JSON.stringify(requestPayload),
       });
       const data = await res.json().catch(function () {
         return {};
@@ -4926,6 +5433,7 @@
         // the stale result instead of writing it into the new ticket.
         return;
       }
+      if (!sizingRequestIsCurrent(requestSeq, requestFingerprint)) return;
       if (!res.ok) {
         setTicketError(detailToText(data.detail || data));
         return;
@@ -4941,7 +5449,7 @@
       const usdtEl = $("ticket-usdt");
       if (usdtEl && data.notional_usdt != null) {
         let val = data.notional_usdt;
-        if (sizeMode() === "margin") {
+        if (requestMode === "margin") {
           // T3-04: no "|| 1" fallback — writing full notional as margin when
           // leverage is missing/invalid would oversize up to Nx once the
           // user later fills in the real leverage.
@@ -4962,6 +5470,7 @@
         "ok"
       );
     } catch (err) {
+      if (!sizingRequestIsCurrent(requestSeq, requestFingerprint)) return;
       setTicketError(err && err.message ? err.message : String(err));
     }
   }
@@ -6057,40 +6566,74 @@
     }
   }
 
-  /** TML v2 (Task V5): read the CURRENT server-truth armed_rules for one
-   *  position (from the last alerts poll) and return a FULL rules object with
-   *  `patch` applied on top — always real booleans for BOTH known rule names.
-   *  CRITICAL: POST /api/positions/arm's `set_armed_rules` REPLACES the whole
-   *  armed_rules dict server-side (it does not merge), so every arm request
-   *  from the UI must carry the complete desired state, not just the rule the
-   *  user just clicked — otherwise toggling Trail would silently wipe an
-   *  already-armed Auto-BE (and vice-versa). */
-  function _mergedArmedRules(key, patch) {
-    const mgmt = state.positionMgmt[key];
-    const current = (mgmt && mgmt.armed_rules) || {};
-    return Object.assign(
-      { auto_be: !!current.auto_be, auto_trail: !!current.auto_trail },
-      patch
+  /** Validate that the current server-truth snapshot covers this position,
+   *  then return only the explicit rule change. The server merges this patch
+   *  atomically under the trade lock, so a stale tab cannot overwrite another
+   *  rule that changed after the snapshot. */
+  function _validatedArmedRulePatch(key, patch) {
+    return _knownArmedRules(key) ? Object.assign({}, patch) : null;
+  }
+
+  function _validArmedRulesObject(rules) {
+    return Boolean(
+      rules && typeof rules === "object" && !Array.isArray(rules) &&
+      !Object.keys(rules).some(function (name) {
+        return (name !== "auto_be" && name !== "auto_trail") ||
+          typeof rules[name] !== "boolean";
+      })
     );
   }
 
+  function _armResultMatches(data, key, ruleName, nextArmed) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    if (!_validMgmtIdentity(data.symbol, data.side)) return false;
+    if (_mgmtKey(data.symbol, data.side) !== key) return false;
+    const rules = data.armed_rules;
+    if (!_validArmedRulesObject(rules)) return false;
+    return nextArmed
+      ? rules[ruleName] === true
+      : rules[ruleName] !== true;
+  }
+
+  function _armOutcomeUnknown() {
+    showToast(
+      "⚠ Automation outcome unknown — wait for server status before acting again.",
+      "err"
+    );
+  }
+
+  function _allAutomationRulesDisabled() {
+    if (state.positionMgmtKnown !== true) return false;
+    return Object.keys(state.positionMgmt).every(function (key) {
+      const row = state.positionMgmt[key];
+      const rules = row && row.armed_rules;
+      return _validArmedRulesObject(rules) &&
+        !Object.keys(rules).some(function (name) { return rules[name] === true; });
+    });
+  }
+
   /** Task 7: toggle the HL-only Auto-BE autonomous rule for ONE open
-   *  position. Sends the FULL merged rules object (see _mergedArmedRules) with
-   *  a REAL boolean for auto_be — the server 400s on anything else (a truthy
-   *  string like "false" must never arm a money path). Double-submit guarded
-   *  per (symbol,side) — the SAME lock as armAutoTrail, since both toggles
-   *  read+merge+POST the same server record and must never race each other.
+   *  position. Sends only the explicit auto_be patch with a REAL boolean — the
+   *  server 400s on anything else (a truthy
+   *  string like "false" must never arm a money path). All trade-lock mutations
+   *  are mutually exclusive in the client, so toggles cannot race one another
+   *  or silently queue behind an entry, cancel, close or stop replacement.
    *  Re-renders immediately with the button disabled while in flight, then
    *  re-fetches the alerts poll right away (rather than waiting up to 30s) so
    *  the toggle reflects the ACTUAL server-side result, never an optimistic
    *  guess. */
   async function armAutoBe(symbol, side, nextArmed) {
     const key = _mgmtKey(symbol, side);
-    if (state.armBusy[key]) return;
+    if (moneyActionBusy()) return;
+    const rules = _validatedArmedRulePatch(key, { auto_be: !!nextArmed });
+    if (!rules) {
+      showToast("Automation status is unavailable; wait for a successful refresh.", "warn");
+      return;
+    }
     state.armBusy[key] = true;
-    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    refreshMoneyActionControls();
+    let responseMatched = false;
     try {
-      const rules = _mergedArmedRules(key, { auto_be: !!nextArmed });
       const res = await armPosition(symbol, side, rules);
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
@@ -6100,33 +6643,56 @@
         );
         return;
       }
-      showToast(
-        (nextArmed ? "Auto-BE enabled: " : "Auto-BE disabled: ") +
-          String(symbol || "") + " (" + String(side || "") + ")",
-        "ok"
-      );
+      if (!_armResultMatches(data, key, "auto_be", nextArmed)) {
+        _armOutcomeUnknown();
+        return;
+      }
+      responseMatched = true;
     } catch (err) {
       showToast("Could not update automation: " + (err && err.message), "err");
     } finally {
-      state.armBusy[key] = false;
       // Refresh from the server immediately — the toggle must show what the
-      // backend actually persisted, not what we just requested.
-      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
-      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+      // backend actually persisted, not what we just requested. Keep every
+      // mutation locked until that reconciliation attempt has settled.
+      let reconciled = false;
+      try {
+        reconciled = await refreshPositionAlerts();
+      } catch (_) { /* next scheduled poll retries */ }
+      finally {
+        if (responseMatched) {
+          const current = reconciled ? _knownArmedRules(key) : null;
+          if (current && current.auto_be === !!nextArmed) {
+            showToast(
+              (nextArmed ? "Auto-BE enabled: " : "Auto-BE disabled: ") +
+                String(symbol || "") + " (" + String(side || "") + ")",
+              "ok"
+            );
+          } else {
+            _armOutcomeUnknown();
+          }
+        }
+        state.armBusy[key] = false;
+        refreshMoneyActionControls();
+      }
     }
   }
 
   /** TML v2 (Task V5): toggle the HL-only Auto-Trail autonomous rule for ONE
-   *  open position — mirrors armAutoBe exactly (same merge-not-clobber via
-   *  _mergedArmedRules, same shared armBusy lock, same immediate re-poll for
+   *  open position — mirrors armAutoBe exactly (same atomic server patch,
+   *  same shared armBusy lock, same immediate re-poll for
    *  server-truth, same real-boolean discipline). */
   async function armAutoTrail(symbol, side, nextArmed) {
     const key = _mgmtKey(symbol, side);
-    if (state.armBusy[key]) return;
+    if (moneyActionBusy()) return;
+    const rules = _validatedArmedRulePatch(key, { auto_trail: !!nextArmed });
+    if (!rules) {
+      showToast("Automation status is unavailable; wait for a successful refresh.", "warn");
+      return;
+    }
     state.armBusy[key] = true;
-    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    refreshMoneyActionControls();
+    let responseMatched = false;
     try {
-      const rules = _mergedArmedRules(key, { auto_trail: !!nextArmed });
       const res = await armPosition(symbol, side, rules);
       const data = await res.json().catch(function () { return {}; });
       if (!res.ok) {
@@ -6136,17 +6702,34 @@
         );
         return;
       }
-      showToast(
-        (nextArmed ? "Auto-Trail enabled: " : "Auto-Trail disabled: ") +
-          String(symbol || "") + " (" + String(side || "") + ")",
-        "ok"
-      );
+      if (!_armResultMatches(data, key, "auto_trail", nextArmed)) {
+        _armOutcomeUnknown();
+        return;
+      }
+      responseMatched = true;
     } catch (err) {
       showToast("Could not update automation: " + (err && err.message), "err");
     } finally {
-      state.armBusy[key] = false;
-      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
-      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+      let reconciled = false;
+      try {
+        reconciled = await refreshPositionAlerts();
+      } catch (_) { /* next scheduled poll retries */ }
+      finally {
+        if (responseMatched) {
+          const current = reconciled ? _knownArmedRules(key) : null;
+          if (current && current.auto_trail === !!nextArmed) {
+            showToast(
+              (nextArmed ? "Auto-Trail enabled: " : "Auto-Trail disabled: ") +
+                String(symbol || "") + " (" + String(side || "") + ")",
+              "ok"
+            );
+          } else {
+            _armOutcomeUnknown();
+          }
+        }
+        state.armBusy[key] = false;
+        refreshMoneyActionControls();
+      }
     }
   }
 
@@ -6215,19 +6798,56 @@
    *  remembers the ts already shown per (symbol,side,kind) so a poll that
    *  returns the SAME still-active alert never re-toasts it; only a changed
    *  ts (a fresh occurrence) surfaces again. */
+  function markPositionMgmtUnknown() {
+    state.positionMgmtKnown = false;
+    try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+  }
+
+  function _validMgmtIdentity(symbol, side) {
+    if (side !== "long" && side !== "short") return false;
+    if (typeof symbol !== "string" || symbol !== symbol.trim() ||
+        symbol !== symbol.toUpperCase()) return false;
+    const exchange = currentExchangeId();
+    if (exchange === "hyperliquid") return /^[A-Z0-9]{2,20}$/.test(symbol);
+    if (exchange === "mexc") {
+      return /^[A-Z0-9]{2,32}_[A-Z0-9]{2,16}$/.test(symbol);
+    }
+    return false;
+  }
+
+  function validPositionMgmtRow(row) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+    if (!_validMgmtIdentity(row.symbol, row.side)) return false;
+    const rules = row.armed_rules;
+    if (!_validArmedRulesObject(rules)) return false;
+    return Boolean(row.alerts && typeof row.alerts === "object" && !Array.isArray(row.alerts));
+  }
+
   async function refreshPositionAlerts() {
     let data;
     try {
       const res = await fetchPositionAlerts();
-      if (!res.ok) return;
+      if (!res.ok) {
+        markPositionMgmtUnknown();
+        return false;
+      }
       data = await res.json();
     } catch (_) {
-      return; // best-effort — the next scheduled poll retries
+      markPositionMgmtUnknown();
+      return false; // best-effort — the next scheduled poll retries
     }
-    const rows = (data && data.alerts) || [];
+    const rows = data && data.alerts;
+    if (!Array.isArray(rows) || !rows.every(validPositionMgmtRow)) {
+      markPositionMgmtUnknown();
+      return false;
+    }
     const nextMgmt = {};
-    rows.forEach(function (r) {
+    for (const r of rows) {
       const key = _mgmtKey(r.symbol, r.side);
+      if (Object.prototype.hasOwnProperty.call(nextMgmt, key)) {
+        markPositionMgmtUnknown();
+        return false;
+      }
       nextMgmt[key] = r;
       const alerts = r.alerts || {};
       Object.keys(alerts).forEach(function (kind) {
@@ -6239,9 +6859,11 @@
         state._seenAlertTs[seenKey] = ts;
         _surfaceMgmtAlert(r.symbol, r.side, kind, a);
       });
-    });
+    }
     state.positionMgmt = nextMgmt;
+    state.positionMgmtKnown = true;
     try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+    return true;
   }
 
   /** Task 7 kill-switch (spec §3.5): disarms ALL autonomous rules on EVERY
@@ -6250,8 +6872,13 @@
    *  the monitor loop stops acting on it next cycle. Confirms first (global,
    *  irreversible-until-rearmed action), then refreshes the alerts poll so
    *  every card's toggle clears right away. */
+  function setKillswitchBusy(on) {
+    state.killswitchBusy = on;
+    refreshMoneyActionControls();
+  }
+
   async function killswitchAllPositions() {
-    if (state.killswitchBusy) return;
+    if (moneyActionBusy()) return;
     if (
       !window.confirm(
         "Disable all automation rules for every open position now?"
@@ -6259,7 +6886,9 @@
     ) {
       return;
     }
-    state.killswitchBusy = true;
+    setKillswitchBusy(true);
+    let responseMatched = false;
+    let disarmedCount = null;
     try {
       const res = await killswitchPositions();
       const data = await res.json().catch(function () { return {}; });
@@ -6270,13 +6899,41 @@
         );
         return;
       }
-      showToast("Automation disabled for " + fmt(data.disarmed, 0) + " position(s).", "ok");
+      if (
+        typeof data.disarmed !== "number" || !Number.isSafeInteger(data.disarmed) ||
+        data.disarmed < 0
+      ) {
+        showToast(
+          "⚠ Kill-switch outcome unknown — wait for server status before acting again.",
+          "err"
+        );
+        return;
+      }
+      disarmedCount = data.disarmed;
+      responseMatched = true;
     } catch (err) {
       showToast("Kill switch failed: " + (err && err.message), "err");
     } finally {
-      state.killswitchBusy = false;
-      try { await refreshPositionAlerts(); } catch (_) { /* next scheduled poll retries */ }
-      try { renderPositions(state.account); } catch (_) { /* best-effort UI */ }
+      let reconciled = false;
+      try {
+        reconciled = await refreshPositionAlerts();
+      } catch (_) { /* next scheduled poll retries */ }
+      finally {
+        if (responseMatched) {
+          if (reconciled && _allAutomationRulesDisabled()) {
+            showToast(
+              "Automation disabled for " + fmt(disarmedCount, 0) + " position(s).",
+              "ok"
+            );
+          } else {
+            showToast(
+              "⚠ Kill-switch outcome unknown — wait for server status before acting again.",
+              "err"
+            );
+          }
+        }
+        setKillswitchBusy(false);
+      }
     }
   }
 
@@ -7460,7 +8117,7 @@
     // untrusted); links are http(s)-whitelisted + rel="noopener noreferrer".
     function card(it, kind) {
       const url = String((it && it.url) || "");
-      const safe = /^https?:\/\//i.test(url) ? url : "";
+      const safe = safeExternalNewsUrl(url);
       const hits = coinsMentioned(
         String((it && it.title) || "") + " " + String((it && it.summary) || "")
       );
@@ -7810,7 +8467,9 @@
     if (state._gridStructFp === structFp && grid.querySelector(".mini-tile")) {
       posSyms.concat(watchSyms).forEach(function (s) {
         const m = _miniTileModel(s, chartColors, cs);
-        const tile = grid.querySelector('.mini-tile[data-symbol="' + m.key + '"]');
+        const tile = findByDataValue(
+          grid, ".mini-tile", "data-symbol", m.key
+        );
         if (tile) updateMiniTile(tile, m);
       });
       return;
@@ -7921,14 +8580,22 @@
     });
   }
 
-  async function loadLlm() {
+  async function loadLlm(duringSwitch) {
+    if (llmSwitching && duringSwitch !== true) return null;
+    const generation = llmSwitchGeneration;
     try {
       const res = await apiFetch("/api/llm");
       if (!res.ok) return;
       const data = await res.json();
-      applyLlmStatus(data);
+      if (generation !== llmSwitchGeneration) return null;
+      const applied = applyLlmStatus(data);
+      if (state.account) renderPositions(state.account);
+      return applied ? data : null;
     } catch (err) {
-      console.error("loadLlm", err);
+      if (generation === llmSwitchGeneration) {
+        console.error("loadLlm", err);
+      }
+      return null;
     }
   }
 
@@ -7939,8 +8606,44 @@
     return (p && p.label) || providerId || "AI";
   }
 
+  function isValidLlmStatus(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    const knownProviders = ["claude", "xai", "openai", "ollama"];
+    if (knownProviders.indexOf(data.provider) < 0) {
+      return false;
+    }
+    if (typeof data.position_reevaluation_allowed !== "boolean") return false;
+    if (!Array.isArray(data.providers)) return false;
+    const seen = {};
+    const rowsValid = data.providers.every(function (provider) {
+      if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
+        return false;
+      }
+      if (
+        knownProviders.indexOf(provider.id) < 0 ||
+        seen[provider.id] === true ||
+        typeof provider.label !== "string" ||
+        !provider.label.trim() ||
+        typeof provider.configured !== "boolean"
+      ) {
+        return false;
+      }
+      seen[provider.id] = true;
+      return true;
+    });
+    return rowsValid && seen[data.provider] === true;
+  }
+
   function applyLlmStatus(data) {
-    if (!data) return;
+    if (!isValidLlmStatus(data)) {
+      state.health = Object.assign({}, state.health || {}, {
+        position_reevaluation_allowed: false,
+      });
+      return false;
+    }
+    state.health = Object.assign({}, state.health || {}, {
+      position_reevaluation_allowed: data.position_reevaluation_allowed,
+    });
     const sel = $("llm-select");
     if (sel && data.provider) sel.value = data.provider;
     const label = $("llm-label");
@@ -7966,9 +8669,18 @@
       return p.id === data.provider;
     });
     if (me) setDot($("dot-xai"), !!me.configured);
+    return true;
   }
 
   async function switchLlm(provider) {
+    if (llmSwitching) return;
+    llmSwitching = true;
+    llmSwitchGeneration += 1;
+    const sel = $("llm-select");
+    if (sel) {
+      sel.disabled = true;
+      sel.setAttribute("aria-busy", "true");
+    }
     try {
       const res = await apiFetch("/api/llm", {
         method: "POST",
@@ -7980,25 +8692,31 @@
       });
       if (!res.ok) {
         showToast(detailToText(data.detail || data), "err");
-        loadLlm(); // revert dropdown to server truth
+        await loadLlm(true); // revert dropdown to server truth
         return;
       }
-      applyLlmStatus(data);
+      if (!applyLlmStatus(data)) {
+        if (state.account) renderPositions(state.account);
+        showToast("Could not switch AI provider: invalid server response", "err");
+        await loadLlm(true);
+        return;
+      }
       if (state.account) renderPositions(state.account);
       showToast("AI provider changed: " + llmLabelFor(data, data.provider), "ok");
     } catch (err) {
       showToast("Could not switch AI provider: " + (err && err.message), "err");
-      loadLlm();
+      await loadLlm(true);
+    } finally {
+      llmSwitching = false;
+      if (sel) {
+        sel.disabled = false;
+        sel.setAttribute("aria-busy", "false");
+      }
     }
   }
 
   // ── KI-Keys panel (authenticated post-setup key management) ──────────
-  var KI_DEFAULT_MODELS = {
-    claude: "claude-opus-4-8",
-    xai: "grok-4",
-    openai: "gpt-5.1",
-    ollama: "llama3.1",
-  };
+  var AI_DEFAULT_MODELS = Object.create(null);
 
   function kiPill(ok, text) {
     var pill = $("ki-test-pill");
@@ -8025,6 +8743,12 @@
     if (!ul) return;
     ul.innerHTML = "";
     (data.providers || []).forEach(function (p) {
+      if (
+        p && typeof p.id === "string" &&
+        typeof p.default_model === "string" && p.default_model.trim()
+      ) {
+        AI_DEFAULT_MODELS[p.id] = p.default_model.trim();
+      }
       var li = document.createElement("li");
       var dot = document.createElement("span");
       dot.className = "status-dot " + (p.configured ? "ok" : "unknown");
@@ -8039,6 +8763,7 @@
       li.appendChild(txt);
       ul.appendChild(li);
     });
+    kiSyncProvider();
   }
 
   function kiSyncProvider() {
@@ -8048,7 +8773,7 @@
     if (kf) kf.classList.toggle("hidden", isOllama);
     var modelInput = $("ki-model");
     if (modelInput && !modelInput.value.trim()) {
-      modelInput.value = KI_DEFAULT_MODELS[p] || "";
+      modelInput.value = AI_DEFAULT_MODELS[p] || "";
     }
     var pill = $("ki-test-pill");
     if (pill) pill.classList.add("hidden");
@@ -8147,8 +8872,43 @@
 
   /** Close a share of the position. fraction 1 = full, 0.25 = 25 %.
    *  The server closes that share of the CURRENT hold with lot rounding. */
+  function closeResultIsVerified(data) {
+    const response = data && data.response;
+    const responseValid = Array.isArray(response)
+      ? response.length > 0
+      : Boolean(response && typeof response === "object" && Object.keys(response).length);
+    const warningsValid = data && (
+      data.warnings === undefined ||
+      (Array.isArray(data.warnings) && data.warnings.every(function (item) {
+        return typeof item === "string";
+      }))
+    );
+    return Boolean(
+      data && data.ok === true && data.status === "closed" &&
+      data.verified === true &&
+      typeof data.closed_vol === "number" && Number.isFinite(data.closed_vol) &&
+      data.closed_vol > 0 &&
+      typeof data.hold_vol === "number" && Number.isFinite(data.hold_vol) &&
+      data.hold_vol > 0 &&
+      typeof data.residual_vol === "number" && Number.isFinite(data.residual_vol) &&
+      data.residual_vol >= 0 && responseValid && warningsValid
+    );
+  }
+
+  function reportUnknownCloseOutcome(message) {
+    showToast(message, "err");
+    markMutationOutcomeUnknown("close");
+  }
+
   async function closePositionFrac(symbol, side, fraction) {
-    if (state.closeBusy || state.orderBusy) return;
+    if (state.mutationOutcomeUnknown.close) {
+      showToast(
+        "Previous close outcome is unknown. Wait for fresh position and order data before retrying.",
+        "err"
+      );
+      return;
+    }
+    if (moneyActionBusy()) return;
     if (!symbol || !side) return;
     const pct = Math.round((fraction || 1) * 100);
     const text =
@@ -8156,6 +8916,7 @@
       " with a MARKET order now?";
     if (!window.confirm(text)) return;
     state.closeBusy = true;
+    refreshMoneyActionControls();
     try {
       const payload = { symbol: symbol, side: side };
       if (fraction >= 1) payload.fraction = 1;
@@ -8168,6 +8929,13 @@
       const data = await res.json().catch(function () {
         return {};
       });
+      if (mutationHttpOutcomeUnknown(res)) {
+        reportUnknownCloseOutcome(
+          "⚠ Close outcome unknown after server error — the position may already have changed. " +
+            "Check the live position and orders on the exchange; do not retry blindly."
+        );
+        return;
+      }
       if (!res.ok || data.ok === false) {
         // A close can fail (or only PARTIALLY fill / stay unverified) while still
         // returning HTTP 200 — never paint that green (audit F-A1): the residual
@@ -8175,6 +8943,13 @@
         showToast(detailToText(data.detail || data), "err");
         loadAccount();
         loadOpenOrders();
+        return;
+      }
+      if (!closeResultIsVerified(data)) {
+        reportUnknownCloseOutcome(
+          "⚠ Close outcome unknown — check the live position and orders on the " +
+            "exchange before acting again. Do not retry blindly."
+        );
         return;
       }
       const closedTxt =
@@ -8203,30 +8978,25 @@
     } catch (err) {
       console.error("closePositionFrac", err);
       // The server may have ALREADY executed the close — the response was
-      // merely lost (network/timeout), not a clean rejection (that's handled
-      // above via !res.ok, still an honest "fehlgeschlagen"). Never imply
-      // "nothing happened": warn to check the exchange, block a blind retry,
-      // and reconcile from the exchange.
-      showToast(
+      // merely lost. Treat it like an ambiguous HTTP 408/5xx response: keep
+      // the matching retry blocked until fresh exchange reads reconcile it.
+      reportUnknownCloseOutcome(
         "⚠ Response lost — the action may have executed. Check positions and orders " +
           "on the exchange; do not retry blindly. (" +
-          (err && err.message ? err.message : err) + ")",
-        "err"
+          (err && err.message ? err.message : err) + ")"
       );
-      try { loadAccount(); } catch (_) {}
-      try { loadOpenOrders(); } catch (_) {}
-      try { loadHistory(); } catch (_) {}
     } finally {
       state.closeBusy = false;
+      refreshMoneyActionControls();
     }
   }
 
-  function slMoveResultToast(data, requestedPx, successPrefix) {
+  function slMoveResultToast(data, successPrefix) {
     data = data && typeof data === "object" ? data : {};
     const warnings = Array.isArray(data.warnings)
-      ? data.warnings.filter(Boolean).map(String)
+      ? data.warnings.filter(Boolean)
       : [];
-    if (data.verified !== true) {
+    if (data.verified === false) {
       const status = data.status ? " (" + String(data.status) + ")" : "";
       const detail = warnings.length ? " — " + warnings.join("; ") : "";
       return {
@@ -8234,16 +9004,61 @@
           "⚠ Stop change not verified" + status + detail +
           " — check open stops on the exchange before acting again.",
         kind: "err",
+        unknown: false,
+      };
+    }
+    if (data.verified !== true) {
+      return {
+        message:
+          "⚠ Stop change outcome unknown — check open stops on the exchange " +
+          "before acting again. Do not retry blindly.",
+        kind: "err",
+        unknown: true,
+      };
+    }
+    const statusValid =
+      data.status === "modify_sl_ok" ||
+      data.status === "modify_sl_ok_old_cancel_failed";
+    const newOidValid =
+      (typeof data.new_oid === "string" && data.new_oid.trim() !== "") ||
+      (typeof data.new_oid === "number" && Number.isFinite(data.new_oid));
+    const idListValid = function (items) {
+      return Array.isArray(items) && items.every(function (item) {
+        return (typeof item === "string" && item.trim() !== "") ||
+          (typeof item === "number" && Number.isFinite(item));
+      });
+    };
+    const warningsValid = Array.isArray(data.warnings) &&
+      data.warnings.every(function (item) { return typeof item === "string"; });
+    if (
+      data.ok !== true || !statusValid ||
+      typeof data.new_sl !== "number" || !Number.isFinite(data.new_sl) ||
+      data.new_sl <= 0 || !newOidValid ||
+      !idListValid(data.cancelled_old) || !idListValid(data.failed_cancel) ||
+      !warningsValid
+    ) {
+      return {
+        message:
+          "⚠ Stop change outcome unknown — check open stops on the exchange " +
+          "before acting again. Do not retry blindly.",
+        kind: "err",
+        unknown: true,
       };
     }
     const warningText = warnings.length ? " — ⚠ " + warnings.join("; ") : "";
     return {
       message:
         successPrefix +
-        fmt(data.new_sl != null ? data.new_sl : requestedPx, 6) +
+        fmt(data.new_sl, 6) +
         warningText,
       kind: warningText ? "err" : "ok",
+      unknown: false,
     };
+  }
+
+  function reportUnknownStopOutcome(message) {
+    showToast(message, "err");
+    markMutationOutcomeUnknown("sl");
   }
 
   /** N3-09: Move/replace the stop-loss of an OPEN position to an ARBITRARY
@@ -8257,7 +9072,14 @@
    *  that. There is NO path to the API that skips the window.confirm below. */
   async function moveStopTo(symbol, side, px, opts) {
     opts = opts || {};
-    if (state.slBusy || state.closeBusy || state.orderBusy) return;
+    if (state.mutationOutcomeUnknown.sl) {
+      showToast(
+        "Previous stop outcome is unknown. Wait for fresh position and order data before retrying.",
+        "err"
+      );
+      return;
+    }
+    if (moneyActionBusy()) return;
     if (!symbol || !side || !Number.isFinite(px) || px <= 0) return;
     const isBe = !!opts.be;
     const target = isBe ? "Break-Even " + fmt(px, 6) : fmt(px, 6);
@@ -8268,6 +9090,7 @@
       "This is a real order action.";
     if (!window.confirm(text)) return;
     state.slBusy = true;
+    refreshMoneyActionControls();
     try {
       const res = await apiFetch("/api/orders/modify-sl", {
         method: "POST",
@@ -8277,35 +9100,38 @@
       const data = await res.json().catch(function () {
         return {};
       });
+      if (mutationHttpOutcomeUnknown(res)) {
+        reportUnknownStopOutcome(
+          "⚠ Stop change outcome unknown after server error — open stops may already " +
+            "have changed. Check the exchange; do not retry blindly."
+        );
+        return;
+      }
       if (!res.ok) {
         showToast(detailToText(data.detail || data), "err");
         return;
       }
       const toast = slMoveResultToast(
         data,
-        px,
         isBe ? "SL moved to break-even: " : "SL set: "
       );
       showToast(toast.message, toast.kind);
+      if (toast.unknown) markMutationOutcomeUnknown("sl");
       loadAccount();
       loadOpenOrders();
     } catch (err) {
       console.error("moveStopTo", err);
       // The server may have ALREADY placed (and possibly cancel+replaced)
-      // the new stop — the response was merely lost (network/timeout), not
-      // a clean rejection (that's handled above via !res.ok, still an
-      // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
-      // check the exchange, block a blind retry, and reconcile.
-      showToast(
+      // the new stop. Treat it like an ambiguous HTTP 408/5xx response: keep
+      // another stop replacement blocked until fresh exchange reads reconcile it.
+      reportUnknownStopOutcome(
         "⚠ Response lost — the stop action may have executed. Check positions and orders " +
           "on the exchange; do not retry blindly. (" +
-          (err && err.message ? err.message : err) + ")",
-        "err"
+          (err && err.message ? err.message : err) + ")"
       );
-      try { loadAccount(); } catch (_) {}
-      try { loadOpenOrders(); } catch (_) {}
     } finally {
       state.slBusy = false;
+      refreshMoneyActionControls();
     }
   }
 
@@ -8408,7 +9234,7 @@
   function onSlDragStart(ev) {
     const geom = state._slHoverGeom || getActiveSlGeom();
     if (!geom || !state.candleSeries) return;
-    if (state.orderBusy || state.slBusy || state.closeBusy) {
+    if (moneyActionBusy()) {
       showToast("An order action is in progress; stop dragging is locked.", null);
       return;
     }
@@ -8480,7 +9306,14 @@
    *  window.confirm guarantees no send without explicit confirmation, and the
    *  slBusy/orderBusy guards block a confirm while another order is in flight. */
   async function moveStopViaDrag(symbol, side, newSl) {
-    if (state.slBusy || state.closeBusy || state.orderBusy) {
+    if (state.mutationOutcomeUnknown.sl) {
+      showToast(
+        "Previous stop outcome is unknown. Wait for fresh position and order data before retrying.",
+        "err"
+      );
+      return;
+    }
+    if (moneyActionBusy()) {
       showToast("An order action is in progress; the stop move was not sent.", null);
       return;
     }
@@ -8492,6 +9325,7 @@
       "This is a real order action.";
     if (!window.confirm(text)) return; // explicit confirm — the ONLY send gate
     state.slBusy = true;
+    refreshMoneyActionControls();
     try {
       const res = await apiFetch("/api/orders/modify-sl", {
         method: "POST",
@@ -8501,31 +9335,35 @@
       const data = await res.json().catch(function () {
         return {};
       });
+      if (mutationHttpOutcomeUnknown(res)) {
+        reportUnknownStopOutcome(
+          "⚠ Stop change outcome unknown after server error — open stops may already " +
+            "have changed. Check the exchange; do not retry blindly."
+        );
+        return;
+      }
       if (!res.ok) {
         showToast(detailToText(data.detail || data), "err");
         return;
       }
-      const toast = slMoveResultToast(data, newSl, "SL moved: ");
+      const toast = slMoveResultToast(data, "SL moved: ");
       showToast(toast.message, toast.kind);
+      if (toast.unknown) markMutationOutcomeUnknown("sl");
       loadAccount();
       loadOpenOrders();
     } catch (err) {
       console.error("moveStopViaDrag", err);
       // The server may have ALREADY placed (and possibly cancel+replaced)
-      // the new stop — the response was merely lost (network/timeout), not
-      // a clean rejection (that's handled above via !res.ok, still an
-      // honest "fehlgeschlagen"). Never imply "nothing happened": warn to
-      // check the exchange, block a blind retry, and reconcile.
-      showToast(
+      // the new stop. Treat it like an ambiguous HTTP 408/5xx response: keep
+      // another stop replacement blocked until fresh exchange reads reconcile it.
+      reportUnknownStopOutcome(
         "⚠ Response lost — the stop action may have executed. Check positions and orders " +
           "on the exchange; do not retry blindly. (" +
-          (err && err.message ? err.message : err) + ")",
-        "err"
+          (err && err.message ? err.message : err) + ")"
       );
-      try { loadAccount(); } catch (_) {}
-      try { loadOpenOrders(); } catch (_) {}
     } finally {
       state.slBusy = false;
+      refreshMoneyActionControls();
     }
   }
 
@@ -8786,12 +9624,8 @@
       type = "market";
     }
 
-    document.querySelectorAll(".side-btn").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-side") === side);
-    });
-    document.querySelectorAll(".type-btn").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-type") === type);
-    });
+    syncSegmentButtons(".side-btn", "data-side", side);
+    syncSegmentButtons(".type-btn", "data-type", type);
 
     const panel = $("ticket-panel");
     if (panel) panel.dataset.side = side;
@@ -8855,12 +9689,7 @@
     document.querySelectorAll(".trigger-mode-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
         state.triggerMode = btn.getAttribute("data-trigger") === "manual" ? "manual" : "auto";
-        document.querySelectorAll(".trigger-mode-btn").forEach(function (b) {
-          b.classList.toggle(
-            "active",
-            b.getAttribute("data-trigger") === state.triggerMode
-          );
-        });
+        syncSegmentButtons(".trigger-mode-btn", "data-trigger", state.triggerMode);
         updateTriggerModeUi();
       });
     });
@@ -8876,6 +9705,7 @@
     setSizeMode(state.sizeMode); // reflect restored mode in buttons + label
     setSltpMode(state.sltpMode); // build the %/currency suffix badges (T3-02)
     syncTicketSegments();
+    syncSegmentButtons(".trigger-mode-btn", "data-trigger", state.triggerMode);
     updateTriggerModeUi();
   }
 
@@ -9096,6 +9926,7 @@
       aiLinesBtn.addEventListener("click", () => {
         state.showAiLines = !state.showAiLines;
         aiLinesBtn.classList.toggle("active", state.showAiLines);
+        aiLinesBtn.setAttribute("aria-pressed", state.showAiLines ? "true" : "false");
         drawProposalLines();
       });
     }
@@ -9105,6 +9936,7 @@
       zonesBtn.addEventListener("click", () => {
         state.showZones = !state.showZones;
         zonesBtn.classList.toggle("active", state.showZones);
+        zonesBtn.setAttribute("aria-pressed", state.showZones ? "true" : "false");
         drawTradeZones();
       });
     }
@@ -9248,26 +10080,44 @@
     const confirmBtn = $("btn-confirm-live");
     if (!modal || !body) return;
 
-    state.previewToken = preview.token || null;
+    const previewToken =
+      typeof preview.token === "string" && preview.token.trim()
+        ? preview.token
+        : null;
+    const ttl = previewTtlSeconds(preview.expires_in_seconds);
+    const previewContractInvalid =
+      preview.ok === true && (previewToken === null || ttl === null);
+    state.previewToken =
+      preview.ok === true && previewToken !== null && ttl !== null
+        ? previewToken
+        : null;
     state.previewSummary = preview.summary || null;
 
     const s = preview.summary || {};
     const gate = preview.gate || {};
-    const okGates = preview.ok === true && !!preview.token;
-    const armed = state.health && state.health.trading_enabled === true;
-    const testnet = state.health && state.health.exchange === "hyperliquid" && state.health.hl_testnet === true;
-    const canConfirm = okGates && armed;
+    const okGates = preview.ok === true && previewToken !== null;
+    const health = state.health || {};
+    const armed = health.trading_enabled === true;
+    const exchangeReady = health.exchange_configured === true;
+    const executionReady = armed && exchangeReady;
+    const testnet = health.exchange === "hyperliquid" && health.hl_testnet === true;
+    const canConfirm = okGates && ttl !== null && executionReady;
     const title = $("confirm-title");
-    if (title) title.textContent = !armed ? "Order Preview"
+    if (title) title.textContent = !executionReady ? "Order Preview"
       : testnet ? "Confirm Order · Testnet"
-      : state.health.live_trading === true ? "Confirm Order · Real Funds" : "Confirm Order";
+      : health.live_trading === true ? "Confirm Order · Real Funds" : "Confirm Order";
     if (confirmBtn) confirmBtn.textContent = confirmActionLabel();
     const errors = preview.errors || gate.errors || [];
 
     let html = "";
 
     // 1) Blocker box FIRST — the single clear answer to "why can't I confirm?"
-    if (!okGates && errors.length) {
+    if (previewContractInvalid) {
+      html +=
+        '<div class="blocker-box">' +
+        '<div class="blocker-title">INVALID PREVIEW - submission is locked</div>' +
+        "<p>The server returned an invalid confirmation token or expiry. Run the review again.</p></div>";
+    } else if (!okGates && errors.length) {
       html +=
         '<div class="blocker-box">' +
         '<div class="blocker-title">⛔ Order blocked — resolve these items first:</div>' +
@@ -9280,6 +10130,12 @@
         '<div class="blocker-title">🔒 DISARMED — live trading is off</div>' +
         '<p>All risk gates pass. To enable submission, set <code>TRADING_ENABLED=true</code> ' +
         "in <code>.env</code> and restart the app.</p></div>";
+    } else if (okGates && !exchangeReady) {
+      html +=
+        '<div class="blocker-box">' +
+        '<div class="blocker-title">⛔ EXCHANGE NOT READY — submission is locked</div>' +
+        "<p>Exchange credentials are incomplete or invalid. Review the local configuration " +
+        "before creating another preview.</p></div>";
     }
 
     // 2) Order summary as a compact, readable card
@@ -9346,7 +10202,6 @@
     }
 
     if (canConfirm) {
-      const ttl = preview.expires_in_seconds || 60;
       html +=
         '<p class="live-warn">⚠ ' + (testnet ? "TESTNET ORDER — submitted to testnet after confirmation. "
           : "LIVE ORDER — submitted with real funds after confirmation. ") +
@@ -9376,9 +10231,13 @@
       confirmBtn.disabled = !canConfirm || needManualAck || needRrrAck;
       confirmBtn.title = canConfirm
         ? (needManualAck || needRrrAck ? "Select all required acknowledgements" : "Submit order now")
-        : !okGates
+          : previewContractInvalid
+          ? "Preview response is invalid; review the order again"
+          : !okGates
           ? "Risk gates block this order; see details above"
-          : "DISARMED — TRADING_ENABLED=false";
+          : !armed
+          ? "DISARMED — TRADING_ENABLED=false"
+          : "Exchange credentials are incomplete";
       if (needManualAck) {
         const ack = $("manual-ack-box");
         if (ack) {
@@ -9406,7 +10265,7 @@
 
     if (state._ttlTimer) clearInterval(state._ttlTimer);
     if (canConfirm) {
-      let left = preview.expires_in_seconds || 60;
+      let left = ttl;
       state._ttlTimer = setInterval(function () {
         left -= 1;
         const tEl = $("confirm-ttl");
@@ -9491,6 +10350,38 @@
     }
   }
 
+  function ticketFormFingerprint() {
+    function value(id) {
+      const element = $(id);
+      return element ? element.value : "";
+    }
+    return JSON.stringify({
+      symbol: state.symbol || "",
+      side: value("ticket-side"),
+      order_type: value("ticket-type"),
+      size: value("ticket-usdt"),
+      size_mode: sizeMode(),
+      leverage: value("ticket-leverage"),
+      price: value("ticket-price"),
+      entry: value("ticket-entry"),
+      sl: value("ticket-sl"),
+      tp: value("ticket-tp1"),
+      sltp_mode: sltpMode(),
+      trigger_mode: state.triggerMode,
+      proposal_id: state.ticketProposalId,
+      proposal_symbol: state.ticketProposalSymbol,
+    });
+  }
+
+  function rejectChangedPreviewInputs(fingerprint) {
+    if (ticketFormFingerprint() === fingerprint) return false;
+    const message =
+      "Ticket inputs changed while risk gates were checked. Review the updated order again.";
+    setTicketError(message);
+    showToast(message, "err");
+    return true;
+  }
+
   async function runPreview() {
     // T3-07: the confirm modal owns the current token/ack state — if it's
     // open, Enter in a ticket field (or a stray submit) must NOT silently
@@ -9498,7 +10389,27 @@
     // is looking at right now. Close it explicitly first.
     const openModal = $("confirm-modal");
     if (openModal && !openModal.classList.contains("hidden")) return;
+    if (state.confirmOutcomeUnknown === true) {
+      const message =
+        "Previous confirmation outcome is unknown. Wait for account and open-order reconciliation before reviewing another order.";
+      setTicketError(message);
+      showToast(message, "err");
+      return;
+    }
+    if (mutationOutcomeBlocksEntry()) {
+      const message =
+        "Previous trade outcome is unknown. Wait for exchange-state reconciliation before reviewing another order.";
+      setTicketError(message);
+      showToast(message, "err");
+      return;
+    }
     if (state.orderBusy) return;
+    if (state.closeBusy || state.slBusy || cancelActionBusy() || automationActionBusy()) {
+      setTicketError(
+        "Another order or position action is in progress. Wait for it to finish before reviewing a new order."
+      );
+      return;
+    }
     if (!state.market) {
       setTicketError("Market data for this symbol is missing. Load it first.");
       return;
@@ -9512,6 +10423,7 @@
       return;
     }
     setTicketError("");
+    const inputFingerprint = ticketFormFingerprint();
     const ticket = readTicket();
     if (ticket.vol == null || ticket.vol <= 0) {
       setTicketError(
@@ -9526,6 +10438,7 @@
     const returnFocus = document.activeElement && document.activeElement !== document.body
       ? document.activeElement : btn;
     state.orderBusy = true;
+    refreshMoneyActionControls();
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Checking risk gates…";
@@ -9534,6 +10447,7 @@
     try {
       // Refresh arming flag
       await loadHealth();
+      if (rejectChangedPreviewInputs(inputFingerprint)) return;
 
       const res = await apiFetch("/api/orders/preview", {
         method: "POST",
@@ -9546,6 +10460,7 @@
       } catch (_) {
         data = null;
       }
+      if (rejectChangedPreviewInputs(inputFingerprint)) return;
 
       if (!res.ok) {
         // Server-side error (contract/ticker/exchange) — no summary to show
@@ -9557,18 +10472,25 @@
 
       // ok OR not-ok: the modal now renders blockers, summary and confirm
       // state itself, so the user always sees WHY confirm is (un)available.
-      if (data.summary) {
-        openConfirmModal(data, returnFocus);
-      } else {
-        const errs = (data.errors || []).map(_humanGate).join(" · ") || "Risk gates rejected the order";
-        setTicketError(errs);
+      if (!isValidPreviewResponse(data)) {
+        state.previewToken = null;
+        state.previewSummary = null;
+        const message = "Invalid preview response. Review the order again.";
+        setTicketError(message);
+        showToast(message, "err");
+        return;
       }
+
+      // Accepted and rejected gate results share the same reviewed summary.
+      // The modal renders every blocker and keeps Confirm disabled for ok=false.
+      openConfirmModal(data, returnFocus);
     } catch (err) {
+      if (rejectChangedPreviewInputs(inputFingerprint)) return;
       console.error("runPreview", err);
       setTicketError("Network error: " + (err && err.message ? err.message : err));
     } finally {
       state.orderBusy = false;
-      updateOrderButtonsEnabled();
+      refreshMoneyActionControls();
       updateTriggerModeUi();
     }
   }
@@ -9589,18 +10511,63 @@
       if (el) el.value = "";
     });
     state.triggerMode = "auto";
-    document.querySelectorAll(".trigger-mode-btn").forEach(function (b) {
-      b.classList.toggle("active", b.getAttribute("data-trigger") === "auto");
-    });
+    syncSegmentButtons(".trigger-mode-btn", "data-trigger", state.triggerMode);
     updateTriggerModeUi();
     try { drawTicketLines(); } catch (_) {}
     try { updateRiskReadout(); } catch (_) {}
+  }
+
+  function confirmationResultIsPlaced(data) {
+    const status = data && typeof data.status === "string" ? data.status : "";
+    return Boolean(
+      data && data.ok === true &&
+      /^(placed|recovered_placed)(?:_|$)/.test(status) &&
+      typeof data.external_oid === "string" && data.external_oid.trim() !== "" &&
+      typeof data.sl_verified === "boolean" &&
+      typeof data.sl_checked === "boolean" &&
+      typeof data.sl_fully_verified === "boolean" &&
+      typeof data.sl_detail === "string" &&
+      Array.isArray(data.warnings) && data.warnings.every(function (item) {
+        return typeof item === "string";
+      }) &&
+      Array.isArray(data.post_errors) && data.post_errors.every(function (item) {
+        return typeof item === "string";
+      })
+    );
+  }
+
+  function reportUnknownConfirmation(errorText, toastText) {
+    const errEl = $("confirm-error");
+    if (errEl) {
+      errEl.classList.remove("hidden");
+      errEl.textContent = errorText;
+    }
+    showToast(toastText, "err");
+    markConfirmationOutcomeUnknown();
   }
 
   async function runConfirm() {
     // Set busy immediately (before any await) so a double-click cannot
     // fire two confirms with the same preview token.
     if (state.orderBusy) return;
+    if (state.confirmOutcomeUnknown === true || mutationOutcomeBlocksEntry()) {
+      const errEl = $("confirm-error");
+      if (errEl) {
+        errEl.classList.remove("hidden");
+        errEl.textContent =
+          "Previous trade outcome is unknown. Wait for exchange-state reconciliation, then review the order again.";
+      }
+      return;
+    }
+    if (state.closeBusy || state.slBusy || cancelActionBusy() || automationActionBusy()) {
+      const errEl = $("confirm-error");
+      if (errEl) {
+        errEl.classList.remove("hidden");
+        errEl.textContent =
+          "Another order or position action is in progress. Wait for it to finish, then review the order again.";
+      }
+      return;
+    }
     if (!state.previewToken) {
       const errEl = $("confirm-error");
       if (errEl) {
@@ -9622,6 +10589,7 @@
     const ttl = $("confirm-ttl");
     if (ttl && ttl.parentElement) ttl.parentElement.textContent = "Submitting order — waiting for confirmation.";
     state.orderBusy = true;
+    refreshMoneyActionControls();
     state.previewToken = null; // one-shot client-side; server also consumes
     if (confirmBtn) {
       confirmBtn.disabled = true;
@@ -9629,8 +10597,17 @@
     }
 
     try {
-      await loadHealth();
-      if (!state.health || !state.health.trading_enabled) {
+      const freshHealth = await loadHealth();
+      if (!freshHealth) {
+        const errEl = $("confirm-error");
+        if (errEl) {
+          errEl.classList.remove("hidden");
+          errEl.textContent =
+            "Unable to verify the current trading state. Review the order again.";
+        }
+        return;
+      }
+      if (freshHealth.trading_enabled !== true) {
         const errEl = $("confirm-error");
         if (errEl) {
           errEl.classList.remove("hidden");
@@ -9638,6 +10615,15 @@
             "DISARMED: TRADING_ENABLED=false — submission is locked.";
         }
         // Token was already cleared client-side; user must re-preview after arming
+        return;
+      }
+      if (freshHealth.exchange_configured !== true) {
+        const errEl = $("confirm-error");
+        if (errEl) {
+          errEl.classList.remove("hidden");
+          errEl.textContent =
+            "EXCHANGE NOT READY: credentials are incomplete — submission is locked.";
+        }
         return;
       }
 
@@ -9654,6 +10640,16 @@
       }
 
       if (!res.ok) {
+        if (res.status === 408 || res.status >= 500) {
+          reportUnknownConfirmation(
+            "SERVER ERROR while confirming (HTTP " + res.status +
+              ") — the order may already be placed. Do not submit it again. " +
+              "Check positions and orders on the exchange.",
+            "⚠ Confirmation outcome unknown after server error — the order may " +
+              "be LIVE. Check the exchange and do not confirm again."
+          );
+          return;
+        }
         const msg = detailToText(data && data.detail);
         const errEl = $("confirm-error");
         if (errEl) {
@@ -9662,6 +10658,22 @@
         }
         showToast(msg, "err");
         loadHistory();
+        return;
+      }
+
+      // A transport-level 2xx is not proof that the money mutation completed.
+      // Only the OrderService success contract may drive the placed-order UI;
+      // malformed or fail-closed bodies leave the ticket intact and require
+      // exchange reconciliation because the remote outcome is ambiguous.
+      if (!confirmationResultIsPlaced(data)) {
+        const msg =
+          "CONFIRMATION RESPONSE INVALID — the order may already be placed. " +
+          "Do not submit it again. Check positions and orders on the exchange.";
+        reportUnknownConfirmation(
+          msg,
+          "⚠ Confirmation outcome unknown — the order may be LIVE. Check the " +
+            "exchange and do not confirm again."
+        );
         return;
       }
 
@@ -9676,6 +10688,24 @@
           "CRITICAL: stop-loss was not verified — " +
             (data.sl_detail || "") +
             (data.flatten ? " (emergency close attempted)" : ""),
+          "err"
+        );
+      } else if (data.sl_fully_verified === false) {
+        showToast(
+          "PARTIAL FILL: the stop protects only the confirmed fill. The resting " +
+            "remainder can fill without protection. Check or cancel it on the exchange now.",
+          "err"
+        );
+      } else if (data.status.indexOf("recovered_placed") === 0) {
+        showToast(
+          "ORDER RECOVERED AFTER TRANSPORT ERROR: the exchange reports it as " +
+            "placed. Verify the order, position, and protection now. Do not submit it again.",
+          "err"
+        );
+      } else if (data.post_errors.length) {
+        showToast(
+          "ORDER PLACED, BUT LOCAL RECORDING IS INCOMPLETE. Verify the order and " +
+            "protection on the exchange. Do not submit it again.",
           "err"
         );
       } else {
@@ -9728,27 +10758,17 @@
       // The server may have ALREADY placed (confirm runs seconds due to SL
       // verify). Never imply "nothing happened": warn to check the exchange,
       // block a blind re-preview, and reconcile from the exchange.
-      const errEl = $("confirm-error");
-      if (errEl) {
-        errEl.classList.remove("hidden");
-        errEl.textContent =
+      reportUnknownConfirmation(
           "NETWORK ERROR while confirming — the order may already be placed. " +
           "Do not submit it again. Check positions and orders on the exchange. (" +
-          (err && err.message ? err.message : err) + ")";
-      }
-      showToast(
+          (err && err.message ? err.message : err) + ")",
         "⚠ Confirmation response lost — the order may be LIVE. Check the exchange " +
-          "and do not confirm again.",
-        "err"
+          "and do not confirm again."
       );
-      // Reconcile so the UI reflects any order the server actually placed.
-      try { loadAccount(); } catch (_) {}
-      try { loadOpenOrders(); } catch (_) {}
-      try { loadHistory(); } catch (_) {}
     } finally {
       state.orderBusy = false;
       setConfirmSubmitting(false);
-      updateOrderButtonsEnabled();
+      refreshMoneyActionControls();
       updateTriggerModeUi();
       if (confirmBtn) {
         confirmBtn.textContent = confirmActionLabel();
@@ -9789,14 +10809,24 @@
     // automatically with same-origin requests — nothing to read from the DOM.
     initChart();
     wireUi();
+    applyPersistedUnknownOutcomes();
     loadTradeMarkers();
     // Another tab persisted trade markers (e.g. set a manual SL) — pick up
     // its state and redraw so we don't keep showing our stale copy (audit F3).
     window.addEventListener("storage", function (e) {
-      if (e.key !== TRADE_MARKERS_KEY) return;
-      loadTradeMarkers();
-      try { if (state.account) renderPositions(state.account); } catch (_) {}
-      try { drawTradeZones(); } catch (_) {}
+      if (e.key === PERSIST.UNKNOWN_OUTCOMES && e.newValue) {
+        if (applyPersistedUnknownOutcomes(e.newValue)) {
+          void loadAccount();
+          void loadOpenOrders();
+          void loadHistory();
+        }
+        return;
+      }
+      if (e.key === TRADE_MARKERS_KEY) {
+        loadTradeMarkers();
+        try { if (state.account) renderPositions(state.account); } catch (_) {}
+        try { drawTradeZones(); } catch (_) {}
+      }
     });
     const h = await loadHealth();
     if (h && h.max_leverage && $("ticket-leverage")) {

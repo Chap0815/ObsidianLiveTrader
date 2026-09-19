@@ -58,8 +58,8 @@ async def test_single_pass_resolves_win_and_loss(db_path):
     win_id = await _seed_long(db, symbol="BTC_USDT")
     loss_id = await _seed_long(db, symbol="ETH_USDT")
     client = FakeClient({
-        "BTC_USDT": [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)],
-        "ETH_USDT": [_candle(0, 100.0, 100.0), _candle(10, 100.2, 98.5)],
+        "BTC_USDT": [_candle(0, 100.0, 100.0), _candle(15, 102.5, 100.0)],
+        "ETH_USDT": [_candle(0, 100.0, 100.0), _candle(15, 100.2, 98.5)],
     })
     now = T0 + timedelta(hours=1)
     await resolve_pending_once(db, client, window_s=WINDOW, now=now)
@@ -69,6 +69,83 @@ async def test_single_pass_resolves_win_and_loss(db_path):
     assert rows[win_id]["realized_r"] == pytest.approx(2.0)
     assert rows[loss_id]["status"] == "LOSS"
     assert rows[loss_id]["realized_r"] == -1.0
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_finalize_row_refreshed_during_kline_fetch(db_path):
+    """A deduped proposal refresh invalidates the resolver's old snapshot."""
+    db = Database(db_path)
+    await db.init()
+    context_hash = "same-market-context"
+    jid = await _seed_long(db, context_hash=context_hash)
+    refreshed_at = (T0 + timedelta(minutes=5)).isoformat()
+
+    class RefreshingClient:
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            refreshed_id = await _seed_long(
+                db,
+                context_hash=context_hash,
+                created_at=refreshed_at,
+                proposal_id=22,
+                tp1=103.0,
+                rrr=3.0,
+            )
+            assert refreshed_id == jid
+            # These candles prove a WIN only for the snapshot read before the
+            # refresh. They must not finalize the replacement proposal.
+            return [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)]
+
+    await resolve_pending_once(
+        db,
+        RefreshingClient(),
+        window_s=WINDOW,
+        now=T0 + timedelta(hours=1),
+    )
+
+    rows = await db.recent_journal()
+    assert rows[0]["id"] == jid
+    assert rows[0]["created_at"] == refreshed_at
+    assert rows[0]["tp1"] == 103.0
+    assert rows[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_resolver_guard_survives_same_timestamp_dedupe_refresh(db_path):
+    """A refresh in created_at's same one-second bucket still invalidates work."""
+    db = Database(db_path)
+    await db.init()
+    context_hash = "same-timestamp-context"
+    jid = await _seed_long(db, context_hash=context_hash)
+
+    class SameTimestampRefreshClient:
+        async def klines(self, symbol, interval, limit_hint=200, *, paced=False):
+            refreshed_id = await _seed_long(
+                db,
+                context_hash=context_hash,
+                created_at=T0_ISO,
+                proposal_id=23,
+                tp1=103.0,
+                rrr=3.0,
+            )
+            assert refreshed_id == jid
+            # This proves WIN only for the old tp1=102 snapshot. The refreshed
+            # proposal has tp1=103 and must remain pending despite identical t0.
+            return [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)]
+
+    await resolve_pending_once(
+        db,
+        SameTimestampRefreshClient(),
+        window_s=WINDOW,
+        now=T0 + timedelta(hours=1),
+    )
+
+    rows = await db.recent_journal()
+    assert rows[0]["id"] == jid
+    assert rows[0]["created_at"] == T0_ISO
+    assert rows[0]["tp1"] == 103.0
+    assert rows[0]["status"] == "PENDING"
+    pending = await db.pending_journal_entries()
+    assert pending[0]["snapshot_version"] == 2
 
 
 @pytest.mark.asyncio
@@ -303,7 +380,7 @@ async def test_loop_can_be_cancelled_cleanly(db_path):
     app = FakeApp()
     app.state.db = db
     app.state.mexc = FakeClient(
-        {"BTC_USDT": [_candle(0, 100.0, 100.0), _candle(10, 102.5, 100.0)]}
+        {"BTC_USDT": [_candle(0, 100.0, 100.0), _candle(15, 102.5, 100.0)]}
     )
 
     task = asyncio.create_task(run_resolver_loop(app))

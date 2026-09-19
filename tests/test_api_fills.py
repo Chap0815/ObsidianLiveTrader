@@ -14,7 +14,7 @@ from app.mexc.client import MexcClient
 
 SAMPLE_FILLS = [
     {
-        "symbol": "SOL",
+        "symbol": "SOL_USDT",
         "px": 142.3,
         "sz": 0.5,
         "side": "buy",
@@ -44,6 +44,30 @@ def test_fills_supported_returns_rows():
     assert ex.user_fills.await_args.kwargs["limit"] == 50
 
 
+def test_fills_uses_declared_client_exchange_for_symbol_semantics(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    row = {**SAMPLE_FILLS[0], "symbol": "SOL"}
+    ex = MagicMock()
+    ex.exchange_id = "hyperliquid"
+    ex.user_fills = AsyncMock(return_value=[row])
+
+    with TestClient(app) as client:
+        client.app.state.mexc = ex
+        client.app.state.exchange = ex
+        response = client.get(
+            "/api/fills", params={"symbol": "SOL_USDT", "limit": 50}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"fills": [row], "supported": True, "error": None}
+    ex.user_fills.assert_awaited_once_with(symbol="SOL", limit=50)
+
+
 def test_fills_unsupported_client_empty():
     class NoFills:
         pass
@@ -54,6 +78,20 @@ def test_fills_unsupported_client_empty():
         r = client.get("/api/fills")
     assert r.status_code == 200
     assert r.json() == {"fills": [], "supported": False, "error": None}
+
+
+@pytest.mark.parametrize("invalid_symbol", ["", "   ", "BTC/USDT"])
+def test_fills_rejects_invalid_symbol_before_client_capability_check(invalid_symbol):
+    class NoFills:
+        pass
+
+    with TestClient(app) as client:
+        client.app.state.mexc = NoFills()
+        client.app.state.exchange = NoFills()
+        response = client.get("/api/fills", params={"symbol": invalid_symbol})
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Invalid symbol")
 
 
 def test_fills_supported_true_for_real_mexc_client():
@@ -95,8 +133,9 @@ def test_fills_supported_true_for_real_mexc_client():
 
 
 def test_fills_exchange_error_soft():
+    marker = "SYNTHETIC_PRIVATE_FILL_ERROR"
     ex = MagicMock()
-    ex.user_fills = AsyncMock(side_effect=HyperliquidError("info down"))
+    ex.user_fills = AsyncMock(side_effect=HyperliquidError(marker))
     with TestClient(app) as client:
         client.app.state.mexc = ex
         client.app.state.exchange = ex
@@ -104,7 +143,53 @@ def test_fills_exchange_error_soft():
     assert r.status_code == 200
     body = r.json()
     assert body["supported"] is True
-    assert "info down" in body["error"]
+    assert body["error"] == "Exchange fill history unavailable"
+    assert marker not in r.text
+
+
+@pytest.mark.parametrize(
+    "malformed_rows",
+    [
+        None,
+        {},
+        [None],
+        [SAMPLE_FILLS[0], SAMPLE_FILLS[0]],
+        [{key: value for key, value in SAMPLE_FILLS[0].items() if key != "sz"}],
+        [{**SAMPLE_FILLS[0], "privateDiagnostic": "SYNTHETIC_PRIVATE_FILL_RAW"}],
+        [{**SAMPLE_FILLS[0], "symbol": "ETH_USDT"}],
+        [{**SAMPLE_FILLS[0], "px": "142.3"}],
+        [{**SAMPLE_FILLS[0], "fee": float("inf")}],
+        [{**SAMPLE_FILLS[0], "oid": 0}],
+        [{**SAMPLE_FILLS[0], "side": "sell", "dir": "Open Long"}],
+        [{**SAMPLE_FILLS[0], "time": 1}],
+        [{**SAMPLE_FILLS[0], "time": 10**20}],
+    ],
+)
+def test_fills_rejects_malformed_or_oversized_adapter_rows(
+    monkeypatch, malformed_rows
+):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.security.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    ex = MagicMock()
+    ex.user_fills = AsyncMock(return_value=malformed_rows)
+    with TestClient(app) as client:
+        client.app.state.mexc = ex
+        client.app.state.exchange = ex
+        response = client.get(
+            "/api/fills", params={"symbol": "SOL_USDT", "limit": 1}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "fills": [],
+        "supported": True,
+        "error": "Exchange fill history unavailable",
+    }
+    assert "SYNTHETIC_PRIVATE_FILL_RAW" not in response.text
 
 
 @pytest.mark.asyncio

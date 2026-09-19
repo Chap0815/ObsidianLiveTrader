@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from app.env_builder import (  # noqa: E402
     DEFAULT_MODELS,
+    EnvPermissionHardeningError,
     build_full_env,
     normalize_answers,
     restrict_env_permissions,
@@ -172,7 +173,10 @@ def _write_full_env(content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(content)
-        restrict_env_permissions(tmp)  # haerten, bevor es die echte .env wird
+        if restrict_env_permissions(tmp) is not True:
+            raise EnvPermissionHardeningError(
+                "Local configuration permissions could not be secured."
+            )
         os.replace(tmp, ENV_PATH)
     except Exception:
         tmp.unlink(missing_ok=True)

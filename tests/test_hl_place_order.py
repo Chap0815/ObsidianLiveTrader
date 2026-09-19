@@ -133,7 +133,7 @@ async def test_hl_contract_meta_rejects_nonstring_market_identity(invalid_name):
     )
 
     with pytest.raises(HyperliquidError, match="Unknown Hyperliquid coin"):
-        await c.contract_meta(str(invalid_name).upper())
+        await c.contract_meta("BTC")
 
 
 @pytest.mark.asyncio
@@ -286,6 +286,19 @@ async def test_set_leverage_accepts_documented_default_success():
             "status": "ok",
             "response": {"type": "default", "data": {"statuses": ["success"]}},
         },
+        {
+            "status": "ok",
+            "response": {"type": "default", "data": {"error": "rejected"}},
+        },
+        {
+            "status": "ok",
+            "response": {"type": "default", "error": "rejected"},
+        },
+        {
+            "status": "ok",
+            "error": "rejected",
+            "response": {"type": "default"},
+        },
         {"status": "ok"},
         {"status": "ok", "response": {}},
         {},
@@ -315,13 +328,30 @@ async def test_set_leverage_rejects_invalid_inputs_before_send(leverage, open_ty
 
 
 @pytest.mark.asyncio
-async def test_set_leverage_rejects_empty_symbol_before_send():
+@pytest.mark.parametrize(
+    "invalid_symbol", ["  ", "BTC/USDT", "B", "BTC_PRIVATE", "BTC_USDT_EXTRA"]
+)
+async def test_set_leverage_rejects_invalid_symbol_before_send(invalid_symbol):
     c = _client()
 
     with pytest.raises(HyperliquidError, match="symbol"):
-        await c.set_leverage("  ", 5, 1)
+        await c.set_leverage(invalid_symbol, 5, 1)
 
     c._exchange.update_leverage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["BTC", "btc_usdt", "BTC-USDC"])
+async def test_set_leverage_accepts_supported_symbol_aliases(symbol):
+    c = _client()
+    c._exchange.update_leverage.return_value = {
+        "status": "ok",
+        "response": {"type": "default"},
+    }
+
+    await c.set_leverage(symbol, 5, 1)
+
+    c._exchange.update_leverage.assert_called_once_with(5, "BTC", False)
 
 
 @pytest.mark.asyncio
@@ -341,7 +371,10 @@ async def test_hl_place_order_side_and_type_mapping():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_symbol", [True, 77, ["BTC"], {"coin": "BTC"}])
+@pytest.mark.parametrize(
+    "invalid_symbol",
+    [True, 77, ["BTC"], {"coin": "BTC"}, "BTC/USDT", "B"],
+)
 async def test_hl_place_order_rejects_nonstring_symbol_before_send(invalid_symbol):
     c = _client()
     c._meta_cache = (
@@ -429,6 +462,20 @@ async def test_hl_place_order_rejects_nonstring_symbol_before_send(invalid_symbo
                 "data": {"statuses": [{"resting": {"oid": 0}}]},
             },
         },
+        {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {
+                            "filled": {"oid": 1, "totalSz": "0.01"},
+                            "resting": {"oid": 2},
+                        }
+                    ]
+                },
+            },
+        },
     ],
 )
 async def test_hl_place_order_rejects_unrecognized_success_shape(response):
@@ -446,6 +493,101 @@ async def test_hl_place_order_rejects_unrecognized_success_shape(response):
             }
         )
     c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "status": "ok",
+            "error": "rejected despite outer status",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{"filled": {"oid": 1, "totalSz": "0.01"}}]
+                },
+            },
+        },
+        {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {
+                            "filled": {
+                                "oid": 1,
+                                "totalSz": "0.01",
+                                "error": "nested rejection",
+                            }
+                        }
+                    ]
+                },
+            },
+        },
+    ],
+)
+async def test_hl_place_order_rejects_error_at_any_response_depth(response):
+    c = _client()
+    c._exchange.market_open = MagicMock(return_value=response)
+
+    with pytest.raises(HyperliquidError, match="order rejected"):
+        await c.place_order(
+            {"symbol": "BTC", "side": "long", "type": "market", "vol": 0.01}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "trigger_fields"),
+    [
+        ("sl", {"stopLossPrice": 99.0}),
+        ("tp", {"takeProfitPrice": 110.0}),
+        (
+            "tp2",
+            {
+                "takeProfitPrice": 110.0,
+                "takeProfitPrice2": 120.0,
+                "tp1Share": 0.5,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("failure_mode", ["response", "exception"])
+async def test_hl_trigger_failure_does_not_retain_provider_detail(
+    target, trigger_fields, failure_mode
+):
+    marker = "SYNTHETIC_PRIVATE_TRIGGER_DIAGNOSTIC"
+    c = _client()
+    if failure_mode == "response":
+        failure = {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {"statuses": [{"error": marker}]},
+            },
+        }
+        detail = "trigger response rejected or invalid"
+    else:
+        failure = RuntimeError(marker)
+        detail = "trigger request failed"
+    c._exchange.order = MagicMock(
+        side_effect=[_OK, failure] if target == "tp2" else failure
+    )
+
+    out = await c.place_order(
+        {
+            "symbol": "BTC",
+            "side": "long",
+            "type": "market",
+            "vol": 0.01,
+            **trigger_fields,
+        }
+    )
+
+    assert out["triggerErrors"] == [f"{target}: {detail}"]
+    assert marker not in repr(out)
 
 
 @pytest.mark.asyncio
@@ -516,6 +658,46 @@ async def test_hl_place_order_rejects_reduce_only_market_before_send():
 
     c._exchange.market_open.assert_not_called()
     c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vol", "sz"),
+    [
+        (0.02, 0.01),
+        (0, 0.01),
+        (False, 0.01),
+        ("", 0.01),
+    ],
+)
+async def test_hl_place_order_rejects_ambiguous_size_aliases_before_send(vol, sz):
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="exactly one of vol or sz"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": vol,
+                "sz": sz,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hl_place_order_accepts_single_sz_alias():
+    c = _client()
+
+    result = await c.place_order(
+        {"symbol": "BTC", "side": 1, "type": "market", "sz": 0.01}
+    )
+
+    assert result["entryFilledSz"] == pytest.approx(0.01)
+    c._exchange.market_open.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -718,6 +900,30 @@ async def test_hl_place_order_stamps_cloid_from_external_oid():
     )
     passed = c._exchange.market_open.call_args.kwargs["cloid"]
     assert passed.to_raw() == external_oid_to_cloid("mlt-abc123").to_raw()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_external_oid", [None, True, "path/escape", "x" * 65]
+)
+async def test_hl_place_order_rejects_invalid_external_oid_before_send(
+    invalid_external_oid,
+):
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="externalOid"):
+        await c.place_order(
+            {
+                "symbol": "BTC",
+                "side": 1,
+                "type": "market",
+                "vol": 0.01,
+                "externalOid": invalid_external_oid,
+            }
+        )
+
+    c._exchange.market_open.assert_not_called()
+    c._exchange.order.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -924,6 +1130,9 @@ async def test_order_by_external_oid_malformed_status_spelling_cannot_prove_dead
     "order",
     [
         {"coin": "ETH", "oid": 7},
+        {"coin": "BTC_USDT", "oid": 7},
+        {"coin": "BTC/USDT", "oid": 7},
+        {"coin": "B", "oid": 7},
         {"coin": "BTC"},
         {"coin": "BTC", "oid": True},
         {"coin": "BTC", "oid": 0},
@@ -947,6 +1156,38 @@ async def test_order_by_external_oid_rejects_wrong_recovery_identity(order):
 
 
 @pytest.mark.asyncio
+async def test_order_by_external_oid_does_not_fallback_after_cloid_identity_conflict():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(
+        return_value={
+            "status": "order",
+            "order": {
+                "order": {"coin": "ETH", "oid": 7},
+                "status": "filled",
+            },
+        }
+    )
+    c._info = info
+    wanted = external_oid_to_cloid("mlt-cloid-conflict").to_raw()
+    c.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 8,
+                "symbol": "BTC",
+                "raw": {"coin": "BTC", "cloid": wanted},
+            }
+        ]
+    )
+    c.open_stop_orders = AsyncMock(return_value=[])
+
+    assert await c.order_by_external_oid("BTC", "mlt-cloid-conflict") == {}
+    c.open_orders.assert_not_awaited()
+    c.open_stop_orders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_coin", [True, 7, ["BTC"], {"coin": "BTC"}])
 async def test_order_by_external_oid_rejects_nonstring_cloid_coin(invalid_coin):
     c = _client()
@@ -965,9 +1206,7 @@ async def test_order_by_external_oid_rejects_nonstring_cloid_coin(invalid_coin):
     info.frontend_open_orders = MagicMock(return_value=[])
     c._info = info
 
-    result = await c.order_by_external_oid(
-        str(invalid_coin).upper(), "mlt-invalid-cloid-coin"
-    )
+    result = await c.order_by_external_oid("BTC", "mlt-invalid-cloid-coin")
 
     assert result == {}
 
@@ -994,11 +1233,40 @@ async def test_order_by_external_oid_fallback_rejects_nonstring_symbol(
     )
     c.open_stop_orders = AsyncMock(return_value=[])
 
-    result = await c.order_by_external_oid(
-        str(invalid_symbol).upper(), "mlt-invalid-fallback-symbol"
-    )
+    result = await c.order_by_external_oid("BTC", "mlt-invalid-fallback-symbol")
 
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_rejects_invalid_requested_symbol_before_query():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    c._info = info
+
+    with pytest.raises(HyperliquidError, match="symbol"):
+        await c.order_by_external_oid("BTC/USDT", "mlt-invalid-symbol")
+
+    info.query_order_by_cloid.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_external_oid", [None, True, "", "path/escape", "x" * 65]
+)
+async def test_order_by_external_oid_rejects_invalid_external_oid_before_query(
+    invalid_external_oid,
+):
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    c._info = info
+
+    with pytest.raises(HyperliquidError, match="externalOid"):
+        await c.order_by_external_oid("BTC", invalid_external_oid)
+
+    info.query_order_by_cloid.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1021,6 +1289,144 @@ async def test_order_by_external_oid_fallback_rejects_other_symbol_cloid():
     c.open_stop_orders = AsyncMock(return_value=[])
 
     assert await c.order_by_external_oid("BTC", "mlt-fallback-symbol") == {}
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_fallback_deduplicates_same_order():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value={"status": "unknownOid"})
+    c._info = info
+    wanted = external_oid_to_cloid("mlt-fallback-match").to_raw()
+    row = {
+        "orderId": 7,
+        "symbol": "BTC",
+        "raw": {"coin": "BTC", "cloid": wanted},
+    }
+    c.open_orders = AsyncMock(return_value=[row])
+    c.open_stop_orders = AsyncMock(return_value=[dict(row)])
+
+    result = await c.order_by_external_oid("BTC", "mlt-fallback-match")
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["orderId"] == 7
+    assert result[0]["externalOid"] == "mlt-fallback-match"
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_fallback_preserves_distinct_same_id_rows():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value={"status": "unknownOid"})
+    c._info = info
+    external_oid = "mlt-conflicting-duplicate"
+    wanted = external_oid_to_cloid(external_oid).to_raw()
+    first = {
+        "orderId": 7,
+        "symbol": "BTC",
+        "side": "B",
+        "reduceOnly": False,
+        "vol": 1.0,
+        "raw": {
+            "coin": "BTC",
+            "cloid": wanted,
+            "side": "B",
+            "reduceOnly": False,
+            "origSz": "1",
+            "sz": "1",
+        },
+    }
+    conflicting = {
+        **first,
+        "side": "A",
+        "raw": {**first["raw"], "side": "A"},
+    }
+    c.open_orders = AsyncMock(return_value=[first])
+    c.open_stop_orders = AsyncMock(return_value=[conflicting])
+
+    result = await c.order_by_external_oid("BTC", external_oid)
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert {row["side"] for row in result} == {"A", "B"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("external_oid", "invalid_value"), [("True", True), ("7", 7)]
+)
+async def test_order_by_external_oid_fallback_rejects_nonstring_id_alias(
+    external_oid, invalid_value
+):
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value={"status": "unknownOid"})
+    c._info = info
+    c.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC",
+                "raw": {"coin": "BTC", "externalOid": invalid_value},
+            }
+        ]
+    )
+    c.open_stop_orders = AsyncMock(return_value=[])
+
+    assert await c.order_by_external_oid("BTC", external_oid) == {}
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_fallback_rejects_conflicting_id_aliases():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value={"status": "unknownOid"})
+    c._info = info
+    wanted = external_oid_to_cloid("mlt-conflicting-alias").to_raw()
+    c.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC",
+                "raw": {
+                    "coin": "BTC",
+                    "cloid": wanted,
+                    "externalOid": "other-order",
+                },
+            }
+        ]
+    )
+    c.open_stop_orders = AsyncMock(return_value=[])
+
+    assert await c.order_by_external_oid("BTC", "mlt-conflicting-alias") == {}
+
+
+@pytest.mark.asyncio
+async def test_order_by_external_oid_fallback_rejects_multiple_order_ids():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    info = MagicMock()
+    info.query_order_by_cloid = MagicMock(return_value={"status": "unknownOid"})
+    c._info = info
+    wanted = external_oid_to_cloid("mlt-ambiguous-fallback").to_raw()
+    c.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": order_id,
+                "symbol": "BTC",
+                "raw": {"coin": "BTC", "cloid": wanted},
+            }
+            for order_id in (7, 8)
+        ]
+    )
+    c.open_stop_orders = AsyncMock(return_value=[])
+
+    assert await c.order_by_external_oid("BTC", "mlt-ambiguous-fallback") == {}
 
 
 @pytest.mark.asyncio
@@ -1068,6 +1474,21 @@ async def test_place_stop_order_rejects_nonfinite_volume_before_send():
             "BTC",
             position_side="long",
             vol=float("nan"),
+            trigger_px=99_000.0,
+        )
+
+    c._exchange.order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_place_stop_order_rejects_invalid_symbol_before_send():
+    c = _client()
+
+    with pytest.raises(HyperliquidError, match="symbol"):
+        await c.place_stop_order(
+            "BTC/USDT",
+            position_side="long",
+            vol=0.01,
             trigger_px=99_000.0,
         )
 
@@ -1137,10 +1558,41 @@ async def test_close_recheck_rejects_nonstring_market_identity(invalid_coin):
     c._exchange.market_close = MagicMock(return_value=_OK)
 
     with pytest.raises(HyperliquidError, match="position identity"):
+        await c.close_position_market("BTC", side="long", vol=0.5)
+
+    c._exchange.market_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_invalid_requested_symbol_before_live_recheck():
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)
+    c._exchange.market_close = MagicMock(return_value=_OK)
+
+    with pytest.raises(HyperliquidError, match="symbol"):
+        await c.close_position_market("BTC/USDT", side="long", vol=0.5)
+
+    c._info.user_state.assert_not_called()
+    c._exchange.market_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_external_oid", ["", True, "path/escape", "x" * 65])
+async def test_close_rejects_invalid_external_oid_before_live_recheck(
+    invalid_external_oid,
+):
+    c = _client()
+    c.account_address = "0x" + "a" * 40
+    c._info = _fake_info("BTC", 0.5)
+    c._exchange.market_close = MagicMock(return_value=_OK)
+
+    with pytest.raises(HyperliquidError, match="externalOid"):
         await c.close_position_market(
-            str(invalid_coin).upper(), side="long", vol=0.5
+            "BTC", side="long", vol=0.5, external_oid=invalid_external_oid
         )
 
+    c._info.user_state.assert_not_called()
     c._exchange.market_close.assert_not_called()
 
 
@@ -1555,6 +2007,8 @@ async def test_cancel_order_invalidates_user_state_cache():
         {"orderId": 7, "symbol": 77},
         {"orderId": 7, "symbol": ["BTC"]},
         {"orderId": 7, "symbol": {"coin": "BTC"}},
+        {"orderId": 7, "symbol": "BTC/USDT"},
+        {"orderId": 7, "symbol": "B"},
         [],
     ],
 )
@@ -1620,6 +2074,13 @@ async def test_hl_cancel_batch_rejects_duplicate_targets_before_send():
             "response": {
                 "type": "cancel",
                 "data": {"statuses": [{"error": "already filled"}]},
+            },
+        },
+        {
+            "status": "ok",
+            "response": {
+                "type": "cancel",
+                "data": {"statuses": ["success"], "error": "partial rejection"},
             },
         },
         {"status": "ok", "response": {"type": "cancel", "data": {}}},

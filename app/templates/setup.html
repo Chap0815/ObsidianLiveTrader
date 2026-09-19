@@ -28,7 +28,7 @@
       </div>
     </header>
 
-    <form id="setup-form" autocomplete="off">
+    <form id="setup-form" autocomplete="off" aria-busy="false">
 
       <!-- Schritt 1: Börse -->
       <section class="panel setup-section">
@@ -48,7 +48,7 @@
             <label class="choice-card">
               <input type="radio" name="exchange" value="mexc" />
               <span class="choice-title">MEXC Futures</span>
-              <span class="choice-desc">USDT-M perpetuals. Grant trading permission only; keep withdrawals disabled.</span>
+              <span class="choice-desc">Live venue with no testnet. Real funds are used after you arm trading.</span>
             </label>
           </div>
 
@@ -77,6 +77,10 @@
           </div>
 
           <div id="fields-mexc" class="setup-fields hidden">
+            <div class="setup-note setup-note-danger">
+              <strong>MEXC has no testnet.</strong> Trading remains <strong>DISARMED</strong>
+              after setup; every later order submission uses real funds.
+            </div>
             <label>
               <span>MEXC API Key</span>
               <span class="key-row">
@@ -103,9 +107,9 @@
           <label>
             <span>Provider <em class="label-note">you can switch it later from the dashboard</em></span>
             <select id="llm-provider">
-              <option value="claude" selected>Claude Opus (Anthropic)</option>
+              <option value="claude" selected>Claude (Anthropic)</option>
               <option value="xai">Grok (xAI)</option>
-              <option value="openai">Codex (OpenAI)</option>
+              <option value="openai">OpenAI</option>
               <option value="ollama">Ollama — local, no key required</option>
               <option value="none">Start without AI</option>
             </select>
@@ -221,7 +225,7 @@
 
       <button type="submit" id="btn-save" class="btn-submit">Save configuration and open dashboard</button>
       <p id="setup-error" class="error-text hidden" role="alert"></p>
-      <p id="setup-ok" class="hint hidden">Saved — opening the dashboard…</p>
+      <p id="setup-ok" class="hint hidden" role="status" aria-live="polite">Saved — opening the dashboard…</p>
     </form>
   </main>
 {% endblock %}
@@ -231,6 +235,17 @@
     (function () {
       "use strict";
       function $(id) { return document.getElementById(id); }
+      var setupSaving = false;
+
+      function setSetupSaving(active) {
+        setupSaving = active;
+        $("setup-form").setAttribute("aria-busy", active ? "true" : "false");
+        var btn = $("btn-save");
+        btn.disabled = active;
+        btn.textContent = active
+          ? "Saving…"
+          : "Save configuration and open dashboard";
+      }
 
       // W3-07: ONE model truth — injected from the server DEFAULT_MODELS
       // (env_builder), never a duplicated hardcoded JS list. tojson is
@@ -247,6 +262,16 @@
       }
       function currentRisk() {
         return document.querySelector('input[name="risk_profile"]:checked').value;
+      }
+
+      function setupSuccessMessage(exchange) {
+        if (exchange === "hl-mainnet") {
+          return "Mainnet configuration saved. Trading remains disabled. Complete the Mainnet safety checklist and set the separate Mainnet acknowledgement before arming.";
+        }
+        if (exchange === "mexc") {
+          return "MEXC configuration saved. Trading remains disabled. Every future order uses real funds.";
+        }
+        return "Testnet configuration saved. Trading remains disabled.";
       }
 
       function syncExchange() {
@@ -363,6 +388,7 @@
 
       $("setup-form").addEventListener("submit", async function (e) {
         e.preventDefault();
+        if (setupSaving) return;
         $("setup-error").classList.add("hidden");
 
         var ex = currentExchange();
@@ -404,9 +430,7 @@
           return fail("Enter an API key for the selected AI provider, or choose Ollama / Start without AI.");
         }
 
-        var btn = $("btn-save");
-        btn.disabled = true;
-        btn.textContent = "Saving…";
+        setSetupSaving(true);
         try {
           var res = await fetch("/api/setup", {
             method: "POST",
@@ -417,16 +441,15 @@
           if (!res.ok) {
             var d = data && data.detail;
             fail(typeof d === "string" ? d : JSON.stringify(d || "Could not save configuration"));
-            btn.disabled = false;
-            btn.textContent = "Save configuration and open dashboard";
+            setSetupSaving(false);
             return;
           }
+          $("setup-ok").textContent = setupSuccessMessage(ex);
           $("setup-ok").classList.remove("hidden");
-          setTimeout(function () { window.location.href = "/"; }, 900);
+          setTimeout(function () { window.location.href = "/"; }, ex === "hl-mainnet" ? 3500 : 900);
         } catch (err) {
           fail("Network error: " + (err && err.message ? err.message : err));
-          btn.disabled = false;
-          btn.textContent = "Save configuration and open dashboard";
+          setSetupSaving(false);
         }
       });
     })();

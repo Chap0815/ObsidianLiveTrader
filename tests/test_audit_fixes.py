@@ -8,12 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.config import Settings
 from app.models import ContractMeta, OrderTicket, Ticker
-from app.orders.service import OrderError, OrderService
+from app.orders.service import OrderError, OrderOutcomeUnknown, OrderService
 from app.orders.tokens import PreviewStore
 from app.risk.gates import validate_order
 from app.mexc.errors import MexcError
 from app.mexc.client import MexcClient, normalize_klines  # noqa: F401
 from app.hyperliquid.client import HyperliquidClient, _opt_f
+from app.hyperliquid.errors import HyperliquidError
 
 
 def _settings(**kwargs) -> Settings:
@@ -382,12 +383,61 @@ async def test_sl_echo_in_response_is_not_trusted():
 async def test_sl_trigger_oid_counts_as_verified():
     """An explicit exchange trigger oid (HL adapter) is real evidence."""
     client = _happy_client({"orderId": 1, "slTriggerOid": 555})
+    client.exchange_id = "hyperliquid"
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
     assert prev["ok"]
     out = await svc.confirm(prev["token"])
     assert out["sl_verified"] is True
+    assert out["response"]["slTriggerOid"] == 555
     client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_oid", [True, 0, -1, 1.5, "bad", "9" * 5_000]
+)
+async def test_invalid_sl_trigger_oid_is_not_verified(invalid_oid):
+    client = _happy_client({"orderId": 1, "slTriggerOid": invalid_oid})
+    client.exchange_id = "hyperliquid"
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert "SL trigger error" in out["sl_detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger_errors", "expected_verified", "expects_tp_warning"),
+    [
+        (["sl: rejected"], False, False),
+        (["tp: rejected"], True, True),
+        ("malformed", False, True),
+    ],
+)
+async def test_trigger_error_contract_cannot_conflict_with_sl_verification(
+    trigger_errors, expected_verified, expects_tp_warning
+):
+    client = _happy_client(
+        {
+            "orderId": 1,
+            "slTriggerOid": 555,
+            "triggerErrors": trigger_errors,
+        }
+    )
+    client.exchange_id = "hyperliquid"
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is expected_verified
+    assert any("take-profit triggers" in warning for warning in out["warnings"]) is (
+        expects_tp_warning
+    )
 
 
 @pytest.mark.asyncio
@@ -577,6 +627,54 @@ async def test_unfilled_resting_limit_not_flattened_or_cancelled():
     assert "unverified" not in out["status"] and "flatten" not in out["status"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "place_response",
+    [
+        {
+            "orderId": 777,
+            "unfilled": True,
+            "entryFilledSz": 1.0,
+            "slTriggerOid": None,
+        },
+        {
+            "orderId": 777,
+            "unfilled": True,
+            "entryFilledSz": 0.0,
+            "slTriggerOid": None,
+            "response": {
+                "status": "ok",
+                "response": {
+                    "data": {
+                        "statuses": [{"filled": {"oid": 777, "totalSz": 1.0}}]
+                    }
+                },
+            },
+        },
+    ],
+    ids=["top-level-size", "nested-exchange-fill"],
+)
+async def test_conflicting_unfilled_marker_does_not_bypass_sl_verification(
+    place_response,
+):
+    client = _happy_client(place_response)
+    svc = OrderService(
+        client,
+        _settings(auto_flatten_if_sl_unverified=True),
+        PreviewStore(),
+    )
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["status"] != "placed_unfilled_resting"
+    assert out["sl_verified"] is False
+    assert out["flatten"]["action"] == "skipped_invalid_fill_report"
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+
+
 # ── O-01 + O-02: MEXC auto-flatten must not fire on a correctly protected trade ─
 #
 # On MEXC the SL is attached position-bound in the create body (stopLossPrice)
@@ -601,6 +699,37 @@ def _mexc_client(place_response, *, post_hold: float = 1.0):
     return client
 
 
+def _mexc_recovery_result(
+    external_oid: str, *, match: str = "history", **order_fields
+) -> dict:
+    order = {
+        "externalOid": external_oid,
+        "orderId": 7,
+        "symbol": "BTC_USDT",
+        **order_fields,
+    }
+    return {
+        "match": match,
+        "externalOid": external_oid,
+        "order": order,
+    }
+
+
+def _hl_recovery_result(external_oid: str, **order_fields) -> dict:
+    return {
+        "match": "cloid",
+        "externalOid": external_oid,
+        "order": {
+            "order": {
+                "coin": "BTC",
+                "oid": 7,
+                **order_fields,
+            },
+            "status": "filled",
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_mexc_empty_stop_list_not_flattened():
     """O-01: empty open_stop_orders on MEXC (position-bound SL) must NOT cause a
@@ -619,6 +748,114 @@ async def test_mexc_empty_stop_list_not_flattened():
 
 
 @pytest.mark.asyncio
+async def test_mexc_oversized_reported_fill_is_not_sl_evidence():
+    client = _mexc_client({"orderId": 7, "dealVol": 2.0})
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_oversized_recovered_fill_is_not_sl_evidence():
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, dealVol=2.0, state=3
+        )
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_oversized_market_hold_delta_is_not_sl_evidence():
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(2.0), _filled_pos(2.0)]
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(
+        _ticket(
+            order_type="market",
+            price=None,
+            vol=1.0,
+            take_profit=102_500.0,
+        )
+    )
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_partial_reported_limit_fill_is_not_fully_verified():
+    client = _mexc_client({"orderId": 7, "dealVol": 0.4}, post_hold=0.4)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is True
+    assert out["sl_fully_verified"] is False
+    assert "partial_fill" in out["status"]
+    assert any("PARTIALLY FILLED" in warning for warning in out["warnings"])
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_partial_lookup_fill_is_not_fully_verified():
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(0.4), _filled_pos(0.4)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, dealVol=0.4, state=3
+        )
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket(vol=1.0))
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is True
+    assert out["sl_fully_verified"] is False
+    assert "partial_fill" in out["status"]
+    assert any("PARTIALLY FILLED" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_mexc_position_level_sl_verified_via_fill_delta():
     """O-01 positive path (production shape: MEXC create returns only an orderId,
     no fill field). X2-01: for a LIMIT the fill is proven by ORDER-OWN evidence
@@ -626,8 +863,13 @@ async def test_mexc_position_level_sl_verified_via_fill_delta():
     delta (which an external same-side bump could forge). Filled ⟹ the
     position-bound SL is active. No flatten."""
     client = _mexc_client({"data": 1})  # no reported fill → order-own evidence
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
     client.order_by_external_oid = AsyncMock(
-        return_value={"match": "history", "order": {"dealVol": 1.0, "state": 3}}
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, dealVol=1.0, state=3
+        )
     )
     svc = OrderService(
         client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
@@ -636,6 +878,67 @@ async def test_mexc_position_level_sl_verified_via_fill_delta():
     assert prev["ok"], prev.get("errors")
     out = await svc.confirm(prev["token"])
     assert out["sl_verified"] is True
+    client.order_by_external_oid.assert_awaited_once()
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_limit_fill_requires_exact_recovery_identity():
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        return_value={
+            "match": "history",
+            "externalOid": "mlt-other",
+            "order": {
+                "externalOid": "mlt-other",
+                "orderId": 7,
+                "dealVol": 1.0,
+                "state": 3,
+            },
+        }
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
+    client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_limit_fill_rejects_foreign_symbol_recovery():
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid,
+            symbol="ETH_USDT",
+            dealVol=1.0,
+            state=3,
+        )
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
     client.close_position_market.assert_not_awaited()
 
 
@@ -664,9 +967,14 @@ async def test_mexc_filled_entry_with_sl_is_verified_quietly():
     stopLossPrice>0 is VERIFIED (not UNKNOWN) — a quiet info note, NOT the loud
     'UNBEKANNT'/'not verified' alarm that would fire on every MEXC trade."""
     client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
     # LIMIT fill proven by order-own evidence (X2-01), not the hold delta.
     client.order_by_external_oid = AsyncMock(
-        return_value={"match": "history", "order": {"dealVol": 1.0, "state": 3}}
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, dealVol=1.0, state=3
+        )
     )
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
@@ -677,6 +985,7 @@ async def test_mexc_filled_entry_with_sl_is_verified_quietly():
     assert "unverified" not in out["status"] and "unknown" not in out["status"]
     assert not any("UNBEKANNT" in w for w in out["warnings"])
     assert not any("not verified" in w.lower() for w in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
     client.close_position_market.assert_not_awaited()
 
 
@@ -755,7 +1064,9 @@ async def test_mexc_resting_limit_external_bump_not_verified():
         side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
     )
     client.order_by_external_oid = AsyncMock(
-        return_value={"match": "open", "order": {"dealVol": 0.0, "state": 2}}
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, match="open", dealVol=0.0, state=2
+        )
     )
     svc = OrderService(
         client, _settings(auto_flatten_if_sl_unverified=True), PreviewStore()
@@ -767,6 +1078,7 @@ async def test_mexc_resting_limit_external_bump_not_verified():
     assert out["sl_checked"] is False
     assert out["status"] == "placed_sl_unknown"
     assert any("UNKNOWN" in w for w in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
     client.close_position_market.assert_not_awaited()
     client.cancel_order.assert_not_awaited()
 
@@ -861,13 +1173,27 @@ async def test_transport_timeout_recovery_returns_ok_not_error():
     client = _happy_client({"orderId": 1})
     oid = None
 
+    marker = "SYNTHETIC_PRIVATE_RECOVERY_DETAIL"
+
     async def _place(_body):
-        raise MexcError("timeout connecting to upstream")
+        raise MexcError("timeout " + marker)
 
     client.place_order = AsyncMock(side_effect=_place)
 
     async def _by_ext(symbol, external_oid):
-        return {"orderId": 42, "externalOid": external_oid, "symbol": symbol}
+        return {
+            "orderId": 42,
+            "externalOid": external_oid,
+            "symbol": symbol,
+            "side": 1,
+            "vol": 1.0,
+            "type": 1,
+            "openType": 1,
+            "price": 100_000.0,
+            "leverage": 5,
+            "stopLossPrice": 99_000.0,
+            "takeProfitPrice": 102_000.0,
+        }
 
     client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
     svc = OrderService(client, _settings(), PreviewStore())
@@ -880,13 +1206,209 @@ async def test_transport_timeout_recovery_returns_ok_not_error():
     assert out["sl_verified"] is False
     assert out["sl_checked"] is True
     assert any("DO NOT re-preview" in w for w in out["warnings"])
+    assert marker not in str(out)
+
+
+@pytest.mark.asyncio
+async def test_transport_timeout_recovery_rejects_foreign_symbol():
+    """An exact externalOid cannot recover an order for another contract."""
+    client = _happy_client({"orderId": 1})
+    client.place_order = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def _by_ext(_symbol, external_oid):
+        return {
+            "orderId": 42,
+            "externalOid": external_oid,
+            "symbol": "ETH_USDT",
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    with pytest.raises(OrderOutcomeUnknown, match="outcome is unknown"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order_fields",
+    [
+        {"side": 3, "vol": 1.0},
+        {"side": True, "vol": 1.0},
+        {"side": 1, "vol": 2.0},
+        {"side": 1, "vol": "NaN"},
+    ],
+)
+async def test_transport_timeout_recovery_rejects_conflicting_mexc_order_economics(
+    order_fields,
+):
+    client = _happy_client({"orderId": 1})
+    client.place_order = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def _by_ext(_symbol, external_oid):
+        return {
+            "match": "history",
+            "externalOid": external_oid,
+            "order": {
+                "externalOid": external_oid,
+                "orderId": 42,
+                "symbol": "BTC_USDT",
+                **order_fields,
+            },
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    with pytest.raises(OrderOutcomeUnknown, match="outcome is unknown"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order_fields",
+    [
+        {"type": 5, "openType": 1, "price": 100_000.0},
+        {"type": 1, "openType": 2, "price": 100_000.0},
+        {"type": 1, "openType": 1, "price": 99_999.0},
+        {"type": 1, "openType": 1, "price": 100_000.0, "leverage": 4},
+        {"type": 1, "openType": 1, "price": 100_000.0, "leverage": True},
+        {"type": 1, "openType": 1, "price": 100_000.0, "stopLossPrice": 98_000.0},
+        {
+            "type": 1,
+            "openType": 1,
+            "price": 100_000.0,
+            "takeProfitPrice": 103_000.0,
+        },
+    ],
+)
+async def test_transport_timeout_recovery_rejects_conflicting_mexc_order_terms(
+    order_fields,
+):
+    client = _happy_client({"orderId": 1})
+    client.place_order = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def _by_ext(_symbol, external_oid):
+        return {
+            "match": "history",
+            "externalOid": external_oid,
+            "order": {
+                "externalOid": external_oid,
+                "orderId": 42,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "vol": 1.0,
+                **order_fields,
+            },
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    with pytest.raises(OrderOutcomeUnknown, match="outcome is unknown"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order_fields",
+    [
+        {"side": "A", "origSz": "1", "reduceOnly": False},
+        {"side": "B", "origSz": "2", "reduceOnly": False},
+        {"side": "B", "origSz": "1", "reduceOnly": True},
+    ],
+)
+async def test_hl_entry_recovery_rejects_conflicting_order_economics(order_fields):
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "hyperliquid"
+    client.place_order = AsyncMock(side_effect=HyperliquidError("timeout"))
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _hl_recovery_result(
+            external_oid, **order_fields
+        )
+    )
+    svc = OrderService(client, _settings(exchange="hyperliquid"), PreviewStore())
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
+    assert prev["ok"], prev["errors"]
+
+    with pytest.raises(OrderOutcomeUnknown, match="outcome is unknown"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_hl_entry_recovery_checks_all_distinct_same_id_rows():
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "hyperliquid"
+    client.place_order = AsyncMock(side_effect=HyperliquidError("timeout"))
+
+    async def _by_ext(_symbol, external_oid):
+        common = {
+            "externalOid": external_oid,
+            "orderId": 7,
+            "symbol": "BTC",
+            "origSz": "1",
+            "sz": "0",
+            "reduceOnly": False,
+        }
+        return [{**common, "side": "B"}, {**common, "side": "A"}]
+
+    client.order_by_external_oid = AsyncMock(side_effect=_by_ext)
+    svc = OrderService(client, _settings(exchange="hyperliquid"), PreviewStore())
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
+    assert prev["ok"], prev["errors"]
+
+    with pytest.raises(OrderOutcomeUnknown, match="outcome is unknown"):
+        await svc.confirm(prev["token"])
+
+    assert client.place_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_hl_entry_recovery_accepts_matching_order_economics():
+    client = _happy_client({"orderId": 1})
+    client.exchange_id = "hyperliquid"
+    client.place_order = AsyncMock(side_effect=HyperliquidError("timeout"))
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _hl_recovery_result(
+            external_oid,
+            side="B",
+            origSz="1",
+            sz="0",
+            reduceOnly=False,
+        )
+    )
+    svc = OrderService(client, _settings(exchange="hyperliquid"), PreviewStore())
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
+    assert prev["ok"], prev["errors"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["response"]["recovered"] is True
 
 
 @pytest.mark.asyncio
 async def test_sl_unknown_does_not_flatten():
     """If the SL-lookup endpoint itself errors, state is UNKNOWN — never flatten."""
+    marker = "SYNTHETIC_PRIVATE_SL_LOOKUP_DETAIL"
     client = _happy_client({"orderId": 1})  # no SL evidence in response
-    client.open_stop_orders = AsyncMock(side_effect=MexcError("endpoint 404"))
+    client.open_stop_orders = AsyncMock(side_effect=MexcError(marker))
     # Gate-time + pre_hold succeed; post-place SL position lookup fails → UNKNOWN
     client.positions = AsyncMock(
         side_effect=[
@@ -904,6 +1426,35 @@ async def test_sl_unknown_does_not_flatten():
     assert out["sl_checked"] is False
     assert out["status"] == "placed_sl_unknown"
     client.close_position_market.assert_not_awaited()  # NOT flattened on unknown
+    assert marker not in str(out)
+
+
+@pytest.mark.asyncio
+async def test_post_place_verification_exception_is_not_reflected():
+    marker = "SYNTHETIC_PRIVATE_VERIFY_EXCEPTION"
+    client = _happy_client({"orderId": 1})
+    client.open_stop_orders = AsyncMock(side_effect=RuntimeError(marker))
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["post_errors"] == ["post-place SL verification failed"]
+    assert marker not in str(out)
+
+
+@pytest.mark.asyncio
+async def test_trigger_rejection_detail_is_not_reflected():
+    marker = "SYNTHETIC_PRIVATE_TRIGGER_REJECTION"
+    client = _happy_client({"orderId": 1, "triggerErrors": [marker]})
+    client.exchange_id = "hyperliquid"
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert "exchange reported an SL trigger error" in out["sl_detail"]
+    assert marker not in str(out)
 
 
 @pytest.mark.asyncio
@@ -1003,6 +1554,10 @@ async def test_auto_flatten_timeout_recovers_exact_close_external_oid_once():
             "order": {
                 "externalOid": recovery_oid,
                 "orderId": 7,
+                "side": 4,
+                "vol": 1.0,
+                "type": 5,
+                "openType": 1,
                 "state": 3,
             },
         }
@@ -1016,14 +1571,138 @@ async def test_auto_flatten_timeout_recovers_exact_close_external_oid_once():
 
     assert client.close_position_market.await_count == 1
     assert client.order_by_external_oid.await_count == 1
-    assert out["flatten"]["match"] == "history"
+    assert out["flatten"]["recovered"] is True
     assert any("recovered" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_timeout_recovery_rejects_foreign_symbol():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def recover(_symbol, recovery_oid):
+        return {
+            "match": "history",
+            "externalOid": recovery_oid,
+            "order": {
+                "externalOid": recovery_oid,
+                "orderId": 7,
+                "symbol": "ETH_USDT",
+                "state": 3,
+            },
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert out["flatten"] == {"error": "automatic close failed"}
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_timeout_recovery_rejects_wrong_mexc_close_side():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def recover(_symbol, recovery_oid):
+        return {
+            "match": "history",
+            "externalOid": recovery_oid,
+            "order": {
+                "externalOid": recovery_oid,
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "vol": 1.0,
+                "state": 3,
+            },
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert out["flatten"] == {"error": "automatic close failed"}
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_timeout_recovery_rejects_wrong_mexc_close_type():
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+
+    async def recover(_symbol, recovery_oid):
+        return {
+            "match": "history",
+            "externalOid": recovery_oid,
+            "order": {
+                "externalOid": recovery_oid,
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": 4,
+                "vol": 1.0,
+                "type": 1,
+                "openType": 1,
+                "state": 3,
+            },
+        }
+
+    client.order_by_external_oid = AsyncMock(side_effect=recover)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    assert out["flatten"] == {"error": "automatic close failed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered_side, accepted", [("B", False), ("A", True)])
+async def test_hl_auto_flatten_recovery_binds_close_economics(
+    recovered_side, accepted
+):
+    client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
+    client.exchange_id = "hyperliquid"
+    client.close_position_market = AsyncMock(
+        side_effect=HyperliquidError("timeout")
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _hl_recovery_result(
+            external_oid,
+            side=recovered_side,
+            origSz="1",
+            sz="0",
+            reduceOnly=True,
+        )
+    )
+    svc = OrderService(client, _settings(exchange="hyperliquid"), PreviewStore())
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
+    assert prev["ok"], prev["errors"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert client.close_position_market.await_count == 1
+    if accepted:
+        assert out["flatten"]["recovered"] is True
+    else:
+        assert out["flatten"] == {"error": "automatic close failed"}
 
 
 @pytest.mark.asyncio
 async def test_auto_flatten_timeout_mismatched_recovery_never_resends():
     client = _happy_client({"orderId": 1, "dealVol": 1.0}, post_hold=1.0)
-    client.close_position_market = AsyncMock(side_effect=MexcError("timeout"))
+    marker = "SYNTHETIC_PRIVATE_FLATTEN_DETAIL"
+    client.close_position_market = AsyncMock(
+        side_effect=MexcError("timeout " + marker)
+    )
     client.order_by_external_oid = AsyncMock(
         return_value={"match": "history", "externalOid": "close:other"}
     )
@@ -1035,7 +1714,8 @@ async def test_auto_flatten_timeout_mismatched_recovery_never_resends():
 
     assert client.close_position_market.await_count == 1
     assert client.order_by_external_oid.await_count == 1
-    assert out["flatten"] == {"error": "timeout"}
+    assert out["flatten"] == {"error": "automatic close failed"}
+    assert marker not in str(out)
 
 
 @pytest.mark.asyncio
@@ -1189,6 +1869,7 @@ async def test_manual_mode_scale_out_warns_ladder_not_placed():
 async def test_auto_mode_still_attaches_sl():
     """Default (auto) keeps the exchange SL trigger in the body."""
     client = _happy_client({"orderId": 1, "slTriggerOid": 5})
+    client.exchange_id = "hyperliquid"
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())  # default trigger_mode=auto
     out = await svc.confirm(prev["token"])
@@ -1279,6 +1960,61 @@ async def test_flatten_uses_reported_fill_not_bot_inflated_hold():
 
 
 @pytest.mark.asyncio
+async def test_flatten_does_not_fallback_to_hold_for_invalid_fill_report():
+    client = _happy_client(
+        {"orderId": 777, "dealVol": 0.0, "deal_vol": 1.0}
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+    assert out["flatten"]["action"] == "skipped_invalid_fill_report"
+    assert any("fill report is invalid" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "place_response",
+    [
+        {"orderId": 777, "oid": 999, "dealVol": 1.0},
+        {
+            "orderId": 777,
+            "dealVol": 1.0,
+            "response": {
+                "status": "ok",
+                "response": {
+                    "data": {
+                        "statuses": [
+                            {"filled": {"oid": 999, "totalSz": 1.0}}
+                        ]
+                    }
+                },
+            },
+        },
+    ],
+    ids=["top-level-aliases", "nested-exchange-status"],
+)
+async def test_auto_flatten_does_not_use_fill_from_ambiguous_entry_identity(
+    place_response,
+):
+    client = _happy_client(place_response)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    client.close_position_market.assert_not_awaited()
+    client.cancel_order.assert_not_awaited()
+    assert out["flatten"]["action"] == "skipped_invalid_fill_report"
+    assert any("fill report is invalid" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
 async def test_flatten_reported_zero_fill_cancels_resting_despite_bot_hold():
     """Response reports 0 fill while hold rose (external bot) → treat as unfilled
     and cancel the resting entry; never market-close the bot's/our old size."""
@@ -1307,9 +2043,10 @@ async def test_flatten_reported_zero_fill_cancels_resting_despite_bot_hold():
 
 @pytest.mark.asyncio
 async def test_auto_flatten_cancel_inner_error_is_not_reported_cancelled():
+    marker = "SYNTHETIC_PRIVATE_RESTING_CANCEL_DETAIL"
     client = _happy_client({"orderId": 777, "dealVol": 0})
     client.cancel_order = AsyncMock(
-        return_value=[{"orderId": 777, "errorCode": 3001, "errorMsg": "busy"}]
+        return_value=[{"orderId": 777, "errorCode": 3001, "errorMsg": marker}]
     )
     svc = OrderService(client, _settings(), PreviewStore())
     prev = await svc.preview(_ticket())
@@ -1321,6 +2058,59 @@ async def test_auto_flatten_cancel_inner_error_is_not_reported_cancelled():
     assert out["flatten"]["cancelled"] == []
     assert out["flatten"]["cancel_errors"]
     assert any("could NOT be cancelled" in warning for warning in out["warnings"])
+    assert marker not in str(out)
+
+
+@pytest.mark.asyncio
+async def test_auto_flatten_cancel_foreign_identity_is_not_reported_cancelled():
+    client = _happy_client({"orderId": 777, "dealVol": 0})
+    client.cancel_order = AsyncMock(
+        return_value=[{"orderId": 999, "errorCode": 0}]
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["flatten"]["cancelled"] == []
+    assert out["flatten"]["cancel_errors"]
+    assert any("could NOT be cancelled" in warning for warning in out["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "place_response",
+    [
+        {"orderId": 777, "oid": 999, "dealVol": 0},
+        {
+            "orderId": 777,
+            "dealVol": 0,
+            "response": {
+                "status": "ok",
+                "response": {
+                    "data": {"statuses": [{"resting": {"oid": 999}}]}
+                },
+            },
+        },
+    ],
+    ids=["top-level-aliases", "nested-exchange-status"],
+)
+async def test_auto_flatten_does_not_cancel_ambiguous_entry_identity(place_response):
+    client = _happy_client(place_response)
+    svc = OrderService(client, _settings(), PreviewStore())
+    prev = await svc.preview(_ticket())
+    assert prev["ok"]
+
+    out = await svc.confirm(prev["token"])
+
+    client.cancel_order.assert_not_awaited()
+    assert "orderId" not in out["response"]
+    assert out["flatten"]["action"] == "skipped_invalid_fill_report"
+    assert any(
+        "fill report is invalid" in warning
+        for warning in out["warnings"]
+    )
 
 
 # ── Fix 2: side-aware / directional tick rounding ───────────────────────────
@@ -1361,14 +2151,51 @@ def _open_orders_settings():
     return Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s")
 
 
-def test_orders_open_reports_stops_error(monkeypatch):
+@pytest.mark.parametrize("invalid_symbol", ["", "   ", "BTC/USDT"])
+def test_orders_open_rejects_explicit_invalid_symbol_before_private_reads(
+    monkeypatch, invalid_symbol
+):
     from fastapi.testclient import TestClient
     from app.main import app
 
     monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
     mock = MagicMock()
-    mock.open_orders = AsyncMock(return_value=[{"orderId": 1}])
-    mock.open_stop_orders = AsyncMock(side_effect=MexcError("stoporder 404"))
+    mock.open_orders = AsyncMock(
+        side_effect=AssertionError("invalid symbol must block regular-order read")
+    )
+    mock.open_stop_orders = AsyncMock(
+        side_effect=AssertionError("invalid symbol must block stop-order read")
+    )
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open", params={"symbol": invalid_symbol})
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Invalid symbol")
+    mock.open_orders.assert_not_awaited()
+    mock.open_stop_orders.assert_not_awaited()
+
+
+def test_orders_open_reports_stops_error(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    marker = "SYNTHETIC_PRIVATE_STOP_ORDERS_ERROR"
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 1,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "price": 100_000.0,
+                "vol": 2.0,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(side_effect=MexcError(marker))
     with TestClient(app) as tc:
         tc.app.state.mexc = mock
         tc.app.state.exchange = mock
@@ -1376,7 +2203,8 @@ def test_orders_open_reports_stops_error(monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["stop_orders"] == []
-    assert body["stops_error"] and "stoporder" in body["stops_error"].lower()
+    assert body["stops_error"] == "Exchange stop orders unavailable"
+    assert marker not in r.text
     assert body["error"] is None
 
 
@@ -1395,6 +2223,683 @@ def test_orders_open_no_stops_error_on_success(monkeypatch):
     body = r.json()
     assert body["stop_orders"] == []
     assert body["stops_error"] is None
+
+
+def test_orders_open_uses_declared_client_exchange_for_symbol_semantics(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.exchange_id = "hyperliquid"
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC",
+                "side": "B",
+                "reduceOnly": False,
+                "vol": 0.01,
+                "price": 100_000.0,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(return_value=[])
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open", params={"symbol": "BTC_USDT"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "orders": [
+            {
+                "orderId": 7,
+                "symbol": "BTC",
+                "side": "B",
+                "reduceOnly": False,
+                "vol": 0.01,
+                "price": 100_000.0,
+            }
+        ],
+        "stop_orders": [],
+        "stops_error": None,
+        "error": None,
+    }
+    mock.open_orders.assert_awaited_once_with("BTC")
+    mock.open_stop_orders.assert_awaited_once_with("BTC")
+
+
+def test_orders_open_allowlists_public_order_fields(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    regular_secret = "SYNTHETIC_PRIVATE_OPEN_ORDER_TOKEN"
+    stop_secret = "SYNTHETIC_PRIVATE_STOP_ORDER_TOKEN"
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "vol": 2.0,
+                "price": 100_000.0,
+                "reduceOnly": False,
+                "sessionToken": regular_secret,
+                "raw": {"authorization": regular_secret},
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "tpsl": "sl",
+                "reduceOnly": True,
+                "vol": 2.0,
+                "credential": stop_secret,
+                "raw": {"cookie": stop_secret},
+            }
+        ]
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "orders": [
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": "buy",
+                "vol": 2.0,
+                "price": 100_000.0,
+                "reduceOnly": False,
+            }
+        ],
+        "stop_orders": [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "tpsl": "sl",
+                "reduceOnly": True,
+                "vol": 2.0,
+            }
+        ],
+        "stops_error": None,
+        "error": None,
+    }
+    assert regular_secret not in response.text
+    assert stop_secret not in response.text
+
+
+@pytest.mark.parametrize(
+    ("raw_side", "side", "reduce_only"),
+    [
+        (1, "buy", False),
+        ("2", "buy", True),
+        (3, "sell", False),
+        ("4", "sell", True),
+    ],
+)
+def test_orders_open_normalizes_mexc_side_and_close_intent(
+    monkeypatch, raw_side, side, reduce_only
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": raw_side,
+                "vol": 2.0,
+                "price": 100_000.0,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(return_value=[])
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["orders"] == [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": side,
+            "reduceOnly": reduce_only,
+            "vol": 2.0,
+            "price": 100_000.0,
+        }
+    ]
+
+
+def test_orders_open_normalizes_regular_order_price_and_size_aliases(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                "price": "0",
+                "sz": "2.25",
+                "quantity": 2.25,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(return_value=[])
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["orders"] == [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": "buy",
+            "reduceOnly": False,
+            "vol": 2.25,
+            "price": 0.0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "economics",
+    [
+        {},
+        {"price": 100_000.0},
+        {"vol": 2.0},
+        {"price": None, "vol": 2.0},
+        {"price": True, "vol": 2.0},
+        {"price": "nan", "vol": 2.0},
+        {"price": -1.0, "vol": 2.0},
+        {"price": 100_000.0, "vol": 0},
+        {"price": 100_000.0, "vol": False},
+        {"price": 100_000.0, "vol": "inf"},
+        {"price": 100_000.0, "vol": 2.0, "quantity": 3.0},
+        {"price": 100_000.0, "vol": 2.0, "sz": None},
+        {"price": 10**400, "vol": 2.0},
+    ],
+)
+def test_orders_open_rejects_invalid_regular_order_economics(
+    monkeypatch, economics
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "side": 1,
+                **economics,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(return_value=[])
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "orders": [],
+        "stop_orders": [],
+        "error": "Exchange open orders unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "order_fields",
+    [
+        {},
+        {"side": True},
+        {"side": 0},
+        {"side": 2, "reduceOnly": False},
+        {"side": 1, "reduceOnly": True},
+        {"side": 1, "reduceOnly": "false"},
+        {"side": 1, "reduceOnly": False, "reduce_only": True},
+    ],
+)
+def test_orders_open_rejects_ambiguous_mexc_side_or_close_intent(
+    monkeypatch, order_fields
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "vol": 2.0,
+                "price": 100_000.0,
+                **order_fields,
+            }
+        ]
+    )
+    mock.open_stop_orders = AsyncMock(return_value=[])
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "orders": [],
+        "stop_orders": [],
+        "error": "Exchange open orders unavailable",
+    }
+
+
+def test_orders_open_normalizes_stop_trigger_price_alias(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(return_value=[])
+    mock.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "trigger_price": "99000",
+                "orderType": "Stop",
+                "reduceOnly": True,
+            }
+        ]
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "orders": [],
+        "stop_orders": [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "reduceOnly": True,
+            }
+        ],
+        "stops_error": None,
+        "error": None,
+    }
+
+
+def test_orders_open_normalizes_stop_size_aliases(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(return_value=[])
+    mock.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "vol": None,
+                "sz": "2.25",
+                "quantity": 2.25,
+            }
+        ]
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["stop_orders"] == [
+        {
+            "orderId": 8,
+            "symbol": "BTC_USDT",
+            "triggerPrice": 99_000.0,
+            "orderType": "Stop",
+            "vol": 2.25,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "malformed_rows",
+    [
+        None,
+        {},
+        [None],
+        [{}],
+        [{"price": 100_000.0}],
+        [{"orderId": True}],
+        [{"orderId": 7, "oid": 8}],
+        [{"orderId": 7}],
+        [{"orderId": 7, "symbol": "btc_usdt"}],
+        pytest.param(
+            [
+                {"orderId": 7, "symbol": "BTC_USDT"},
+                {"id": "7", "symbol": "BTC_USDT"},
+            ],
+            id="duplicate-order-id",
+        ),
+        pytest.param(
+            [
+                {"orderId": index + 1, "symbol": "BTC_USDT"}
+                for index in range(501)
+            ],
+            id="oversized",
+        ),
+    ],
+)
+def test_orders_open_rejects_malformed_primary_adapter_rows(
+    monkeypatch, malformed_rows
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(return_value=malformed_rows)
+    mock.open_stop_orders = AsyncMock(return_value=[])
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "orders": [],
+        "stop_orders": [],
+        "error": "Exchange open orders unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed_stops",
+    [
+        None,
+        {},
+        [None],
+        [{}],
+        [{"triggerPrice": 99_000.0}],
+        [{"id": True}],
+        [{"id": 8, "orderId": 9}],
+        [{"orderId": 8}],
+        [{"orderId": 8, "symbol": "btc_usdt"}],
+        [{"orderId": 8, "symbol": "BTC_USDT"}],
+        [{"orderId": 8, "symbol": "BTC_USDT", "triggerPrice": True}],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "stopLossPrice": 99_000.0,
+                "reduceOnly": "true",
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "stopLossPrice": 99_000.0,
+                "positionType": 1,
+                "position_type": 2,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "stopLossPrice": 99_000.0,
+                "reduceOnly": True,
+                "reduce_only": False,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "tpsl": "tp",
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "type": 1,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": 1,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "trigger_price": 98_000.0,
+                "orderType": "Stop",
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "trigger_price": True,
+                "orderType": "Stop",
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "vol": 2.0,
+                "quantity": 3.0,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "vol": False,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "vol": 0,
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "vol": "nan",
+            }
+        ],
+        [
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "triggerPrice": 99_000.0,
+                "orderType": "Stop",
+                "sz": 10**400,
+            }
+        ],
+        pytest.param(
+            [
+                {"orderId": 8, "symbol": "BTC_USDT"},
+                {"oid": "8", "symbol": "BTC_USDT"},
+            ],
+            id="duplicate-order-id",
+        ),
+        pytest.param(
+            [
+                {"orderId": index + 1, "symbol": "BTC_USDT"}
+                for index in range(501)
+            ],
+            id="oversized",
+        ),
+    ],
+)
+def test_orders_open_marks_malformed_stop_adapter_rows_unknown(
+    monkeypatch, malformed_stops
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    adapter_orders = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": 1,
+            "price": 100_000.0,
+            "vol": 2.0,
+        }
+    ]
+    public_orders = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": "buy",
+            "reduceOnly": False,
+            "price": 100_000.0,
+            "vol": 2.0,
+        }
+    ]
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(return_value=adapter_orders)
+    mock.open_stop_orders = AsyncMock(return_value=malformed_stops)
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "orders": public_orders,
+        "stop_orders": [],
+        "stops_error": "Exchange stop orders unavailable",
+        "error": None,
+    }
+
+
+@pytest.mark.parametrize("foreign_resource", ["orders", "stops"])
+def test_orders_open_rejects_foreign_symbol_from_scoped_adapter(
+    monkeypatch, foreign_resource
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    matching = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": 1,
+            "price": 100_000.0,
+            "vol": 2.0,
+        }
+    ]
+    public_matching = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "side": "buy",
+            "reduceOnly": False,
+            "price": 100_000.0,
+            "vol": 2.0,
+        }
+    ]
+    foreign = [{"orderId": 8, "symbol": "ETH_USDT"}]
+    mock = MagicMock()
+    mock.open_orders = AsyncMock(
+        return_value=foreign if foreign_resource == "orders" else matching
+    )
+    mock.open_stop_orders = AsyncMock(
+        return_value=foreign if foreign_resource == "stops" else []
+    )
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = mock
+        tc.app.state.exchange = mock
+        response = tc.get("/api/orders/open", params={"symbol": "BTC_USDT"})
+
+    assert response.status_code == 200
+    if foreign_resource == "orders":
+        assert response.json() == {
+            "orders": [],
+            "stop_orders": [],
+            "error": "Exchange open orders unavailable",
+        }
+    else:
+        assert response.json() == {
+            "orders": public_matching,
+            "stop_orders": [],
+            "stops_error": "Exchange stop orders unavailable",
+            "error": None,
+        }
 
 
 def test_orders_open_reads_orders_and_stops_concurrently(monkeypatch):
@@ -1438,8 +2943,9 @@ def test_orders_open_preserves_primary_error_priority(monkeypatch):
     from app.main import app
 
     monkeypatch.setattr("app.main.get_settings", _open_orders_settings)
+    marker = "SYNTHETIC_PRIVATE_OPEN_ORDERS_ERROR"
     mock = MagicMock()
-    mock.open_orders = AsyncMock(side_effect=MexcError("orders failed"))
+    mock.open_orders = AsyncMock(side_effect=MexcError(marker))
     mock.open_stop_orders = AsyncMock(side_effect=MexcError("stops failed"))
     with TestClient(app) as tc:
         tc.app.state.mexc = mock
@@ -1447,7 +2953,8 @@ def test_orders_open_preserves_primary_error_priority(monkeypatch):
         response = tc.get("/api/orders/open")
 
     body = response.json()
-    assert body["error"] == "orders failed"
+    assert body["error"] == "Exchange open orders unavailable"
+    assert marker not in response.text
     assert body["orders"] == []
     assert body["stop_orders"] == []
 
@@ -1483,7 +2990,7 @@ def test_orders_open_cancels_stop_read_after_primary_failure(monkeypatch):
         tc.app.state.exchange = mock
         response = tc.get("/api/orders/open")
 
-    assert response.json()["error"] == "orders failed"
+    assert response.json()["error"] == "Exchange open orders unavailable"
     assert stop_cancelled is True
 
 
@@ -1607,11 +3114,11 @@ async def test_open_stop_orders_tries_fallback_paths():
         calls.append(path)
         if len(calls) == 1:
             raise MexcError("first path 404")
-        return [{"stopLossPrice": 99_000.0, "state": 1}]
+        return [{"orderId": 7, "stopLossPrice": 99_000.0, "state": 1}]
 
     c._request = fake_request  # type: ignore[assignment]
     out = await c.open_stop_orders("BTC_USDT")
-    assert out == [{"stopLossPrice": 99_000.0, "state": 1}]
+    assert out == [{"orderId": 7, "stopLossPrice": 99_000.0, "state": 1}]
     assert len(calls) == 2  # first failed, second succeeded
 
 
@@ -1815,21 +3322,31 @@ def test_labeled_stop_still_classified_as_sl_regardless_of_side():
 
 
 @pytest.mark.asyncio
-async def test_close_inner_error_not_reported_closed():
+@pytest.mark.parametrize(
+    "inner_error_resp",
+    [
+        {
+            "status": "ok",
+            "response": {
+                "data": {"statuses": [{"error": "Order could not immediately match"}]}
+            },
+        },
+        {
+            "orderId": 9,
+            "result": {"batch": [{"error": "synthetic nested rejection"}]},
+        },
+    ],
+    ids=["hyperliquid-status", "nested-error-outside-statuses"],
+)
+async def test_close_inner_error_not_reported_closed(inner_error_resp):
     """An outwardly-200 close response carrying an inner error (Hyperliquid
     nests rejections inside statuses[]) must NOT be reported as closed/ok."""
-    inner_error_resp = {
-        "status": "ok",
-        "response": {
-            "data": {"statuses": [{"error": "Order could not immediately match"}]}
-        },
-    }
     client = MagicMock()
     client.exchange_id = "hyperliquid"
     client.contract_meta = AsyncMock(return_value=_contract())
     client.positions = AsyncMock(
         return_value=[
-            {"symbol": "BTC_USDT", "positionType": 1, "holdVol": 1.0,
+            {"symbol": "BTC", "positionType": 1, "holdVol": 1.0,
              "holdAvgPrice": 100_000.0}
         ]
     )
@@ -1911,7 +3428,8 @@ async def test_successful_close_survives_local_audit_failure():
     """A completed exchange close must not turn into a retry-baiting DB error."""
     client = _close_client(first_hold=_pos(5.0), reread=[])
     db = MagicMock()
-    db.insert_order = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    marker = "SYNTHETIC_PRIVATE_SQLITE_DETAIL"
+    db.insert_order = AsyncMock(side_effect=RuntimeError(marker))
     svc = OrderService(client, _settings(), PreviewStore(), db=db)
 
     out = await svc.close_position(symbol="BTC_USDT", side="long")
@@ -1919,12 +3437,13 @@ async def test_successful_close_survives_local_audit_failure():
     assert out["ok"] is True
     assert out["status"] == "closed"
     assert any("audit log failed" in warning for warning in out["warnings"])
+    assert marker not in str(out)
     client.close_position_market.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_uncertain_place_error_survives_local_audit_failure():
-    """The check-externalOid warning is authoritative even if SQLite is down."""
+    """The unknown-outcome warning stays authoritative if SQLite is down."""
     client = _happy_client({"orderId": 1})
     client.place_order = AsyncMock(side_effect=MexcError("timeout"))
     client.order_by_external_oid = AsyncMock(return_value={})
@@ -1935,10 +3454,11 @@ async def test_uncertain_place_error_survives_local_audit_failure():
     svc = OrderService(client, _settings(), PreviewStore(), db=db)
     preview = await svc.preview(_ticket())
 
-    with pytest.raises(OrderError, match="externalOid") as exc_info:
+    with pytest.raises(OrderOutcomeUnknown, match="externalOid") as exc_info:
         await svc.confirm(preview["token"])
 
-    assert "audit log failed" in str(exc_info.value)
+    assert "sqlite unavailable" not in str(exc_info.value)
+    db.insert_order.assert_awaited_once()
     assert client.place_order.await_count == 1
 
 
@@ -2043,6 +3563,52 @@ def test_recovery_rejects_unknown_marker_even_with_exact_oid():
     assert not _recovery_is_match({"externalOid": "mlt-1"}, "mlt-1")
 
 
+@pytest.mark.parametrize("marker", [False, "", None, 0])
+def test_recovery_rejects_explicit_falsy_marker(marker):
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(
+        {"match": marker, "externalOid": "mlt-1", "orderId": 7}, "mlt-1"
+    )
+
+
+@pytest.mark.parametrize(
+    "recovered",
+    [
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "order": {
+                "externalOid": "mlt-1",
+                "orderId": 7,
+                "error": "synthetic rejection",
+            },
+        },
+        {
+            "match": "cloid",
+            "externalOid": "mlt-1",
+            "order": {
+                "order": {"coin": "BTC", "oid": 7},
+                "status": "filled",
+                "raw": {"Error": {"code": 1}},
+            },
+        },
+        [
+            {
+                "externalOid": "mlt-1",
+                "orderId": 7,
+                "raw": {"error": "synthetic rejection"},
+            }
+        ],
+    ],
+    ids=["mexc-marker", "hl-marker", "raw-list-fallback"],
+)
+def test_recovery_rejects_explicit_error_markers(recovered):
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(recovered, "mlt-1")
+
+
 @pytest.mark.parametrize(
     "recovered",
     [
@@ -2078,6 +3644,12 @@ def test_recovery_rejects_unknown_marker_even_with_exact_oid():
                 "orderId": 7,
             },
         },
+        {
+            "match": "history",
+            "externalOid": "mlt-1",
+            "orderId": 8,
+            "order": {"externalOid": "mlt-1", "orderId": 7},
+        },
     ],
 )
 def test_recovery_marker_requires_concrete_order_identity(recovered):
@@ -2107,6 +3679,35 @@ def test_recovery_marker_accepts_concrete_order_identity(recovered):
     assert _recovery_is_match(recovered, "mlt-1")
 
 
+def test_recovery_symbol_identity_rejects_foreign_contract_and_accepts_hl_coin():
+    from app.orders.service import _recovery_is_match
+
+    mexc = {
+        "match": "history",
+        "externalOid": "mlt-1",
+        "order": {
+            "externalOid": "mlt-1",
+            "orderId": 7,
+            "symbol": "ETH_USDT",
+        },
+    }
+    assert not _recovery_is_match(
+        mexc, "mlt-1", expected_symbol="BTC_USDT"
+    )
+
+    hyperliquid = {
+        "match": "cloid",
+        "externalOid": "mlt-1",
+        "order": {"order": {"coin": "BTC", "oid": 7}},
+    }
+    assert _recovery_is_match(
+        hyperliquid,
+        "mlt-1",
+        expected_symbol="BTC_USDT",
+        allow_bare_base_alias=True,
+    )
+
+
 def test_recovery_rejects_oversized_digit_order_id_without_conversion_error():
     from app.orders.service import _recovery_is_match
 
@@ -2125,6 +3726,58 @@ def test_recovery_fallback_rejects_conflicting_external_oid_aliases():
             "orderId": 7,
         },
         "mlt-1",
+    )
+
+
+@pytest.mark.parametrize(
+    "recovered",
+    [
+        [
+            {"externalOid": "mlt-1", "orderId": 7},
+            {"externalOid": "mlt-1", "orderId": 8},
+        ],
+        [
+            {"externalOid": "mlt-1"},
+            {"externalOid": "mlt-1", "orderId": 7},
+        ],
+        [
+            {
+                "externalOid": "mlt-1",
+                "external_oid": "mlt-other",
+                "orderId": 7,
+            },
+            {"externalOid": "mlt-1", "orderId": 7},
+        ],
+        [{"externalOid": "mlt-1", "orderId": 7}, None],
+        [
+            {"externalOid": "mlt-1", "orderId": 7},
+            {"externalOid": "mlt-other", "orderId": 8},
+        ],
+        [{"externalOid": "mlt-1", "orderId": 7}, {"orderId": 8}],
+        [{"externalOid": "mlt-1", "orderId": 7}, {}],
+    ],
+    ids=[
+        "multiple-order-ids",
+        "malformed-match",
+        "conflicting-alias",
+        "non-object-row",
+        "foreign-external-id-row",
+        "missing-external-id-row",
+        "empty-row",
+    ],
+)
+def test_recovery_fallback_rejects_ambiguous_matching_rows(recovered):
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(recovered, "mlt-1")
+
+
+@pytest.mark.parametrize("marker", [False, "", "not-found", "history"])
+def test_recovery_list_fallback_rejects_marker_rows(marker):
+    from app.orders.service import _recovery_is_match
+
+    assert not _recovery_is_match(
+        [{"match": marker, "externalOid": "mlt-1", "orderId": 7}], "mlt-1"
     )
 
 
@@ -2173,6 +3826,87 @@ def test_aggregate_reported_fill_overflow_is_unknown():
     assert _extract_filled_vol(response) is None
 
 
+@pytest.mark.parametrize(
+    "place_response",
+    [
+        {"data": 1, "dealVol": 1.0, "deal_vol": 0.0},
+        {"data": 1, "dealVol": 1.0, "deal_vol": "invalid"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_mexc_conflicting_reported_fill_is_not_sl_evidence(place_response):
+    client = _mexc_client(place_response)
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, dealVol=1.0, state=3
+        )
+    )
+    svc = OrderService(client, _settings(exchange="mexc"), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mexc_market_invalid_fill_report_does_not_use_hold_delta():
+    client = _mexc_client(
+        {"orderId": 1, "dealVol": 1.0, "deal_vol": 0.0}
+    )
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    svc = OrderService(client, _settings(exchange="mexc"), PreviewStore())
+    prev = await svc.preview(
+        _ticket(order_type="market", price=None, take_profit=102_500.0)
+    )
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        {"dealVol": 1.0, "deal_vol": 0.0, "state": 3},
+        {"dealVol": 0.4, "state": 3, "orderState": 2},
+    ],
+)
+@pytest.mark.asyncio
+async def test_mexc_conflicting_recovered_fill_evidence_is_not_sl_evidence(order):
+    client = _mexc_client({"data": 1})
+    client.positions = AsyncMock(
+        side_effect=[[], [], _filled_pos(1.0), _filled_pos(1.0)]
+    )
+    client.order_by_external_oid = AsyncMock(
+        side_effect=lambda _symbol, external_oid: _mexc_recovery_result(
+            external_oid, **order
+        )
+    )
+    svc = OrderService(client, _settings(exchange="mexc"), PreviewStore())
+    prev = await svc.preview(_ticket())
+
+    out = await svc.confirm(prev["token"])
+
+    assert out["sl_verified"] is False
+    assert out["sl_checked"] is False
+    assert out["status"] == "placed_sl_unknown"
+    assert any("UNKNOWN" in warning for warning in out["warnings"])
+    client.order_by_external_oid.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_recovered_mexc_partial_fill_uses_order_fill_evidence():
     client = _happy_client({"orderId": 1})
@@ -2203,7 +3937,10 @@ async def test_recovered_mexc_partial_fill_uses_order_fill_evidence():
     out = await svc.confirm(prev["token"])
 
     assert out["sl_verified"] is True
+    assert out["sl_fully_verified"] is False
     assert "recovered_placed" in out["status"]
+    assert "partial_fill" in out["status"]
+    assert any("PARTIALLY FILLED" in warning for warning in out["warnings"])
     assert client.place_order.await_count == 1
     assert client.order_by_external_oid.await_count == 1
     client.close_position_market.assert_not_awaited()
@@ -2449,3 +4186,67 @@ async def test_sl_ambiguous_stop_endpoint_is_unknown_not_missing_no_flatten():
     assert out["sl_checked"] is False
     assert out["status"] == "placed_sl_unknown"
     client.close_position_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sl_verify_scans_full_stop_snapshot_before_trusting_match():
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 99_000.0,
+            },
+            {
+                "orderId": 8,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 99_000.0,
+                "trigger_price": 98_000.0,
+            },
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(client, _settings(), PreviewStore())
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=99_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
+async def test_sl_verify_scans_full_position_snapshot_before_trusting_match():
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.open_stop_orders = AsyncMock(return_value=[])
+    client.positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+                "stop_loss": 99_000.0,
+            },
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+                "stop_loss": 99_000.0,
+                "sl_price": 98_000.0,
+            },
+        ]
+    )
+    svc = OrderService(client, _settings(), PreviewStore())
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=99_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False

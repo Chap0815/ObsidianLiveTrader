@@ -76,3 +76,46 @@ def test_setup_defaults_come_from_server():
     # show the REAL min_rrr (1.5), not the previously hardcoded lie ("RRR 2.0").
     assert float(RISK_PROFILES["balanced"]["min_rrr"]) == 1.5
     assert "RRR 1.5" in html
+
+
+def test_setup_makes_mexc_live_only_status_explicit():
+    from app.main import _setup_template_context, templates
+
+    html = templates.env.get_template("setup.html").render(
+        csp_nonce="n", **_setup_template_context()
+    )
+
+    assert "Live venue with no testnet" in html
+    assert "MEXC has no testnet" in html
+    assert "every later order submission uses real funds" in html
+
+
+def test_setup_mainnet_success_keeps_remaining_safety_gates_explicit():
+    from app.main import _setup_template_context, templates
+
+    html = templates.env.get_template("setup.html").render(
+        csp_nonce="n", **_setup_template_context()
+    )
+
+    assert "Mainnet configuration saved" in html
+    assert "Trading remains disabled" in html
+    assert "separate Mainnet acknowledgement before arming" in html
+
+
+def test_provider_labels_do_not_claim_a_specific_configurable_model():
+    from app.main import _setup_template_context, templates
+
+    setup_html = templates.env.get_template("setup.html").render(
+        csp_nonce="n", **_setup_template_context()
+    )
+    dashboard_html = templates.env.get_template("dashboard.html").render(
+        csp_nonce="n", app_version="test"
+    )
+    rendered = setup_html + dashboard_html
+
+    assert "Claude Opus" not in rendered
+    assert "Codex (OpenAI)" not in rendered
+    assert '<option value="claude" selected>Claude (Anthropic)</option>' in setup_html
+    assert '<option value="openai">OpenAI</option>' in setup_html
+    assert '<option value="claude">Claude</option>' in dashboard_html
+    assert '<option value="openai">OpenAI</option>' in dashboard_html
