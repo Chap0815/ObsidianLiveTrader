@@ -144,28 +144,48 @@ def test_lockfiles_cover_the_active_installed_dependency_closure():
         **_locked_versions("requirements.lock"),
         **_locked_versions("requirements-dev.lock"),
     }
-    environment = default_environment()
-    environment["extra"] = ""
-    problems: list[str] = []
+    requested_extras: dict[str, set[str]] = {
+        package: set() for package in locked
+    }
+    problems: set[str] = set()
 
-    for package, package_version in locked.items():
-        for raw in installed_requirements(package) or []:
-            requirement = Requirement(raw)
-            if requirement.marker is not None and not requirement.marker.evaluate(
-                environment
-            ):
-                continue
-            dependency = _canonical_name(requirement.name)
-            dependency_version = locked.get(dependency)
-            if dependency_version is None:
-                problems.append(f"{package}: missing dependency pin for {dependency}")
-            elif dependency_version not in requirement.specifier:
-                problems.append(
-                    f"{package}=={package_version}: {dependency}=={dependency_version} "
-                    f"is outside {requirement.specifier}"
-                )
+    extras_changed = True
+    while extras_changed:
+        extras_changed = False
+        for package, package_version in locked.items():
+            environments = []
+            for extra in {"", *requested_extras[package]}:
+                environment = default_environment()
+                environment["extra"] = extra
+                environments.append(environment)
 
-    assert not problems, "incomplete locked dependency closure:\n" + "\n".join(problems)
+            for raw in installed_requirements(package) or []:
+                requirement = Requirement(raw)
+                if requirement.marker is not None and not any(
+                    requirement.marker.evaluate(environment)
+                    for environment in environments
+                ):
+                    continue
+                dependency = _canonical_name(requirement.name)
+                dependency_version = locked.get(dependency)
+                if dependency_version is None:
+                    problems.add(f"{package}: missing dependency pin for {dependency}")
+                    continue
+                if dependency_version not in requirement.specifier:
+                    problems.add(
+                        f"{package}=={package_version}: "
+                        f"{dependency}=={dependency_version} "
+                        f"is outside {requirement.specifier}"
+                    )
+                dependency_extras = requested_extras[dependency]
+                new_extras = set(requirement.extras) - dependency_extras
+                if new_extras:
+                    dependency_extras.update(new_extras)
+                    extras_changed = True
+
+    assert not problems, "incomplete locked dependency closure:\n" + "\n".join(
+        sorted(problems)
+    )
 
 
 def test_ci_installs_exact_lockfiles_without_dependency_resolution():
