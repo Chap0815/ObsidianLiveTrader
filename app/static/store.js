@@ -35,6 +35,7 @@ var PERSIST = {
   TRADE_MARKERS: "obsidian_trade_markers",
   OPEN_TABS: "obsidian_open_tabs",
   WATCHLIST: "obsidian_watchlist",
+  UNKNOWN_OUTCOMES: "obsidian_unknown_trade_outcomes",
 };
 
 // One-time token migration: if the canonical key is empty but the legacy alias
@@ -67,6 +68,7 @@ var state = {
   priceLines: [],
   health: null,
   account: null,
+  _accountSeq: 0,
   _accountLoadPromise: null,
   _accountLoadQueued: false,
   _accountStaleWarned: false,
@@ -75,6 +77,13 @@ var state = {
   previewToken: null,
   previewSummary: null,
   orderBusy: false,
+  confirmOutcomeUnknown: false,
+  _confirmUnknownId: null,
+  _confirmUnknownAccountAfter: 0,
+  _confirmUnknownOrdersAfter: 0,
+  _confirmUnknownAccountReady: false,
+  _confirmUnknownOrdersReady: false,
+  mutationOutcomeUnknown: { close: null, sl: null, cancels: {} },
   closeBusy: false,
   slBusy: false, // SL→BE move in flight (double-submit guard)
   _slDrag: null, // C3-04b: active SL-line drag {symbol,side,entry,sl,newSl,vol,cs,tp}
@@ -193,6 +202,7 @@ var state = {
   // poll cadence — the ⚡ Auto-BE toggle NEVER guesses optimistically, it only
   // ever reflects what this poll last reported.
   positionMgmt: {}, // "SYMBOL|side" -> {armed_rules, be_done, alerts} (last poll row)
+  positionMgmtKnown: false, // true only after a valid complete /api/positions/alerts response
   armBusy: {}, // "SYMBOL|side" -> true while POST /api/positions/arm is in flight (double-click guard)
   killswitchBusy: false, // POST /api/positions/killswitch in flight guard
   _seenAlertTs: {}, // "SYMBOL|side|kind" -> ts already surfaced (client-side de-dup so a poll never re-toasts the SAME alert)

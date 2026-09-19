@@ -139,6 +139,49 @@ def test_api_history_after_seed(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_api_history_keeps_raw_order_diagnostics_local(tmp_path, monkeypatch):
+    path = str(tmp_path / "public_history.db")
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv("TRADING_ENABLED", "false")
+    get_settings.cache_clear()
+    marker = "SYNTHETIC_PRIVATE_EXCHANGE_DIAGNOSTIC"
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as tc:
+        db: Database = tc.app.state.db
+
+        async def seed():
+            await db.insert_order(
+                symbol="BTC_USDT",
+                side="long",
+                request_json={"private_request": marker},
+                response_json={"private_response": marker},
+                status="place_error",
+                error=marker,
+            )
+
+        import asyncio
+
+        asyncio.run(seed())
+        response = tc.get("/api/history")
+        stored = asyncio.run(db.recent_orders(limit=1))[0]
+
+    assert response.status_code == 200, response.text
+    public = response.json()["orders"][0]
+    assert set(public) == {"id", "created_at", "symbol", "side", "status", "error"}
+    assert public["error"] == (
+        "Order operation did not complete cleanly. Check the live exchange state."
+    )
+    assert marker not in response.text
+    assert stored["request"]["private_request"] == marker
+    assert stored["response"]["private_response"] == marker
+    assert stored["error"] == marker
+    get_settings.cache_clear()
+
+
 def _minimal_proposal() -> TradeProposal:
     return TradeProposal(
         htf_trend="bullish",
@@ -220,10 +263,10 @@ def test_analyze_persists_proposal(tmp_path, monkeypatch):
         assert hist["proposals"][0]["annotations"]["advisory_only"] is True
 
 
-def test_500_body_hides_internal_detail(tmp_path, monkeypatch):
+def test_500_body_and_logs_hide_internal_detail(tmp_path, monkeypatch, caplog):
     """B-03: a DB failure in history/journal/journal_stats/journal_clear must
     return a generic message — the raw exception (can contain file paths,
-    SQL, secrets) must never reach the client, only the server log."""
+    SQL, secrets) must reach neither the client nor persistent server logs."""
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "boom.db"))
     monkeypatch.setenv("TRADING_ENABLED", "false")
     get_settings.cache_clear()
@@ -255,5 +298,9 @@ def test_500_body_hides_internal_detail(tmp_path, monkeypatch):
             assert "secret-path" not in body_text
             detail = r.json().get("detail")
             assert detail == "internal error"
+
+    assert secret_detail not in caplog.text
+    assert "secret-path" not in caplog.text
+    assert caplog.text.count("type=RuntimeError") == 5
 
     get_settings.cache_clear()

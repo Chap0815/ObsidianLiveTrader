@@ -1,15 +1,16 @@
-# requirements.lock — exact, reproducible pin of the tested environment (F-18).
-# Validated with requirements-dev.txt (1892 passed, 2026-09-07).
+# requirements.lock — exact version pin of the tested environment (F-18).
+# Validated together with requirements-dev.lock by the full offline CI suite.
 # requirements.txt keeps version RANGES for flexibility; this lockfile is the
-# byte-for-byte reproducible set. To reproduce exactly:
-#   .venv/Scripts/python.exe -m pip install --require-virtualenv -r requirements.lock
+# reproducible dependency version set. To install it:
+#   .venv/Scripts/python.exe -m pip install --require-virtualenv pip==26.2.1
+#   .venv/Scripts/python.exe -m pip install --require-virtualenv --no-deps -r requirements.lock
 # Regenerate after intentional dependency changes:
 #   .venv/Scripts/python.exe -m pip freeze > requirements.lock
 #
 aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
-anyio==4.14.1
+anyio==4.14.2
 bitarray==3.8.2
 certifi==2026.6.17
 charset-normalizer==3.4.9

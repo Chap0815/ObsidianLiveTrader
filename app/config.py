@@ -290,6 +290,32 @@ class Settings(BaseSettings):
     # is shown unchanged (no overfit on a tiny sample).
     tm_recal_min_sample: int = 20
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def reject_unsafe_scalar_coercion(cls, v, info):
+        field = cls.model_fields.get(info.field_name)
+        if (
+            isinstance(v, bool)
+            and field is not None
+            and field.annotation in {int, float}
+        ):
+            raise ValueError("boolean is not a numeric setting")
+        if (
+            field is not None
+            and field.annotation is bool
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
+        ):
+            raise ValueError("numeric value is not a boolean setting")
+        if (
+            field is not None
+            and field.annotation is bool
+            and isinstance(v, str)
+            and v.lower() not in {"false", "true"}
+        ):
+            raise ValueError("boolean settings must use true or false")
+        return v
+
     @model_validator(mode="after")
     def _apply_risk_profile(self):
         """Fill preset values for any risk field NOT explicitly set in .env.
@@ -353,6 +379,7 @@ class Settings(BaseSettings):
         return "classic"
 
     @field_validator(
+        "scanner_max_coins",
         "scanner_universe_size",
         "scanner_rank_top_n",
         "scanner_prefilter_top_k",
@@ -634,6 +661,16 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("sl_verify_attempts", "close_verify_attempts")
+    @classmethod
+    def exchange_verify_attempts_ok(cls, v: int, info) -> int:
+        if not (1 <= v <= 10):
+            raise ValueError(
+                f"{info.field_name.upper()} must be an integer in [1, 10] "
+                f"(got {v!r})"
+            )
+        return v
+
     @field_validator("sl_verify_delay_s")
     @classmethod
     def sl_verify_delay_s_ok(cls, v: float) -> float:
@@ -669,6 +706,36 @@ class Settings(BaseSettings):
         if not (1 <= int(v) <= 3600):
             raise ValueError(
                 f"PREVIEW_TOKEN_TTL_SECONDS must be an integer in [1, 3600] "
+                f"(got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("journal_resolve_interval_s")
+    @classmethod
+    def journal_resolve_interval_s_ok(cls, v: int) -> int:
+        if not (5 <= int(v) <= 3600):
+            raise ValueError(
+                "JOURNAL_RESOLVE_INTERVAL_S must be an integer in [5, 3600] "
+                f"(got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("journal_window_hours")
+    @classmethod
+    def journal_window_hours_ok(cls, v: int) -> int:
+        if not (1 <= int(v) <= 8760):
+            raise ValueError(
+                "JOURNAL_WINDOW_HOURS must be an integer in [1, 8760] "
+                f"(got {v!r})"
+            )
+        return int(v)
+
+    @field_validator("journal_min_sample")
+    @classmethod
+    def journal_min_sample_ok(cls, v: int) -> int:
+        if not (1 <= int(v) <= 1000):
+            raise ValueError(
+                "JOURNAL_MIN_SAMPLE must be an integer in [1, 1000] "
                 f"(got {v!r})"
             )
         return int(v)

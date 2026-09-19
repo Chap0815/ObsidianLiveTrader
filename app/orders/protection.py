@@ -59,6 +59,66 @@ def classify_order_label(label: object) -> str | None:
     return None
 
 
+def classify_order_label_fields(row: object) -> tuple[str | None, bool]:
+    """Classify all known label aliases only when their meanings agree.
+
+    The boolean reports whether the alias set is usable. Empty values and the
+    generic ``plan`` label carry no direction and allow the caller's existing
+    unlabeled fallback. Any other unknown, non-string or SL/TP-conflicting label
+    makes the row ambiguous.
+    """
+    if not isinstance(row, dict):
+        return None, False
+    kinds: list[str] = []
+    primary_label_seen = False
+    for key in ("orderType", "tpsl"):
+        if key not in row or row.get(key) is None:
+            continue
+        value = row.get(key)
+        if not isinstance(value, str):
+            return None, False
+        normalized = value.strip().lower()
+        if not normalized or normalized == "plan":
+            continue
+        primary_label_seen = True
+        kind = classify_order_label(value)
+        if kind is None:
+            return None, False
+        kinds.append(kind)
+    # MEXC commonly uses numeric ``type`` for execution style. It is only an
+    # SL/TP label fallback when neither dedicated label alias carried meaning.
+    if not primary_label_seen and "type" in row and row.get("type") is not None:
+        value = row.get("type")
+        if not isinstance(value, str):
+            return None, False
+        normalized = value.strip().lower()
+        if normalized and normalized != "plan":
+            kind = classify_order_label(value)
+            if kind is None:
+                return None, False
+            kinds.append(kind)
+    if len(set(kinds)) > 1:
+        return None, False
+    return (kinds[0] if kinds else None), True
+
+
+def classify_reduce_only_fields(row: object) -> tuple[bool | None, bool]:
+    """Return one reduce-only value only when every present alias agrees."""
+    if not isinstance(row, dict):
+        return None, False
+    values: list[bool] = []
+    for key in ("reduceOnly", "reduce_only"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if not isinstance(value, bool):
+            return None, False
+        values.append(value)
+    if len(set(values)) > 1:
+        return None, False
+    return (values[0] if values else None), True
+
+
 def _position_side(value: object) -> str | None:
     if isinstance(value, bool):
         return None
@@ -68,6 +128,20 @@ def _position_side(value: object) -> str | None:
     if normalized in ("2", "short"):
         return "short"
     return None
+
+
+def classify_position_side_fields(row: object) -> tuple[str | None, bool]:
+    """Return one hedge side only when all present aliases are valid and agree."""
+    if not isinstance(row, dict):
+        return None, False
+    values = [
+        _position_side(row.get(key))
+        for key in ("positionType", "position_type")
+        if key in row and row.get(key) is not None
+    ]
+    if any(value is None for value in values) or len(set(values)) > 1:
+        return None, False
+    return (values[0] if values else None), True
 
 
 def classify_unlabeled_trigger(
@@ -120,22 +194,18 @@ def classify_protection(
     for row in stops or []:
         if not isinstance(row, dict):
             continue
-        position_types = [
-            row.get(key)
-            for key in ("positionType", "position_type")
-            if key in row and row.get(key) is not None
-        ]
-        if position_types:
-            normalized_types = [_position_side(value) for value in position_types]
-            if any(value is None for value in normalized_types) or len(
-                set(normalized_types)
-            ) != 1:
-                continue
-            if (
-                side_n in ("long", "short")
-                and normalized_types[0] != side_n
-            ):
-                continue
+        reduce_only, reduce_only_valid = classify_reduce_only_fields(row)
+        if not reduce_only_valid or reduce_only is False:
+            continue
+        position_side, position_side_valid = classify_position_side_fields(row)
+        if not position_side_valid:
+            continue
+        if (
+            position_side is not None
+            and side_n in ("long", "short")
+            and position_side != side_n
+        ):
+            continue
         sl_field = _positive_price(row.get("stopLossPrice"))
         tp_field = _positive_price(row.get("takeProfitPrice"))
         invalid_explicit = (
@@ -155,10 +225,9 @@ def classify_protection(
         trg = _positive_price(raw_trg)
         if trg is None:
             continue
-        label_raw = row.get("orderType")
-        if label_raw is not None and not isinstance(label_raw, str):
+        kind, labels_valid = classify_order_label_fields(row)
+        if not labels_valid:
             continue
-        kind = classify_order_label(label_raw)
         if kind == "tp":
             tp = trg
         elif kind == "sl":

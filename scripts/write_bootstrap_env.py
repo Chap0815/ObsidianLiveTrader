@@ -18,7 +18,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.env_builder import build_minimal_env, restrict_env_permissions  # noqa: E402
+from app.env_builder import (  # noqa: E402
+    EnvPermissionHardeningError,
+    build_minimal_env,
+    restrict_env_permissions,
+)
 
 ENV_PATH = ROOT / ".env"
 
@@ -50,7 +54,10 @@ def write_bootstrap_env(path: Path, *, port: int) -> bool:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        restrict_env_permissions(tmp)
+        if restrict_env_permissions(tmp) is not True:
+            raise EnvPermissionHardeningError(
+                "Local configuration permissions could not be secured."
+            )
         try:
             os.link(tmp, path)
         except FileExistsError:

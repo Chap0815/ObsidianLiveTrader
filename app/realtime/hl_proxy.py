@@ -35,6 +35,7 @@ HL_HEARTBEAT_INTERVAL = 30.0
 HL_IDLE_TIMEOUT = 45.0
 HL_BACKOFF_START = 1.0
 HL_BACKOFF_CAP = 10.0
+HL_MAX_UPSTREAM_QUEUE = 4
 _MIN_REALTIME_TIMESTAMP_MS = 1_000_000_000_000
 _MAX_REALTIME_FUTURE_SKEW_MS = 5 * 60 * 1000
 
@@ -209,6 +210,11 @@ async def proxy_hyperliquid_market(
                     ping_timeout=20,
                     open_timeout=15,
                     max_size=8 * 1024 * 1024,
+                    # Keep the 8 MB compatibility ceiling for unusually large
+                    # trade bursts, but bound queued frames to 32 MB per
+                    # browser connection instead of the library's 128 MB
+                    # default. TCP backpressure handles bursts beyond it.
+                    max_queue=HL_MAX_UPSTREAM_QUEUE,
                 ) as upstream:
                     for sub in subs:
                         await upstream.send(json.dumps(sub))
@@ -247,8 +253,19 @@ async def proxy_hyperliquid_market(
             except WebSocketDisconnect:
                 raise
             except Exception as e:
+                # _run_upstream_session also surfaces unexpected failures from
+                # the shared browser-control task. Do not misclassify those as
+                # a reconnectable upstream failure or swallow them below.
+                if client_task.done():
+                    client_exc = client_task.exception()
+                    if client_exc is not None:
+                        raise client_exc
                 # Upstream connect/subscribe/pump failed → reconnect below.
-                log.warning("hl upstream ended coin=%s: %s", coin, e)
+                # A remote close reason is untrusted log input; retain only its
+                # exception class for diagnostics.
+                log.warning(
+                    "hl upstream ended coin=%s type=%s", coin, type(e).__name__
+                )
 
             if client_task.done():
                 break
@@ -267,10 +284,18 @@ async def proxy_hyperliquid_market(
     except WebSocketDisconnect:
         log.info("browser disconnected coin=%s", coin)
     except Exception as e:
-        log.warning("hl proxy error coin=%s: %s", coin, e)
+        # The client receive stack is part of this exception boundary. Never
+        # reflect or log its raw exception text: it may contain transport or
+        # request details. The type is enough to classify local diagnostics.
+        log.warning("hl proxy error coin=%s type=%s", coin, type(e).__name__)
         try:
             await client_ws.send_json(
-                {"type": "status", "status": "error", "error": str(e), "coin": coin}
+                {
+                    "type": "status",
+                    "status": "error",
+                    "error": "Internal error",
+                    "coin": coin,
+                }
             )
         except Exception:
             pass

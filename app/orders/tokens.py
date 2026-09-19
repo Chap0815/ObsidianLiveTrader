@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import secrets
 import threading
 import time
@@ -92,6 +93,19 @@ class PreviewStore:
             if time.monotonic() >= float(item["expires_at"]):
                 return None
             return copy.deepcopy(item["payload"])
+
+    def remaining_seconds(self, token: str) -> int | None:
+        """Return the active token's whole-second lifetime, rounded up."""
+        with self._lock:
+            self._purge_unlocked()
+            item = self._items.get(token)
+            if item is None or item["used"]:
+                return None
+            remaining = float(item["expires_at"]) - time.monotonic()
+            if remaining <= 0:
+                self._items.pop(token, None)
+                return None
+            return max(1, math.ceil(remaining))
 
     def clear(self) -> None:
         with self._lock:

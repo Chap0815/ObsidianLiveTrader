@@ -12,6 +12,8 @@ def _client():
 
 
 def test_get_status_returns_no_secrets():
+    from app.env_builder import DEFAULT_MODELS
+
     with _client() as tc:
         r = tc.get("/api/settings/llm")
     assert r.status_code == 200
@@ -20,7 +22,8 @@ def test_get_status_returns_no_secrets():
     ids = {p["id"] for p in data["providers"]}
     assert ids == {"claude", "xai", "openai", "ollama"}
     for p in data["providers"]:
-        assert set(p) == {"id", "label", "configured", "model"}
+        assert set(p) == {"id", "label", "configured", "model", "default_model"}
+        assert p["default_model"] == DEFAULT_MODELS[p["id"]]
         # non-secret fields only — never an api key
         assert "api_key" not in p
         assert "key" not in p
@@ -106,13 +109,17 @@ def test_llm_key_rejects_oversized_key_before_write(tmp_path, monkeypatch):
     env.write_text(original, encoding="utf-8")
     monkeypatch.setattr(main_mod, "ENV_PATH", env)
 
+    marker = "SYNTHETIC_OVERSIZED_KEY_MARKER"
+    secret = marker + "x" * (8193 - len(marker))
     with _client() as tc:
         r = tc.post(
             "/api/settings/llm-key",
-            json={"provider": "openai", "api_key": "x" * 8193},
+            json={"provider": "openai", "api_key": secret},
         )
 
     assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
     assert env.read_text(encoding="utf-8") == original
 
 
@@ -217,19 +224,119 @@ def test_llm_status_does_not_report_deliberate_override_as_fallback(monkeypatch)
     assert response.json()["fallback_active"] is False
 
 
+def test_llm_status_reports_external_position_review_as_blocked(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(
+            llm_provider="claude",
+            anthropic_api_key="synthetic-claude-key",
+            include_account_in_llm=False,
+        ),
+    )
+    with _client() as tc:
+        tc.app.state.llm_override = None
+        response = tc.get("/api/llm")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["position_reevaluation_allowed"] is False
+
+
+def test_llm_switch_reports_local_position_review_as_allowed(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        main_mod,
+        "get_settings",
+        lambda: Settings(
+            llm_provider="claude",
+            anthropic_api_key="synthetic-claude-key",
+            include_account_in_llm=False,
+        ),
+    )
+    with _client() as tc:
+        tc.app.state.llm_override = None
+        response = tc.post("/api/llm", json={"provider": "ollama"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["provider"] == "ollama"
+    assert body["position_reevaluation_allowed"] is True
+
+
 def test_settings_probe_rejects_oversized_key_before_provider(monkeypatch):
     import app.llm.probe as probe_mod
 
     probe = AsyncMock(return_value={"ok": True})
     monkeypatch.setattr(probe_mod, "probe_provider", probe)
+    marker = "SYNTHETIC_PROBE_KEY_MARKER"
+    secret = marker + "x" * (8193 - len(marker))
     with _client() as tc:
         r = tc.post(
             "/api/settings/test-provider",
-            json={"provider": "openai", "api_key": "x" * 8193},
+            json={"provider": "openai", "api_key": secret},
         )
 
     assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
     probe.assert_not_awaited()
+
+
+def test_validation_error_redacts_nested_secret_inputs(monkeypatch):
+    marker = "SYNTHETIC_NESTED_KEY_MARKER"
+    monkeypatch.setattr(main_mod, "_setup_needed", lambda: True)
+    with _client() as tc:
+        r = tc.post(
+            "/api/setup/test-provider",
+            json={
+                "provider": {"ANTHROPIC_API_KEY": marker},
+                "api_key": "bounded",
+            },
+        )
+
+    assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
+
+
+def test_validation_error_redacts_scalar_body_that_may_be_a_secret():
+    marker = "SYNTHETIC_RAW_BODY_SECRET_MARKER"
+    with _client() as tc:
+        r = tc.post("/api/settings/test-provider", json=marker)
+
+    assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
+
+
+def test_validation_error_redacts_provider_specific_secret_field():
+    marker = "SYNTHETIC_PROVIDER_KEY_MARKER"
+    with _client() as tc:
+        r = tc.post(
+            "/api/settings/test-provider",
+            json={
+                "provider": "openai",
+                "api_key": "bounded",
+                "ANTHROPIC_API_KEY": marker,
+            },
+        )
+
+    assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
+
+
+def test_validation_error_redacts_one_time_confirm_token():
+    marker = "SYNTHETIC_CONFIRM_TOKEN_MARKER"
+    with _client() as tc:
+        r = tc.post("/api/orders/confirm", json={"token": "A" * 43 + marker})
+
+    assert r.status_code == 422
+    assert marker not in r.text
+    assert "[redacted]" in r.text
 
 
 def test_setup_probe_rejects_unknown_field_before_provider(monkeypatch):
@@ -296,3 +403,28 @@ def test_llm_key_permission_error_maps_to_409(tmp_path, monkeypatch):
     assert r.status_code == 409
     assert "locked" in r.json()["detail"]
     assert "XAI_API_KEY=xai-secret" not in env.read_text(encoding="utf-8")
+
+
+def test_llm_key_acl_failure_maps_to_server_error_without_publishing(
+    tmp_path, monkeypatch
+):
+    import app.env_builder as env_builder
+
+    env = tmp_path / ".env"
+    original = "SETUP_COMPLETE=true\nXAI_API_KEY=old-value\nXAI_MODEL=grok-4\n"
+    env.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(main_mod, "ENV_PATH", env)
+    monkeypatch.setattr(env_builder, "restrict_env_permissions", lambda path: False)
+
+    with _client() as tc:
+        response = tc.post(
+            "/api/settings/llm-key",
+            json={"provider": "xai", "api_key": "new-secret", "model": "grok-4"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Local configuration permissions could not be secured."
+    )
+    assert env.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".env.*.tmp")) == []

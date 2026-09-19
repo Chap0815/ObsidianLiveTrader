@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+
 import pytest
 
 from app.db.repo import Database
@@ -54,6 +57,137 @@ async def test_insert_and_readback_pending(db_path):
 
 
 @pytest.mark.asyncio
+async def test_dedupe_never_revives_row_resolved_after_pending_lookup(db_path):
+    context_hash = "same-context-race"
+    original = Database(db_path)
+    await original.init()
+    original_id = await original.insert_journal_entry(
+        **_base_kwargs(context_hash=context_hash, created_at="2026-01-01T00:00:00+00:00")
+    )
+
+    dedupe = Database(db_path)
+    resolver = Database(db_path)
+    selected = asyncio.Event()
+    resume = asyncio.Event()
+    original_acquire = dedupe._acquire
+
+    class PausedCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        async def fetchone(self):
+            row = await self._cursor.fetchone()
+            selected.set()
+            await resume.wait()
+            return row
+
+    class CoordinatedConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        async def execute(self, query, parameters=()):
+            cursor = await self._connection.execute(query, parameters)
+            if "SELECT id FROM journal_entries" in query:
+                return PausedCursor(cursor)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    @asynccontextmanager
+    async def coordinated_acquire():
+        async with original_acquire() as connection:
+            yield CoordinatedConnection(connection)
+
+    dedupe._acquire = coordinated_acquire
+    task = asyncio.create_task(
+        dedupe.insert_journal_entry(
+            **_base_kwargs(
+                context_hash=context_hash,
+                created_at="2026-01-01T00:05:00+00:00",
+                tp1=103.0,
+            )
+        )
+    )
+    await selected.wait()
+    try:
+        await resolver.update_journal_outcome(
+            original_id,
+            status="WIN",
+            resolved_price=102.0,
+            realized_r=2.0,
+        )
+    finally:
+        resume.set()
+    new_id = await task
+
+    rows = {row["id"]: row for row in await original.recent_journal()}
+    assert new_id != original_id
+    assert rows[original_id]["status"] == "WIN"
+    assert rows[original_id]["resolved_price"] == 102.0
+    assert rows[new_id]["status"] == "PENDING"
+    assert rows[new_id]["tp1"] == 103.0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dedupe_decisions_are_serialized_without_duplicate_rows(db_path):
+    db = Database(db_path)
+    await db.init()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    active = 0
+    max_active = 0
+    acquire_calls = 0
+    original_acquire = db._acquire
+
+    @asynccontextmanager
+    async def observed_acquire():
+        nonlocal active, max_active, acquire_calls
+        acquire_calls += 1
+        this_call = acquire_calls
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            if this_call == 1:
+                first_entered.set()
+                await release_first.wait()
+            async with original_acquire() as connection:
+                yield connection
+        finally:
+            active -= 1
+
+    db._acquire = observed_acquire
+    first = asyncio.create_task(
+        db.insert_journal_entry(
+            **_base_kwargs(
+                context_hash="concurrent-context",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+        )
+    )
+    await first_entered.wait()
+    second = asyncio.create_task(
+        db.insert_journal_entry(
+            **_base_kwargs(
+                context_hash="concurrent-context",
+                created_at="2026-01-01T00:01:00+00:00",
+            )
+        )
+    )
+    # The second task is queued before the release callback. Without the
+    # journal lock it enters observed_acquire synchronously and raises
+    # max_active to two; with the lock it waits outside the critical section.
+    asyncio.get_running_loop().call_soon(release_first.set)
+    first_id, second_id = await asyncio.gather(first, second)
+
+    assert max_active == 1
+    assert first_id == second_id
+    pending = await db.pending_journal_entries()
+    assert len(pending) == 1
+    assert pending[0]["snapshot_version"] == 2
+
+
+@pytest.mark.asyncio
 async def test_order_type_migration_idempotent_on_legacy_db(db_path):
     """order_type is an additive column (Lern-Loop fix). On a pre-existing DB
     whose journal_entries table predates the column, init() must ALTER-add it
@@ -93,6 +227,7 @@ async def test_order_type_migration_idempotent_on_legacy_db(db_path):
     assert pend[lim]["order_type"] == "limit"
     # Legacy rows / omitted order_type stay NULL -> resolver keeps LIMIT modeling.
     assert pend[n]["order_type"] is None
+    assert {row["snapshot_version"] for row in pend.values()} == {1}
 
 
 @pytest.mark.asyncio

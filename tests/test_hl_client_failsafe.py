@@ -19,6 +19,101 @@ from app.hyperliquid.client import HyperliquidClient
 from app.hyperliquid.errors import HyperliquidError
 
 
+@pytest.mark.parametrize(
+    ("testnet", "base_url"),
+    [
+        (True, "https://api.hyperliquid.xyz"),
+        (False, "https://api.hyperliquid-testnet.xyz"),
+        (True, "https://evil.example.com"),
+        (True, "http://api.hyperliquid-testnet.xyz"),
+        (True, "https://user:secret@api.hyperliquid-testnet.xyz"),
+        (True, "https://api.hyperliquid-testnet.xyz/path"),
+        (True, "https://api.hyperliquid-testnet.xyz?token=secret"),
+        (True, "https://api.hyperliquid-testnet.xyz:444"),
+    ],
+)
+def test_client_constructor_rejects_unsafe_or_mismatched_network_target(
+    testnet, base_url
+):
+    with pytest.raises(HyperliquidError, match="base URL"):
+        HyperliquidClient(
+            private_key="synthetic-private-key",
+            testnet=testnet,
+            base_url=base_url,
+        )
+
+
+@pytest.mark.parametrize("testnet", [None, 0, 1, "true", "false"])
+def test_client_constructor_requires_literal_boolean_network_flag(testnet):
+    with pytest.raises(HyperliquidError, match="testnet flag"):
+        HyperliquidClient(testnet=testnet)
+
+
+@pytest.mark.parametrize(
+    ("testnet", "base_url"),
+    [
+        (True, "https://api.hyperliquid-testnet.xyz:443/"),
+        (False, "https://api.hyperliquid.xyz:443/"),
+    ],
+)
+def test_client_constructor_accepts_canonical_explicit_network_target(
+    testnet, base_url
+):
+    client = HyperliquidClient(testnet=testnet, base_url=base_url)
+    try:
+        assert client.testnet is testnet
+        assert client.base_url == base_url.rstrip("/")
+    finally:
+        client._executor_trade.shutdown(wait=False, cancel_futures=True)
+        client._executor_data.shutdown(wait=False, cancel_futures=True)
+        client._executor_account.shutdown(wait=False, cancel_futures=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("http_timeout_s", float("nan")),
+        ("http_timeout_s", float("inf")),
+        ("http_timeout_s", -1.0),
+        ("http_timeout_s", 0.49),
+        ("http_timeout_s", 120.01),
+        ("http_timeout_s", True),
+        ("http_timeout_s", "10"),
+        ("http_timeout_s", 10**400),
+        ("market_slippage_pct", float("nan")),
+        ("market_slippage_pct", float("inf")),
+        ("market_slippage_pct", -0.01),
+        ("market_slippage_pct", 100.01),
+        ("market_slippage_pct", True),
+        ("market_slippage_pct", "0.5"),
+        ("market_slippage_pct", 10**400),
+    ],
+)
+def test_client_constructor_rejects_invalid_numeric_safety_bounds(field, value):
+    with pytest.raises(HyperliquidError, match="must be a finite number"):
+        HyperliquidClient(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("http_timeout_s", "market_slippage_pct"),
+    [(0.5, 0.0), (120.0, 100.0)],
+)
+def test_client_constructor_accepts_numeric_safety_boundaries(
+    http_timeout_s, market_slippage_pct
+):
+    client = HyperliquidClient(
+        http_timeout_s=http_timeout_s,
+        market_slippage_pct=market_slippage_pct,
+    )
+    try:
+        assert client._http_timeout_s == http_timeout_s
+        assert client.market_slippage == max(0.0005, market_slippage_pct / 100.0)
+    finally:
+        client._executor_trade.shutdown(wait=False, cancel_futures=True)
+        client._executor_data.shutdown(wait=False, cancel_futures=True)
+        client._executor_account.shutdown(wait=False, cancel_futures=True)
+
+
 def _client(info: MagicMock) -> HyperliquidClient:
     c = HyperliquidClient(private_key="0x" + "1" * 64, testnet=True)
     c.account_address = "0x" + "2" * 40
@@ -204,6 +299,47 @@ async def test_ticker_rejects_nonfinite_mid_price(mid):
 
     with pytest.raises(HyperliquidError, match="Non-finite mid price"):
         await client.ticker("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", [None, True, 15, "", "1m", "Min15", "1h"])
+async def test_klines_reject_invalid_interval_before_sdk(interval):
+    info = MagicMock()
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="interval is invalid"):
+        await client.klines("BTC", interval)
+
+    client._get_info.assert_not_called()
+    info.candles_snapshot.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_hint", [None, True, 0, -1, 1.5, "200", 1501])
+async def test_klines_reject_invalid_limit_before_sdk(limit_hint):
+    info = MagicMock()
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="limit_hint is invalid"):
+        await client.klines("BTC", "15m", limit_hint=limit_hint)
+
+    client._get_info.assert_not_called()
+    info.candles_snapshot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_klines_reject_oversized_response_before_materializing_rows(monkeypatch):
+    row = {"t": 1_700_000_000_000, "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}
+    info = MagicMock()
+    info.candles_snapshot = MagicMock(return_value=[row] * 12)
+    client = _client(info)
+    monkeypatch.setattr(
+        "app.hyperliquid.client.Candle",
+        MagicMock(side_effect=AssertionError("oversized rows must not materialize")),
+    )
+
+    with pytest.raises(HyperliquidError, match="exceeds requested limit"):
+        await client.klines("BTC", "15m", limit_hint=2)
 
 
 @pytest.mark.asyncio
@@ -445,6 +581,23 @@ async def test_open_stop_orders_returns_triggers_on_recognized_list():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "sdk_method"),
+    [("open_orders", "open_orders"), ("open_stop_orders", "frontend_open_orders")],
+)
+async def test_open_order_reads_reject_invalid_filter_before_sdk(
+    method_name, sdk_method
+):
+    info = MagicMock()
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="symbol"):
+        await getattr(c, method_name)("BTC/USDT")
+
+    getattr(info, sdk_method).assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_open_stop_orders_ignores_explicit_foreign_rows_before_validation():
     info = MagicMock()
     info.frontend_open_orders = MagicMock(
@@ -504,6 +657,9 @@ async def test_open_stop_orders_ignores_non_reduce_only_trigger():
         {"coin": " "},
         {"coin": True},
         {"coin": 123},
+        {"coin": "BTC_USDT"},
+        {"coin": "BTC/USDT"},
+        {"coin": "B"},
         {"oid": True},
         {"oid": 0},
     ],
@@ -534,6 +690,9 @@ async def test_open_stop_orders_rejects_malformed_protective_trigger(overrides):
         {"coin": " "},
         {"coin": True},
         {"coin": 123},
+        {"coin": "BTC_USDT"},
+        {"coin": "BTC/USDT"},
+        {"coin": "B"},
         {"oid": None},
         {"oid": True},
         {"oid": 0},
@@ -808,6 +967,18 @@ async def test_positions_reject_open_position_without_symbol(symbol, coin):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", [None, "BTC"])
+@pytest.mark.parametrize("coin", ['BTC"]#SELECTOR', "B", "A" * 21])
+async def test_positions_reject_malformed_open_position_symbol(symbol, coin):
+    info = MagicMock()
+    info.user_state = MagicMock(return_value=_state_with_open_position(coin=coin))
+    c = _client(info)
+
+    with pytest.raises(HyperliquidError, match="position symbol"):
+        await c.positions(symbol, fresh=True)
+
+
+@pytest.mark.asyncio
 async def test_symbol_scoped_positions_ignore_explicit_foreign_invalid_row():
     state = _state_with_open_position()
     foreign = _state_with_open_position(coin="ETH", szi=None)["assetPositions"][0]
@@ -943,7 +1114,6 @@ async def test_user_fills_rejects_unrecognized_top_level_shape(payload):
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("coin", ""),
         ("px", "NaN"),
         ("px", "0"),
         ("sz", "Infinity"),
@@ -956,29 +1126,49 @@ async def test_user_fills_rejects_unrecognized_top_level_shape(payload):
         ("time", True),
     ],
 )
-async def test_user_fills_skips_invalid_required_fields(field, value):
+async def test_user_fills_rejects_invalid_required_fields(field, value):
     info = MagicMock()
     info.user_fills = MagicMock(return_value=[_valid_fill(**{field: value})])
     c = _client(info)
 
-    assert await c.user_fills("BTC") == []
+    with pytest.raises(HyperliquidError, match="invalid fill row"):
+        await c.user_fills("BTC")
 
 
 @pytest.mark.asyncio
-async def test_user_fills_skips_implausibly_future_timestamp(monkeypatch):
+async def test_user_fills_rejects_implausibly_future_timestamp(monkeypatch):
     now_s = 1_700_000_000.0
     monkeypatch.setattr("app.hyperliquid.client.time.time", lambda: now_s)
     info = MagicMock()
     info.user_fills = MagicMock(
-        return_value=[
-            _valid_fill(time=int(now_s * 1000) + 300_001),
-            _valid_fill(time=int(now_s * 1000) + 300_000),
-        ]
+        return_value=[_valid_fill(time=int(now_s * 1000) + 300_001)]
+    )
+
+    with pytest.raises(HyperliquidError, match="invalid fill row"):
+        await _client(info).user_fills("BTC")
+
+
+@pytest.mark.asyncio
+async def test_user_fills_accepts_maximum_future_timestamp_skew(monkeypatch):
+    now_s = 1_700_000_000.0
+    monkeypatch.setattr("app.hyperliquid.client.time.time", lambda: now_s)
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        return_value=[_valid_fill(time=int(now_s * 1000) + 300_000)]
     )
 
     rows = await _client(info).user_fills("BTC")
 
     assert [row["time"] for row in rows] == [int(now_s * 1000) + 300_000]
+
+
+@pytest.mark.asyncio
+async def test_user_fills_rejects_non_object_row():
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=["malformed-fill"])
+
+    with pytest.raises(HyperliquidError, match="non-object row"):
+        await _client(info).user_fills("BTC")
 
 
 @pytest.mark.asyncio
@@ -1017,12 +1207,36 @@ async def test_user_fills_degrades_known_direction_side_contradiction(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("coin", [" ", True, 123])
-async def test_user_fills_unscoped_skips_invalid_coin_identity(coin):
+@pytest.mark.parametrize(
+    "coin", ["", " ", True, 123, "BTC_USDT", "BTC/USDT", "B"]
+)
+async def test_user_fills_rejects_invalid_coin_identity(coin):
     info = MagicMock()
     info.user_fills = MagicMock(return_value=[_valid_fill(coin=coin)])
 
-    assert await _client(info).user_fills() == []
+    with pytest.raises(HyperliquidError, match="coin identity"):
+        await _client(info).user_fills()
+
+
+@pytest.mark.asyncio
+async def test_user_fills_rejects_malformed_scoped_coin_identity():
+    info = MagicMock()
+    info.user_fills = MagicMock(return_value=[_valid_fill(coin="BTC_USDT")])
+
+    with pytest.raises(HyperliquidError, match="coin identity"):
+        await _client(info).user_fills("BTC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_symbol", [True, "BTC/USDT"])
+async def test_user_fills_rejects_invalid_filter_before_sdk(invalid_symbol):
+    info = MagicMock()
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="symbol"):
+        await client.user_fills(invalid_symbol)
+
+    info.user_fills.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1315,38 @@ async def test_user_fills_symbol_filters_share_short_ttl_upstream_read():
 
 
 @pytest.mark.asyncio
+async def test_user_fills_fresh_bypasses_warm_epoch_cache():
+    info = MagicMock()
+    info.user_fills = MagicMock(
+        side_effect=[
+            [_valid_fill(time=1_700_000_000_000)],
+            [_valid_fill(time=1_700_000_001_000)],
+        ]
+    )
+    client = _client(info)
+
+    cached_epoch = await client.user_fills("BTC")
+    live_epoch = await client.user_fills("BTC", fresh=True)
+
+    assert cached_epoch[0]["time"] == 1_700_000_000_000
+    assert live_epoch[0]["time"] == 1_700_000_001_000
+    assert info.user_fills.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [None, True, 0, -1, 1.5, "100", 501])
+async def test_user_fills_reject_invalid_limit_before_sdk(limit):
+    info = MagicMock()
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="limit is invalid"):
+        await client.user_fills("BTC", limit=limit)
+
+    client._get_info.assert_not_called()
+    info.user_fills.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_user_fills_cache_is_scoped_to_account_address():
     info = MagicMock()
     info.user_fills = MagicMock(
@@ -1127,6 +1373,7 @@ async def test_user_fills_cache_ttl_starts_after_slow_fetch(monkeypatch):
     client = _client(info)
     fake_time = MagicMock()
     fake_time.monotonic = MagicMock(side_effect=[100.0, 100.0, 103.0, 103.0])
+    fake_time.time = MagicMock(return_value=1_700_000_000.0)
     monkeypatch.setattr("app.hyperliquid.client.time", fake_time)
 
     await client.user_fills("BTC_USDT")
@@ -1263,7 +1510,7 @@ async def test_user_state_cache_ttl_uses_monotonic_time(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_assets_positions_serve_stale_cache_on_429():
+async def test_assets_positions_serve_stale_cache_on_429(caplog):
     """A warm cache older than the TTL but within the stale bound must be served
     when the refetch 429s — a transient rate-limit burst degrades to a slightly
     stale read instead of 502-ing the market view / starving the trade monitor."""
@@ -1274,10 +1521,15 @@ async def test_assets_positions_serve_stale_cache_on_429():
     # Age the cache past the TTL but within the stale bound, then 429 the refetch.
     ts, state, addr = c._user_state_cache
     c._user_state_cache = (time.monotonic() - 5.0, state, addr)
-    info.user_state = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
+    secret_marker = "synthetic-secret-in-upstream-error"
+    info.user_state = MagicMock(
+        side_effect=RuntimeError(f"429 Too Many Requests {secret_marker}")
+    )
     rows = await c.assets()
     assert rows[0]["equity"] == 1000.0  # stale equity served, no raise
     assert await c.positions() == []  # stale positions served, no raise
+    assert "RuntimeError" in caplog.text
+    assert secret_marker not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1720,9 +1972,8 @@ async def test_funding_rate_rejects_nonfinite_value():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_name", [True, 7, ["BTC"], {"coin": "BTC"}])
 async def test_market_context_does_not_match_nonstring_market_identity(invalid_name):
-    requested = str(invalid_name).upper()
     info = MagicMock()
-    info.all_mids = MagicMock(return_value={requested: "10"})
+    info.all_mids = MagicMock(return_value={"BTC": "10"})
     info.meta_and_asset_ctxs = MagicMock(
         return_value=[
             {"universe": [{"name": invalid_name}]},
@@ -1738,15 +1989,43 @@ async def test_market_context_does_not_match_nonstring_market_identity(invalid_n
     )
     client = _client(info)
 
-    ticker = await client.ticker(requested)
+    ticker = await client.ticker("BTC")
     with pytest.raises(HyperliquidError, match="funding"):
-        await client.funding_rate(requested)
-    extras = await client.market_extras(requested)
+        await client.funding_rate("BTC")
+    extras = await client.market_extras("BTC")
 
     assert ticker.funding_rate is None
     assert extras["open_interest"] is None
     assert extras["premium"] is None
     assert extras["prev_day_px"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("contract_meta", ("BTC_USDT_EXTRA",)),
+        ("ticker", ("BTC_USDT_EXTRA",)),
+        ("funding_rate", ("BTC_USDT_EXTRA",)),
+        ("market_extras", ("BTC_USDT_EXTRA",)),
+        ("klines", ("BTC_USDT_EXTRA", "15m")),
+        ("positions", ("BTC_USDT_EXTRA",)),
+        ("account_state", ("BTC_USDT_EXTRA",)),
+    ],
+)
+async def test_symbol_bound_reads_reject_invalid_symbol_before_sdk(method, args):
+    info = MagicMock()
+    client = _client(info)
+
+    with pytest.raises(HyperliquidError, match="symbol is invalid"):
+        await getattr(client, method)(*args)
+
+    client._get_info.assert_not_called()
+    info.user_state.assert_not_called()
+    info.meta.assert_not_called()
+    info.all_mids.assert_not_called()
+    info.meta_and_asset_ctxs.assert_not_called()
+    info.candles_snapshot.assert_not_called()
 
 
 @pytest.mark.asyncio

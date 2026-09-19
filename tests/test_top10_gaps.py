@@ -131,6 +131,7 @@ async def test_confirm_survives_audit_db_write_failure_after_live_place():
     den Nutzer zum gefährlichen Re-Preview verleiten. Erwartung: ok=True,
     korrekter Status ('placed'), und der Audit-Fehler nur in post_errors."""
     client = _happy_client({"orderId": 1, "slTriggerOid": 555})
+    client.exchange_id = "hyperliquid"
     db = MagicMock()
     db.insert_preview = AsyncMock()
     db.mark_preview_used = AsyncMock()
@@ -477,6 +478,34 @@ def test_ws_market_accepts_loopback_origin_mexc_poll_branch(monkeypatch):
     assert msg["type"] == "status"
     assert msg["status"] == "poll_fallback"
     assert msg["exchange"] == "mexc"
+
+
+def test_ws_market_outer_error_log_does_not_reflect_diagnostics(
+    monkeypatch, caplog
+):
+    from app.config import get_settings
+
+    marker = "SYNTHETIC_PRIVATE_WS_OUTER_ERROR"
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    monkeypatch.setattr(
+        "app.main._mexc_poll_fallback",
+        AsyncMock(side_effect=RuntimeError(marker)),
+    )
+    get_settings.cache_clear()
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect(
+            "/ws/market?symbol=BTC_USDT",
+            headers={"origin": "http://testserver"},
+        ) as ws:
+            assert ws.receive_json()["status"] == "poll_fallback"
+            assert ws.receive_json()["error"] == "Internal error"
+
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 # ── Gap 7: /api/scan — keine Kontexte → 502 mit errors-Payload ──────────────

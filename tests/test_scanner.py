@@ -2,7 +2,13 @@
 
 import pytest
 
-from app.llm.scanner import ScanResult, build_scan_contexts, parse_scan_results
+from app.llm.client import LlmError
+from app.llm.scanner import (
+    ScanResult,
+    _parse_scan_or_raise,
+    build_scan_contexts,
+    parse_scan_results,
+)
 from app.models import Candle
 
 
@@ -31,6 +37,17 @@ def test_parse_scan_results_drops_invalid_rows():
 
 def test_parse_scan_results_empty():
     assert parse_scan_results('{"results": []}') == []
+
+
+def test_scanner_json_error_does_not_reflect_provider_content():
+    raw = "not-json SYNTHETIC_SECRET_MARKER"
+
+    with pytest.raises(LlmError) as exc_info:
+        _parse_scan_or_raise(raw, {"BTC"}, "synthetic-model")
+
+    assert str(exc_info.value) == "Scanner response is not valid JSON"
+    assert "SYNTHETIC_SECRET_MARKER" not in str(exc_info.value)
+    assert exc_info.value.raw == raw
 
 
 def test_parse_scan_results_bounds_display_text():
@@ -211,6 +228,53 @@ async def test_scan_with_llm_restricts_to_context_symbols(monkeypatch):
     contexts = [{"symbol": "BTC"}, {"symbol": "ETH"}]
     results, model = await scanner_mod.scan_with_llm(contexts, settings)
     assert [r.symbol for r in results] == ["BTC"]
+
+
+@pytest.mark.asyncio
+async def test_scan_with_llm_strips_private_fields_at_transport_boundary(monkeypatch):
+    import json
+
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    marker = "SYNTHETIC_PRIVATE_SCANNER_VALUE"
+    captured: dict = {}
+
+    async def fake_anthropic_text(
+        system, user, model, settings, timeout=120.0, *, provider_label="Claude"
+    ):
+        captured["contexts"] = json.loads(user.split("COINS:\n", 1)[1])
+        return '{"results": [{"symbol": "BTC", "bias": "long", "score": 8}]}'
+
+    monkeypatch.setattr(scanner_mod, "_anthropic_text", fake_anthropic_text)
+    settings = Settings(_env_file=None, anthropic_api_key="synthetic-claude-key")
+    contexts = [
+        {
+            "symbol": "BTC",
+            "last_price": 100.0,
+            "account": {"equity_usdt": marker},
+            "ltf": {
+                "read": {
+                    "ema_stack": "bullish",
+                    "account_snapshot": marker,
+                }
+            },
+            "diagnostics": {"authorization": marker},
+        }
+    ]
+
+    results, _ = await scanner_mod.scan_with_llm(contexts, settings)
+
+    assert [r.symbol for r in results] == ["BTC"]
+    assert captured["contexts"] == [
+        {
+            "symbol": "BTC",
+            "last_price": 100.0,
+            "ltf": {"read": {"ema_stack": "bullish"}},
+        }
+    ]
+    assert marker not in str(captured)
+    assert contexts[0]["account"]["equity_usdt"] == marker
 
 
 @pytest.mark.asyncio
@@ -475,10 +539,12 @@ async def test_build_scan_contexts_isolates_error_with_gather():
 
     clear_daily_cache()
 
+    marker = "SYNTHETIC_PRIVATE_SCANNER_COIN_ERROR"
+
     class FakeClient:
         async def klines(self, symbol, interval, limit_hint=120, *, paced=False):
             if symbol == "BROKEN":
-                raise RuntimeError("exchange down for this coin")
+                raise RuntimeError(marker)
             return [
                 Candle(
                     time=(1_700_000_000 + i * 900) * 1000,
@@ -494,6 +560,7 @@ async def test_build_scan_contexts_isolates_error_with_gather():
     contexts, errors = await build_scan_contexts(FakeClient(), overview, "15m", "1H")
     assert [c["symbol"] for c in contexts] == ["OKX"]
     assert len(errors) == 1 and "BROKEN" in errors[0]
+    assert marker not in str(errors)
 
 
 # --- S2-04: scanner rationale must survive the analyzer handoff sanitizer --
@@ -637,6 +704,33 @@ def test_scan_response_has_scanned_at(monkeypatch):
     # distinct post-slice stage1_size (never larger than the universe).
     assert "universe_size" in data and "stage1_size" in data
     assert data["stage1_size"] <= data["universe_size"]
+
+
+def test_scan_overview_error_does_not_reflect_diagnostics(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.hyperliquid.errors import HyperliquidError
+    from app.main import app
+
+    marker = "SYNTHETIC_PRIVATE_SCAN_OVERVIEW_ERROR"
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(exchange="mexc", mexc_api_key="k", mexc_api_secret="s"),
+    )
+    client = MagicMock()
+    client.market_overview = AsyncMock(side_effect=HyperliquidError(marker))
+
+    with TestClient(app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        response = tc.post("/api/scan", json={"tf": "15m", "htf": "1H"})
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exchange market overview unavailable"
+    assert marker not in response.text
 
 
 @pytest.mark.asyncio
@@ -792,6 +886,245 @@ async def test_scanner_anthropic_thinking_disabled(monkeypatch):
     body = _CapturingClient.posted_bodies[-1]
     assert body["thinking"] == {"type": "disabled"}
     assert body["max_tokens"] == 6000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["anthropic", "openai"])
+@pytest.mark.parametrize("response_kind", ["non_json", "non_object"])
+async def test_scanner_transports_map_invalid_success_response_to_llmerror(
+    monkeypatch, transport, response_kind
+):
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    marker = "SYNTHETIC_SECRET_MARKER"
+
+    class Response:
+        status_code = 200
+        text = marker
+
+        @staticmethod
+        def json():
+            if response_kind == "non_json":
+                raise ValueError(marker)
+            return [marker]
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", Client)
+
+    with pytest.raises(LlmError) as exc_info:
+        if transport == "anthropic":
+            await scanner_mod._anthropic_text(
+                "system", "user", "synthetic-model", Settings(anthropic_api_key="k")
+            )
+        else:
+            await scanner_mod._openai_compat_text(
+                "system",
+                "user",
+                "synthetic-model",
+                "https://synthetic.invalid/v1",
+                "synthetic-key",
+            )
+
+    assert str(exc_info.value) == "Scanner provider returned invalid response"
+    assert marker not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["anthropic", "openai"])
+async def test_scanner_transport_error_does_not_reflect_diagnostics(
+    monkeypatch, transport
+):
+    import httpx
+
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    marker = "SYNTHETIC_PRIVATE_SCANNER_TRANSPORT_ERROR"
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError(marker)
+
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", Client)
+
+    with pytest.raises(LlmError) as exc_info:
+        if transport == "anthropic":
+            await scanner_mod._anthropic_text(
+                "system", "user", "synthetic-model", Settings(anthropic_api_key="k")
+            )
+        else:
+            await scanner_mod._openai_compat_text(
+                "system",
+                "user",
+                "synthetic-model",
+                "https://synthetic.invalid/v1",
+                "synthetic-key",
+            )
+
+    assert str(exc_info.value).endswith("request failed")
+    assert marker not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_scanner_empty_content_does_not_reflect_unknown_finish_reason(monkeypatch):
+    import app.llm.scanner as scanner_mod
+
+    marker = "SYNTHETIC_SECRET_MARKER"
+
+    class Response:
+        status_code = 200
+        text = "synthetic"
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {"finish_reason": marker, "message": {"content": ""}}
+                ]
+            }
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", Client)
+
+    with pytest.raises(LlmError) as exc_info:
+        await scanner_mod._openai_compat_text(
+            "system",
+            "user",
+            "synthetic-model",
+            "https://synthetic.invalid/v1",
+            "synthetic-key",
+        )
+
+    message = str(exc_info.value)
+    assert "finish_reason=unknown" in message
+    assert marker not in message
+
+
+@pytest.mark.asyncio
+async def test_scanner_claude_retries_one_transient_response(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import app.llm.client as client_mod
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            Client.calls += 1
+            if Client.calls == 1:
+                return Response(503, {"error": "synthetic transient"})
+            return Response(
+                200,
+                {"content": [{"type": "text", "text": '{"results": []}'}]},
+            )
+
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+
+    text = await scanner_mod._anthropic_text(
+        "system", "user", "claude-sonnet-5", Settings(anthropic_api_key="k")
+    )
+
+    assert text == '{"results": []}'
+    assert Client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_scanner_claude_persistent_transient_stops_after_one_retry(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import app.llm.client as client_mod
+    import app.llm.scanner as scanner_mod
+    from app.config import Settings
+    from app.llm.client import LlmError
+
+    class Response:
+        status_code = 503
+        text = '{"error":"synthetic down"}'
+
+        @staticmethod
+        def json():
+            return {"error": "synthetic down"}
+
+    class Client:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            Client.calls += 1
+            return Response()
+
+    monkeypatch.setattr(scanner_mod.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(LlmError):
+        await scanner_mod._anthropic_text(
+            "system", "user", "claude-sonnet-5", Settings(anthropic_api_key="k")
+        )
+
+    assert Client.calls == 2
 
 
 # --- Task 24 (S2-01/S2-08/S2-02): universe union + prefilter + chunk-merge ---

@@ -11,11 +11,13 @@ import functools
 import hashlib
 import logging
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from threading import Lock
 from typing import Any
+from urllib.parse import urlparse
 
 from app.hyperliquid.errors import HyperliquidError
 from app.models import Candle, ContractMeta, FundingRate, Ticker
@@ -27,6 +29,66 @@ INTERVAL_MAP = {
     "4H": "4h",
     "1D": "1d",
 }
+
+_HL_COIN_RE = re.compile(r"^[A-Z0-9]{2,20}$")
+_HL_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}(?:_(?:USDT|USDC))?$")
+_HL_EXTERNAL_OID_RE = re.compile(r"^[A-Za-z0-9:_-]{1,64}$")
+_MAX_KLINE_LIMIT_HINT = 1500
+_MAX_USER_FILLS_LIMIT = 500
+
+
+def _validated_hl_base_url(
+    value: Any, *, testnet: Any, testnet_url: str, mainnet_url: str
+) -> str:
+    """Bind the adapter target to one canonical Hyperliquid network."""
+    if type(testnet) is not bool:
+        raise HyperliquidError("Hyperliquid testnet flag must be a literal boolean")
+    if value is not None and not isinstance(value, str):
+        raise HyperliquidError("Hyperliquid base URL is invalid")
+    raw = (value or (testnet_url if testnet else mainnet_url)).strip().rstrip("/")
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise HyperliquidError("Hyperliquid base URL is invalid") from exc
+    expected_host = (
+        urlparse(testnet_url).hostname if testnet else urlparse(mainnet_url).hostname
+    )
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path
+        or port not in (None, 443)
+        or (parsed.hostname or "").lower() != str(expected_host or "").lower()
+    ):
+        raise HyperliquidError(
+            "Hyperliquid base URL is invalid or does not match the testnet flag"
+        )
+    return raw
+
+
+def _validated_safety_float(
+    value: Any, *, field: str, minimum: float, maximum: float
+) -> float:
+    """Validate direct adapter safety inputs without coercing other types."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HyperliquidError(
+            f"{field} must be a finite number in [{minimum}, {maximum}]"
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HyperliquidError(
+            f"{field} must be a finite number in [{minimum}, {maximum}]"
+        ) from exc
+    if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+        raise HyperliquidError(
+            f"{field} must be a finite number in [{minimum}, {maximum}]"
+        )
+    return parsed
 
 
 def _opt_f(v: Any) -> float | None:
@@ -76,6 +138,21 @@ def to_hl_coin(symbol: str) -> str:
     if "_" in s:
         s = s.split("_")[0]
     return s
+
+
+def _required_hl_coin(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise HyperliquidError(f"{field} symbol is invalid")
+    normalized = value.strip().upper().replace("-", "_")
+    if _HL_SYMBOL_RE.fullmatch(normalized) is None:
+        raise HyperliquidError(f"{field} symbol is invalid")
+    return to_hl_coin(normalized)
+
+
+def _required_external_oid(value: Any) -> str:
+    if not isinstance(value, str) or _HL_EXTERNAL_OID_RE.fullmatch(value) is None:
+        raise HyperliquidError("externalOid is invalid")
+    return value
 
 
 # Hyperliquid perp min order value (USDC notional)
@@ -269,11 +346,29 @@ class HyperliquidClient:
     ):
         from hyperliquid.utils import constants
 
+        validated_base_url = _validated_hl_base_url(
+            base_url,
+            testnet=testnet,
+            testnet_url=constants.TESTNET_API_URL,
+            mainnet_url=constants.MAINNET_API_URL,
+        )
+        validated_http_timeout_s = _validated_safety_float(
+            http_timeout_s,
+            field="Hyperliquid HTTP timeout",
+            minimum=0.5,
+            maximum=120.0,
+        )
+        validated_market_slippage_pct = _validated_safety_float(
+            market_slippage_pct,
+            field="Hyperliquid market slippage percent",
+            minimum=0.0,
+            maximum=100.0,
+        )
         self.testnet = testnet
         # Q-01: hard upstream timeout for every SDK HTTP call. asyncio.wait_for
         # around to_thread does NOT abort a blocked requests call, so the only
         # real stall bound is a request-level timeout on the SDK's session.
-        self._http_timeout_s = float(http_timeout_s)
+        self._http_timeout_s = validated_http_timeout_s
         # Q-01: SEPARATED, size-bounded executors. A single bounded pool would
         # still let a scanner fan-out of hanging HL calls fill it and starve
         # confirm/close. So the money path (place/cancel/close/modify) gets its
@@ -292,11 +387,8 @@ class HyperliquidClient:
             max_workers=2, thread_name_prefix="hl-account"
         )
         # Max adverse fill for market orders (fraction for SDK)
-        self.market_slippage = max(0.0005, float(market_slippage_pct) / 100.0)
-        self.base_url = (
-            base_url
-            or (constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL)
-        ).rstrip("/")
+        self.market_slippage = max(0.0005, validated_market_slippage_pct / 100.0)
+        self.base_url = validated_base_url
         self.private_key = (private_key or "").strip()
         self.account_address = (account_address or "").strip()
         self._info = None
@@ -520,10 +612,10 @@ class HyperliquidClient:
                 continue
             try:
                 close()
-            except Exception:
+            except Exception as exc:
                 log.warning(
-                    "Failed to close a Hyperliquid SDK HTTP session",
-                    exc_info=True,
+                    "Failed to close a Hyperliquid SDK HTTP session type=%s",
+                    type(exc).__name__,
                 )
 
     async def _to_thread(
@@ -728,9 +820,11 @@ class HyperliquidClient:
         return await self._to_thread(_o)
 
     async def contract_meta(self, symbol: str) -> ContractMeta:
+        coin = _required_hl_coin(symbol, field="contract metadata")
+
         def _m():
-            row = self._asset_row(symbol)
-            coin = row["name"].strip().upper()
+            row = self._asset_row(coin)
+            row_coin = row["name"].strip().upper()
             sz_dec = _required_int(
                 row.get("szDecimals"), "szDecimals", minimum=0
             )
@@ -742,7 +836,7 @@ class HyperliquidClient:
             if is_delisted is not None and not isinstance(is_delisted, bool):
                 raise HyperliquidError("isDelisted is invalid")
             return ContractMeta(
-                symbol=coin,
+                symbol=row_coin,
                 contract_size=1.0,  # size is in coins
                 # I3: HL has no fixed tick size (5-sig-fig rounding instead), so
                 # price_unit=0.0 is a deliberate boundary, not a TODO. The
@@ -759,7 +853,7 @@ class HyperliquidClient:
                 api_allowed=is_delisted is not True,
                 price_scale=None,
                 vol_scale=sz_dec,
-                base_coin=coin,
+                base_coin=row_coin,
                 quote_coin="USDC",
                 state=0,
             )
@@ -767,8 +861,9 @@ class HyperliquidClient:
         return await self._to_thread(_m)
 
     async def ticker(self, symbol: str) -> Ticker:
+        coin = _required_hl_coin(symbol, field="ticker")
+
         def _t():
-            coin = to_hl_coin(symbol)
             info = self._get_info()
             mids = info.all_mids()
             if coin not in mids:
@@ -820,8 +915,9 @@ class HyperliquidClient:
         fabricated as a neutral 0.0 observation.
         """
 
+        coin = _required_hl_coin(symbol, field="funding rate")
+
         def _f():
-            coin = to_hl_coin(symbol)
             meta_ctx = self._meta_ctxs_sync()
             if (
                 not isinstance(meta_ctx, (list, tuple))
@@ -863,8 +959,9 @@ class HyperliquidClient:
         this method (see app/analysis/context._fetch_market_extras).
         """
 
+        coin = _required_hl_coin(symbol, field="market extras")
+
         def _x():
-            coin = to_hl_coin(symbol)
             meta_ctx = self._meta_ctxs_sync()
             universe = meta_ctx[0].get("universe") if meta_ctx else []
             ctxs = meta_ctx[1] if meta_ctx and len(meta_ctx) > 1 else []
@@ -897,25 +994,18 @@ class HyperliquidClient:
     async def klines(
         self, symbol: str, interval: str, limit_hint: int = 200, *, paced: bool = False
     ) -> list[Candle]:
+        coin = _required_hl_coin(symbol, field="kline")
+        if not isinstance(interval, str) or interval not in INTERVAL_MAP:
+            raise HyperliquidError("kline interval is invalid")
+        if (
+            isinstance(limit_hint, bool)
+            or not isinstance(limit_hint, int)
+            or not 1 <= limit_hint <= _MAX_KLINE_LIMIT_HINT
+        ):
+            raise HyperliquidError("kline limit_hint is invalid")
+        hl_iv = INTERVAL_MAP[interval]
+
         def _k():
-            coin = to_hl_coin(symbol)
-            iv = INTERVAL_MAP.get(interval, interval)
-            # map UI intervals to HL
-            hl_iv = {
-                "Min5": "5m",
-                "Min15": "15m",
-                "Min60": "1h",
-                "Hour4": "4h",
-                "Day1": "1d",
-                "5m": "5m",
-                "15m": "15m",
-                "1H": "1h",
-                "4H": "4h",
-                "1D": "1d",
-                "1h": "1h",
-                "4h": "4h",
-                "1d": "1d",
-            }.get(iv, "15m")
             end = int(time.time() * 1000)
             # bar ms
             bar_ms = {
@@ -924,13 +1014,15 @@ class HyperliquidClient:
                 "1h": 60 * 60_000,
                 "4h": 4 * 60 * 60_000,
                 "1d": 24 * 60 * 60_000,
-            }.get(hl_iv, 15 * 60_000)
-            start = end - bar_ms * max(int(limit_hint), 10)
+            }[hl_iv]
+            start = end - bar_ms * max(limit_hint, 10)
             latest_candle_time = end + _MAX_MARKET_FUTURE_SKEW_MS
             info = self._get_info()
             raw = info.candles_snapshot(coin, hl_iv, start, end)
             if not isinstance(raw, list):
                 raise HyperliquidError("kline response has an unrecognized shape")
+            if len(raw) > max(limit_hint, 10) + 1:
+                raise HyperliquidError("kline response exceeds requested limit")
             out: list[Candle] = []
             for r in raw or []:
                 if not isinstance(r, dict):
@@ -1127,9 +1219,9 @@ class HyperliquidClient:
                 if cache_is_usable:
                     if should_warn:
                         log.warning(
-                            "user_state fetch failed (%s); serving cached state "
+                            "user_state fetch failed type=%s; serving cached state "
                             "aged %.1fs (<= %.1fs bound) to ride out the burst",
-                            e,
+                            type(e).__name__,
                             now - cache[0],
                             _USER_STATE_MAX_STALE_S,
                         )
@@ -1231,12 +1323,13 @@ class HyperliquidClient:
             coin = coin_raw.strip().upper() if isinstance(coin_raw, str) else ""
             # Only a valid, explicit other coin is proven foreign. Missing or
             # malformed identity must remain in the fail-closed validation path.
-            if coin_f and coin and coin != coin_f:
+            coin_valid = _HL_COIN_RE.fullmatch(coin) is not None
+            if coin_f and coin_valid and coin != coin_f:
                 continue
             szi = _required_finite_float(pos.get("szi"), "position size")
             if abs(szi) < 1e-12:
                 continue
-            if not coin:
+            if not coin_valid:
                 raise HyperliquidError("Invalid open position symbol")
             entry = _required_finite_float(pos.get("entryPx"), "position entry")
             if entry <= 0:
@@ -1288,9 +1381,15 @@ class HyperliquidClient:
     async def positions(
         self, symbol: str | None = None, *, fresh: bool = False
     ) -> list[dict[str, Any]]:
+        coin_f = (
+            _required_hl_coin(symbol, field="position filter")
+            if symbol is not None
+            else None
+        )
+
         def _p():
             state = self._fetch_state_sync(fresh=fresh)
-            return [] if state is None else self._positions_from_state(state, symbol)
+            return [] if state is None else self._positions_from_state(state, coin_f)
 
         try:
             if fresh:
@@ -1318,13 +1417,19 @@ class HyperliquidClient:
         for every other caller.
         """
 
+        coin_f = (
+            _required_hl_coin(symbol, field="account state filter")
+            if symbol is not None
+            else None
+        )
+
         def _as():
             state = self._fetch_state_sync(fresh=fresh)
             if state is None:
                 return [], []
             return (
                 self._assets_from_state(state),
-                self._positions_from_state(state, symbol),
+                self._positions_from_state(state, coin_f),
             )
 
         try:
@@ -1336,14 +1441,27 @@ class HyperliquidClient:
             raise HyperliquidError(f"user_state failed: {e}") from e
 
     async def user_fills(
-        self, symbol: str | None = None, limit: int = 100
+        self, symbol: str | None = None, limit: int = 100, *, fresh: bool = False
     ) -> list[dict[str, Any]]:
         """Recent executions of the account (userFills), newest first.
 
         Read-only /info call — also shows fills placed outside this app.
         Normalized shape for the UI: symbol, px, sz, side, time(ms), dir,
-        closed_pnl, oid, fee.
+        closed_pnl, oid, fee. ``fresh=True`` bypasses the short UI cache for
+        trade-epoch decisions after an external close/reopen.
         """
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_USER_FILLS_LIMIT
+        ):
+            raise HyperliquidError("user_fills limit is invalid")
+        coin_f = (
+            _required_hl_coin(symbol, field="user fills")
+            if symbol is not None
+            else None
+        )
 
         def _f():
             if not self.account_address and not self.private_key:
@@ -1360,7 +1478,8 @@ class HyperliquidClient:
                 account_epoch = self._account_cache_epoch
             now = time.monotonic()
             if (
-                cache_epoch == account_epoch
+                not fresh
+                and cache_epoch == account_epoch
                 and cache is not None
                 and cache[2] == addr
                 and (now - cache[0]) < _USER_FILLS_TTL_S
@@ -1375,7 +1494,8 @@ class HyperliquidClient:
                         fetch_epoch = self._account_cache_epoch
                     now = time.monotonic()
                     if (
-                        cache_epoch == fetch_epoch
+                        not fresh
+                        and cache_epoch == fetch_epoch
                         and cache is not None
                         and cache[2] == addr
                         and (now - cache[0]) < _USER_FILLS_TTL_S
@@ -1396,16 +1516,18 @@ class HyperliquidClient:
                             if self._account_cache_epoch == fetch_epoch:
                                 self._user_fills_cache = (fetched_at, fills, addr)
                                 self._user_fills_cache_epoch = fetch_epoch
-            coin_f = to_hl_coin(symbol) if symbol else None
             out: list[dict[str, Any]] = []
             latest_fill_time = int(time.time() * 1000) + _MAX_MARKET_FUTURE_SKEW_MS
             for f in fills:
                 if not isinstance(f, dict):
-                    continue
+                    raise HyperliquidError("user_fills contains a non-object row")
                 coin_raw = f.get("coin")
                 coin = coin_raw.strip().upper() if isinstance(coin_raw, str) else ""
-                if coin_f and coin != coin_f:
+                coin_valid = _HL_COIN_RE.fullmatch(coin) is not None
+                if coin_f and coin_valid and coin != coin_f:
                     continue
+                if not coin_valid:
+                    raise HyperliquidError("user_fills contains an invalid coin identity")
                 side_raw = str(f.get("side") or "")
                 px = _opt_f(f.get("px"))
                 sz = _opt_f(f.get("sz"))
@@ -1413,11 +1535,12 @@ class HyperliquidClient:
                     fill_time = _required_int(
                         f.get("time"), "fill time", minimum=_MIN_MARKET_TIMESTAMP_MS
                     )
-                except HyperliquidError:
-                    continue
+                except HyperliquidError as exc:
+                    raise HyperliquidError(
+                        "user_fills contains an invalid fill row"
+                    ) from exc
                 if (
-                    not coin
-                    or side_raw not in ("A", "B")
+                    side_raw not in ("A", "B")
                     or px is None
                     or px <= 0
                     or sz is None
@@ -1425,7 +1548,7 @@ class HyperliquidClient:
                     or fill_time <= 0
                     or fill_time > latest_fill_time
                 ):
-                    continue
+                    raise HyperliquidError("user_fills contains an invalid fill row")
                 direction_raw = f.get("dir")
                 direction = direction_raw if isinstance(direction_raw, str) else ""
                 # The SDK supplies execution side and semantic direction as
@@ -1448,28 +1571,25 @@ class HyperliquidClient:
                 oid_raw = f.get("oid")
                 fee_raw = f.get("fee")
                 fee = 0.0 if fee_raw in (None, "") else _opt_f(fee_raw)
-                try:
-                    out.append(
-                        {
-                            "symbol": coin,
-                            "px": px,
-                            "sz": sz,
-                            "side": "buy" if side_raw == "B" else "sell",
-                            "time": fill_time,
-                            "dir": direction,
-                            # F2: signed position size BEFORE this fill. ==0 marks
-                            # a Flat->Open (trade-epoch) fill; used to derive a
-                            # STABLE reopen signature. Kept as a float when present.
-                            "start_position": _opt_f(f.get("startPosition")),
-                            "closed_pnl": _opt_f(f.get("closedPnl")),
-                            "oid": oid_raw if _is_positive_oid(oid_raw) else None,
-                            "fee": fee,
-                        }
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    continue
+                out.append(
+                    {
+                        "symbol": coin,
+                        "px": px,
+                        "sz": sz,
+                        "side": "buy" if side_raw == "B" else "sell",
+                        "time": fill_time,
+                        "dir": direction,
+                        # F2: signed position size BEFORE this fill. ==0 marks
+                        # a Flat->Open (trade-epoch) fill; used to derive a
+                        # STABLE reopen signature. Kept as a float when present.
+                        "start_position": _opt_f(f.get("startPosition")),
+                        "closed_pnl": _opt_f(f.get("closedPnl")),
+                        "oid": oid_raw if _is_positive_oid(oid_raw) else None,
+                        "fee": fee,
+                    }
+                )
             out.sort(key=lambda r: r["time"], reverse=True)
-            return out[: max(1, int(limit))]
+            return out[:limit]
 
         try:
             async with self._user_fills_read_lock:
@@ -1493,8 +1613,7 @@ class HyperliquidClient:
         position_type: int | None = None,
         position_id: int | None = None,
     ) -> dict[str, Any]:
-        if not isinstance(symbol, str) or not symbol.strip():
-            raise HyperliquidError("symbol is required for leverage change")
+        coin = _required_hl_coin(symbol, field="leverage")
         if isinstance(leverage, bool) or not isinstance(leverage, int) or leverage <= 0:
             raise HyperliquidError("leverage must be a positive integer")
         if (
@@ -1506,7 +1625,6 @@ class HyperliquidClient:
 
         def _l():
             ex = self._get_exchange()
-            coin = to_hl_coin(symbol)
             is_cross = open_type == 2
             return ex.update_leverage(leverage, coin, is_cross)
 
@@ -1519,15 +1637,15 @@ class HyperliquidClient:
         # a rejection or an uncertain mutation result and must block the entry.
         error = _status_error(result)
         response = result.get("response") if isinstance(result, dict) else None
-        response_data = response.get("data") if isinstance(response, dict) else None
         if error:
             raise HyperliquidError(f"set_leverage rejected: {error}", raw=result)
         if (
             not isinstance(result, dict)
             or result.get("status") != "ok"
+            or set(result) != {"status", "response"}
             or not isinstance(response, dict)
             or response.get("type") != "default"
-            or (isinstance(response_data, dict) and "statuses" in response_data)
+            or set(response) != {"type"}
         ):
             raise HyperliquidError("uncertain set_leverage response shape", raw=result)
         return result
@@ -1535,12 +1653,19 @@ class HyperliquidClient:
     async def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         """Accept internal/MEXC-shaped body and map to HL SDK order/market_open."""
 
+        coin = _required_hl_coin(body.get("symbol"), field="order")
+        entry_cloid = (
+            external_oid_to_cloid(_required_external_oid(body.get("externalOid")))
+            if "externalOid" in body
+            else None
+        )
+        size_fields = [field for field in ("vol", "sz") if field in body]
+        if len(size_fields) != 1:
+            raise HyperliquidError("exactly one of vol or sz must be provided")
+        size_raw = body[size_fields[0]]
+
         def _place():
             ex = self._get_exchange()
-            raw_symbol = body.get("symbol")
-            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
-                raise HyperliquidError("order symbol must be a non-empty string")
-            coin = to_hl_coin(raw_symbol)
             side_raw = body.get("side")
             # MEXC open sides only: 1 long open, 3 short open; also long/short.
             # Reject close sides (2/4) and unknown values — bool(2) would wrongly buy.
@@ -1563,9 +1688,7 @@ class HyperliquidClient:
                     f"unsupported order side {side_raw!r} "
                     "(use 1/long or 3/short; close via close_position_market)"
                 )
-            sz = _required_finite_float(
-                body.get("vol") or body.get("sz") or 0, "order size"
-            )
+            sz = _required_finite_float(size_raw, "order size")
             if sz <= 0:
                 raise HyperliquidError("size/vol must be > 0")
             otype = body.get("type")
@@ -1665,8 +1788,6 @@ class HyperliquidClient:
             # Stamp OUR externalOid onto the exchange order as a Cloid so a
             # transport timeout can recover the real (possibly filled) order and
             # never bait a re-confirm into a double position.
-            entry_cloid = external_oid_to_cloid(str(body.get("externalOid") or ""))
-
             if is_market:
                 # Cap adverse fill: SDK crosses at mid*(1±slippage)
                 result = ex.market_open(
@@ -1762,10 +1883,10 @@ class HyperliquidClient:
                     sl_trigger_oid = _extract_oid(sl_res)
                     err = _order_response_error(sl_res)
                     if sl_trigger_oid is None or err:
-                        trigger_errors.append(f"sl: {err or 'no oid in response'}")
+                        trigger_errors.append("sl: trigger response rejected or invalid")
                         sl_trigger_oid = None
-                except Exception as te:
-                    trigger_errors.append(f"sl: {te}")
+                except Exception:
+                    trigger_errors.append("sl: trigger request failed")
 
             # Optional TP ladder (scale-out): split the reduce-only TP across two
             # rungs (tp1 at tp_px, tp2 at tp2_px) instead of one. Falls back to a
@@ -1788,20 +1909,20 @@ class HyperliquidClient:
                     tp_trigger_oid = _extract_oid(tp_res)
                     err = _order_response_error(tp_res)
                     if tp_trigger_oid is None or err:
-                        trigger_errors.append(f"tp: {err or 'no oid in response'}")
+                        trigger_errors.append("tp: trigger response rejected or invalid")
                         tp_trigger_oid = None
-                except Exception as te:
-                    trigger_errors.append(f"tp: {te}")
+                except Exception:
+                    trigger_errors.append("tp: trigger request failed")
             if do_ladder and tp2_px is not None:
                 try:
                     tp2_res = _place_trigger(tp2_px, "tp", tp_sz2)
                     tp_trigger_oid2 = _extract_oid(tp2_res)
                     err = _order_response_error(tp2_res)
                     if tp_trigger_oid2 is None or err:
-                        trigger_errors.append(f"tp2: {err or 'no oid in response'}")
+                        trigger_errors.append("tp2: trigger response rejected or invalid")
                         tp_trigger_oid2 = None
-                except Exception as te:
-                    trigger_errors.append(f"tp2: {te}")
+                except Exception:
+                    trigger_errors.append("tp2: trigger request failed")
 
             return {
                 "orderId": _extract_oid(result),
@@ -1847,6 +1968,8 @@ class HyperliquidClient:
         position is therefore never unprotected during a SL move.
         """
 
+        coin = _required_hl_coin(symbol, field="stop")
+
         def _place():
             trigger_kind = str(tpsl).strip().lower()
             if trigger_kind not in ("sl", "tp"):
@@ -1854,7 +1977,6 @@ class HyperliquidClient:
             if reduce_only is not True:
                 raise HyperliquidError("protective trigger must be reduce-only")
             ex = self._get_exchange()
-            coin = to_hl_coin(symbol)
             pos = (position_side or "").lower()
             if pos not in ("long", "short"):
                 raise HyperliquidError(
@@ -1937,13 +2059,8 @@ class HyperliquidClient:
                         "HL cancel requires exactly one orderId or oid per order"
                     )
                 raw_oid = item.get(id_keys[0])
-                raw_symbol = item.get("symbol")
-                if not isinstance(raw_symbol, str) or not raw_symbol.strip():
-                    raise HyperliquidError(
-                        "HL cancel requires a positive orderId and symbol"
-                    )
-                coin = to_hl_coin(raw_symbol)
-                if not _is_positive_oid(raw_oid) or not coin:
+                coin = _required_hl_coin(item.get("symbol"), field="cancel")
+                if not _is_positive_oid(raw_oid):
                     raise HyperliquidError(
                         "HL cancel requires a positive orderId and symbol"
                     )
@@ -1990,6 +2107,12 @@ class HyperliquidClient:
         return result
 
     async def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        coin_f = (
+            _required_hl_coin(symbol, field="open order")
+            if symbol is not None
+            else None
+        )
+
         def _o():
             info = self._get_info()
             addr = self.account_address
@@ -2005,17 +2128,17 @@ class HyperliquidClient:
                     "open_orders returned an unrecognized shape "
                     f"({type(orders).__name__})"
                 )
-            coin_f = to_hl_coin(symbol) if symbol else None
             out = []
             for o in orders:
                 if not isinstance(o, dict):
                     raise HyperliquidError("open_orders contains a non-object row")
                 coin_raw = o.get("coin")
                 coin = coin_raw.strip().upper() if isinstance(coin_raw, str) else ""
-                if not coin:
-                    raise HyperliquidError("open_orders contains an invalid row")
-                if coin_f and coin != coin_f:
+                coin_valid = _HL_COIN_RE.fullmatch(coin) is not None
+                if coin_f and coin_valid and coin != coin_f:
                     continue
+                if not coin_valid:
+                    raise HyperliquidError("open_orders contains an invalid row")
                 oid = o.get("oid")
                 side = str(o.get("side") or "")
                 vol = _opt_f(o.get("sz"))
@@ -2053,6 +2176,12 @@ class HyperliquidClient:
     async def open_stop_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Open trigger (SL/TP) orders via frontend_open_orders (includes triggers)."""
 
+        coin_f = (
+            _required_hl_coin(symbol, field="open stop order")
+            if symbol is not None
+            else None
+        )
+
         def _s():
             info = self._get_info()
             addr = self.account_address
@@ -2083,7 +2212,6 @@ class HyperliquidClient:
                     "frontend_open_orders returned an unrecognized shape "
                     f"({type(orders).__name__}); refusing to treat as 'no stops'"
                 )
-            coin_f = to_hl_coin(symbol) if symbol else None
             out = []
             for o in orders:
                 if not isinstance(o, dict):
@@ -2092,8 +2220,13 @@ class HyperliquidClient:
                     )
                 coin_raw = o.get("coin")
                 coin = coin_raw.strip().upper() if isinstance(coin_raw, str) else ""
-                if coin_f and coin and coin != coin_f:
+                coin_valid = _HL_COIN_RE.fullmatch(coin) is not None
+                if coin_f and coin_valid and coin != coin_f:
                     continue
+                if not coin_valid:
+                    raise HyperliquidError(
+                        "invalid order identity in frontend_open_orders"
+                    )
                 otype = str(o.get("orderType") or "")
                 trigger_flag = o.get("isTrigger")
                 if trigger_flag is not None and not isinstance(trigger_flag, bool):
@@ -2115,10 +2248,6 @@ class HyperliquidClient:
                     )
                 if not reduce_only:
                     continue
-                if not coin:
-                    raise HyperliquidError(
-                        "invalid protective trigger in frontend_open_orders"
-                    )
                 if not _is_positive_oid(o.get("oid")):
                     raise HyperliquidError(
                         "invalid protective trigger in frontend_open_orders"
@@ -2182,13 +2311,15 @@ class HyperliquidClient:
         # "close:"-Namespace: selbst wenn ein Aufrufer die Entry-externalOid
         # durchreicht, kollidiert der Close-Cloid nie mit dem Entry-Cloid
         # (gleiche OID => gleicher Hash => ambiger Lookup waere die Folge).
+        coin = _required_hl_coin(symbol, field="close")
         close_cloid = (
-            external_oid_to_cloid(f"close:{external_oid}") if external_oid else None
+            external_oid_to_cloid(f"close:{_required_external_oid(external_oid)}")
+            if external_oid is not None
+            else None
         )
 
         def _cl():
             ex = self._get_exchange()
-            coin = to_hl_coin(symbol)
             want = (side or "").lower()
             if want not in ("long", "short"):
                 raise HyperliquidError(
@@ -2298,9 +2429,8 @@ class HyperliquidClient:
         + trigger orders for the cloid. Returns {} when nothing matches
         (fail-closed: recovery must not false-positive).
         """
-        oid = (external_oid or "").strip()
-        if not oid:
-            return {}
+        symbol = _required_hl_coin(symbol, field="recovery")
+        oid = _required_external_oid(external_oid)
         cloid = external_oid_to_cloid(oid)
         cloid_raw = cloid.to_raw() if cloid is not None else None
 
@@ -2320,7 +2450,7 @@ class HyperliquidClient:
                 if not _hl_recovery_identity_matches(
                     order_wrapper, symbol, cloid_raw
                 ):
-                    status = None
+                    return {}
                 elif _hl_order_state_is_dead(order_wrapper):
                     # X-05: the deterministic cloid lookup resolved to a
                     # terminal-dead order (canceled/rejected/…). Mirror MEXC's
@@ -2347,7 +2477,7 @@ class HyperliquidClient:
         wanted = {oid}
         if cloid_raw:
             wanted.add(cloid_raw)
-        hits: list[dict[str, Any]] = []
+        hits_by_order_id: dict[str, list[dict[str, Any]]] = {}
         for o in list(orders or []) + list(stops or []):
             if not isinstance(o, dict):
                 continue
@@ -2359,7 +2489,7 @@ class HyperliquidClient:
                 or to_hl_coin(row_symbol) != to_hl_coin(symbol)
             ):
                 continue
-            matched = False
+            identity_values: list[str] = []
             for src in (o, raw):
                 for key in (
                     "cloid",
@@ -2368,14 +2498,27 @@ class HyperliquidClient:
                     "externalOid",
                     "external_oid",
                 ):
-                    val = src.get(key)
-                    if val is not None and str(val) in wanted:
-                        hits.append({**o, "externalOid": oid})
-                        matched = True
-                        break
-                if matched:
-                    break
-        return hits if hits else {}
+                    if key not in src:
+                        continue
+                    value = src.get(key)
+                    if not isinstance(value, str) or not value:
+                        return {}
+                    identity_values.append(value)
+            matched_values = [value for value in identity_values if value in wanted]
+            if not matched_values:
+                continue
+            if len(matched_values) != len(identity_values):
+                return {}
+            order_id = o.get("orderId")
+            if not _is_positive_oid(order_id):
+                return {}
+            candidate = {**o, "externalOid": oid}
+            same_order_hits = hits_by_order_id.setdefault(str(order_id), [])
+            if candidate not in same_order_hits:
+                same_order_hits.append(candidate)
+        if len(hits_by_order_id) != 1:
+            return {}
+        return next(iter(hits_by_order_id.values()))
 
 
 # Exact terminal values documented for Hyperliquid's orderStatus response.
@@ -2459,11 +2602,8 @@ def _hl_recovery_identity_matches(
     if not isinstance(order, dict):
         return False
     returned_coin = order.get("coin")
-    if (
-        not isinstance(returned_coin, str)
-        or not returned_coin.strip()
-        or to_hl_coin(returned_coin) != to_hl_coin(symbol)
-    ):
+    coin = returned_coin.strip().upper() if isinstance(returned_coin, str) else ""
+    if _HL_COIN_RE.fullmatch(coin) is None or coin != symbol:
         return False
     if not _is_positive_oid(order.get("oid")):
         return False
@@ -2475,12 +2615,34 @@ def _hl_recovery_identity_matches(
     )
 
 
+def _nested_response_error(value: Any) -> str | None:
+    """Return any explicit error marker found in a mutation response tree."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and key.strip().lower() == "error":
+                if isinstance(child, str):
+                    return child.strip() or "unknown exchange error"
+                return "exchange returned an explicit error marker"
+            nested = _nested_response_error(child)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _nested_response_error(child)
+            if nested:
+                return nested
+    return None
+
+
 def _status_error(result: Any) -> str | None:
-    """Return error text from an HL order response, or None if accepted."""
+    """Return error text from an HL mutation response, or None if absent."""
     if not isinstance(result, dict):
         return None
     if result.get("status") not in (None, "ok"):
         return str(result.get("status"))
+    nested_error = _nested_response_error(result)
+    if nested_error:
+        return nested_error
     try:
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
     except Exception:
@@ -2533,13 +2695,16 @@ def _order_response_error(result: Any) -> str | None:
     ):
         return "unrecognized order response"
     status = statuses[0]
-    if isinstance(status.get("filled"), dict):
+    variants = [key for key in ("filled", "resting") if key in status]
+    if len(variants) != 1 or set(status) != {variants[0]}:
+        return "unrecognized order response"
+    if variants[0] == "filled" and isinstance(status.get("filled"), dict):
         filled = status["filled"]
         total_sz = _opt_f(filled.get("totalSz"))
         if not _is_positive_oid(filled.get("oid")) or total_sz is None or total_sz <= 0:
             return "unrecognized order response"
         return None
-    if isinstance(status.get("resting"), dict):
+    if variants[0] == "resting" and isinstance(status.get("resting"), dict):
         return (
             None
             if _is_positive_oid(status["resting"].get("oid"))

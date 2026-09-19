@@ -39,9 +39,12 @@ def _mock_client(positions, *, sl_price=98.0):
     implemented; any order-write attribute is deliberately absent so a stray
     write would AttributeError and fail the test."""
     client = MagicMock()
+    client.place_stop_order = AsyncMock()
     client.account_snapshot = AsyncMock(return_value={"positions": positions})
     client.open_stop_orders = AsyncMock(
-        return_value=[{"triggerPrice": sl_price, "orderType": "Stop"}]
+        return_value=[
+            {"symbol": "BTC", "triggerPrice": sl_price, "orderType": "Stop"}
+        ]
     )
     return client
 
@@ -112,6 +115,111 @@ def test_arm_sets_rules_and_freezes_baseline(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_arm_rule_patch_preserves_concurrent_other_rule(tmp_path, monkeypatch):
+    """A stale tab changing Auto-BE must not overwrite the current Trail rule."""
+    db_path = str(tmp_path / "arm_patch.db")
+    monkeypatch.setenv("DATABASE_PATH", db_path)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    _run(_seed_open(db_path, "BTC_USDT"))
+    _run(
+        Database(db_path).set_armed_rules(
+            "BTC_USDT", "long", {"auto_trail": True}
+        )
+    )
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+
+        enable = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+        assert enable.status_code == 200, enable.text
+        assert enable.json()["armed_rules"] == {
+            "auto_be": True,
+            "auto_trail": True,
+        }
+
+        client.account_snapshot.reset_mock()
+        client.open_stop_orders.reset_mock()
+        disable = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": False}},
+        )
+        assert disable.status_code == 200, disable.text
+        assert disable.json()["armed_rules"] == {"auto_trail": True}
+        client.account_snapshot.assert_not_awaited()
+        client.open_stop_orders.assert_not_awaited()
+
+    row = _run(Database(db_path).get_open_position_mgmt("BTC_USDT", "long"))
+    assert row["armed_rules"] == {"auto_trail": True}
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_arm_resolves_replacement_client_after_trade_lock(tmp_path):
+    """A queued arm must validate the client installed while it was waiting."""
+    from types import SimpleNamespace
+
+    import app.main as main
+    from app.models import ArmRequest
+
+    db = Database(str(tmp_path / "arm_client_swap.db"))
+    await db.init()
+    await db.upsert_position_mgmt(
+        "BTC_USDT",
+        "long",
+        entry_snap=100.0,
+        initial_sl_snap=98.0,
+        r1=2.0,
+        opened_at=1_700_000_000_000,
+        invalidation_price=None,
+    )
+    old_client = _mock_client([_pos()])
+    new_client = _mock_client([_pos()])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class GateLock:
+        async def __aenter__(self):
+            entered.set()
+            await release.wait()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    state = SimpleNamespace(
+        db=db,
+        mexc=old_client,
+        exchange=old_client,
+        trade_lock=GateLock(),
+        tm_be_attempts={},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    task = asyncio.create_task(
+        main.positions_arm(
+            request,
+            ArmRequest(
+                symbol="BTC_USDT", side="long", rules={"auto_be": True}
+            ),
+            None,
+        )
+    )
+    await entered.wait()
+
+    state.mexc = new_client
+    state.exchange = new_client
+    release.set()
+    result = await task
+
+    assert result["armed_rules"] == {"auto_be": True}
+    old_client.account_snapshot.assert_not_awaited()
+    new_client.account_snapshot.assert_awaited_once_with(fresh=True)
+
+
 def test_disarm_all_rules_succeeds_without_exchange_read(tmp_path, monkeypatch):
     """Turning automation off is local control and must survive an exchange outage."""
     db_path = str(tmp_path / "disarm_offline.db")
@@ -170,6 +278,30 @@ def test_arm_non_live_position_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
     get_settings.cache_clear()
 
+
+def test_arm_account_error_does_not_reflect_diagnostics(tmp_path, monkeypatch):
+    from app.mexc.errors import MexcError
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_account_error.db"))
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    marker = "SYNTHETIC_PRIVATE_ARM_ACCOUNT_ERROR"
+
+    with TestClient(app) as tc:
+        client = _mock_client([])
+        client.account_snapshot = AsyncMock(side_effect=MexcError(marker))
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        response = tc.post(
+            "/api/positions/arm",
+            json={"symbol": "BTC_USDT", "side": "long", "rules": {"auto_be": True}},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exchange account data unavailable"
+    assert marker not in response.text
+    get_settings.cache_clear()
+
     with TestClient(app) as tc:
         # No open positions → arming a phantom position must 404.
         tc.app.state.mexc = _mock_client([])
@@ -202,13 +334,16 @@ def test_arm_duplicate_live_position_rejected_before_baseline_write(tmp_path, mo
     get_settings.cache_clear()
 
 
-def test_arm_overflowed_entry_rejected_before_baseline_read(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bad_entry", [10**400, True, "100.0"])
+def test_arm_invalid_entry_rejected_before_baseline_read(
+    tmp_path, monkeypatch, bad_entry
+):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_overflowed_entry.db"))
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
     get_settings.cache_clear()
 
     with TestClient(app) as tc:
-        client = _mock_client([_pos(entry=10**400)])
+        client = _mock_client([_pos(entry=bad_entry)])
         tc.app.state.mexc = client
         tc.app.state.exchange = client
         r = tc.post(
@@ -221,7 +356,7 @@ def test_arm_overflowed_entry_rejected_before_baseline_read(tmp_path, monkeypatc
     get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("bad_hold", [None, 0, -1, True, "bad", 10**400])
+@pytest.mark.parametrize("bad_hold", [None, 0, -1, True, "bad", "1.0", 10**400])
 def test_arm_rejects_invalid_live_position_size_before_baseline_read(
     tmp_path, monkeypatch, bad_hold
 ):
@@ -263,13 +398,19 @@ def test_arm_missing_position_collection_is_upstream_error(tmp_path, monkeypatch
     get_settings.cache_clear()
 
 
-def test_arm_unidentified_position_row_blocks_valid_match(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "bad_position",
+    [{}, _pos(symbol="BTC_USDT#SYNTHETIC_PRIVATE_POSITION")],
+)
+def test_arm_invalid_position_row_blocks_valid_match(
+    tmp_path, monkeypatch, bad_position
+):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "arm_invalid_position_row.db"))
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
     get_settings.cache_clear()
 
     with TestClient(app) as tc:
-        client = _mock_client([_pos(), {}])
+        client = _mock_client([_pos(), bad_position])
         tc.app.state.mexc = client
         tc.app.state.exchange = client
         r = tc.post(
@@ -278,6 +419,7 @@ def test_arm_unidentified_position_row_blocks_valid_match(tmp_path, monkeypatch)
         )
         assert r.status_code == 502, r.text
         assert "account position data" in r.text.lower()
+        assert "SYNTHETIC_PRIVATE_POSITION" not in r.text
         client.open_stop_orders.assert_not_awaited()
     get_settings.cache_clear()
 
@@ -292,7 +434,13 @@ def test_alerts_returns_set_alert_state(tmp_path, monkeypatch):
             db_path,
             "BTC_USDT",
             armed=True,
-            alert_state={"thesis": {"active": True, "message": "These verletzt"}},
+            alert_state={
+                "thesis": {
+                    "active": True,
+                    "message": "These verletzt",
+                    "ts": 123,
+                }
+            },
         )
     )
 
@@ -306,6 +454,57 @@ def test_alerts_returns_set_alert_state(tmp_path, monkeypatch):
         assert row["side"] == "long"
         assert row["armed_rules"] == {"auto_be": True}
         assert row["alerts"]["thesis"]["active"] is True
+        assert row["alerts"]["thesis"]["message"] == (
+            "The thesis invalidation level was crossed. Check the position."
+        )
+    get_settings.cache_clear()
+
+
+def test_alerts_allowlists_persisted_feed_without_reflecting_text(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "alerts_public_contract.db")
+    monkeypatch.setenv("DATABASE_PATH", db_path)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    marker = "SYNTHETIC_PRIVATE_LEGACY_PROVIDER_ERROR"
+    _run(
+        _seed_open(
+            db_path,
+            "BTC_USDT",
+            alert_state={
+                "auto_be_error": {
+                    "active": True,
+                    "halted": True,
+                    "message": marker,
+                    "ts": 456,
+                    "provider_response": marker,
+                },
+                "unknown_kind": {
+                    "active": True,
+                    "message": marker,
+                    "ts": 456,
+                },
+                "time_stop": {"active": "true", "message": marker, "ts": 456},
+            },
+        )
+    )
+
+    with TestClient(app) as tc:
+        r = tc.get("/api/positions/alerts")
+
+    assert r.status_code == 200, r.text
+    alerts = r.json()["alerts"][0]["alerts"]
+    assert alerts == {
+        "auto_be_error": {
+            "active": True,
+            "halted": True,
+            "message": (
+                "Auto-management is stopped. Check the live stop state and arm it "
+                "again."
+            ),
+            "ts": 456,
+        }
+    }
+    assert marker not in r.text
     get_settings.cache_clear()
 
 
@@ -333,7 +532,100 @@ def test_alerts_fail_closed_for_malformed_persisted_controls(tmp_path, monkeypat
     get_settings.cache_clear()
 
 
-def test_alerts_db_failure_is_unavailable_not_empty(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rows",
+    [
+        ["SYNTHETIC_PRIVATE_NON_OBJECT_ROW"],
+        [
+            {
+                "symbol": "SYNTHETIC_PRIVATE_WRONG_SYMBOL",
+                "side": "long",
+                "armed_rules": {},
+                "be_done": 0,
+                "last_alert_state": {},
+            }
+        ],
+        [
+            {
+                "symbol": "BTC_USDT",
+                "side": "SYNTHETIC_PRIVATE_WRONG_SIDE",
+                "armed_rules": {},
+                "be_done": 0,
+                "last_alert_state": {},
+            }
+        ],
+        [
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "armed_rules": {},
+                "be_done": 0,
+                "last_alert_state": {},
+            },
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "armed_rules": {"auto_be": True},
+                "be_done": 1,
+                "last_alert_state": {},
+            },
+        ],
+    ],
+)
+async def test_alerts_reject_invalid_or_duplicate_persisted_identity(rows, caplog):
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    db = MagicMock()
+    db.list_open_position_mgmt = AsyncMock(return_value=rows)
+    state = SimpleNamespace(
+        db=db,
+        mexc=SimpleNamespace(exchange_id="mexc"),
+        exchange=SimpleNamespace(exchange_id="mexc"),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    with pytest.raises(main.HTTPException) as exc:
+        await main.positions_alerts(request, None)
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "position management alerts unavailable"
+    assert "SYNTHETIC_PRIVATE" not in str(exc.value.detail)
+    assert "SYNTHETIC_PRIVATE" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_alerts_accept_canonical_hyperliquid_identity():
+    from types import SimpleNamespace
+
+    import app.main as main
+
+    db = MagicMock()
+    db.list_open_position_mgmt = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC",
+                "side": "short",
+                "armed_rules": {"auto_trail": True},
+                "be_done": 0,
+                "last_alert_state": {},
+            }
+        ]
+    )
+    client = SimpleNamespace(exchange_id="hyperliquid")
+    state = SimpleNamespace(db=db, mexc=client, exchange=client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    result = await main.positions_alerts(request, None)
+
+    assert result["alerts"][0]["symbol"] == "BTC"
+    assert result["alerts"][0]["side"] == "short"
+    assert result["alerts"][0]["armed_rules"] == {"auto_trail": True}
+
+
+def test_alerts_db_failure_is_unavailable_not_empty(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "alerts_error.db"))
     monkeypatch.setenv("LOCAL_API_TOKEN", "")
     get_settings.cache_clear()
@@ -341,9 +633,8 @@ def test_alerts_db_failure_is_unavailable_not_empty(tmp_path, monkeypatch):
     with TestClient(app) as tc:
         original_db = tc.app.state.db
         failing_db = MagicMock()
-        failing_db.list_open_position_mgmt = AsyncMock(
-            side_effect=RuntimeError("sqlite unavailable")
-        )
+        marker = "SYNTHETIC_PRIVATE_ALERT_DB_ERROR"
+        failing_db.list_open_position_mgmt = AsyncMock(side_effect=RuntimeError(marker))
         tc.app.state.db = failing_db
         try:
             r = tc.get("/api/positions/alerts")
@@ -353,8 +644,10 @@ def test_alerts_db_failure_is_unavailable_not_empty(tmp_path, monkeypatch):
             tc.app.state.db = original_db
 
         assert r.status_code == 503, r.text
-        assert "sqlite unavailable" not in r.text
+        assert marker not in r.text
         assert missing.status_code == 503, missing.text
+        assert marker not in caplog.text
+        assert "type=RuntimeError" in caplog.text
     get_settings.cache_clear()
 
 
@@ -453,7 +746,9 @@ def test_arm_auto_be_rejected_on_non_hl(tmp_path, monkeypatch):
     get_settings.cache_clear()
     with TestClient(app) as tc:
         client = _mock_client([_pos()])
-        del client.place_stop_order  # non-HL: no HL stop-order method
+        client.exchange_id = "mexc"
+        # A method name alone must not grant Hyperliquid-only capabilities.
+        client.place_stop_order = AsyncMock()
         tc.app.state.mexc = client
         tc.app.state.exchange = client
         r = tc.post(
@@ -472,7 +767,8 @@ def test_arm_auto_trail_rejected_on_non_hl(tmp_path, monkeypatch):
     get_settings.cache_clear()
     with TestClient(app) as tc:
         client = _mock_client([_pos()])
-        del client.place_stop_order  # non-HL: no HL stop-order method
+        client.exchange_id = "mexc"
+        client.place_stop_order = AsyncMock()
         tc.app.state.mexc = client
         tc.app.state.exchange = client
         r = tc.post(
@@ -515,3 +811,130 @@ def test_rearm_clears_auto_be_halt(tmp_path, monkeypatch):
         assert "auto_be_error" not in r.json().get("last_alert_state", {})
         assert ("BTC_USDT", "long") not in tc.app.state.tm_be_attempts
     get_settings.cache_clear()
+
+
+def test_rearm_auto_trail_clears_shared_auto_management_halt(tmp_path, monkeypatch):
+    """Re-arming Trail resets the retry state shared by both automatic rules."""
+    db_file = str(tmp_path / "rearm_trail.db")
+    monkeypatch.setenv("DATABASE_PATH", db_file)
+    monkeypatch.setenv("LOCAL_API_TOKEN", "")
+    get_settings.cache_clear()
+    _run(
+        _seed_open(
+            db_file,
+            "BTC_USDT",
+            alert_state={"auto_be_error": {"active": True, "halted": True, "ts": 1}},
+        )
+    )
+
+    with TestClient(app) as tc:
+        client = _mock_client([_pos()])
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        tc.app.state.tm_be_attempts = {("BTC_USDT", "long"): 3}
+
+        response = tc.post(
+            "/api/positions/arm",
+            json={
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "rules": {"auto_trail": True},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert "auto_be_error" not in response.json().get("last_alert_state", {})
+        assert ("BTC_USDT", "long") not in tc.app.state.tm_be_attempts
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_rearm_alert_cleanup_failure_does_not_secretly_enable_rule(monkeypatch):
+    """A failed re-arm response must not leave autonomous trading enabled."""
+    from types import SimpleNamespace
+
+    import app.main as main
+    import app.orders.monitor as monitor
+    from app.models import ArmRequest
+
+    db = MagicMock()
+    db.get_open_position_mgmt = AsyncMock(
+        return_value={
+            "symbol": "BTC_USDT",
+            "side": "long",
+            "armed_rules": {},
+            "last_alert_state": {
+                "auto_be_error": {"active": True, "halted": True, "ts": 1}
+            },
+        }
+    )
+    db.set_armed_rules = AsyncMock()
+    db.set_alert_state = AsyncMock(side_effect=RuntimeError("synthetic DB failure"))
+    client = _mock_client([_pos()])
+    state = SimpleNamespace(
+        db=db,
+        mexc=client,
+        exchange=client,
+        trade_lock=asyncio.Lock(),
+        tm_be_attempts={("BTC_USDT", "long"): 3},
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    monkeypatch.setattr(monitor, "ensure_baseline", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="synthetic DB failure"):
+        await main.positions_arm(
+            request,
+            ArmRequest(
+                symbol="BTC_USDT", side="long", rules={"auto_trail": True}
+            ),
+            None,
+        )
+
+    db.set_armed_rules.assert_not_awaited()
+    assert state.tm_be_attempts[("BTC_USDT", "long")] == 3
+
+
+@pytest.mark.asyncio
+async def test_disarm_succeeds_when_stale_alert_cleanup_fails(monkeypatch, caplog):
+    """Local disarming remains authoritative when cosmetic DB cleanup fails."""
+    from types import SimpleNamespace
+
+    import app.main as main
+    from app.models import ArmRequest
+
+    stale_alert = {"auto_be_error": {"active": True, "halted": True, "ts": 1}}
+    db = MagicMock()
+    db.get_open_position_mgmt = AsyncMock(
+        return_value={
+            "symbol": "BTC_USDT",
+            "side": "long",
+            "armed_rules": {"auto_trail": True},
+            "last_alert_state": stale_alert,
+        }
+    )
+    db.set_armed_rules = AsyncMock()
+    marker = "SYNTHETIC_PRIVATE_DISARM_DB_DETAIL"
+    db.set_alert_state = AsyncMock(side_effect=RuntimeError(marker))
+    attempts = {("BTC_USDT", "long"): 3}
+    state = SimpleNamespace(
+        db=db,
+        trade_lock=asyncio.Lock(),
+        tm_be_attempts=attempts,
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    result = await main.positions_arm(
+        request,
+        ArmRequest(
+            symbol="BTC_USDT", side="long", rules={"auto_trail": False}
+        ),
+        None,
+    )
+
+    db.set_armed_rules.assert_awaited_once_with("BTC_USDT", "long", {})
+    db.set_alert_state.assert_awaited_once_with("BTC_USDT", "long", {})
+    assert result["armed_rules"] == {}
+    assert result["last_alert_state"] == stale_alert
+    assert ("BTC_USDT", "long") not in attempts
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text

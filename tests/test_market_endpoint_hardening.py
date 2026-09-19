@@ -182,6 +182,33 @@ async def test_symbols_malformed_top_level_uses_visible_fallback():
     assert state.symbols_cache is None
 
 
+@pytest.mark.asyncio
+async def test_symbols_exchange_error_does_not_reflect_diagnostics():
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.hyperliquid.errors import HyperliquidError
+    from app.main import symbols
+
+    marker = "SYNTHETIC_PRIVATE_SYMBOL_ERROR"
+    exchange = SimpleNamespace(
+        list_symbols=AsyncMock(side_effect=HyperliquidError(marker))
+    )
+    state = SimpleNamespace(
+        mexc=exchange,
+        exchange=exchange,
+        symbols_cache=None,
+        symbols_lock=asyncio.Lock(),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    response = await symbols(request)
+
+    assert response["error"] == "Exchange symbols unavailable"
+    assert marker not in str(response)
+    assert response["fallback"] is True
+
+
 def test_market_rejects_invalid_tf():
     with TestClient(app) as client:
         client.app.state.mexc = MagicMock()
@@ -215,6 +242,25 @@ def test_market_accepts_known_intervals():
                 "/api/market/BTC_USDT", params={"tf": "5m", "htf": "4H"}
             )
     assert r.status_code == 200, r.text
+
+
+def test_market_exchange_error_does_not_reflect_diagnostics():
+    from app.hyperliquid.errors import HyperliquidError
+
+    marker = "SYNTHETIC_PRIVATE_MARKET_ERROR"
+    with TestClient(app) as client:
+        client.app.state.mexc = MagicMock()
+        client.app.state.exchange = client.app.state.mexc
+        client.app.state.market_cache = {}
+        with patch(
+            "app.main.build_market_snapshot",
+            new=AsyncMock(side_effect=HyperliquidError(marker)),
+        ):
+            response = client.get("/api/market/BTC_USDT")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exchange market data unavailable"
+    assert marker not in response.text
 
 
 def test_market_cache_ttl_skips_upstream_refetch():

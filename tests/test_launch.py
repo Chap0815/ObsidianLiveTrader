@@ -90,9 +90,12 @@ def test_ensure_deps_prefers_requirements_lock_when_present(
 
     install_calls = [c for c in calls if "install" in c and "-r" in c]
     assert install_calls, "expected a pip install -r <file> call"
+    bootstrap_call = next(c for c in calls if "install" in c and "-r" not in c)
+    assert bootstrap_call[-1] == "pip==26.2.1"
     req_arg = install_calls[0][install_calls[0].index("-r") + 1]
     assert req_arg.endswith("requirements.lock")
     assert "requirements.txt" not in req_arg
+    assert "--no-deps" in install_calls[0]
 
 
 def test_ensure_deps_falls_back_to_requirements_txt_without_lock(
@@ -122,6 +125,33 @@ def test_ensure_deps_falls_back_to_requirements_txt_without_lock(
     install_calls = [c for c in calls if "install" in c and "-r" in c]
     req_arg = install_calls[0][install_calls[0].index("-r") + 1]
     assert req_arg.endswith("requirements.txt")
+    assert "--no-deps" not in install_calls[0]
+
+
+def test_dependency_marker_tracks_interpreter_bootstrap_and_resolution_contract(
+    launch, tmp_path, monkeypatch
+):
+    req = tmp_path / "requirements.lock"
+    req.write_text("fastapi==0.139.0\n", encoding="utf-8")
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-312-64bit")
+
+    state = launch._deps_marker_state(req)
+
+    assert "python:cpython-312-64bit" in state
+    assert "pip==26.2.1" in state
+    assert "mode:no-deps" in state
+    assert "schema:" in state
+
+
+def test_dependency_marker_changes_with_interpreter_abi(launch, tmp_path, monkeypatch):
+    req = tmp_path / "requirements.lock"
+    req.write_text("fastapi==0.139.0\n", encoding="utf-8")
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-311-64bit")
+    old_state = launch._deps_marker_state(req)
+
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-312-64bit")
+
+    assert launch._deps_marker_state(req) != old_state
 
 
 def test_ensure_deps_marker_tracks_actual_file_used_switch_reinstalls(

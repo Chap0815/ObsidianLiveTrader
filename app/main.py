@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html as _html
+import ipaddress
 import json
 import logging
 import math
@@ -14,10 +15,13 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -45,6 +49,7 @@ from app.llm.client import (
 
 from app.llm.prompts import build_system_prompt
 from app.llm.recalibration import recalibrate
+from app.journal.resolver import geometry_ok
 from app.mexc.client import INTERVAL_MAP as MEXC_INTERVAL_MAP
 from app.mexc.client import empty_account
 from app.mexc.errors import MexcError
@@ -61,17 +66,31 @@ from app.models import (
     OrderTicket,
     ReevaluateRequest,
 )
-from app.orders.protection import classify_protection
-from app.orders.service import OrderError, OrderService, estimate_same_side_risk_usdt
+from app.orders.protection import (
+    classify_order_label_fields,
+    classify_position_side_fields,
+    classify_protection,
+    classify_reduce_only_fields,
+)
+from app.orders.service import (
+    OrderError,
+    OrderOutcomeUnknown,
+    OrderRejectedByExchange,
+    OrderService,
+    client_uses_hyperliquid_semantics,
+    estimate_same_side_risk_usdt,
+)
 from app.orders.tokens import PreviewStore
 from app.risk.sizing import adverse_market_entry, suggest_vol
 from app.security import (
     AUTH_COOKIE_NAME,
+    _is_loopback_client,
     _origin_matches_request,
     build_csp,
     loopback_or_token_middleware,
     normalize_symbol,
     require_local_token,
+    valid_normalized_position_symbol,
 )
 
 if TYPE_CHECKING:  # type-only import — resolves the `MexcClient` annotations, no runtime cost
@@ -107,8 +126,11 @@ async def _journal_track_record(request: "Request", s) -> dict | None:
         raw = await db.journal_stats()
         stats = build_stats_response(raw, min_sample=s.journal_min_sample)
         return build_track_record(stats, min_sample=s.journal_min_sample)
-    except Exception:
-        log.debug("track_record build failed (advisory, ignored)", exc_info=True)
+    except Exception as exc:
+        log.debug(
+            "track_record build failed (advisory, ignored) type=%s",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -129,8 +151,11 @@ async def _journal_stats_for_recal(request: "Request", s) -> dict | None:
 
         raw = await db.journal_stats()
         return build_stats_response(raw, min_sample=s.journal_min_sample)
-    except Exception:
-        log.debug("recal stats build failed (advisory, ignored)", exc_info=True)
+    except Exception as exc:
+        log.debug(
+            "recal stats build failed (advisory, ignored) type=%s",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -621,8 +646,11 @@ async def lifespan(app: FastAPI):
             aclose = getattr(client, "aclose", None)
             if callable(aclose):
                 await aclose()
-        except BaseException:
-            log.warning("exchange client cleanup failed during startup", exc_info=True)
+        except BaseException as exc:
+            log.warning(
+                "exchange client cleanup failed during startup type=%s",
+                type(exc).__name__,
+            )
         finally:
             try:
                 await db.close()
@@ -702,8 +730,11 @@ async def lifespan(app: FastAPI):
             from app.journal.resolver import run_resolver_loop
 
             resolver_task = _asyncio.create_task(run_resolver_loop(app))
-        except Exception:
-            log.warning("journal resolver failed to start", exc_info=True)
+        except Exception as exc:
+            log.warning(
+                "journal resolver failed to start type=%s",
+                type(exc).__name__,
+            )
     # Trade-Management monitor: second background task (spec §2), started only
     # when tm_enabled. Money-executing (autonomous SL→BE via the modify-sl
     # path); fail-safe per cycle. Cancelled+awaited on shutdown exactly like the
@@ -714,8 +745,11 @@ async def lifespan(app: FastAPI):
             from app.orders.monitor import run_trade_monitor_loop
 
             monitor_task = _asyncio.create_task(run_trade_monitor_loop(app))
-        except Exception:
-            log.warning("trade monitor failed to start", exc_info=True)
+        except Exception as exc:
+            log.warning(
+                "trade monitor failed to start type=%s",
+                type(exc).__name__,
+            )
     try:
         yield
     finally:
@@ -751,6 +785,84 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Obsidian Live Trader", version="0.3.0", lifespan=lifespan)
+
+_SENSITIVE_VALIDATION_KEYS = frozenset(
+    {
+        "api_key",
+        "api_secret",
+        "authorization",
+        "cookie",
+        "hl_private_key",
+        "llm_api_key",
+        "local_api_token",
+        "local_auth",
+        "mexc_api_key",
+        "mexc_api_secret",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "x_local_token",
+    }
+)
+_SENSITIVE_VALIDATION_SUFFIXES = (
+    "_api_key",
+    "_api_secret",
+    "_password",
+    "_private_key",
+    "_secret",
+    "_token",
+)
+
+
+def _is_sensitive_validation_key(value: object) -> bool:
+    key = str(value).strip().lower()
+    return key in _SENSITIVE_VALIDATION_KEYS or key.endswith(
+        _SENSITIVE_VALIDATION_SUFFIXES
+    )
+
+
+def _redact_validation_input(value):
+    """Preserve error structure without reflecting any rejected raw values."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[redacted]"
+                if _is_sensitive_validation_key(key)
+                else _redact_validation_input(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_validation_input(item) for item in value]
+    return "[redacted]"
+
+
+@app.exception_handler(RequestValidationError)
+async def _safe_request_validation_error(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    errors = []
+    for raw_error in exc.errors():
+        error = dict(raw_error)
+        loc = error.get("loc") or ()
+        sensitive = any(
+            isinstance(part, str) and _is_sensitive_validation_key(part)
+            for part in loc
+        )
+        if sensitive:
+            error["input"] = "[redacted]"
+            error["msg"] = "Sensitive value failed validation"
+            error.pop("ctx", None)
+        else:
+            if "input" in error:
+                error["input"] = _redact_validation_input(error["input"])
+            if "ctx" in error:
+                error["ctx"] = _redact_validation_input(error["ctx"])
+        errors.append(error)
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": errors}))
+
+
 app.middleware("http")(loopback_or_token_middleware)
 # DNS-rebinding guard: only loopback host headers are served. "testserver" (the
 # FastAPI/Starlette TestClient default Host) is a TEST artifact and must NEVER be
@@ -806,6 +918,16 @@ def _exchange_client(request: Request):
     )
 
 
+def _active_exchange_id(client: object | None, *, fallback: str) -> str:
+    """Use a declared adapter identity for interpreting that adapter's data."""
+    client_exchange = getattr(client, "exchange_id", None)
+    return (
+        client_exchange
+        if client_exchange in ("mexc", "hyperliquid")
+        else fallback
+    )
+
+
 def _reject_changed_exchange(request: Request, client: object) -> None:
     """Never return data fetched from a replaced exchange client."""
     if _exchange_client(request) is not client:
@@ -849,7 +971,67 @@ def _order_service(request: Request) -> OrderService:
         raise HTTPException(status_code=503, detail="Preview store not initialized")
     db = getattr(request.app.state, "db", None)
     lock = _app_trade_lock(request)
-    return OrderService(client, s, store, db=db, trade_lock=lock)
+    return OrderService(
+        client,
+        s,
+        store,
+        db=db,
+        trade_lock=lock,
+        client_is_active=lambda candidate: (
+            _exchange_client(request) is candidate and get_settings() == s
+        ),
+    )
+
+
+def _order_outcome_unknown_http() -> HTTPException:
+    """Return a stable, secret-free response that forces client reconciliation."""
+    message = (
+        "Exchange mutation outcome is unknown. Reconcile live positions and "
+        "open orders before retrying."
+    )
+    return HTTPException(
+        status_code=502,
+        detail={"errors": [message], "message": message},
+    )
+
+
+def _order_error_http(exc: OrderError) -> HTTPException:
+    """Preserve business errors while suppressing nested exchange diagnostics."""
+    if isinstance(exc, OrderRejectedByExchange):
+        message = (
+            "Exchange request failed. The operation has no confirmed "
+            "successful result."
+        )
+        return HTTPException(
+            status_code=400,
+            detail={"errors": [message], "message": message},
+        )
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ExchangeError):
+            message = (
+                "Exchange request failed. The operation has no confirmed "
+                "successful result."
+            )
+            return HTTPException(
+                status_code=400,
+                detail={"errors": [message], "message": message},
+            )
+        current = current.__cause__ or current.__context__
+    return HTTPException(
+        status_code=400,
+        detail={"errors": exc.errors, "message": str(exc)},
+    )
+
+
+def _exchange_error_http() -> HTTPException:
+    """Return an upstream failure without reflecting provider-controlled text."""
+    return HTTPException(
+        status_code=502,
+        detail="Exchange request failed. Review exchange connectivity and state.",
+    )
 
 
 def _app_trade_lock(request: Request) -> asyncio.Lock:
@@ -922,6 +1104,14 @@ def _llm_fallback_active(request: Request, configured: Settings, effective: Sett
     return effective.llm_provider != _canonical_llm_provider(configured.llm_provider)
 
 
+def _position_reevaluation_allowed(settings: Settings) -> bool:
+    """Whether position data may reach the effective advisory provider."""
+    return (
+        _canonical_llm_provider(settings.llm_provider) == "ollama"
+        or settings.include_account_in_llm is True
+    )
+
+
 @app.get("/api/health")
 async def health(request: Request):
     s = get_settings()
@@ -949,6 +1139,7 @@ async def health(request: Request):
         "llm_provider_configured": s.llm_provider,
         "llm_fallback_active": _llm_fallback_active(request, s, eff),
         "llm_configured": eff.llm_ready,
+        "position_reevaluation_allowed": _position_reevaluation_allowed(eff),
         "claude_configured": s.claude_ready,
         "xai_configured": s.xai_ready,
         "default_symbol": s.default_symbol,
@@ -967,10 +1158,11 @@ def _llm_status(request: Request) -> dict:
         "provider": eff.llm_provider,
         "provider_configured": s.llm_provider,
         "fallback_active": _llm_fallback_active(request, s, eff),
+        "position_reevaluation_allowed": _position_reevaluation_allowed(eff),
         "providers": [
-            {"id": "claude", "label": "Claude Opus", "configured": s.claude_ready},
+            {"id": "claude", "label": "Claude", "configured": s.claude_ready},
             {"id": "xai", "label": "Grok", "configured": s.xai_ready},
-            {"id": "openai", "label": "Codex", "configured": s.openai_ready},
+            {"id": "openai", "label": "OpenAI", "configured": s.openai_ready},
             {"id": "ollama", "label": "Ollama (local)", "configured": s.ollama_ready},
         ],
     }
@@ -1174,7 +1366,11 @@ async def setup_save(request: Request, body: dict):
     # ".env.setup-tmp" — sonst koennte ein lokaler Prozess den Pfad vorher
     # anlegen/symlinken. Gleiches Verzeichnis wie ENV_PATH, damit der
     # abschliessende os.replace atomar bleibt.
-    from app.env_builder import replace_with_retry, restrict_env_permissions
+    from app.env_builder import (
+        EnvPermissionHardeningError,
+        replace_with_retry,
+        restrict_env_permissions,
+    )
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(ENV_PATH.parent), prefix=f"{ENV_PATH.name}.", suffix=".tmp"
@@ -1186,14 +1382,29 @@ async def setup_save(request: Request, body: dict):
         # B3-02: schon die tmp-Datei traegt Secrets — Rechte VOR dem Validieren
         # und dem Replace einschraenken (replace erhaelt die ACL der Quelle;
         # nach dem Replace haerten waere ein Secret-Fenster mit geerbten Rechten).
-        restrict_env_permissions(tmp)
+        if restrict_env_permissions(tmp) is not True:
+            raise EnvPermissionHardeningError(
+                "Local configuration permissions could not be secured."
+            )
         try:
             s = Settings(_env_file=str(tmp))
         except Exception as e:
             tmp.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}") from e
+            # Pydantic validation strings can include the rejected input_value.
+            # This temporary file contains exchange and LLM credentials, so an
+            # internal parse error must never be reflected to the setup client.
+            raise HTTPException(
+                status_code=400,
+                detail="Generated configuration failed validation.",
+            ) from e
     except HTTPException:
         raise
+    except EnvPermissionHardeningError as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Local configuration permissions could not be secured.",
+        ) from e
     except (PermissionError, OSError) as e:
         tmp.unlink(missing_ok=True)
         raise HTTPException(
@@ -1218,42 +1429,78 @@ async def setup_save(request: Request, body: dict):
             aclose = getattr(client, "aclose", None)
             if callable(aclose):
                 await aclose()
-        except BaseException:
-            log.warning("uninstalled setup client cleanup failed", exc_info=True)
+        except BaseException as exc:
+            log.warning(
+                "uninstalled setup client cleanup failed type=%s",
+                type(exc).__name__,
+            )
 
+    installed = False
+    old = None
     try:
-        replace_with_retry(tmp, ENV_PATH)
-    except (PermissionError, OSError) as e:
-        tmp.unlink(missing_ok=True)
-        await discard_uninstalled_client()
-        raise HTTPException(
-            status_code=409,
-            detail=".env is currently locked by another program. Please try again.",
-        ) from e
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        await discard_uninstalled_client()
-        raise
-    restrict_env_permissions(ENV_PATH)  # belt-and-suspenders: nach dem Replace erneut haerten
+        # Client replacement is a control mutation: serialize it with all money
+        # actions. A request already inside the lock finishes on the old client;
+        # a queued request rejects that stale client after setup releases it.
+        async with _app_trade_lock(request):
+            # Two first-run saves may have passed the initial open-window check.
+            # Only the winner may publish its complete configuration.
+            if not _setup_needed():
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Setup is already complete (SETUP_COMPLETE) and locked. "
+                        "Change AI keys in the authenticated settings."
+                    ),
+                )
+            try:
+                replace_with_retry(tmp, ENV_PATH)
+            except (PermissionError, OSError) as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        ".env is currently locked by another program. "
+                        "Please try again."
+                    ),
+                ) from e
+            restrict_env_permissions(ENV_PATH)
 
-    # Hot-apply: fresh settings + fresh exchange client, no restart needed
-    get_settings.cache_clear()
-    old = _exchange_client(request)
-    request.app.state.mexc = client
-    request.app.state.exchange = client
-    request.app.state._owned_exchange_client = client
-    request.app.state.symbols_cache = None
-    # Every payload below is derived from the active exchange client. Replace
-    # the dictionaries instead of clearing them so any already-running request
-    # can only finish into its detached old cache after this hot swap.
-    request.app.state.market_cache = {}
-    request.app.state.mini_cache = {}
-    request.app.state.analyze_cache = {}
-    request.app.state.tm_atr_cache = {}
-    request.app.state.llm_override = None
+            # Hot-apply: fresh settings + fresh exchange client, no restart needed.
+            get_settings.cache_clear()
+            old = _exchange_client(request)
+            request.app.state.mexc = client
+            request.app.state.exchange = client
+            request.app.state._owned_exchange_client = client
+            request.app.state.symbols_cache = None
+            # Every payload below is derived from the active exchange client.
+            # Replace dictionaries so in-flight reads retain a detached generation.
+            request.app.state.market_cache = {}
+            request.app.state.mini_cache = {}
+            request.app.state.analyze_cache = {}
+            request.app.state.tm_atr_cache = {}
+            request.app.state.llm_override = None
+            installed = True
+    except BaseException:
+        if not installed:
+            tmp.unlink(missing_ok=True)
+            await discard_uninstalled_client()
+        raise
+    # The identity swap above is complete and queued old-client mutations now
+    # fail their post-lock activity check. Transport cleanup must not retain the
+    # trade lock: a slow close may never delay Kill-switch, Close or SL actions.
+    # Once ownership moved to ``client``, lifespan no longer knows about ``old``.
+    # Shield its close from request cancellation so the detached client's HTTP
+    # pools/executors cannot leak until process exit. Cancellation still reaches
+    # the caller, but only after this bounded client cleanup has settled.
     if old is not None:
+        close_task = asyncio.create_task(old.aclose())
         try:
-            await old.aclose()
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            try:
+                await close_task
+            except Exception:
+                pass
+            raise
         except Exception:
             pass
     return {"ok": True, "exchange": s.exchange, "llm_provider": s.llm_provider}
@@ -1286,15 +1533,15 @@ async def setup_test_provider(request: Request, body: LLMProbeRequest):
 # below depends on require_local_token. Writes go through the whitelist-only
 # atomic patcher; stored secrets are NEVER returned to the client.
 _PROVIDER_LABELS = {
-    "claude": "Claude Opus",
+    "claude": "Claude",
     "xai": "Grok",
-    "openai": "Codex",
+    "openai": "OpenAI",
     "ollama": "Ollama (local)",
 }
 
 
 def _settings_llm_status(request: Request) -> dict:
-    from app.env_builder import LLM_KEY_VARS
+    from app.env_builder import DEFAULT_MODELS, LLM_KEY_VARS
 
     s = get_settings()
     eff = _llm_settings(request)
@@ -1316,6 +1563,7 @@ def _settings_llm_status(request: Request) -> dict:
             "label": _PROVIDER_LABELS[pid],
             "configured": bool(configured[pid]),
             "model": models[pid],
+            "default_model": DEFAULT_MODELS[pid],
         }
         for pid in LLM_KEY_VARS
     ]
@@ -1341,6 +1589,7 @@ async def settings_llm_key(
     """
     from app.env_builder import (
         DEFAULT_MODELS,
+        EnvPermissionHardeningError,
         LLM_KEY_VARS,
         SETTINGS_LLM_WRITABLE,
         patch_env_vars,
@@ -1381,6 +1630,11 @@ async def settings_llm_key(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        except EnvPermissionHardeningError as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Local configuration permissions could not be secured.",
+            ) from e
         except (PermissionError, OSError) as e:
             raise HTTPException(
                 status_code=409,
@@ -1504,7 +1758,7 @@ async def symbols(request: Request):
                 }
             try:
                 syms = await client.list_symbols()
-            except ExchangeError as e:
+            except ExchangeError:
                 if attempt == 0 and _exchange_client(request) is not client:
                     cache = getattr(request.app.state, "symbols_cache", None)
                     continue
@@ -1513,7 +1767,7 @@ async def symbols(request: Request):
                     return {"symbols": cache[1], "error": None, "stale": True}
                 return {
                     "symbols": _fallback_symbols(),
-                    "error": str(e),
+                    "error": "Exchange symbols unavailable",
                     "fallback": True,
                 }
             if _exchange_client(request) is not client:
@@ -1589,7 +1843,9 @@ async def market(
             )
         except ExchangeError as e:
             _reject_changed_exchange(request, client)
-            raise HTTPException(status_code=502, detail=str(e)) from e
+            raise HTTPException(
+                status_code=502, detail="Exchange market data unavailable"
+            ) from e
         _reject_changed_exchange(request, client)
         payload = snapshot_to_api_dict(snap)
         cache[cache_key] = (_time.monotonic(), payload)
@@ -1695,7 +1951,7 @@ async def mini(
         errors: list[str] = list(invalid_errors)
         for sym, r in zip(syms, gathered):
             if isinstance(r, Exception):
-                errors.append(f"{sym}: {r}")
+                errors.append(f"{sym}: market data unavailable")
             else:
                 results.append(r)
         payload = {"results": results, "errors": errors}
@@ -1723,8 +1979,66 @@ NEWS_NEGATIVE_CACHE_TTL = 20.0  # all-feeds-failed payload: cache only briefly
 NEWS_FEED_TIMEOUT = 6.0     # per-feed hard timeout
 NEWS_MAX_ITEMS = 40
 NEWS_MAX_FEED_BYTES = 2 * 1024 * 1024  # 2 MB cap per feed response (F-14, DoS)
+NEWS_MAX_LINK_LENGTH = 2_048
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _TAG_RE = _re.compile(r"<[^>]+>")
+
+
+def _safe_news_url(value: object) -> str:
+    """Keep a bounded public HTTP(S) article URL or make the item non-clickable."""
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip()
+    if (
+        not raw
+        or len(raw) > NEWS_MAX_LINK_LENGTH
+        or any(character.isspace() or ord(character) < 32 for character in raw)
+    ):
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or (parsed.scheme.lower() == "http" and port not in (None, 80))
+        or (parsed.scheme.lower() == "https" and port not in (None, 443))
+        or host == "localhost"
+        or host.endswith((".localhost", ".local", ".internal"))
+    ):
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return ""
+        labels = ascii_host.split(".")
+        browser_numeric_host = all(
+            _re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label)
+            for label in labels
+        )
+        if (
+            len(labels) < 2
+            or browser_numeric_host
+            or any(
+                not _re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label
+                )
+                for label in labels
+            )
+        ):
+            return ""
+    else:
+        if not address.is_global:
+            return ""
+    return raw
 
 
 def _strip_html(s: str) -> str:
@@ -1777,6 +2091,11 @@ def _parse_feed(xml_text: str, source: str) -> list[dict]:
         is_atom = True
     out: list[dict] = []
     for node in nodes:
+        # The endpoint can return at most NEWS_MAX_ITEMS. Bound each untrusted
+        # feed at the same limit so a compact XML document cannot amplify into
+        # thousands of temporary dictionaries that are discarded after merge.
+        if len(out) >= NEWS_MAX_ITEMS:
+            break
         if is_atom:
             title = node.findtext(f"{_ATOM}title", "")
             link_el = node.find(f"{_ATOM}link")
@@ -1796,7 +2115,7 @@ def _parse_feed(xml_text: str, source: str) -> list[dict]:
             {
                 "title": title,
                 "source": source,
-                "url": (url or "").strip(),
+                "url": _safe_news_url(url),
                 "published": iso,
                 "summary": _strip_html(summary)[:280],
                 "_sort": sort_key,
@@ -1834,6 +2153,16 @@ async def _refresh_news(request: Request) -> dict:
         text = await _fetch_feed_body(client, url)
         return _parse_feed(text, source)
 
+    async def bounded_one(
+        source: str, url: str, client: httpx.AsyncClient
+    ) -> list[dict]:
+        # httpx's timeout limits individual connect/read/write/pool phases. A
+        # slow-drip peer can keep yielding chunks inside the read timeout, so
+        # also cap the complete fetch-and-parse operation by wall-clock time.
+        return await asyncio.wait_for(
+            one(source, url, client), timeout=NEWS_FEED_TIMEOUT
+        )
+
     # Known stable HTTPS feed endpoints — a feed that suddenly issues a
     # redirect (e.g. a compromised/hijacked host pointing at loopback, LAN or
     # cloud-metadata targets) must fail isolated for that feed, not be
@@ -1842,7 +2171,7 @@ async def _refresh_news(request: Request) -> dict:
         timeout=NEWS_FEED_TIMEOUT, follow_redirects=False
     ) as client:
         gathered = await asyncio.gather(
-            *(one(src, url, client) for src, url in NEWS_FEEDS),
+            *(bounded_one(src, url, client) for src, url in NEWS_FEEDS),
             return_exceptions=True,
         )
 
@@ -1850,7 +2179,7 @@ async def _refresh_news(request: Request) -> dict:
     errors: list[str] = []
     for (src, _url), r in zip(NEWS_FEEDS, gathered):
         if isinstance(r, Exception):
-            errors.append(f"{src}: {r}")
+            errors.append(f"{src}: feed unavailable")
         else:
             items.extend(r)
 
@@ -1911,6 +2240,188 @@ async def news(request: Request):
         return await _refresh_news(request)
 
 
+def _finite_real_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+_ACCOUNT_POSITION_FIELDS = {
+    "position_id",
+    "symbol",
+    "side",
+    "position_type",
+    "hold_vol",
+    "entry_price",
+    "leverage",
+    "open_type",
+    "unrealized_pnl",
+    "realised",
+    "liquidate_price",
+    "im",
+    "margin_ratio",
+    "state",
+    "contract_size",
+}
+_PUBLIC_POSITION_ID_RE = _re.compile(r"^[A-Z0-9:_-]{1,64}$")
+
+
+def _valid_account_position(row: object, *, exchange: str) -> bool:
+    if not isinstance(row, dict) or row.keys() != _ACCOUNT_POSITION_FIELDS:
+        return False
+
+    if not valid_normalized_position_symbol(row["symbol"], exchange=exchange):
+        return False
+
+    side = row["side"]
+    if side not in ("long", "short"):
+        return False
+    position_type = row["position_type"]
+    if type(position_type) is not int or position_type != (1 if side == "long" else 2):
+        return False
+    if row["open_type"] not in ("isolated", "cross"):
+        return False
+
+    for field in ("hold_vol", "entry_price", "contract_size"):
+        value = row[field]
+        if not _finite_real_number(value) or value <= 0:
+            return False
+    for field in ("leverage", "liquidate_price", "im"):
+        value = row[field]
+        if value is not None and (not _finite_real_number(value) or value <= 0):
+            return False
+    for field in ("unrealized_pnl", "realised", "margin_ratio"):
+        value = row[field]
+        if value is not None and not _finite_real_number(value):
+            return False
+
+    position_id = row["position_id"]
+    if position_id is not None:
+        if type(position_id) is int:
+            if position_id <= 0:
+                return False
+        elif not (
+            isinstance(position_id, str)
+            and _PUBLIC_POSITION_ID_RE.fullmatch(position_id) is not None
+        ):
+            return False
+    state = row["state"]
+    return state is None or type(state) is int
+
+
+def _valid_account_snapshot(snapshot: object, *, exchange: str) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.keys() != {
+        "equity_usdt",
+        "available_usdt",
+        "positions",
+        "error",
+    }:
+        return False
+    for field in ("equity_usdt", "available_usdt"):
+        value = snapshot[field]
+        if not _finite_real_number(value):
+            return False
+    positions = snapshot["positions"]
+    if not isinstance(positions, list) or not all(
+        _valid_account_position(row, exchange=exchange) for row in positions
+    ):
+        return False
+    # A successful adapter call must return data without a diagnostic string.
+    # Only this HTTP boundary may create the fixed public soft-error messages;
+    # otherwise an adapter/provider detail could be reflected to the browser.
+    return snapshot["error"] is None
+
+
+_FILL_REQUIRED_FIELDS = {
+    "symbol",
+    "px",
+    "sz",
+    "side",
+    "time",
+    "dir",
+    "closed_pnl",
+    "oid",
+    "fee",
+}
+_FILL_ALLOWED_FIELDS = _FILL_REQUIRED_FIELDS | {"start_position"}
+_MIN_PUBLIC_FILL_TIMESTAMP_MS = 946_684_800_000
+_MAX_PUBLIC_FILL_FUTURE_SKEW_MS = 5 * 60 * 1000
+_FILL_DIRECTION_SIDE = {
+    "open long": "buy",
+    "close short": "buy",
+    "short > long": "buy",
+    "liquidated short": "buy",
+    "open short": "sell",
+    "close long": "sell",
+    "long > short": "sell",
+    "liquidated long": "sell",
+}
+
+
+def _valid_fill_rows(
+    rows: object, *, exchange: str, symbol: str | None, limit: int
+) -> bool:
+    if not isinstance(rows, list) or len(rows) > limit:
+        return False
+    latest_fill_time = int(_time.time() * 1000) + _MAX_PUBLIC_FILL_FUTURE_SKEW_MS
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        if not _FILL_REQUIRED_FIELDS <= row.keys() <= _FILL_ALLOWED_FIELDS:
+            return False
+        try:
+            row_symbol = normalize_symbol(row["symbol"], exchange=exchange)
+        except HTTPException:
+            return False
+        if symbol is not None and row_symbol != symbol:
+            return False
+        side = row["side"]
+        if side not in ("buy", "sell"):
+            return False
+        direction = row["dir"]
+        if not isinstance(direction, str) or len(direction) > 64:
+            return False
+        direction_side = _FILL_DIRECTION_SIDE.get(direction.strip().lower())
+        if direction_side is not None and direction_side != side:
+            return False
+        if not _finite_real_number(row["px"]) or row["px"] <= 0:
+            return False
+        if not _finite_real_number(row["sz"]) or row["sz"] <= 0:
+            return False
+        if (
+            isinstance(row["time"], bool)
+            or not isinstance(row["time"], int)
+            or row["time"] < _MIN_PUBLIC_FILL_TIMESTAMP_MS
+            or row["time"] > latest_fill_time
+        ):
+            return False
+        for field in ("closed_pnl", "fee", "start_position"):
+            if field in row and row[field] is not None and not _finite_real_number(
+                row[field]
+            ):
+                return False
+        oid = row["oid"]
+        if oid is not None:
+            if isinstance(oid, bool):
+                return False
+            if isinstance(oid, int):
+                if oid <= 0:
+                    return False
+            elif not (
+                isinstance(oid, str)
+                and 1 <= len(oid) <= 64
+                and oid.isdigit()
+                and oid.strip("0")
+            ):
+                return False
+    return True
+
+
 @app.get("/api/account")
 async def account(request: Request, _: None = Depends(require_local_token)):
     """Private balance + positions; soft errors use 200, client swaps use 409."""
@@ -1923,13 +2434,16 @@ async def account(request: Request, _: None = Depends(require_local_token)):
     client = _exchange_client(request)
     if client is None:
         return empty_account(error="Exchange client not initialized")
+    active_exchange = _active_exchange_id(client, fallback=s.exchange)
 
     try:
         snapshot = await client.account_snapshot()
-    except ExchangeError as e:
+    except ExchangeError:
         _reject_changed_exchange(request, client)
-        return empty_account(error=str(e))
+        return empty_account(error="Exchange account data unavailable")
     _reject_changed_exchange(request, client)
+    if not _valid_account_snapshot(snapshot, exchange=active_exchange):
+        return empty_account(error="Exchange account data unavailable")
     return snapshot
 
 
@@ -1942,22 +2456,37 @@ async def fills(
 ):
     """Recent account executions for the chart trade markers. Read-only.
 
-    Only exchanges with a fill-history API are supported (Hyperliquid
-    userFills); others report supported=False and the UI hides the markers.
+    Only exchanges with a fill-history API are supported; others report
+    supported=False and the UI hides the markers.
     Soft errors (rate limit etc.) return 200 with an error string. Client swaps
     during the private read return 409 so data from the old account is discarded.
     """
     client = _exchange_client(request)
+    active_exchange = _active_exchange_id(
+        client, fallback=get_settings().exchange
+    )
+    if symbol is not None:
+        symbol = normalize_symbol(symbol, exchange=active_exchange)
     if client is None or not hasattr(client, "user_fills"):
         return {"fills": [], "supported": False, "error": None}
-    if symbol:
-        symbol = normalize_symbol(symbol)
     try:
         rows = await client.user_fills(symbol=symbol, limit=limit)
-    except ExchangeError as e:
+    except ExchangeError:
         _reject_changed_exchange(request, client)
-        return {"fills": [], "supported": True, "error": str(e)}
+        return {
+            "fills": [],
+            "supported": True,
+            "error": "Exchange fill history unavailable",
+        }
     _reject_changed_exchange(request, client)
+    if not _valid_fill_rows(
+        rows, exchange=active_exchange, symbol=symbol, limit=limit
+    ):
+        return {
+            "fills": [],
+            "supported": True,
+            "error": "Exchange fill history unavailable",
+        }
     return {"fills": rows, "supported": True, "error": None}
 
 
@@ -2070,7 +2599,12 @@ def _journal_order_type(action: str | None, entry, last_price) -> str | None:
     direction = _journal_direction(action)
     if direction is None:
         return None
-    if not isinstance(entry, (int, float)) or not isinstance(last_price, (int, float)):
+    if (
+        not _finite_real_number(entry)
+        or entry <= 0
+        or not _finite_real_number(last_price)
+        or last_price <= 0
+    ):
         return None
     if direction == "long":
         return "market" if entry >= last_price else "limit"
@@ -2081,11 +2615,8 @@ def _journal_status_for(action: str | None, entry, sl, tp1) -> str:
     """SKIPPED for STAY_OUT (never resolvable) or a non-STAY_OUT proposal that
     is missing entry/sl/tp1 (degenerate — cannot be shadow-resolved). Else
     PENDING (the resolver will pick it up)."""
-    if action == "STAY_OUT":
-        return "SKIPPED"
-    if entry is None or sl is None or tp1 is None:
-        return "SKIPPED"
-    return "PENDING"
+    direction = _journal_direction(action)
+    return "PENDING" if geometry_ok(direction, entry, sl, tp1) else "SKIPPED"
 
 
 @app.post("/api/analyze")
@@ -2194,7 +2725,9 @@ async def analyze(
             )
         except ExchangeError as e:
             _reject_stale_analysis()
-            raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
+            raise HTTPException(
+                status_code=502, detail="Exchange market data unavailable"
+            ) from e
         _reject_stale_analysis()
 
         market_api = snapshot_to_api_dict(snap)
@@ -2204,8 +2737,8 @@ async def analyze(
         if exchange_ready(s) and include_account:
             try:
                 acct = await client.account_snapshot()
-            except ExchangeError as e:
-                acct = empty_account(error=str(e))
+            except ExchangeError:
+                acct = empty_account(error="Exchange account data unavailable")
         else:
             acct = empty_account(
                 error=None
@@ -2477,6 +3010,15 @@ async def reevaluate(
             status_code=400,
             detail=_llm_not_configured_detail(s),
         )
+    if not _position_reevaluation_allowed(s):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Position reevaluation with an external AI requires explicit "
+                "account-data opt-in. Set INCLUDE_ACCOUNT_IN_LLM=true or "
+                "select local Ollama."
+            ),
+        )
 
     client: MexcClient | None = _exchange_client(request)
     if client is None:
@@ -2494,7 +3036,9 @@ async def reevaluate(
     try:
         acct = await client.account_snapshot()
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=f"MEXC account error: {e}") from e
+        raise HTTPException(
+            status_code=502, detail="Exchange account data unavailable"
+        ) from e
 
     positions = acct.get("positions") if isinstance(acct, dict) else None
     if not isinstance(positions, list):
@@ -2548,7 +3092,9 @@ async def reevaluate(
             symbol, tf, htf, client, limit_hint=s.kline_limit_hint
         )
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=f"MEXC market error: {e}") from e
+        raise HTTPException(
+            status_code=502, detail="Exchange market data unavailable"
+        ) from e
 
     market_api = snapshot_to_api_dict(snap)
 
@@ -2557,9 +3103,9 @@ async def reevaluate(
     stops_error: str | None = None
     try:
         stops = await client.open_stop_orders(symbol)
-    except ExchangeError as e:
+    except ExchangeError:
         stops = []
-        stops_error = str(e)
+        stops_error = "Exchange stop orders unavailable"
     current_sl, current_tp = _extract_position_sl_tp(
         stops, side=position.get("side"), entry_price=position.get("entry_price")
     )
@@ -2619,16 +3165,41 @@ async def reevaluate(
     db_re: Database | None = getattr(request.app.state, "db", None)
     if db_re is not None:
         try:
+            from app.orders.monitor import open_position_signature
+
+            position_side = str(position.get("side") or "").lower()
+            open_sig = await open_position_signature(
+                client, position, symbol, position_side
+            )
+            is_hyperliquid = (
+                getattr(client, "exchange_id", "") == "hyperliquid"
+            )
+            observed_opened_at = open_sig if is_hyperliquid else None
+            reopen_opened_at = (
+                open_sig
+                if is_hyperliquid
+                else int(_time.time() * 1000)
+                if open_sig is not None
+                else None
+            )
             row = await db_re.proposal_for_open_position(
-                symbol, str(position.get("side") or "").lower()
+                symbol,
+                position_side,
+                observed_entry=float(position["entry_price"]),
+                observed_open_sig=open_sig,
+                observed_opened_at=observed_opened_at,
+                reopen_opened_at=reopen_opened_at,
             )
             thesis = build_original_thesis((row or {}).get("proposal"))
             if thesis is not None:
                 if row and row.get("created_at"):
                     thesis["proposed_at"] = row.get("created_at")
                 context["original_thesis"] = thesis
-        except Exception:
-            log.debug("original_thesis lookup failed (advisory, ignored)", exc_info=True)
+        except Exception as exc:
+            log.debug(
+                "original_thesis lookup failed (advisory, ignored) type=%s",
+                type(exc).__name__,
+            )
 
     _reject_changed_advisory_context(request, client, analysis_generation)
     try:
@@ -2664,12 +3235,36 @@ async def history(
         return {"proposals": [], "orders": [], "error": "database not initialized"}
     try:
         data = await db.history(limit=limit)
-        data["limit"] = limit
-        return data
-    except Exception:
-        # B-03: never leak the raw exception (can contain file paths/SQL) to
-        # the client; the detail goes to the server log only.
-        log.exception("history read failed")
+        proposals = data.get("proposals") if isinstance(data, dict) else None
+        orders = data.get("orders") if isinstance(data, dict) else None
+        public_orders = []
+        for row in orders if isinstance(orders, list) else []:
+            if not isinstance(row, dict):
+                continue
+            public_orders.append(
+                {
+                    "id": row.get("id"),
+                    "created_at": row.get("created_at"),
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "status": row.get("status"),
+                    "error": (
+                        "Order operation did not complete cleanly. Check the live "
+                        "exchange state."
+                        if row.get("error")
+                        else None
+                    ),
+                }
+            )
+        return {
+            "proposals": proposals if isinstance(proposals, list) else [],
+            "orders": public_orders,
+            "limit": limit,
+        }
+    except Exception as exc:
+        # Raw exceptions can contain file paths, SQL values or secrets. Keep
+        # both the response and persistent server logs diagnostic-only.
+        log.error("history read failed type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="internal error") from None
 
 
@@ -2685,8 +3280,8 @@ async def history_clear(
     try:
         deleted = await db.clear_history()
         return {"ok": True, "deleted": deleted}
-    except Exception:
-        log.exception("history clear failed")
+    except Exception as exc:
+        log.error("history clear failed type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="internal error") from None
 
 
@@ -2708,8 +3303,8 @@ async def journal_list(
     try:
         rows = await db.recent_journal(limit=limit)
         return {"entries": rows, "limit": limit}
-    except Exception:
-        log.exception("journal read failed")
+    except Exception as exc:
+        log.error("journal read failed type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="internal error") from None
 
 
@@ -2728,8 +3323,8 @@ async def journal_stats_endpoint(
     try:
         raw = await db.journal_stats()
         return build_stats_response(raw, min_sample=get_settings().journal_min_sample)
-    except Exception:
-        log.exception("journal stats failed")
+    except Exception as exc:
+        log.error("journal stats failed type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="internal error") from None
 
 
@@ -2747,8 +3342,8 @@ async def journal_clear(
     try:
         deleted = await db.clear_journal()
         return {"ok": True, "deleted": deleted}
-    except Exception:
-        log.exception("journal clear failed")
+    except Exception as exc:
+        log.error("journal clear failed type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="internal error") from None
 
 
@@ -2764,9 +3359,9 @@ async def orders_preview(
     try:
         return await svc.preview(ticket)
     except OrderError as e:
-        raise HTTPException(status_code=400, detail={"errors": e.errors, "message": str(e)}) from e
+        raise _order_error_http(e) from e
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _exchange_error_http() from e
 
 
 @app.post("/api/orders/confirm")
@@ -2779,13 +3374,12 @@ async def orders_confirm(
     svc = _order_service(request)
     try:
         return await svc.confirm(body.token)
+    except OrderOutcomeUnknown as e:
+        raise _order_outcome_unknown_http() from e
     except OrderError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={"errors": e.errors, "message": str(e)},
-        ) from e
+        raise _order_error_http(e) from e
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _exchange_error_http() from e
 
 
 @app.post("/api/orders/cancel")
@@ -2800,13 +3394,12 @@ async def orders_cancel(
     symbol = normalize_symbol(body.symbol) if body.symbol else None
     try:
         return await svc.cancel(order_id=oid, symbol=symbol)
+    except OrderOutcomeUnknown as e:
+        raise _order_outcome_unknown_http() from e
     except OrderError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={"errors": e.errors, "message": str(e)},
-        ) from e
+        raise _order_error_http(e) from e
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _exchange_error_http() from e
 
 
 @app.post("/api/orders/close")
@@ -2822,13 +3415,12 @@ async def orders_close(
         return await svc.close_position(
             symbol=symbol, side=body.side, vol=body.vol, fraction=body.fraction
         )
+    except OrderOutcomeUnknown as e:
+        raise _order_outcome_unknown_http() from e
     except OrderError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={"errors": e.errors, "message": str(e)},
-        ) from e
+        raise _order_error_http(e) from e
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _exchange_error_http() from e
 
 
 @app.post("/api/orders/modify-sl")
@@ -2846,27 +3438,18 @@ async def orders_modify_sl(
     symbol = normalize_symbol(body.symbol)
     try:
         result = await svc.modify_stop_loss(
-            symbol=symbol, side=body.side, new_sl=body.new_sl
+            symbol=symbol,
+            side=body.side,
+            new_sl=body.new_sl,
+            record_user_override=True,
         )
+    except OrderOutcomeUnknown as e:
+        raise _order_outcome_unknown_http() from e
     except OrderError as e:
-        raise HTTPException(
-            status_code=400, detail={"errors": e.errors, "message": str(e)}
-        ) from e
+        raise _order_error_http(e) from e
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _exchange_error_http() from e
 
-    # F4: this is the USER-initiated SL path (the monitor drives the service
-    # directly, never this endpoint). On a CONFIRMED move (verified=True — mirror
-    # the monitor's C2 discipline: an unverified move left the old stop in place)
-    # park the current high-water as the user-override level, so an intentional
-    # LOOSENING of the stop isn't restored by the trail every cycle. Best-effort:
-    # a missing DB / no OPEN mgmt record is a silent no-op (never blocks the move).
-    try:
-        db = getattr(request.app.state, "db", None)
-        if db is not None and isinstance(result, dict) and result.get("verified") is True:
-            await db.set_user_override_hw(symbol, body.side)
-    except Exception:
-        log.warning("modify-sl: set_user_override_hw failed", exc_info=True)
     return result
 
 
@@ -2875,6 +3458,51 @@ async def orders_modify_sl(
 # a CLIENT BUG, never silently ignored (would hide a typo that leaves the user
 # thinking they armed something they didn't).
 _ARM_ALLOWED_RULES = {"auto_be", "auto_trail"}
+
+_PUBLIC_POSITION_ALERT_MESSAGES = {
+    "thesis": "The thesis invalidation level was crossed. Check the position.",
+    "time_stop": "The configured time-stop condition was reached. Check the position.",
+    "auto_be": "App moved the SL to break-even.",
+    "auto_trail": "App tightened the SL (trailing stop).",
+    "auto_be_unavailable": (
+        "Auto-management (BE/trailing) is only available on Hyperliquid."
+    ),
+}
+
+
+def _public_position_alert_state(value: object) -> dict[str, dict]:
+    """Return a bounded feed contract without reflecting persisted text."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for kind, message in _PUBLIC_POSITION_ALERT_MESSAGES.items():
+        raw = value.get(kind)
+        if not isinstance(raw, dict) or raw.get("active") is not True:
+            continue
+        ts = raw.get("ts")
+        if type(ts) is not int or ts < 0:
+            continue
+        out[kind] = {"active": True, "message": message, "ts": ts}
+
+    raw_error = value.get("auto_be_error")
+    if isinstance(raw_error, dict) and raw_error.get("active") is True:
+        ts = raw_error.get("ts")
+        halted = raw_error.get("halted")
+        if type(ts) is int and ts >= 0 and type(halted) is bool:
+            message = (
+                "Auto-management is stopped. Check the live stop state and arm it "
+                "again."
+                if halted
+                else "Auto-management could not confirm the stop move. It will "
+                "retry within the configured attempt limit."
+            )
+            out["auto_be_error"] = {
+                "active": True,
+                "halted": halted,
+                "message": message,
+                "ts": ts,
+            }
+    return out
 
 
 @app.post("/api/positions/arm")
@@ -2896,10 +3524,10 @@ async def positions_arm(
 
     symbol = normalize_symbol(body.symbol)
     side = body.side
-    rules = body.rules or {}
+    rule_patch = body.rules or {}
 
     # Reject unknown rule names up front (400) — do NOT silently drop them.
-    unknown = set(rules) - _ARM_ALLOWED_RULES
+    unknown = set(rule_patch) - _ARM_ALLOWED_RULES
     if unknown:
         raise HTTPException(
             status_code=400,
@@ -2911,7 +3539,9 @@ async def positions_arm(
     # Require REAL booleans — a truthy string like "false" must NEVER arm a
     # money-path auto-action (it drives svc.modify_stop_loss in the monitor).
     # bool(v) would treat "false" as True, so reject non-bool values outright.
-    for _k, _v in rules.items():
+    if not rule_patch:
+        raise HTTPException(status_code=400, detail="At least one rule change is required")
+    for _k, _v in rule_patch.items():
         if not isinstance(_v, bool):
             raise HTTPException(
                 status_code=400, detail=f"Rule '{_k}' must be a boolean (got {type(_v).__name__})"
@@ -2920,39 +3550,64 @@ async def positions_arm(
     db = getattr(request.app.state, "db", None)
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
-    disarming_all = not any(rules.values())
-    rules_to_persist = {} if disarming_all else rules
-    client = _exchange_client(request)
-    if client is None and not disarming_all:
-        raise HTTPException(status_code=503, detail="Exchange client not initialized")
+    enables_any = any(value is True for value in rule_patch.values())
 
-    # Auto-BE and Auto-Trail are HL-only (both drive modify_stop_loss). Reject
-    # arming either on a non-HL exchange at the source — otherwise the monitor
-    # could never execute it and would just keep emitting an "unavailable" alert.
-    # Disarming (auto_be/auto_trail=False) stays allowed on any exchange.
-    if not disarming_all and not hasattr(
-        client, "place_stop_order"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Auto-management (BE/trailing) is only available on Hyperliquid.",
-        )
-
-    async def _persist_rules() -> dict:
-        await db.set_armed_rules(symbol, side, rules_to_persist)
-        attempts = getattr(request.app.state, "tm_be_attempts", None)
-        if isinstance(attempts, dict):
-            attempts.pop((symbol, side), None)
-        record = await db.get_open_position_mgmt(symbol, side)
+    async def _persist_rule_patch() -> dict:
+        current_record = await db.get_open_position_mgmt(symbol, side)
+        stored_rules = (current_record or {}).get("armed_rules")
+        merged_rules = {
+            name: True
+            for name, value in (
+                stored_rules.items() if isinstance(stored_rules, dict) else ()
+            )
+            if name in _ARM_ALLOWED_RULES and value is True
+        }
+        for name, value in rule_patch.items():
+            if value is True:
+                merged_rules[name] = True
+            else:
+                merged_rules.pop(name, None)
+        record = dict(current_record) if isinstance(current_record, dict) else {}
+        stored_alerts = record.get("last_alert_state")
+        cleared_alerts: dict | None = None
+        alert_cleanup_succeeded = False
         if (
-            record
-            and isinstance(record.get("last_alert_state"), dict)
-            and "auto_be_error" in record["last_alert_state"]
+            _ARM_ALLOWED_RULES.intersection(rule_patch)
+            and isinstance(stored_alerts, dict)
+            and "auto_be_error" in stored_alerts
         ):
-            cleared = dict(record["last_alert_state"])
-            cleared.pop("auto_be_error", None)
-            await db.set_alert_state(symbol, side, cleared)
-            record["last_alert_state"] = cleared
+            cleared_alerts = dict(stored_alerts)
+            cleared_alerts.pop("auto_be_error", None)
+
+        # Enabling creates autonomous money-moving capability. Clear a prior
+        # halt first, so a cleanup failure cannot return an error after the rule
+        # was already committed and silently active. A later rule-write failure
+        # may remove stale UI state, but leaves automation safely disarmed.
+        if enables_any and cleared_alerts is not None:
+            await db.set_alert_state(symbol, side, cleared_alerts)
+            alert_cleanup_succeeded = True
+        await db.set_armed_rules(symbol, side, merged_rules)
+        if _ARM_ALLOWED_RULES.intersection(rule_patch):
+            attempts = getattr(request.app.state, "tm_be_attempts", None)
+            if isinstance(attempts, dict):
+                attempts.pop((symbol, side), None)
+        # Disarming remains authoritative even if the cosmetic stale-error
+        # cleanup fails afterward. Never turn a committed safety action into an
+        # HTTP failure, and never log provider/database-controlled detail.
+        if not enables_any and cleared_alerts is not None:
+            try:
+                await db.set_alert_state(symbol, side, cleared_alerts)
+            except Exception as exc:  # noqa: BLE001 — disarming stays authoritative
+                log.warning(
+                    "positions/arm: stale alert cleanup after disarm failed type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                alert_cleanup_succeeded = True
+        if record:
+            record["armed_rules"] = merged_rules
+            if alert_cleanup_succeeded and cleared_alerts is not None:
+                record["last_alert_state"] = cleared_alerts
         return record or {}
 
     # Serialize the live-position check and the durable arm mutation with the
@@ -2961,14 +3616,45 @@ async def positions_arm(
     async with _app_trade_lock(request):
         # Disarming is a local safety control and must remain available while
         # the exchange is unreachable. It creates no capability or baseline.
-        if disarming_all:
-            return await _persist_rules()
+        if not enables_any:
+            return await _persist_rule_patch()
+
+        # Resolve the client only after acquiring the shared lock. Setup uses
+        # this same boundary when hot-swapping the exchange, so a request that
+        # waited behind setup can never arm against the detached old client.
+        client = _exchange_client(request)
+        if client is None:
+            raise HTTPException(
+                status_code=503, detail="Exchange client not initialized"
+            )
+        client_exchange = getattr(client, "exchange_id", None)
+        active_exchange = (
+            client_exchange
+            if client_exchange in ("mexc", "hyperliquid")
+            else get_settings().exchange
+        )
+
+        # Auto-BE and Auto-Trail are HL-only (both drive modify_stop_loss).
+        # Disarming stays exchange-independent in the branch above.
+        if (
+            not client_uses_hyperliquid_semantics(client)
+            or not hasattr(client, "place_stop_order")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Auto-management (BE/trailing) is only available on "
+                    "Hyperliquid."
+                ),
+            )
 
         # Position must be LIVE — can't arm what isn't open (spec §4 identity).
         try:
             snap = await client.account_snapshot(fresh=True)
         except ExchangeError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
+            raise HTTPException(
+                status_code=502, detail="Exchange account data unavailable"
+            ) from e
         positions = snap.get("positions") if isinstance(snap, dict) else None
         if not isinstance(positions, list):
             raise HTTPException(status_code=502, detail="Invalid account position data")
@@ -2976,17 +3662,13 @@ async def positions_arm(
             symbol_raw = position.get("symbol") if isinstance(position, dict) else None
             side_raw = position.get("side") if isinstance(position, dict) else None
             hold_raw = position.get("hold_vol") if isinstance(position, dict) else None
-            try:
-                hold = float(hold_raw) if not isinstance(hold_raw, bool) else None
-            except (TypeError, ValueError, OverflowError):
-                hold = None
             if (
-                not isinstance(symbol_raw, str)
-                or not symbol_raw.strip()
+                not valid_normalized_position_symbol(
+                    symbol_raw, exchange=active_exchange
+                )
                 or side_raw not in ("long", "short")
-                or hold is None
-                or not math.isfinite(hold)
-                or hold <= 0
+                or not _finite_real_number(hold_raw)
+                or hold_raw <= 0
             ):
                 raise HTTPException(
                     status_code=502, detail="Invalid account position data"
@@ -3010,18 +3692,16 @@ async def positions_arm(
                 ),
             )
         pos = matching_positions[0]
-        try:
-            entry = float(pos.get("entry_price"))
-        except (TypeError, ValueError, OverflowError):
-            entry = 0.0
-        if not math.isfinite(entry) or entry <= 0:
+        entry_raw = pos.get("entry_price")
+        if not _finite_real_number(entry_raw) or entry_raw <= 0:
             raise HTTPException(
                 status_code=400, detail="Position has no usable entry price"
             )
+        entry = float(entry_raw)
 
         now_ms = int(_time.time() * 1000)
         await ensure_baseline(db, client, symbol, side, entry, now_ms, pos=pos)
-        return await _persist_rules()
+        return await _persist_rule_patch()
 
 
 @app.get("/api/positions/alerts")
@@ -3041,20 +3721,45 @@ async def positions_alerts(
         )
     try:
         rows = await db.list_open_position_mgmt()
-    except Exception:
-        log.warning("positions/alerts: list_open_position_mgmt failed", exc_info=True)
+    except Exception as exc:
+        log.warning(
+            "positions/alerts: list_open_position_mgmt failed type=%s",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=503, detail="position management alerts unavailable"
         ) from None
+    client = _exchange_client(request)
+    client_exchange = getattr(client, "exchange_id", None) if client else None
+    active_exchange = (
+        client_exchange
+        if client_exchange in ("mexc", "hyperliquid")
+        else get_settings().exchange
+    )
     out = []
+    seen_identities: set[tuple[str, str]] = set()
     for r in rows:
+        symbol = r.get("symbol") if isinstance(r, dict) else None
+        side = r.get("side") if isinstance(r, dict) else None
+        identity = (symbol, side)
+        if (
+            not valid_normalized_position_symbol(symbol, exchange=active_exchange)
+            or side not in ("long", "short")
+            or identity in seen_identities
+        ):
+            log.warning("positions/alerts: invalid persisted position identity")
+            raise HTTPException(
+                status_code=503,
+                detail="position management alerts unavailable",
+            )
+        seen_identities.add(identity)
         stored_rules = r.get("armed_rules")
         rules = stored_rules if isinstance(stored_rules, dict) else {}
         stored_be_done = r.get("be_done")
         out.append(
             {
-                "symbol": r.get("symbol"),
-                "side": r.get("side"),
+                "symbol": symbol,
+                "side": side,
                 "armed_rules": {
                     name: value is True
                     for name, value in rules.items()
@@ -3065,7 +3770,7 @@ async def positions_alerts(
                     if type(stored_be_done) is int and stored_be_done in (0, 1)
                     else None
                 ),
-                "alerts": r.get("last_alert_state") or {},
+                "alerts": _public_position_alert_state(r.get("last_alert_state")),
             }
         )
     return {"alerts": out}
@@ -3091,6 +3796,247 @@ async def positions_killswitch(
     return {"disarmed": disarmed}
 
 
+_PUBLIC_OPEN_ORDER_FIELDS = frozenset(
+    {
+        "orderId",
+        "order_id",
+        "oid",
+        "id",
+        "symbol",
+        "side",
+        "reduceOnly",
+        "reduce_only",
+        "vol",
+        "sz",
+        "quantity",
+        "price",
+        "triggerPrice",
+        "stopLossPrice",
+        "takeProfitPrice",
+        "takeProfitPrice2",
+        "orderType",
+        "tpsl",
+        "type",
+        "typeName",
+        "positionType",
+        "position_type",
+    }
+)
+_PUBLIC_OPEN_ORDER_MAX_ROWS = 500
+
+
+def _public_consistent_order_id(row: dict) -> int | None:
+    """Return one positive ID only when every public alias agrees."""
+    values: list[int] = []
+    for key in ("orderId", "order_id", "oid", "id"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text or len(text) > 128 or not text.isascii() or not text.isdigit():
+                return None
+            parsed = int(text)
+        else:
+            return None
+        if parsed <= 0:
+            return None
+        values.append(parsed)
+    return values[0] if values and len(set(values)) == 1 else None
+
+
+def _public_finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or len(value) > 128:
+            return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _public_consistent_number_fields(
+    row: dict, fields: tuple[str, ...], *, allow_zero: bool
+) -> float | None:
+    values: list[float] = []
+    for key in fields:
+        if key not in row:
+            continue
+        parsed = _public_finite_number(row.get(key))
+        if parsed is None or parsed < 0 or (not allow_zero and parsed == 0):
+            return None
+        values.append(parsed)
+    if not values or any(value != values[0] for value in values[1:]):
+        return None
+    return 0.0 if values[0] == 0 else values[0]
+
+
+def _public_regular_order_economics(row: dict) -> tuple[float, float] | None:
+    """Return canonical price/size only when every visible alias agrees."""
+    price = _public_consistent_number_fields(row, ("price",), allow_zero=True)
+    size = _public_consistent_number_fields(
+        row, ("vol", "sz", "quantity"), allow_zero=False
+    )
+    if price is None or size is None:
+        return None
+    return price, size
+
+
+def _public_optional_stop_size(row: dict) -> tuple[float | None, bool]:
+    """Return one canonical positive size, or a valid unknown when absent."""
+    aliases = {
+        key: row[key]
+        for key in ("vol", "sz", "quantity")
+        if row.get(key) is not None
+    }
+    if not aliases:
+        return None, True
+    size = _public_consistent_number_fields(
+        aliases, ("vol", "sz", "quantity"), allow_zero=False
+    )
+    return size, size is not None
+
+
+def _public_stop_geometry(row: dict) -> dict[str, float] | None:
+    """Return canonical geometry the browser can classify or display."""
+    _reduce_only, reduce_only_valid = classify_reduce_only_fields(row)
+    _position_side, position_side_valid = classify_position_side_fields(row)
+    if not reduce_only_valid or not position_side_valid:
+        return None
+    size, size_valid = _public_optional_stop_size(row)
+    if not size_valid:
+        return None
+    canonical_size = {"vol": size} if size is not None else {}
+    explicit = {
+        key: _public_finite_number(row[key])
+        for key in ("stopLossPrice", "takeProfitPrice")
+        if row.get(key) is not None
+    }
+    if explicit:
+        if any(value is None or value <= 0 for value in explicit.values()):
+            return None
+        return {
+            **{key: value for key, value in explicit.items() if value is not None},
+            **canonical_size,
+        }
+
+    trigger_aliases = {
+        key: row[key]
+        for key in ("triggerPrice", "trigger_price")
+        if row.get(key) is not None
+    }
+    if trigger_aliases:
+        trigger = _public_consistent_number_fields(
+            trigger_aliases,
+            ("triggerPrice", "trigger_price"),
+            allow_zero=False,
+        )
+    else:
+        trigger = _public_consistent_number_fields(
+            row, ("price",), allow_zero=False
+        )
+    if trigger is None:
+        return None
+    _kind, labels_valid = classify_order_label_fields(row)
+    return {"triggerPrice": trigger, **canonical_size} if labels_valid else None
+
+
+def _public_mexc_order_semantics(row: dict) -> tuple[str, bool] | None:
+    """Map MEXC open/close side codes to the browser's canonical contract."""
+    raw_side = row.get("side")
+    if isinstance(raw_side, bool):
+        return None
+    if isinstance(raw_side, int):
+        side_code = raw_side
+    elif isinstance(raw_side, str) and raw_side in ("1", "2", "3", "4"):
+        side_code = int(raw_side)
+    else:
+        return None
+    if side_code not in (1, 2, 3, 4):
+        return None
+
+    expected_reduce_only = side_code in (2, 4)
+    reduce_only, reduce_only_valid = classify_reduce_only_fields(row)
+    if not reduce_only_valid or (
+        reduce_only is not None and reduce_only is not expected_reduce_only
+    ):
+        return None
+    side = "buy" if side_code in (1, 2) else "sell"
+    return side, expected_reduce_only
+
+
+def _public_open_order_rows(
+    rows: list[dict],
+    *,
+    exchange: str,
+    symbol: str | None,
+    require_trigger_geometry: bool = False,
+) -> list[dict]:
+    """Expose only fields consumed by the local order/protection UI."""
+    if len(rows) > _PUBLIC_OPEN_ORDER_MAX_ROWS:
+        raise MexcError("open-order public response exceeds the safe row cap")
+    public_rows: list[dict] = []
+    seen_order_ids: set[int] = set()
+    for row in rows:
+        order_id = _public_consistent_order_id(row)
+        if order_id is None:
+            raise MexcError("open-order public identity is invalid")
+        if order_id in seen_order_ids:
+            raise MexcError("open-order public identity is duplicated")
+        seen_order_ids.add(order_id)
+        row_symbol = row.get("symbol")
+        if not valid_normalized_position_symbol(row_symbol, exchange=exchange):
+            raise MexcError("open-order public symbol identity is invalid")
+        if symbol is not None and row_symbol != symbol:
+            raise MexcError("open-order public symbol does not match the filter")
+        stop_geometry = None
+        if require_trigger_geometry:
+            stop_geometry = _public_stop_geometry(row)
+            if stop_geometry is None:
+                raise MexcError("open-order public trigger geometry is invalid")
+        regular_economics = None
+        if not require_trigger_geometry:
+            regular_economics = _public_regular_order_economics(row)
+            if regular_economics is None:
+                raise MexcError("open-order public economics are invalid")
+        mexc_semantics = None
+        if exchange == "mexc" and not require_trigger_geometry:
+            mexc_semantics = _public_mexc_order_semantics(row)
+            if mexc_semantics is None:
+                raise MexcError("open-order public MEXC side semantics are invalid")
+        public_row = {}
+        for key, value in row.items():
+            if key not in _PUBLIC_OPEN_ORDER_FIELDS:
+                continue
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise MexcError("open-order public field has an invalid shape")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise MexcError("open-order public field is non-finite")
+            public_row[key] = value
+        if mexc_semantics is not None:
+            public_row["side"], public_row["reduceOnly"] = mexc_semantics
+            public_row.pop("reduce_only", None)
+        if regular_economics is not None:
+            public_row["price"], public_row["vol"] = regular_economics
+            public_row.pop("sz", None)
+            public_row.pop("quantity", None)
+        if stop_geometry is not None:
+            public_row.pop("vol", None)
+            public_row.pop("sz", None)
+            public_row.pop("quantity", None)
+            public_row.update(stop_geometry)
+        public_rows.append(public_row)
+    return public_rows
+
+
 @app.get("/api/orders/open")
 async def orders_open(
     request: Request,
@@ -3099,21 +4045,33 @@ async def orders_open(
 ):
     """List open orders + open SL/TP trigger orders (for UI list and chart lines)."""
     s = get_settings()
+    client: MexcClient | None = _exchange_client(request)
+    active_exchange = _active_exchange_id(client, fallback=s.exchange)
+    if symbol is not None:
+        symbol = normalize_symbol(symbol, exchange=active_exchange)
     if not exchange_ready(s):
         return {"orders": [], "stop_orders": [], "error": "Exchange keys not configured"}
-    client: MexcClient | None = _exchange_client(request)
     if client is None:
         return {"orders": [], "stop_orders": [], "error": "Exchange client not initialized"}
-    if symbol:
-        symbol = normalize_symbol(symbol)
     stops_task = asyncio.create_task(client.open_stop_orders(symbol))
     try:
         rows = await client.open_orders(symbol)
-    except ExchangeError as exc:
+        if not isinstance(rows, list) or not all(
+            isinstance(row, dict) for row in rows
+        ):
+            raise MexcError("open-orders adapter response is invalid")
+        rows = _public_open_order_rows(
+            rows, exchange=active_exchange, symbol=symbol
+        )
+    except ExchangeError:
         stops_task.cancel()
         await asyncio.gather(stops_task, return_exceptions=True)
         _reject_changed_exchange(request, client)
-        return {"orders": [], "stop_orders": [], "error": str(exc)}
+        return {
+            "orders": [],
+            "stop_orders": [],
+            "error": "Exchange open orders unavailable",
+        }
     except BaseException:
         stops_task.cancel()
         await asyncio.gather(stops_task, return_exceptions=True)
@@ -3122,12 +4080,22 @@ async def orders_open(
     stops_error: str | None = None
     try:
         stops = await stops_task
-    except ExchangeError as exc:
+        if not isinstance(stops, list) or not all(
+            isinstance(row, dict) for row in stops
+        ):
+            raise MexcError("stop-orders adapter response is invalid")
+        stops = _public_open_order_rows(
+            stops,
+            exchange=active_exchange,
+            symbol=symbol,
+            require_trigger_geometry=True,
+        )
+    except ExchangeError:
         # Distinguish "no SL/TP" from "stop-order endpoint broken": an empty
         # list with stops_error=None means genuinely no triggers; a set
         # stops_error means the lookup failed and the UI must NOT show "no SL".
         stops = []
-        stops_error = str(exc)
+        stops_error = "Exchange stop orders unavailable"
     _reject_changed_exchange(request, client)
     return {
         "orders": rows,
@@ -3156,6 +4124,18 @@ async def sizing_suggest(
     the shared clamp math.
     """
     s = get_settings()
+    if type(ticket.leverage) is not int or ticket.leverage < 1:
+        raise HTTPException(
+            status_code=400, detail="leverage must be an integer greater than 0"
+        )
+    if ticket.leverage > s.max_leverage:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"leverage {ticket.leverage} exceeds "
+                f"MAX_LEVERAGE={s.max_leverage}"
+            ),
+        )
     if s.exchange == "hyperliquid" and ticket.order_type == "limit":
         raise HTTPException(
             status_code=400,
@@ -3169,32 +4149,92 @@ async def sizing_suggest(
         raise HTTPException(status_code=503, detail="MEXC client not initialized")
     symbol = normalize_symbol(ticket.symbol)
     side_l = (ticket.side or "").lower()
+    requested_risk = ticket.risk_pct
+    if requested_risk is None:
+        effective_risk = s.max_risk_pct
+    elif not _finite_real_number(requested_risk) or requested_risk <= 0:
+        # OrderTicket rejects this on HTTP input. Keep the route fail-closed for
+        # internal callers or objects mutated after Pydantic validation: an
+        # explicit invalid request must never expand to MAX_RISK_PCT.
+        raise HTTPException(status_code=400, detail="risk_pct must be greater than 0")
+    else:
+        effective_risk = min(float(requested_risk), s.max_risk_pct)
     try:
         contract = await client.contract_meta(symbol)
         ticker = await client.ticker(symbol)
     except ExchangeError as e:
         _reject_changed_exchange(request, client)
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise HTTPException(
+            status_code=502,
+            detail="Exchange contract or ticker data unavailable",
+        ) from e
     _reject_changed_exchange(request, client)
-    last_raw = ticker.last_price
-    try:
-        if isinstance(last_raw, bool):
-            raise ValueError("boolean ticker price")
-        last = float(last_raw or 0)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(status_code=502, detail="Invalid ticker price") from exc
 
-    entry = float(ticket.entry or ticket.price or last or 0)
-    if (ticket.order_type or "").lower() == "market" and last > 0:
+    contract_values: dict[str, float] = {}
+    for field_name in ("contract_size", "vol_unit", "min_vol", "max_vol"):
+        raw_value = getattr(contract, field_name, None)
+        if not _finite_real_number(raw_value):
+            raise HTTPException(
+                status_code=502, detail="Invalid contract sizing metadata"
+            )
+        contract_values[field_name] = float(raw_value)
+    contract_size = contract_values["contract_size"]
+    vol_unit = contract_values["vol_unit"]
+    min_vol = contract_values["min_vol"]
+    max_vol = contract_values["max_vol"]
+    if (
+        contract_size <= 0
+        or vol_unit <= 0
+        or min_vol <= 0
+        or max_vol <= 0
+        or min_vol > max_vol
+    ):
+        raise HTTPException(
+            status_code=502, detail="Invalid contract sizing metadata"
+        )
+
+    min_leverage = getattr(contract, "min_leverage", None)
+    max_leverage = getattr(contract, "max_leverage", None)
+    if (
+        type(min_leverage) is not int
+        or type(max_leverage) is not int
+        or min_leverage < 1
+        or max_leverage < 1
+        or min_leverage > max_leverage
+    ):
+        raise HTTPException(
+            status_code=502, detail="Invalid contract leverage metadata"
+        )
+    if ticket.leverage < min_leverage or ticket.leverage > max_leverage:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"leverage {ticket.leverage} is outside contract leverage "
+                f"bounds [{min_leverage}, {max_leverage}]"
+            ),
+        )
+
+    last_raw = ticker.last_price
+    if not _finite_real_number(last_raw):
+        raise HTTPException(status_code=502, detail="Invalid ticker price")
+    last = float(last_raw)
+    if last <= 0:
+        raise HTTPException(status_code=502, detail="Invalid ticker price")
+
+    if ticket.order_type == "market":
         try:
             entry = adverse_market_entry(
                 last, side_l, s.market_entry_slippage_pct
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    stop = float(ticket.stop_loss or 0)
-    if entry <= 0 or stop <= 0:
+    else:
+        if not _finite_real_number(ticket.price) or ticket.price <= 0:
+            raise HTTPException(status_code=400, detail="limit price required")
+        entry = float(ticket.price)
+    if not _finite_real_number(ticket.stop_loss) or ticket.stop_loss <= 0:
         raise HTTPException(status_code=400, detail="entry and stop_loss required")
+    stop = float(ticket.stop_loss)
 
     equity = 0.0
     available = 0.0
@@ -3211,22 +4251,22 @@ async def sizing_suggest(
             _reject_changed_exchange(request, client)
             snap = {}
         _reject_changed_exchange(request, client)
-        if not isinstance(snap, dict):
-            snap = {}
+        if (
+            not isinstance(snap, dict)
+            or "error" not in snap
+            or snap["error"] is not None
+        ):
+            raise HTTPException(
+                status_code=400, detail="Account data unavailable for sizing"
+            )
         equity_raw = snap.get("equity_usdt")
-        try:
-            if isinstance(equity_raw, bool):
-                raise ValueError("boolean equity")
-            equity = float(equity_raw or 0)
-        except (TypeError, ValueError, OverflowError):
-            equity = 0.0
+        equity = float(equity_raw) if _finite_real_number(equity_raw) else 0.0
         available_raw = snap.get("available_usdt")
-        try:
-            if isinstance(available_raw, bool):
-                raise ValueError("boolean available margin")
-            available = float(available_raw or 0)
-        except (TypeError, ValueError, OverflowError):
-            available = float("nan")
+        available = (
+            float(available_raw)
+            if _finite_real_number(available_raw)
+            else float("nan")
+        )
         if equity > 0 and side_l in ("long", "short"):
             account_positions = snap.get("positions")
             if not isinstance(account_positions, list):
@@ -3239,7 +4279,7 @@ async def sizing_suggest(
                     account_positions,
                     symbol=symbol,
                     side=side_l,
-                    contract_size=contract.contract_size,
+                    contract_size=contract_size,
                 )
             except ValueError as e:
                 # Unknown same-side exposure is never silently treated as 0.
@@ -3252,34 +4292,29 @@ async def sizing_suggest(
     # Honor the client-requested risk %, but never let it exceed the gate's
     # max_risk_pct — the suggestion must never label a size as "X% risk"
     # while actually sizing for more than X% (or more than the hard cap).
-    requested_risk = ticket.risk_pct
-    if requested_risk is None or requested_risk <= 0:
-        effective_risk = s.max_risk_pct
-    else:
-        effective_risk = min(float(requested_risk), s.max_risk_pct)
-
     vol = suggest_vol(
         equity,
         effective_risk,
-        contract.contract_size,
+        contract_size,
         entry,
         stop,
-        contract.vol_unit,
-        contract.min_vol,
+        vol_unit,
+        min_vol,
         side=side_l,
         slippage_pct=s.risk_slippage_pct,
         existing_risk_usdt=existing_risk,
         available_usdt=available,
         leverage=ticket.leverage,
         max_notional_pct_of_equity=s.max_notional_pct_of_equity,
+        max_vol=max_vol,
     )
-    notional = vol * contract.contract_size * entry
-    coin = vol * contract.contract_size
+    notional = vol * contract_size * entry
+    coin = vol * contract_size
     return {
         "vol": vol,
         "notional_usdt": notional,
         "base_amount": coin,
-        "contract_size": contract.contract_size,
+        "contract_size": contract_size,
         "entry": entry,
         "stop_loss": stop,
         "equity_usdt": equity,
@@ -3298,6 +4333,13 @@ async def ws_market(
     tf: str = Query("15m"),
 ):
     """Realtime market stream (Hyperliquid public WS proxied to browser)."""
+    # WebSocket handshakes do not pass through the HTTP-only loopback/token
+    # middleware. Enforce the application's loopback boundary here before
+    # accept() or any public exchange connection/poll can consume resources.
+    client_host = websocket.client.host if websocket.client else ""
+    if not _is_loopback_client(client_host):
+        await websocket.close(code=1008)
+        return
     # Origin check: a browser always sends Origin. Reject any cross-origin
     # website so an arbitrary page cannot open this socket and drive the
     # Hyperliquid proxy. Non-browser clients (no Origin header) are allowed.
@@ -3335,7 +4377,11 @@ async def ws_market(
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            log.warning("ws_market HL proxy failed for %s: %s", symbol, e)
+            log.warning(
+                "ws_market HL proxy failed for %s type=%s",
+                symbol,
+                type(e).__name__,
+            )
             try:
                 await websocket.send_json(
                     {"type": "status", "status": "error", "error": "Internal error"}
@@ -3369,7 +4415,11 @@ async def ws_market(
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        log.warning("ws_market MEXC poll failed for %s: %s", symbol, e)
+        log.warning(
+            "ws_market MEXC poll failed for %s type=%s",
+            symbol,
+            type(e).__name__,
+        )
         try:
             await websocket.send_json(
                 {"type": "status", "status": "error", "error": "Internal error"}
@@ -3476,9 +4526,11 @@ async def _mexc_poll_send_loop(websocket: WebSocket, client, symbol: str) -> Non
                 latest_timestamp = timestamp
             delay = MEXC_POLL_BASE_DELAY_S
         except Exception as e:
-            # Detail nur ins Server-Log (B-03-Muster) — der Client bekommt
-            # eine generische Meldung, keine rohen Provider-/Stacktexte.
-            log.warning("MEXC-Poll ticker error for %s: %s", symbol, e)
+            log.warning(
+                "MEXC-Poll ticker error for %s type=%s",
+                symbol,
+                type(e).__name__,
+            )
             err_message = {
                 "type": "status",
                 "status": "error",
@@ -3571,7 +4623,9 @@ async def market_scan(
     try:
         overview = await client.market_overview(fetch_n)
     except ExchangeError as e:
-        raise HTTPException(status_code=502, detail=f"market overview failed: {e}") from e
+        raise HTTPException(
+            status_code=502, detail="Exchange market overview unavailable"
+        ) from e
     if not overview:
         raise HTTPException(status_code=502, detail="no market overview data")
 
@@ -3665,8 +4719,12 @@ async def index(request: Request):
     # clients that don't need the browser convenience should prefer sending
     # X-Local-Token explicitly rather than relying on this cookie — the
     # header IS scoped to exactly the request the caller intends.
+    # Only a proven loopback client may bootstrap the raw credential into its
+    # browser. This keeps an accidental future proxy/bind change from turning
+    # public GET / into a token-issuing endpoint.
     token = (s.local_api_token or "").strip()
-    if token:
+    client_host = request.client.host if request.client else ""
+    if token and _is_loopback_client(client_host):
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,

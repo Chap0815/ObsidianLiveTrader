@@ -150,6 +150,38 @@ def test_parse_feed_atom():
     assert items[0]["published"].startswith("2026-07-09")
 
 
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "javascript:alert(1)",
+        "data:text/html,unsafe",
+        "http://127.0.0.1/private",
+        "http://[::1]/private",
+        "http://10.0.0.1/private",
+        "http://localhost/private",
+        "http://127.1/private",
+        "http://0x7f.1/private",
+        "http://2130706433/private",
+        "http://0177.0.0.1/private",
+        "https://user:password@example.com/article",
+        "https://example.com:8443/article",
+        "https://single-label/article",
+        "https://example.com/" + "a" * 2_048,
+        "https://example.com/has whitespace",
+    ],
+)
+def test_parse_feed_keeps_headline_but_removes_unsafe_link(unsafe_url):
+    xml = (
+        "<rss><channel><item><title>Still visible</title><link>"
+        f"{unsafe_url}</link></item></channel></rss>"
+    )
+
+    items = _parse_feed(xml, "Synthetic")
+
+    assert [item["title"] for item in items] == ["Still visible"]
+    assert items[0]["url"] == ""
+
+
 def test_parse_feed_rejects_dtd_entities():
     # Feeds are untrusted network XML: a DTD/entity payload (billion-laughs or
     # XXE vector) must be rejected by the hardened parser, not expanded. The
@@ -162,6 +194,18 @@ def test_parse_feed_rejects_dtd_entities():
     )
     with pytest.raises(defusedxml.common.DefusedXmlException):
         _parse_feed(bomb, "Evil")
+
+
+def test_parse_feed_caps_untrusted_items_before_endpoint_merge():
+    rows = "".join(
+        f"<item><title>Story {index}</title><link>https://example.com/{index}</link></item>"
+        for index in range(main.NEWS_MAX_ITEMS + 25)
+    )
+
+    items = _parse_feed(f"<rss><channel>{rows}</channel></rss>", "Synthetic")
+
+    assert len(items) == main.NEWS_MAX_ITEMS
+    assert items[-1]["title"] == f"Story {main.NEWS_MAX_ITEMS - 1}"
 
 
 # --- endpoint tests --------------------------------------------------------
@@ -181,18 +225,20 @@ def test_news_merges_and_sorts(monkeypatch):
 
 
 def test_news_per_feed_error_isolated(monkeypatch):
+    marker = "SYNTHETIC_PRIVATE_NEWS_UPSTREAM_ERROR"
     feeds = [("Good", "http://ok"), ("Dead", "http://dead")]
     _patch(
         monkeypatch,
         feeds,
-        {"http://ok": RSS_XML, "http://dead": httpx.ConnectError("boom")},
+        {"http://ok": RSS_XML, "http://dead": httpx.ConnectError(marker)},
     )
     with TestClient(app) as client:
         client.app.state.news_cache = None
         r = client.get("/api/news")
     body = r.json()
     assert [i["source"] for i in body["items"]] == ["Good", "Good"]
-    assert len(body["errors"]) == 1 and body["errors"][0].startswith("Dead:")
+    assert body["errors"] == ["Dead: feed unavailable"]
+    assert marker not in r.text
 
 
 def test_news_malformed_xml_isolated(monkeypatch):
@@ -241,6 +287,29 @@ def test_news_oversized_feed_is_rejected_isolated(monkeypatch):
     assert len(body["errors"]) == 1 and body["errors"][0].startswith("Huge:")
     # The good feed still comes through — isolated failure, not a crash.
     assert [i["source"] for i in body["items"]] == ["Good", "Good"]
+
+
+def test_news_feed_has_complete_wall_clock_timeout(monkeypatch):
+    """A peer that keeps each socket read alive must still have a fixed total
+    budget; timing out one feed remains an isolated endpoint error."""
+    feeds = [("Slow", "http://slow")]
+    _patch(monkeypatch, feeds, {"http://slow": RSS_XML})
+    observed_timeouts = []
+
+    async def force_timeout(awaitable, *, timeout):
+        observed_timeouts.append(timeout)
+        awaitable.close()
+        raise TimeoutError
+
+    monkeypatch.setattr(main.asyncio, "wait_for", force_timeout)
+    with TestClient(app) as client:
+        client.app.state.news_cache = None
+        response = client.get("/api/news")
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert response.json()["errors"] == ["Slow: feed unavailable"]
+    assert observed_timeouts == [main.NEWS_FEED_TIMEOUT]
 
 
 @pytest.mark.asyncio

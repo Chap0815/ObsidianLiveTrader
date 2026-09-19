@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from contextlib import asynccontextmanager
@@ -103,6 +104,10 @@ class Database:
     def __init__(self, db_path: str):
         self.path = _resolve_path(db_path)
         self._shared: aiosqlite.Connection | None = None
+        # Dedupe is a SELECT followed by UPDATE-or-INSERT. aiosqlite serializes
+        # individual statements, but two coroutines can still interleave that
+        # sequence on the shared connection and create duplicate samples.
+        self._journal_insert_lock = asyncio.Lock()
 
     def _connect(self):
         # timeout is sqlite3's busy handler window (seconds): wait for a
@@ -145,6 +150,13 @@ class Database:
             async with self._connect() as conn:
                 yield conn
 
+    @asynccontextmanager
+    async def _acquire_journal_insert(self):
+        """Serialize the journal dedupe decision within the single process."""
+        async with self._journal_insert_lock:
+            async with self._acquire() as conn:
+                yield conn
+
     async def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with self._connect() as conn:
@@ -181,6 +193,14 @@ class Database:
                     await conn.execute(
                         f"ALTER TABLE journal_entries ADD COLUMN {_col} TEXT"
                     )
+            # Resolver concurrency token. Unlike created_at (intentionally
+            # second-granular), this increments on every in-place dedupe refresh,
+            # so a resolver can never finalize an older proposal snapshot.
+            if "snapshot_version" not in cols:
+                await conn.execute(
+                    "ALTER TABLE journal_entries ADD COLUMN snapshot_version "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
             # Index on setup_type for the by_setup GROUP BY. Created HERE (not in
             # SCHEMA_SQL) so it runs only AFTER the column exists on both fresh
             # DBs (CREATE TABLE above) and migrated DBs (ALTER above) — a CREATE
@@ -545,7 +565,7 @@ class Database:
         dedupe_window_min: int = 30,
     ) -> int:
         now = created_at or _utc_now_iso()
-        async with self._acquire() as conn:
+        async with self._acquire_journal_insert() as conn:
             # F2-08 dedupe: repeatedly analysing the SAME context within a short
             # window would otherwise write N correlated rows and inflate the
             # sample (tightening the Wilson CI dishonestly). If a still-PENDING
@@ -573,7 +593,7 @@ class Database:
                 dup = await cur.fetchone()
                 if dup is not None:
                     existing_id = int(dup[0])
-                    await conn.execute(
+                    updated = await conn.execute(
                         """
                         UPDATE journal_entries
                         SET created_at = ?, symbol = ?, tf = ?, htf = ?,
@@ -582,8 +602,8 @@ class Database:
                             provider = ?, model = ?, scanner_summary = ?,
                             last_price_t0 = ?, status = ?, proposal_id = ?,
                             setup_type = ?, prompt_version = ?, regime = ?,
-                            order_type = ?
-                        WHERE id = ?
+                            order_type = ?, snapshot_version = snapshot_version + 1
+                        WHERE id = ? AND status = 'PENDING'
                         """,
                         (
                             now, symbol, tf, htf, action, direction,
@@ -593,8 +613,12 @@ class Database:
                             regime, order_type, existing_id,
                         ),
                     )
-                    await conn.commit()
-                    return existing_id
+                    if updated.rowcount == 1:
+                        await conn.commit()
+                        return existing_id
+                    # The resolver finalized this row after our SELECT. Keep the
+                    # completed observation immutable and insert this newer
+                    # analysis as its own row below.
 
             cur = await conn.execute(
                 """
@@ -641,7 +665,8 @@ class Database:
             cur = await conn.execute(
                 """
                 SELECT id, created_at, symbol, tf, htf, action, direction,
-                       entry_price, stop_loss, tp1, rrr, status, order_type
+                       entry_price, stop_loss, tp1, rrr, status, order_type,
+                       snapshot_version
                 FROM journal_entries
                 WHERE status = 'PENDING'
                 ORDER BY id ASC
@@ -655,6 +680,8 @@ class Database:
         entry_id: int,
         *,
         status: str,
+        expected_created_at: str | None = None,
+        expected_snapshot_version: int | None = None,
         resolved_at: str | None = None,
         resolved_price: float | None = None,
         realized_r: float | None = None,
@@ -665,36 +692,96 @@ class Database:
 
         Guarded by `status='PENDING'` in the WHERE clause so the resolver is
         idempotent: a row that already resolved is never revisited/overwritten.
+        ``expected_snapshot_version`` is the authoritative optimistic snapshot
+        guard: journal deduplication may refresh a PENDING row while the resolver
+        is fetching candles, and an outcome derived from the old proposal must
+        not finalize that refreshed row. ``expected_created_at`` remains an
+        additional identity check for callers that have it.
         """
         async with self._acquire() as conn:
-            await conn.execute(
+            params: tuple[Any, ...] = (
+                status,
+                resolved_at or _utc_now_iso(),
+                resolved_price,
+                realized_r,
+                realized_r_net,
+                1 if ambiguous else 0,
+                _utc_now_iso(),
+                entry_id,
+            )
+            if expected_snapshot_version is not None:
+                query = """
+                    UPDATE journal_entries
+                    SET status = ?, resolved_at = ?, resolved_price = ?,
+                        realized_r = ?, realized_r_net = ?, ambiguous = ?,
+                        last_checked_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                          AND snapshot_version = ?
                 """
-                UPDATE journal_entries
-                SET status = ?, resolved_at = ?, resolved_price = ?,
-                    realized_r = ?, realized_r_net = ?, ambiguous = ?,
-                    last_checked_at = ?
-                WHERE id = ? AND status = 'PENDING'
-                """,
-                (
-                    status,
-                    resolved_at or _utc_now_iso(),
-                    resolved_price,
-                    realized_r,
-                    realized_r_net,
-                    1 if ambiguous else 0,
-                    _utc_now_iso(),
-                    entry_id,
-                ),
+                params += (expected_snapshot_version,)
+                if expected_created_at is not None:
+                    query += " AND created_at = ?"
+                    params += (expected_created_at,)
+            elif expected_created_at is not None:
+                query = """
+                    UPDATE journal_entries
+                    SET status = ?, resolved_at = ?, resolved_price = ?,
+                        realized_r = ?, realized_r_net = ?, ambiguous = ?,
+                        last_checked_at = ?
+                    WHERE id = ? AND status = 'PENDING' AND created_at = ?
+                """
+                params += (expected_created_at,)
+            else:
+                query = """
+                    UPDATE journal_entries
+                    SET status = ?, resolved_at = ?, resolved_price = ?,
+                        realized_r = ?, realized_r_net = ?, ambiguous = ?,
+                        last_checked_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                """
+            await conn.execute(
+                query,
+                params,
             )
             await conn.commit()
 
-    async def touch_journal_checked(self, entry_id: int) -> None:
+    async def touch_journal_checked(
+        self,
+        entry_id: int,
+        *,
+        expected_created_at: str | None = None,
+        expected_snapshot_version: int | None = None,
+    ) -> None:
         """Record a resolver pass that left the row PENDING (debug/backoff)."""
         async with self._acquire() as conn:
-            await conn.execute(
-                "UPDATE journal_entries SET last_checked_at = ? WHERE id = ?",
-                (_utc_now_iso(), entry_id),
-            )
+            if expected_snapshot_version is not None:
+                query = """
+                    UPDATE journal_entries SET last_checked_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                          AND snapshot_version = ?
+                """
+                params: tuple[Any, ...] = (
+                    _utc_now_iso(),
+                    entry_id,
+                    expected_snapshot_version,
+                )
+                if expected_created_at is not None:
+                    query += " AND created_at = ?"
+                    params += (expected_created_at,)
+                await conn.execute(query, params)
+            elif expected_created_at is None:
+                await conn.execute(
+                    "UPDATE journal_entries SET last_checked_at = ? WHERE id = ?",
+                    (_utc_now_iso(), entry_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE journal_entries SET last_checked_at = ?
+                    WHERE id = ? AND status = 'PENDING' AND created_at = ?
+                    """,
+                    (_utc_now_iso(), entry_id, expected_created_at),
+                )
             await conn.commit()
 
     async def recent_journal(self, limit: int = 50) -> list[dict[str, Any]]:

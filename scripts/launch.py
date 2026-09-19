@@ -62,6 +62,8 @@ from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_DIR = ROOT / ".venv"
+PINNED_PIP_REQUIREMENT = "pip==26.2.1"
+_DEPS_MARKER_SCHEMA = 3
 
 
 def _system_python() -> str:
@@ -159,10 +161,21 @@ def _select_requirements_file() -> Path | None:
     return None
 
 
+def _interpreter_marker() -> str:
+    """Stable ABI identity for the interpreter that owns the project venv."""
+    cache_tag = getattr(sys.implementation, "cache_tag", None) or "unknown"
+    bitness = 64 if sys.maxsize > 2**32 else 32
+    return f"{cache_tag}-{bitness}bit"
+
+
 def _deps_marker_state(req: Path) -> str:
-    """Identify the selected requirements file by name and exact content."""
+    """Identify all inputs that define the installed dependency environment."""
     digest = hashlib.sha256(req.read_bytes()).hexdigest()
-    return f"{req.name}:sha256:{digest}"
+    mode = "no-deps" if req.name == "requirements.lock" else "resolve"
+    return (
+        f"{req.name}:sha256:{digest}:schema:{_DEPS_MARKER_SCHEMA}:"
+        f"python:{_interpreter_marker()}:pip:{PINNED_PIP_REQUIREMENT}:mode:{mode}"
+    )
 
 
 def ensure_deps(vpy: Path, *, skip: bool) -> None:
@@ -200,21 +213,23 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
             "install",
             "--require-virtualenv",
             "--upgrade",
-            "pip",
+            PINNED_PIP_REQUIREMENT,
         ],
         env=env,
         error_hint=pip_error_hint,
     )
+    install_cmd = [
+        str(vpy),
+        "-m",
+        "pip",
+        "install",
+        "--require-virtualenv",
+    ]
+    if req.name == "requirements.lock":
+        install_cmd.append("--no-deps")
+    install_cmd.extend(["-r", str(req)])
     _run(
-        [
-            str(vpy),
-            "-m",
-            "pip",
-            "install",
-            "--require-virtualenv",
-            "-r",
-            str(req),
-        ],
+        install_cmd,
         env=env,
         error_hint=pip_error_hint,
     )

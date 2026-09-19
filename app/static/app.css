@@ -1895,6 +1895,10 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   color: var(--muted);
   background: var(--bg-elevated);
 }
+.cp-sl-coverage-unknown {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 13%, transparent);
+}
 .cp-sl-missing {
   color: #fff;
   background: var(--short);
@@ -1951,14 +1955,15 @@ body.has-position .statbar { padding-top: 4px; padding-bottom: 4px; }
   transition: background 0.12s ease, color 0.12s ease;
 }
 
-.cp-reeval-btn:hover:not(:disabled) {
+.cp-reeval-btn:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--accent);
   color: #fff;
 }
 
-.cp-reeval-btn:disabled {
+.cp-reeval-btn:disabled,
+.cp-reeval-btn[aria-disabled="true"] {
   opacity: 0.6;
-  cursor: default;
+  cursor: not-allowed;
 }
 
 .cp-reeval-result:empty { margin: 0; }

@@ -17,6 +17,7 @@ TestClient). Hier fehlt nur der Cross-PORT-Fall.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,3 +75,44 @@ def test_ws_market_rejects_invalid_interval_with_1008(monkeypatch):
             ):
                 pass
     assert ei.value.code == 1008
+
+
+@pytest.mark.asyncio
+async def test_ws_market_rejects_non_loopback_client_before_accept(monkeypatch):
+    """WebSockets bypass HTTP middleware, so the handler enforces loopback too."""
+    import app.main as main
+
+    class FakeWebSocket:
+        headers: dict[str, str] = {}
+        client = SimpleNamespace(host="192.0.2.10")
+        url = URL("ws://localhost:8787/ws/market")
+        app = SimpleNamespace(state=SimpleNamespace())
+
+        def __init__(self):
+            self.accepted = False
+            self.close_codes: list[int] = []
+
+        async def accept(self):
+            self.accepted = True
+
+        async def close(self, code=1000):
+            self.close_codes.append(code)
+
+        async def send_json(self, _payload):
+            return None
+
+    fallback = AsyncMock(side_effect=WebSocketDisconnect())
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(exchange="mexc"),
+    )
+    monkeypatch.setattr(main, "normalize_symbol", lambda value: value)
+    monkeypatch.setattr(main, "_mexc_poll_fallback", fallback)
+    websocket = FakeWebSocket()
+
+    await main.ws_market(websocket, symbol="BTC", tf="15m")
+
+    assert websocket.accepted is False
+    assert websocket.close_codes == [1008]
+    fallback.assert_not_awaited()

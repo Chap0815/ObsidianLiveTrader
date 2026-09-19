@@ -10,6 +10,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 TRADE_MATH = ROOT / "app" / "static" / "trade-math.js"
 APP_JS = ROOT / "app" / "static" / "app.js"
+UTILS_JS = ROOT / "app" / "static" / "utils.js"
 
 
 def _call(function_name: str, *args: object) -> object:
@@ -29,6 +30,230 @@ process.stdout.write(JSON.stringify(fn(...args)));
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def _call_utils(function_name: str, *args: object) -> object:
+    script = """
+const fs = require("fs");
+const vm = require("vm");
+vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+const fn = globalThis[process.argv[2]];
+const args = JSON.parse(process.argv[3]);
+process.stdout.write(JSON.stringify(fn(...args)));
+"""
+    result = subprocess.run(
+        ["node", "-e", script, str(UTILS_JS), function_name, json.dumps(args)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_frontend_trading_status_distinguishes_testnet_and_real_funds():
+    assert _call_utils(
+        "tradingStatusLabel",
+        {
+            "trading_enabled": True,
+            "exchange": "hyperliquid",
+            "hl_testnet": True,
+            "live_trading": False,
+            "exchange_configured": True,
+        },
+    ) == "ARMED · TESTNET"
+    for exchange in ("hyperliquid", "mexc"):
+        assert _call_utils(
+            "tradingStatusLabel",
+            {
+                "trading_enabled": True,
+                "exchange": exchange,
+                "hl_testnet": False if exchange == "hyperliquid" else None,
+                "live_trading": True,
+                "exchange_configured": True,
+            },
+        ) == "ARMED · REAL FUNDS"
+
+
+def test_preview_ttl_accepts_only_server_contract_integers():
+    for value in (1, 60, 3600):
+        assert _call_utils("previewTtlSeconds", value) == value
+
+    for value in (None, True, False, 0, -1, 1.5, 3601, "60", "<img src=x>", {}):
+        assert _call_utils("previewTtlSeconds", value) is None
+
+
+def test_fill_response_contract_rejects_malformed_or_contradictory_payloads():
+    assert _call_utils(
+        "isValidFillsResponse",
+        {"supported": True, "fills": [], "error": None},
+    ) is True
+    assert _call_utils(
+        "isValidFillsResponse",
+        {"supported": False, "fills": [], "error": None},
+    ) is True
+    for invalid in (
+        None,
+        [],
+        {"supported": "true", "fills": [], "error": None},
+        {"supported": True, "fills": {}, "error": None},
+        {"supported": True, "fills": [], "error": {}},
+        {"supported": False, "fills": [{"side": "buy"}], "error": None},
+    ):
+        assert _call_utils("isValidFillsResponse", invalid) is False
+
+
+def test_frontend_news_urls_require_public_credential_free_web_hosts():
+    assert (
+        _call_utils("safeExternalNewsUrl", "https://example.com/article")
+        == "https://example.com/article"
+    )
+    for unsafe in (
+        None,
+        "javascript:alert(1)",
+        "data:text/html,unsafe",
+        "http://127.0.0.1/private",
+        "http://127.1/private",
+        "http://0x7f.1/private",
+        "http://[::1]/private",
+        "http://localhost/private",
+        "https://user:password@example.com/article",
+        "https://example.com:8443/article",
+        "https://single-label/article",
+        "https://example.com/has whitespace",
+        "https://example.com/" + "a" * 2_048,
+    ):
+        assert _call_utils("safeExternalNewsUrl", unsafe) == ""
+
+
+def test_confirm_modal_uses_validated_ttl_for_token_and_countdown():
+    app_source = APP_JS.read_text(encoding="utf-8")
+
+    assert "const ttl = previewTtlSeconds(preview.expires_in_seconds);" in app_source
+    assert "preview.ok === true && previewToken !== null && ttl !== null" in app_source
+    assert "const canConfirm = okGates && ttl !== null && executionReady;" in app_source
+    assert "let left = ttl;" in app_source
+    assert "preview.expires_in_seconds || 60" not in app_source
+
+
+def test_preview_response_contract_accepts_valid_pass_and_gate_rejection():
+    summary = {"symbol": "BTC", "side": "long"}
+    gate = {"errors": [], "warnings": []}
+    assert _call_utils(
+        "isValidPreviewResponse",
+        {
+            "ok": True,
+            "token": "synthetic-token",
+            "expires_in_seconds": 60,
+            "summary": summary,
+            "gate": gate,
+            "errors": [],
+            "warnings": [],
+        },
+    ) is True
+    assert _call_utils(
+        "isValidPreviewResponse",
+        {
+            "ok": False,
+            "token": None,
+            "summary": summary,
+            "gate": {"errors": ["blocked"], "warnings": []},
+            "errors": ["blocked"],
+            "warnings": [],
+        },
+    ) is True
+
+
+def test_preview_response_contract_rejects_malformed_success_payloads():
+    base = {
+        "ok": True,
+        "token": "synthetic-token",
+        "expires_in_seconds": 60,
+        "summary": {"symbol": "BTC"},
+        "gate": {"errors": [], "warnings": []},
+        "errors": [],
+        "warnings": [],
+    }
+    mutations = [
+        {"ok": "true"},
+        {"token": {}},
+        {"expires_in_seconds": "60"},
+        {"summary": []},
+        {"gate": []},
+        {"errors": "blocked"},
+        {"warnings": ["safe", {"not": "text"}]},
+    ]
+    for mutation in mutations:
+        assert _call_utils("isValidPreviewResponse", {**base, **mutation}) is False
+
+
+def test_run_preview_opens_modal_for_valid_gate_rejection_only():
+    app_source = APP_JS.read_text(encoding="utf-8")
+    run_preview_source = app_source.split("async function runPreview()", 1)[1].split(
+        "/** C3-03/T3-08", 1
+    )[0]
+
+    assert "if (!res.ok || data.ok === false)" not in run_preview_source
+    assert "if (!isValidPreviewResponse(data))" in run_preview_source
+    assert "openConfirmModal(data, returnFocus);" in run_preview_source
+
+
+def test_frontend_trading_status_fails_visibly_on_ambiguous_network():
+    assert _call_utils(
+        "tradingStatusLabel",
+        {
+            "trading_enabled": True,
+            "exchange": "hyperliquid",
+            "hl_testnet": True,
+            "live_trading": True,
+            "exchange_configured": True,
+        },
+    ) == "ARMED · VERIFY NETWORK"
+    assert _call_utils("tradingStatusLabel", None) == "DISARMED"
+
+
+def test_frontend_trading_status_surfaces_unconfigured_exchange():
+    assert _call_utils(
+        "tradingStatusLabel",
+        {
+            "trading_enabled": True,
+            "exchange": "hyperliquid",
+            "hl_testnet": True,
+            "live_trading": False,
+            "exchange_configured": False,
+        },
+    ) == "ARMED · EXCHANGE NOT READY"
+
+
+def test_frontend_exchange_network_label_is_explicit_and_fail_closed():
+    assert _call_utils(
+        "exchangeNetworkLabel", {"exchange": "hyperliquid", "hl_testnet": True}
+    ) == "HYPERLIQUID · TESTNET"
+    assert _call_utils(
+        "exchangeNetworkLabel", {"exchange": "hyperliquid", "hl_testnet": False}
+    ) == "HYPERLIQUID · MAINNET"
+    assert _call_utils(
+        "exchangeNetworkLabel", {"exchange": "mexc", "hl_testnet": None}
+    ) == "MEXC · LIVE VENUE"
+    assert _call_utils(
+        "exchangeNetworkLabel", {"exchange": "hyperliquid", "hl_testnet": None}
+    ) == "HYPERLIQUID · NETWORK UNKNOWN"
+    assert _call_utils("exchangeNetworkLabel", None) == "—"
+
+
+def test_frontend_position_review_requires_literal_server_capability():
+    assert _call_utils(
+        "canReviewPosition", {"position_reevaluation_allowed": True}
+    ) is True
+    for health in (
+        {"position_reevaluation_allowed": False},
+        {"position_reevaluation_allowed": "true"},
+        {},
+        [],
+        None,
+    ):
+        assert _call_utils("canReviewPosition", health) is False
 
 
 def _classify(order: dict[str, object]) -> dict[str, float | None]:
@@ -56,6 +281,24 @@ def test_frontend_rejects_non_string_order_label():
     }
 
 
+def test_frontend_protection_validates_all_order_label_aliases():
+    assert _classify(
+        {"orderType": "Stop", "tpsl": "tp", "triggerPrice": 95.0}
+    ) == {"sl": None, "tp": None}
+    assert _classify({"tpsl": "sl", "triggerPrice": 105.0}) == {
+        "sl": 105.0,
+        "tp": None,
+    }
+    assert _classify({"type": "tp", "triggerPrice": 95.0}) == {
+        "sl": None,
+        "tp": 95.0,
+    }
+    assert _classify({"type": 1, "triggerPrice": 95.0}) == {
+        "sl": None,
+        "tp": None,
+    }
+
+
 def test_frontend_uses_most_protective_sl_for_multiple_orders():
     assert _call("mostProtectiveSl", [118.0, 105.0], "long") == 118.0
     assert _call("mostProtectiveSl", [112.0, 130.0], "short") == 112.0
@@ -70,9 +313,34 @@ def test_frontend_hyperliquid_symbol_match_rejects_cross_quote_pairs():
     assert "return symbolsMatch(na, nb, isHyperliquid);" in app_source
 
 
+def test_exchange_identity_fallback_does_not_parse_visible_network_label():
+    app_source = APP_JS.read_text(encoding="utf-8")
+
+    assert "label.dataset.exchange" in app_source
+    assert 'lbl.textContent.trim().toLowerCase()' not in app_source
+    # Definition plus symMatch, isHlExchange, markerKey and the strict
+    # position-management response identity validator.
+    assert app_source.count("currentExchangeId()") == 5
+
+
 def test_frontend_protection_filters_opposite_hedge_side():
     assert _classify({"positionType": 2, "stopLossPrice": 105.0}) == {
         "sl": None,
+        "tp": None,
+    }
+
+
+def test_frontend_protection_requires_valid_reduce_only_aliases():
+    rejected = (
+        {"reduceOnly": False, "stopLossPrice": 95.0},
+        {"reduce_only": "true", "stopLossPrice": 95.0},
+        {"reduceOnly": True, "reduce_only": False, "stopLossPrice": 95.0},
+    )
+    for order in rejected:
+        assert _classify(order) == {"sl": None, "tp": None}
+
+    assert _classify({"reduceOnly": True, "stopLossPrice": 95.0}) == {
+        "sl": 95.0,
         "tp": None,
     }
 

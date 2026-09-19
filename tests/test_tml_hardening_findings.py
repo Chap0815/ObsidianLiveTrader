@@ -33,7 +33,11 @@ class FakeClient:
         self._positions = positions
         self._mark = mark
         self._stops = stops if stops is not None else [
-            {"triggerPrice": 98.0, "orderType": "Stop"}
+            {
+                "symbol": "BTC" if is_hl else "BTC_USDT",
+                "triggerPrice": 98.0,
+                "orderType": "Stop",
+            }
         ]
         self._fills = fills  # None => no user_fills attr at all (MEXC-like)
         if is_hl:
@@ -41,14 +45,16 @@ class FakeClient:
         if fills is not None:
             self.user_fills = self._user_fills
 
-    async def _user_fills(self, symbol=None, limit=100):
+    async def _user_fills(self, symbol=None, limit=100, *, fresh=False):
+        assert fresh is True
         return list(self._fills)
 
     async def account_snapshot(self, *, fresh=False):
         return {"positions": self._positions}
 
     async def ticker(self, symbol):
-        return SimpleNamespace(last_price=self._mark)
+        observed = "BTC" if hasattr(self, "place_stop_order") else "BTC_USDT"
+        return SimpleNamespace(symbol=observed, last_price=self._mark)
 
     async def open_stop_orders(self, symbol):
         return list(self._stops)
@@ -61,9 +67,10 @@ def _pos(symbol="BTC_USDT", side="long", entry=100.0, hold=1.0, position_id=None
     return p
 
 
-def _open_fill(time, start_position=0.0, side="long"):
+def _open_fill(time, start_position=0.0, side="long", symbol="BTC"):
     """A normalized userFills row (HL shape). start_position==0 => Flat->Open."""
     return {
+        "symbol": symbol,
         "dir": "Open Long" if side == "long" else "Open Short",
         "time": time,
         "start_position": start_position,
@@ -145,7 +152,12 @@ async def test_f1_frozen_zero_r1_is_healed_and_unblocks_auto_be(monkeypatch, db_
     await db.set_armed_rules("BTC_USDT", "long", {"auto_be": True})
     svc = _install_spy(monkeypatch)
     # A real SL now exists (98) and mark is +1.25R off a healed r1=2.
-    app = _make_app(db, FakeClient([_pos()], mark=102.5, stops=[{"triggerPrice": 98.0}]))
+    app = _make_app(
+        db,
+        FakeClient(
+            [_pos()], mark=102.5, stops=[{"symbol": "BTC", "triggerPrice": 98.0}]
+        ),
+    )
 
     await monitor._run_one_cycle(app, NOW_MS)
 
@@ -229,6 +241,48 @@ async def test_f2_hl_epoch_rolled_out_of_window_does_not_reset(monkeypatch, db_p
 
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 1, "an out-of-window epoch is inconclusive → no reset"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_fill",
+    [
+        None,
+        {
+            "symbol": True,
+            "dir": "Open Long",
+            "start_position": 0.0,
+            "time": 8_000,
+        },
+        {
+            "symbol": "BTC",
+            "dir": "Open Long",
+            "start_position": 0.0,
+            "time": 9_999_999_999_999,
+        },
+    ],
+    ids=["non-object", "invalid-identity", "future-timestamp"],
+)
+async def test_f2_malformed_fill_collection_cannot_reset_trade_epoch(
+    monkeypatch, db_path, invalid_fill
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_f2(db, opened_at=5000)
+    _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=99.0, fills=[_open_fill(5000)])
+    app = _make_app(db, client)
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    # One invalid row makes the adapter response non-authoritative. A plausible
+    # new epoch beside it must not reset the durable management state.
+    client._fills = [invalid_fill, _open_fill(9000)]
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["be_done"] == 1
+    assert row["opened_at"] == 5000
+    assert row["high_water"] == pytest.approx(200.0)
 
 
 @pytest.mark.asyncio

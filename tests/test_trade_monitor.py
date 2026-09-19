@@ -18,19 +18,24 @@ import pytest
 
 from app.db.repo import Database
 from app.orders import monitor
+from app.orders.service import OrderError, OrderOutcomeUnknown
 
 NOW_MS = 1_700_000_000_000
 
 
 class FakeClient:
-    """Minimal exchange client. `is_hl` toggles the place_stop_order attribute
-    that both the monitor and modify_stop_loss use as the HL-only gate."""
+    """Minimal exchange client with an explicit canonical venue identity."""
 
     def __init__(self, positions, mark=102.5, stops=None, is_hl=True):
         self._positions = positions
+        self._is_hl = is_hl
         self._mark = mark
         self._stops = stops if stops is not None else [
-            {"triggerPrice": 98.0, "orderType": "Stop"}
+            {
+                "symbol": "BTC" if is_hl else "BTC_USDT",
+                "triggerPrice": 98.0,
+                "orderType": "Stop",
+            }
         ]
         if is_hl:
             # Presence is all that matters (the real write goes via the spy).
@@ -40,10 +45,24 @@ class FakeClient:
         return {"positions": self._positions}
 
     async def ticker(self, symbol):
-        return SimpleNamespace(last_price=self._mark)
+        observed = "BTC" if self._is_hl else "BTC_USDT"
+        return SimpleNamespace(symbol=observed, last_price=self._mark)
 
     async def open_stop_orders(self, symbol):
         return list(self._stops)
+
+    async def user_fills(self, symbol, *, fresh=False):
+        if not self._is_hl or not self._positions:
+            return []
+        side = str(self._positions[0].get("side") or "long").title()
+        return [
+            {
+                "symbol": symbol.split("_", 1)[0],
+                "dir": f"Open {side}",
+                "start_position": 0.0,
+                "time": NOW_MS,
+            }
+        ]
 
 
 def _pos(symbol="BTC_USDT", side="long", entry=100.0, hold=1.0):
@@ -72,6 +91,20 @@ def _install_spy(monkeypatch, result=None):
     svc = SimpleNamespace(modify_stop_loss=AsyncMock(return_value=result))
     monkeypatch.setattr(monitor, "_make_order_service", lambda app, client, settings: svc)
     return svc
+
+
+@pytest.mark.asyncio
+async def test_monitor_service_rejects_replaced_settings_with_same_client(monkeypatch):
+    client = FakeClient([])
+    app = _make_app(None, client)
+    original = SimpleNamespace(generation=1)
+    active_settings = original
+    monkeypatch.setattr(monitor, "get_settings", lambda: active_settings)
+    service = monitor._make_order_service(app, client, original)
+    active_settings = SimpleNamespace(generation=2)
+
+    with pytest.raises(OrderError, match="Exchange configuration changed"):
+        await service.cancel(order_id="123", symbol="BTC_USDT")
 
 
 @pytest.fixture
@@ -105,7 +138,15 @@ async def test_opened_at_skips_malformed_fill_rows_without_losing_valid_time():
         "BTC_USDT",
         "long",
         NOW_MS,
-        fills=["not-a-fill", {"dir": "Open Long", "time": opened_at}],
+        fills=[
+            "not-a-fill",
+            {
+                "symbol": "BTC",
+                "dir": "Open Long",
+                "start_position": 0,
+                "time": opened_at,
+            },
+        ],
     )
 
     assert result == opened_at
@@ -154,10 +195,52 @@ async def test_opened_at_requires_exact_open_fill_direction():
 
 
 @pytest.mark.asyncio
+async def test_opened_at_ignores_foreign_symbol_fill():
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=[
+            {
+                "symbol": "ETH",
+                "dir": "Open Long",
+                "time": NOW_MS - 5_000,
+            }
+        ],
+    )
+
+    assert result == NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_opened_at_ignores_unlinked_historical_open_fill():
+    result = await monitor._best_effort_opened_at(
+        SimpleNamespace(),
+        None,
+        "BTC_USDT",
+        "long",
+        NOW_MS,
+        fills=[
+            {
+                "symbol": "BTC",
+                "dir": "Open Long",
+                "time": NOW_MS - 86_400_000,
+            }
+        ],
+    )
+
+    assert result == NOW_MS
+
+
+@pytest.mark.asyncio
 async def test_mexc_baseline_does_not_fetch_unlinked_fill_history(db_path):
     db = Database(db_path)
     await db.init()
     client = FakeClient([], is_hl=False)
+    client.exchange_id = "mexc"
+    client.place_stop_order = lambda *args, **kwargs: None
     client.user_fills = AsyncMock(return_value=[])
 
     await monitor.ensure_baseline(
@@ -213,6 +296,42 @@ async def test_current_sl_ignores_explicitly_foreign_mexc_stop():
     assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
         None,
         True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_current_sl_uses_declared_mexc_identity_over_stop_capability():
+    client = FakeClient(
+        [],
+        stops=[
+            {
+                "symbol": "BTC_USDT",
+                "triggerPrice": 98.0,
+                "orderType": "Stop",
+            }
+        ],
+        is_hl=False,
+    )
+    client.exchange_id = "mexc"
+    client.place_stop_order = lambda *args, **kwargs: None
+
+    assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
+        98.0,
+        True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_current_sl_rejects_stop_without_symbol_identity():
+    client = FakeClient(
+        [],
+        stops=[{"triggerPrice": 98.0, "orderType": "Stop"}],
+        is_hl=True,
+    )
+
+    assert await monitor._current_sl(client, "BTC_USDT", "long", 100.0) == (
+        None,
+        False,
     )
 
 
@@ -332,13 +451,35 @@ async def test_hl_epoch_signature_ignores_malformed_fills():
     fills = [
         "not-a-fill",
         {"dir": "Open Long", "start_position": 0, "time": "bad"},
-        {"dir": "Open Long", "start_position": 0, "time": 1_000},
-        {"dir": "Open Long", "start_position": 0, "time": 2_000},
+        {"symbol": "BTC", "dir": "Open Long", "start_position": 0, "time": 1_000},
+        {"symbol": "BTC", "dir": "Open Long", "start_position": 0, "time": 2_000},
     ]
 
     assert (
         await monitor._hl_epoch_signature(
             SimpleNamespace(), "BTC_USDT", "long", fills=fills
+        )
+        == 2_000
+    )
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_requests_fresh_fills():
+    class CacheAwareClient:
+        async def user_fills(self, _symbol, *, fresh=False):
+            epoch = 2_000 if fresh else 1_000
+            return [
+                {
+                    "symbol": "BTC",
+                    "dir": "Open Long",
+                    "start_position": 0,
+                    "time": epoch,
+                }
+            ]
+
+    assert (
+        await monitor._hl_epoch_signature(
+            CacheAwareClient(), "BTC_USDT", "long"
         )
         == 2_000
     )
@@ -390,6 +531,26 @@ async def test_hl_epoch_signature_requires_exact_open_fill_direction():
             fills=[
                 {
                     "dir": "Not Open Long",
+                    "start_position": 0,
+                    "time": 2_000,
+                }
+            ],
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_hl_epoch_signature_ignores_foreign_symbol_fill():
+    assert (
+        await monitor._hl_epoch_signature(
+            SimpleNamespace(),
+            "BTC_USDT",
+            "long",
+            fills=[
+                {
+                    "symbol": "ETH",
+                    "dir": "Open Long",
                     "start_position": 0,
                     "time": 2_000,
                 }
@@ -464,6 +625,7 @@ async def test_armed_hl_at_1r_moves_sl_to_be(monkeypatch, db_path):
     kwargs = svc.modify_stop_loss.await_args.kwargs
     assert kwargs["symbol"] == "BTC_USDT"
     assert kwargs["side"] == "long"
+    assert kwargs["expected_position_signature"] == NOW_MS
     # BE = entry * (1 + fee_rt=0.0006) = 100.06.
     assert kwargs["new_sl"] == pytest.approx(100.06)
 
@@ -505,6 +667,72 @@ async def test_invalid_persisted_be_done_blocks_auto_stop_move(monkeypatch, db_p
             ("BTC_USDT", "long"),
         )
         await conn.commit()
+    service = _install_spy(monkeypatch)
+
+    await monitor._run_one_cycle(
+        _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True)), NOW_MS
+    )
+
+    service.modify_stop_loss.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_r1", ["2.0", True, None, -1.0, float("nan"), float("inf")]
+)
+async def test_invalid_persisted_r1_blocks_auto_stop_move(
+    monkeypatch, db_path, bad_r1
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    read_row = db.get_open_position_mgmt
+
+    async def corrupted_row(symbol, side):
+        row = await read_row(symbol, side)
+        return {**row, "r1": bad_r1}
+
+    db.get_open_position_mgmt = AsyncMock(side_effect=corrupted_row)
+    service = _install_spy(monkeypatch)
+
+    await monitor._run_one_cycle(
+        _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True)), NOW_MS
+    )
+
+    service.modify_stop_loss.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("entry_snap", "100.0"),
+        ("entry_snap", True),
+        ("entry_snap", 0.0),
+        ("initial_sl_snap", "98.0"),
+        ("initial_sl_snap", None),
+        ("opened_at", "1700000000000"),
+        ("opened_at", True),
+        ("invalidation_price", "99.0"),
+        ("high_water", "102.5"),
+        ("high_water", True),
+        ("user_override_hw", "102.5"),
+        ("armed_rules", ["auto_be"]),
+    ],
+)
+async def test_invalid_persisted_management_snapshot_blocks_auto_stop_move(
+    monkeypatch, db_path, field, bad_value
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    read_row = db.get_open_position_mgmt
+
+    async def corrupted_row(symbol, side):
+        row = await read_row(symbol, side)
+        return {**row, field: bad_value}
+
+    db.get_open_position_mgmt = AsyncMock(side_effect=corrupted_row)
     service = _install_spy(monkeypatch)
 
     await monitor._run_one_cycle(
@@ -564,14 +792,25 @@ async def test_disarmed_position_no_auto_action(monkeypatch, db_path):
 
 
 @pytest.mark.asyncio
-async def test_unidentified_position_row_blocks_all_auto_actions(monkeypatch, db_path):
+@pytest.mark.parametrize(
+    "bad_position",
+    [
+        "not-a-dict",
+        _pos(symbol="BTC_USDT#SYNTHETIC_PRIVATE_POSITION"),
+        _pos(hold="1.0"),
+        _pos(entry="100.0"),
+    ],
+)
+async def test_invalid_position_row_blocks_all_auto_actions(
+    monkeypatch, db_path, bad_position
+):
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True)
     svc = _install_spy(monkeypatch)
     # An unidentified row could be a malformed duplicate of the valid position.
     # The whole snapshot is therefore unreliable for automatic money actions.
-    app = _make_app(db, FakeClient(["not-a-dict", _pos()], mark=102.5, is_hl=True))
+    app = _make_app(db, FakeClient([bad_position, _pos()], mark=102.5, is_hl=True))
 
     await monitor._run_one_cycle(app, NOW_MS)
 
@@ -606,7 +845,11 @@ async def test_boolean_entry_is_rejected_before_position_reads(monkeypatch, db_p
     db = Database(db_path)
     await db.init()
     svc = _install_spy(monkeypatch)
-    client = FakeClient([_pos(entry=True)], mark=2.0, stops=[{"triggerPrice": 0.5}])
+    client = FakeClient(
+        [_pos(entry=True)],
+        mark=2.0,
+        stops=[{"symbol": "BTC", "triggerPrice": 0.5}],
+    )
     client.open_stop_orders = AsyncMock(wraps=client.open_stop_orders)
     client.ticker = AsyncMock(wraps=client.ticker)
 
@@ -619,8 +862,10 @@ async def test_boolean_entry_is_rejected_before_position_reads(monkeypatch, db_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_mark", [float("nan"), float("inf"), float("-inf")])
-async def test_nonfinite_mark_is_rejected_without_state_or_order_change(
+@pytest.mark.parametrize(
+    "bad_mark", [float("nan"), float("inf"), float("-inf"), "102.5"]
+)
+async def test_invalid_mark_is_rejected_without_state_or_order_change(
     monkeypatch, db_path, bad_mark
 ):
     db = Database(db_path)
@@ -633,6 +878,27 @@ async def test_nonfinite_mark_is_rejected_without_state_or_order_change(
 
     svc.modify_stop_loss.assert_not_awaited()
     assert await db.list_open_position_mgmt() == []
+
+
+@pytest.mark.asyncio
+async def test_foreign_ticker_symbol_cannot_move_stop_or_poison_high_water(
+    monkeypatch, db_path
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True, rules={"auto_trail": True})
+    svc = _install_spy(monkeypatch)
+    client = FakeClient([_pos()], mark=110.0, is_hl=True)
+    client.ticker = AsyncMock(
+        return_value=SimpleNamespace(symbol="ETH", last_price=110.0)
+    )
+    client.klines = AsyncMock(return_value=_flat_candles(tr=1.0))
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    svc.modify_stop_loss.assert_not_awaited()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["high_water"] == pytest.approx(100.0)
 
 
 @pytest.mark.asyncio
@@ -653,7 +919,7 @@ async def test_boolean_mark_is_rejected_before_auto_stop_move(monkeypatch, db_pa
     client = FakeClient(
         [_pos(side="short")],
         mark=True,
-        stops=[{"triggerPrice": 102.0, "orderType": "Stop"}],
+        stops=[{"symbol": "BTC", "triggerPrice": 102.0, "orderType": "Stop"}],
         is_hl=True,
     )
 
@@ -668,8 +934,11 @@ async def test_non_hl_position_never_auto_bes(monkeypatch, db_path):
     await db.init()
     await _seed_open(db, armed=True)
     svc = _install_spy(monkeypatch)
-    # No place_stop_order attribute -> the HL-only gate blocks the write.
-    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=False))
+    client = FakeClient([_pos()], mark=102.5, is_hl=False)
+    # A stop-capable foreign adapter still must not gain HL-only automation.
+    client.exchange_id = "mexc"
+    client.place_stop_order = lambda *args, **kwargs: None
+    app = _make_app(db, client)
 
     await monitor._run_one_cycle(app, NOW_MS)
 
@@ -680,13 +949,16 @@ async def test_non_hl_position_never_auto_bes(monkeypatch, db_path):
 
 
 @pytest.mark.asyncio
-async def test_persistent_modify_failure_is_bounded(monkeypatch, db_path):
+async def test_persistent_modify_failure_is_bounded(monkeypatch, db_path, caplog):
     """I-1: a persistently failing auto-BE must stop hammering after
     _BE_MAX_ATTEMPTS and go into a sticky halted state, not retry forever."""
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True)
-    svc = SimpleNamespace(modify_stop_loss=AsyncMock(side_effect=RuntimeError("boom")))
+    marker = "SYNTHETIC_PRIVATE_AUTO_MGMT_ERROR"
+    svc = SimpleNamespace(
+        modify_stop_loss=AsyncMock(side_effect=RuntimeError(marker))
+    )
     monkeypatch.setattr(monitor, "_make_order_service", lambda app, client, settings: svc)
     app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
 
@@ -699,6 +971,33 @@ async def test_persistent_modify_failure_is_bounded(monkeypatch, db_path):
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["be_done"] == 0  # never succeeded → stays un-done
     assert row["last_alert_state"]["auto_be_error"]["halted"] is True
+    assert marker not in str(row["last_alert_state"])
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unknown_stop_outcome_halts_automation_without_retry(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    svc = SimpleNamespace(
+        modify_stop_loss=AsyncMock(
+            side_effect=OrderOutcomeUnknown("synthetic private upstream detail")
+        )
+    )
+    monkeypatch.setattr(monitor, "_make_order_service", lambda app, client, settings: svc)
+    app = _make_app(db, FakeClient([_pos()], mark=102.5, is_hl=True))
+
+    await monitor._run_one_cycle(app, NOW_MS)
+    await monitor._run_one_cycle(app, NOW_MS)
+
+    svc.modify_stop_loss.assert_awaited_once()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    alert = row["last_alert_state"]["auto_be_error"]
+    assert alert["halted"] is True
+    assert "outcome is unknown" in alert["message"]
+    assert "private upstream" not in alert["message"]
 
 
 @pytest.mark.asyncio
@@ -1104,13 +1403,14 @@ async def test_verified_modify_latches_be(monkeypatch, db_path):
 
 @pytest.mark.asyncio
 async def test_verified_be_with_latch_failure_does_not_repeat_mutation(
-    monkeypatch, db_path
+    monkeypatch, db_path, caplog
 ):
     """A verified stop plus failed DB latch must halt, not send it every cycle."""
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True)
-    db.mark_be_done = AsyncMock(side_effect=RuntimeError("sqlite unavailable"))
+    marker = "SYNTHETIC_PRIVATE_BE_LATCH_ERROR"
+    db.mark_be_done = AsyncMock(side_effect=RuntimeError(marker))
     svc = _install_spy(
         monkeypatch, result={"verified": True, "status": "modify_sl_ok"}
     )
@@ -1124,6 +1424,9 @@ async def test_verified_be_with_latch_failure_does_not_repeat_mutation(
     assert app.state.tm_be_attempts[("BTC_USDT", "long")] == monitor._BE_MAX_ATTEMPTS
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["last_alert_state"]["auto_be_error"]["halted"] is True
+    assert marker not in str(row["last_alert_state"])
+    assert marker not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio

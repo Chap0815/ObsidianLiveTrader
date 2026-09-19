@@ -158,9 +158,18 @@ def test_visible_ai_status_and_chart_copy_is_english():
     ):
         assert english_rail_label in app_src
     assert 'llmLabel: "AI"' in store_src
+    assert "app.css?v={{ asset_version|default('r29-en') }}" in base_src
     assert "store.js?v={{ asset_version|default('r29') }}" in base_src
-    assert "trade-math.js?v={{ asset_version|default('r36') }}" in base_src
-    assert "app.js?v={{ asset_version|default('r44') }}" in base_src
+    assert "utils.js?v={{ asset_version|default('r30-en') }}" in base_src
+    assert "trade-math.js?v={{ asset_version|default('r38') }}" in base_src
+    assert "app.js?v={{ asset_version|default('r51') }}" in base_src
+
+
+def test_ai_key_modal_uses_server_default_models():
+    src = (_STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "p.default_model" in src
+    assert 'claude: "claude-opus-4-8"' not in src
 
 
 def test_calibration_table_headers_are_english():

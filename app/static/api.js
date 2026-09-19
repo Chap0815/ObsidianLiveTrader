@@ -116,13 +116,14 @@ function apiFetchAbortable(resource, url, opts) {
  * call site. Kept here, not in app.js, for the same STATE-FREE reason as the
  * rest of this file (see header). */
 
-/** Arm/disarm one autonomous rule for ONE open position. `rules` MUST carry
- * REAL booleans (e.g. {auto_be: true}) — the server 400s on any non-bool
- * rule value (a truthy string like "false" must never arm a money path). */
-function armPosition(symbol, side, rules) {
+/** Atomically patch one or more autonomous rules for ONE open position.
+ * `rulePatch` MUST carry REAL booleans (e.g. {auto_be: true}); omitted rules
+ * retain their current server value, preventing stale clients from clobbering
+ * another rule. */
+function armPosition(symbol, side, rulePatch) {
   return apiFetch("/api/positions/arm", {
     method: "POST",
-    body: JSON.stringify({ symbol: symbol, side: side, rules: rules || {} }),
+    body: JSON.stringify({ symbol: symbol, side: side, rules: rulePatch || {} }),
   });
 }
 

@@ -106,17 +106,28 @@ def _origin_matches_request(value: str, request) -> bool:
         return False
     return origin_scheme == request_scheme and o_host == req_host and o_port == req_port
 
-# MEXC: BTC_USDT | Hyperliquid: BTC or BTC_USDT (coin part used on HL)
+# MEXC: BTC_USDT | Hyperliquid: BTC, BTC_USDT or BTC_USDC (coin used on HL)
 SYMBOL_RE_MEXC = re.compile(r"^[A-Z0-9]{2,32}_[A-Z0-9]{2,16}$")
-SYMBOL_RE_HL = re.compile(r"^[A-Z0-9]{2,20}(_[A-Z0-9]{2,16})?$")
+SYMBOL_RE_HL = re.compile(r"^[A-Z0-9]{2,20}(?:_(?:USDT|USDC))?$")
 
 
-def normalize_symbol(symbol: str) -> str:
+def valid_normalized_position_symbol(value: object, *, exchange: str) -> bool:
+    """Whether an adapter position symbol is already in its canonical API form."""
+    if not isinstance(value, str):
+        return False
+    if exchange == "hyperliquid":
+        return "_" not in value and SYMBOL_RE_HL.fullmatch(value) is not None
+    return SYMBOL_RE_MEXC.fullmatch(value) is not None
+
+
+def normalize_symbol(symbol: str, *, exchange: str | None = None) -> str:
     s = (symbol or "").strip().upper().replace("-", "_")
-    try:
-        ex = get_settings().exchange
-    except Exception:
-        ex = "mexc"
+    ex = exchange
+    if ex is None:
+        try:
+            ex = get_settings().exchange
+        except Exception:
+            ex = "mexc"
     if ex == "hyperliquid":
         if not SYMBOL_RE_HL.match(s):
             raise HTTPException(

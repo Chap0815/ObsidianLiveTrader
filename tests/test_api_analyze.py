@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.config import get_settings
 from app.models import TradeProposal
 
@@ -53,6 +55,51 @@ def _patched(analyze_mock, symbol="BTC_USDT"):
     )
 
 
+def test_journal_helpers_accept_valid_directional_geometry():
+    from app.main import _journal_order_type, _journal_status_for
+
+    assert _journal_status_for("BUY", 100.0, 98.0, 104.0) == "PENDING"
+    assert _journal_status_for("SELL", 100.0, 102.0, 96.0) == "PENDING"
+    assert _journal_order_type("BUY", 100.0, 101.0) == "limit"
+    assert _journal_order_type("SELL", 100.0, 99.0) == "limit"
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "last_price"),
+    [
+        ("BUY", True, 100.0),
+        ("BUY", "100.0", 100.0),
+        ("BUY", float("nan"), 100.0),
+        ("BUY", 100.0, float("inf")),
+        ("BUY", 0.0, 100.0),
+        ("SELL", 100.0, False),
+    ],
+)
+def test_journal_order_type_rejects_invalid_prices(action, entry, last_price):
+    from app.main import _journal_order_type
+
+    assert _journal_order_type(action, entry, last_price) is None
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "stop_loss", "tp1"),
+    [
+        ("BUY", True, 98.0, 104.0),
+        ("BUY", "100.0", 98.0, 104.0),
+        ("BUY", float("nan"), 98.0, 104.0),
+        ("BUY", 100.0, 102.0, 104.0),
+        ("SELL", 100.0, 98.0, 96.0),
+        ("STAY_OUT", 100.0, 98.0, 104.0),
+    ],
+)
+def test_journal_status_skips_invalid_or_inverted_geometry(
+    action, entry, stop_loss, tp1
+):
+    from app.main import _journal_status_for
+
+    assert _journal_status_for(action, entry, stop_loss, tp1) == "SKIPPED"
+
+
 def test_analyze_rejects_invalid_interval_before_external_calls(monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -86,6 +133,41 @@ def test_analyze_rejects_invalid_interval_before_external_calls(monkeypatch):
     assert response.status_code == 422
     snapshot.assert_not_awaited()
     llm.assert_not_awaited()
+
+
+def test_analyze_market_error_does_not_reflect_diagnostics(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.hyperliquid.errors import HyperliquidError
+    from app.main import app
+
+    marker = "SYNTHETIC_PRIVATE_ANALYZE_MARKET_ERROR"
+    monkeypatch.setattr(
+        "app.main.get_settings",
+        lambda: Settings(
+            exchange="mexc",
+            mexc_api_key="k",
+            mexc_api_secret="s",
+            anthropic_api_key="test-claude",
+        ),
+    )
+    with TestClient(app) as client:
+        client.app.state.mexc = MagicMock()
+        client.app.state.exchange = client.app.state.mexc
+        client.app.state.analyze_cache = {}
+        with patch(
+            "app.main.build_market_snapshot",
+            new=AsyncMock(side_effect=HyperliquidError(marker)),
+        ):
+            response = client.post(
+                "/api/analyze",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exchange market data unavailable"
+    assert marker not in response.text
 
 
 def test_analyze_nonfinite_derived_annotations_are_omitted(monkeypatch):

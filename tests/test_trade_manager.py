@@ -278,6 +278,57 @@ def test_r1_non_finite_no_crash():
         assert not [a for a in actions if isinstance(a, MoveSlToBe)]
 
 
+def test_boolean_r1_never_emits_money_action():
+    actions = evaluate_rules(
+        side="long",
+        entry=100.0,
+        current_sl=90.0,
+        mark=110.0,
+        mgmt=_mgmt(r1=True, armed_rules={"auto_be": True}),
+        now_ms=0,
+        settings=_settings(),
+    )
+
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("entry", True), ("mark", True), ("current_sl", True)],
+)
+def test_boolean_live_geometry_never_emits_money_action(field, value):
+    inputs = {"entry": 100.0, "current_sl": 90.0, "mark": 110.0}
+    inputs[field] = value
+
+    actions = evaluate_rules(
+        side="long",
+        **inputs,
+        mgmt=_mgmt(armed_rules={"auto_be": True}),
+        now_ms=0,
+        settings=_settings(),
+    )
+
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
+def test_boolean_atr_never_emits_trailing_money_action():
+    actions = evaluate_rules(
+        side="long",
+        entry=100.0,
+        current_sl=90.0,
+        mark=120.0,
+        mgmt=_mgmt(
+            armed_rules={"auto_trail": True},
+            high_water=121.0,
+        ),
+        now_ms=0,
+        settings=_settings(),
+        atr=True,
+    )
+
+    assert not [a for a in actions if isinstance(a, MoveSlToBe)]
+
+
 # ── Purity: input not mutated ───────────────────────────────────────────────
 
 def test_input_mgmt_not_mutated():

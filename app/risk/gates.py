@@ -53,6 +53,17 @@ class GateResult:
         }
 
 
+def _typed_finite_float(value: Any) -> float | None:
+    """Accept only a finite number from an already-normalized gate boundary."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except OverflowError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def validate_order(
     ticket: OrderTicket,
     contract: ContractMeta,
@@ -76,15 +87,11 @@ def validate_order(
     warnings: list[str] = []
 
     existing_risk_f = 0.0
-    try:
-        if isinstance(existing_same_side_risk_usdt, bool):
-            raise ValueError
-        candidate_existing_risk = float(existing_same_side_risk_usdt)
-        if not math.isfinite(candidate_existing_risk) or candidate_existing_risk < 0:
-            raise ValueError
-        existing_risk_f = candidate_existing_risk
-    except (TypeError, ValueError, OverflowError):
+    candidate_existing_risk = _typed_finite_float(existing_same_side_risk_usdt)
+    if candidate_existing_risk is None or candidate_existing_risk < 0:
         errors.append("existing same-side risk is invalid (must be finite and non-negative)")
+    else:
+        existing_risk_f = candidate_existing_risk
 
     # ── Arming switch (preview + confirm) ──────────────────────────────
     if not settings.trading_enabled:
@@ -95,6 +102,14 @@ def validate_order(
         errors.append(msg)
 
     # ── Contract / apiAllowed ──────────────────────────────────────────
+    contract_symbol = (
+        contract.symbol.strip().upper() if type(contract.symbol) is str else ""
+    )
+    ticket_symbol = (
+        ticket.symbol.strip().upper() if type(ticket.symbol) is str else ""
+    )
+    if not contract_symbol or not ticket_symbol or contract_symbol != ticket_symbol:
+        errors.append("Contract metadata symbol does not match order symbol")
     if contract.api_allowed is not True:
         errors.append(
             f"Symbol {contract.symbol or ticket.symbol} does not have literal "
@@ -110,12 +125,12 @@ def validate_order(
 
     def contract_float(field_name: str) -> float:
         raw_value = getattr(contract, field_name)
-        if isinstance(raw_value, bool):
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
             errors.append(f"Invalid {field_name} from exchange meta")
             return float("nan")
         try:
             value = float(raw_value)
-        except (TypeError, ValueError, OverflowError):
+        except OverflowError:
             errors.append(f"Invalid {field_name} from exchange meta")
             return float("nan")
         if not math.isfinite(value):
@@ -235,17 +250,13 @@ def validate_order(
         )
 
     # ── G6 precision: vol / price ──────────────────────────────────────
-    volume_valid = True
-    try:
-        if isinstance(ticket.vol, bool):
-            raise ValueError
-        raw_vol = float(ticket.vol)
-        if not math.isfinite(raw_vol):
-            raise ValueError
-    except (TypeError, ValueError, OverflowError):
-        volume_valid = False
+    raw_vol_value = _typed_finite_float(ticket.vol)
+    volume_valid = raw_vol_value is not None
+    if raw_vol_value is None:
         raw_vol = 0.0
         errors.append("vol must be a finite number")
+    else:
+        raw_vol = raw_vol_value
     if volume_valid and raw_vol <= 0:
         errors.append("vol must be > 0")
 
@@ -266,14 +277,9 @@ def validate_order(
     rounded_price: float | None = None
     limit_price_f: float | None = None
     if order_type == "limit":
-        if ticket.price is not None and not isinstance(ticket.price, bool):
-            try:
-                candidate_limit_price = float(ticket.price)
-            except (TypeError, ValueError, OverflowError):
-                pass
-            else:
-                if math.isfinite(candidate_limit_price) and candidate_limit_price > 0:
-                    limit_price_f = candidate_limit_price
+        candidate_limit_price = _typed_finite_float(ticket.price)
+        if candidate_limit_price is not None and candidate_limit_price > 0:
+            limit_price_f = candidate_limit_price
         if limit_price_f is None:
             errors.append("limit order requires price > 0")
         else:
@@ -287,25 +293,14 @@ def validate_order(
 
     # ── Entry reference for risk ───────────────────────────────────────
     last_price_f: float | None = None
-    if last_price is not None and not isinstance(last_price, bool):
-        try:
-            candidate_last_price = float(last_price)
-        except (TypeError, ValueError, OverflowError):
-            pass
-        else:
-            if math.isfinite(candidate_last_price) and candidate_last_price > 0:
-                last_price_f = candidate_last_price
+    candidate_last_price = _typed_finite_float(last_price)
+    if candidate_last_price is not None and candidate_last_price > 0:
+        last_price_f = candidate_last_price
 
     ticket_entry_f: float | None = None
     if ticket.entry is not None:
-        try:
-            if isinstance(ticket.entry, bool):
-                raise ValueError
-            ticket_entry_f = float(ticket.entry)
-            if not math.isfinite(ticket_entry_f):
-                raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            ticket_entry_f = None
+        ticket_entry_f = _typed_finite_float(ticket.entry)
+        if ticket_entry_f is None:
             errors.append("ticket.entry must be a finite number")
 
     entry_for_risk: float | None = None
@@ -351,18 +346,10 @@ def validate_order(
 
     # ── Price drift (confirm vs preview) ───────────────────────────────
     preview_price_f: float | None = None
-    if (
-        for_confirm
-        and preview_last_price is not None
-        and not isinstance(preview_last_price, bool)
-    ):
-        try:
-            candidate_preview_price = float(preview_last_price)
-        except (TypeError, ValueError, OverflowError):
-            pass
-        else:
-            if math.isfinite(candidate_preview_price) and candidate_preview_price > 0:
-                preview_price_f = candidate_preview_price
+    if for_confirm:
+        candidate_preview_price = _typed_finite_float(preview_last_price)
+        if candidate_preview_price is not None and candidate_preview_price > 0:
+            preview_price_f = candidate_preview_price
 
     if (
         for_confirm
@@ -391,11 +378,9 @@ def validate_order(
                     f"{max_drift} (preview {prev} → now {now}) — re-preview"
                 )
     elif for_confirm and preview_price_f is None:
-        # The preview captured no usable baseline price (its ticker returned no
-        # price), so the confirm-vs-preview drift check can't run. Surface it as a
-        # warning instead of silently skipping — the one-time token's TTL bounds
-        # the exposure window, but the human should re-preview on a large move.
-        warnings.append(
+        # Without a usable preview baseline, Confirm cannot prove that the
+        # reviewed price is still current. Unknown financial state blocks.
+        errors.append(
             "Price drift cannot be checked: preview was created without a market "
             "price — create a new preview after a significant price move"
         )
@@ -406,14 +391,8 @@ def validate_order(
     sl_f: float | None = None
     invalid_sl = False
     if sl is not None:
-        try:
-            if isinstance(sl, bool):
-                raise ValueError
-            sl_f = float(sl)
-            if not math.isfinite(sl_f):
-                raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            sl_f = None
+        sl_f = _typed_finite_float(sl)
+        if sl_f is None:
             invalid_sl = True
 
     if invalid_sl:
@@ -460,34 +439,40 @@ def validate_order(
     tp = ticket.take_profit
     tp_f: float | None = None
     invalid_tp = False
+    tp_geometry_ok = True
     if tp is not None:
-        try:
-            if isinstance(tp, bool):
-                raise ValueError
-            tp_f = float(tp)
-            if not math.isfinite(tp_f):
-                raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            tp_f = None
+        tp_f = _typed_finite_float(tp)
+        if tp_f is None:
             invalid_tp = True
     if invalid_tp:
+        tp_geometry_ok = False
         errors.append("take_profit must be a finite number")
-    elif tp_f is not None and tp_f > 0:
+    elif tp_f is not None and tp_f <= 0:
+        tp_geometry_ok = False
+        errors.append("take_profit must be > 0 when provided")
+    elif tp_f is not None:
         rounded_tp = tp_f
         if price_unit > 0:
             # R-02: same conservative side-aware rounding for TP (long floors
             # toward entry, short ceils toward entry) so RRR is never
             # overstated by a nearest-rounding drift away from entry.
             rounded_tp = round_trigger_to_unit(rounded_tp, price_unit, side=side, kind="tp")
+        if not math.isfinite(rounded_tp) or rounded_tp <= 0:
+            tp_geometry_ok = False
+            rounded_tp = None
+            errors.append("rounded take_profit is invalid")
+        elif entry_for_risk is not None and side in ("long", "short"):
+            if side == "long" and rounded_tp <= entry_for_risk:
+                tp_geometry_ok = False
+                errors.append("long take_profit must be above entry")
+            if side == "short" and rounded_tp >= entry_for_risk:
+                tp_geometry_ok = False
+                errors.append("short take_profit must be below entry")
 
     # ── Equity fail-closed (G3 requires known equity) ──────────────────
-    try:
-        if equity is None or isinstance(equity, bool):
-            raise ValueError
-        equity_f = float(equity)
-    except (TypeError, ValueError, OverflowError):
-        equity_f = 0.0
-    if not math.isfinite(equity_f) or equity_f <= 0:
+    equity_value = _typed_finite_float(equity)
+    equity_f = equity_value if equity_value is not None else 0.0
+    if equity_value is None or equity_f <= 0:
         errors.append(
             "equity unknown/zero — fail-closed (MAX_RISK_PCT cannot be enforced)"
         )
@@ -569,6 +554,7 @@ def validate_order(
         sl_f is not None
         and math.isfinite(sl_f)
         and rounded_tp is not None
+        and tp_geometry_ok
         and entry_for_risk is not None
         and math.isfinite(entry_for_risk)
         and side in ("long", "short")
@@ -652,12 +638,8 @@ def validate_order(
     if available_usdt is None:
         available_f = None
     else:
-        try:
-            if isinstance(available_usdt, bool):
-                raise ValueError
-            available_f = float(available_usdt)
-        except (TypeError, ValueError, OverflowError):
-            available_f = float("nan")
+        available_value = _typed_finite_float(available_usdt)
+        available_f = available_value if available_value is not None else float("nan")
     if available_f is not None and not math.isfinite(available_f):
         errors.append("available USDT is not finite — fail-closed")
     elif available_f is not None and available_f <= 0 and equity_f > 0:

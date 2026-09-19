@@ -9,6 +9,17 @@ from __future__ import annotations
 import math
 
 
+def _typed_finite_float(value: object) -> float | None:
+    """Return a finite float only for an already-typed numeric value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except OverflowError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def adverse_market_entry(last_price: float, side: str, slippage_pct: float) -> float:
     """Return the worst fill allowed by the configured market slippage cap."""
     last = float(last_price)
@@ -90,6 +101,7 @@ def suggest_vol(
     available_usdt: float | None = None,
     leverage: float = 1.0,
     max_notional_pct_of_equity: float = 0.0,
+    max_vol: float | None = None,
 ) -> float:
     """Largest vol (floored to vol_unit) that risks ≈ risk_pct of equity at SL.
 
@@ -107,6 +119,7 @@ def suggest_vol(
       - ``max_notional_pct_of_equity`` / ``available_usdt`` + ``leverage``:
         the equity-relative notional cap and the available-margin cap both
         clamp vol further, same as the notional/margin checks in gates.py.
+      - ``max_vol``: the exchange's absolute contract-volume ceiling.
 
     All new parameters are keyword-only and default to a no-op, so existing
     callers that only pass the base positional args keep their exact legacy
@@ -126,56 +139,90 @@ def suggest_vol(
         existing_risk_usdt,
         leverage,
         max_notional_pct_of_equity,
+        slippage_pct,
     )
-    if any(not math.isfinite(float(value or 0.0)) for value in numeric_inputs):
+    parsed_inputs = tuple(_typed_finite_float(value) for value in numeric_inputs)
+    if any(value is None for value in parsed_inputs):
         return 0.0
-    if available_usdt is not None and not math.isfinite(float(available_usdt)):
+    (
+        equity_f,
+        risk_pct_f,
+        contract_size_f,
+        entry_f,
+        stop_f,
+        vol_unit_f,
+        min_vol_f,
+        existing_risk_f,
+        leverage_f,
+        max_notional_pct_f,
+        slippage_pct_f,
+    ) = parsed_inputs
+    available_f = (
+        None if available_usdt is None else _typed_finite_float(available_usdt)
+    )
+    if available_usdt is not None and available_f is None:
         return 0.0
-    if float(existing_risk_usdt) < 0:
+    max_vol_f = None if max_vol is None else _typed_finite_float(max_vol)
+    if max_vol is not None and max_vol_f is None:
         return 0.0
-    if equity <= 0 or risk_pct <= 0 or contract_size <= 0:
+    if (
+        equity_f <= 0
+        or risk_pct_f <= 0
+        or contract_size_f <= 0
+        or entry_f <= 0
+        or stop_f <= 0
+        or vol_unit_f < 0
+        or min_vol_f < 0
+        or existing_risk_f < 0
+        or leverage_f <= 0
+        or max_notional_pct_f < 0
+        or slippage_pct_f < 0
+        or (max_vol_f is not None and max_vol_f <= 0)
+    ):
         return 0.0
-    distance = abs(float(entry) - float(stop))
+    distance = abs(entry_f - stop_f)
     if distance <= 0:
         return 0.0
 
     side_l = (side or "").strip().lower()
-    if side_l == "long" and float(stop) >= float(entry):
+    if side_l == "long" and stop_f >= entry_f:
         return 0.0
-    if side_l == "short" and float(stop) <= float(entry):
+    if side_l == "short" and stop_f <= entry_f:
         return 0.0
 
-    if slippage_pct and slippage_pct > 0:
-        distance = distance * (1.0 + float(slippage_pct) / 100.0)
+    if slippage_pct_f > 0:
+        distance = distance * (1.0 + slippage_pct_f / 100.0)
 
-    budget = float(equity) * float(risk_pct) / 100.0 - float(existing_risk_usdt)
+    budget = equity_f * risk_pct_f / 100.0 - existing_risk_f
     if not math.isfinite(budget) or budget <= 0:
         return 0.0
 
-    risk_per_vol = float(contract_size) * distance
+    risk_per_vol = contract_size_f * distance
     if not math.isfinite(risk_per_vol) or risk_per_vol <= 0:
         return 0.0
     raw = budget / risk_per_vol
     if not math.isfinite(raw) or raw <= 0:
         return 0.0
 
-    notional_per_vol = float(contract_size) * float(entry)
-    if max_notional_pct_of_equity and max_notional_pct_of_equity > 0 and notional_per_vol > 0:
-        cap_notional = float(equity) * float(max_notional_pct_of_equity) / 100.0
+    notional_per_vol = contract_size_f * entry_f
+    if max_notional_pct_f > 0 and notional_per_vol > 0:
+        cap_notional = equity_f * max_notional_pct_f / 100.0
         raw = min(raw, cap_notional / notional_per_vol)
 
-    if available_usdt is not None:
-        if float(available_usdt) <= 0:
+    if available_f is not None:
+        if available_f <= 0:
             return 0.0
-        if leverage and float(leverage) > 0 and notional_per_vol > 0:
-            raw = min(raw, (float(available_usdt) * float(leverage)) / notional_per_vol)
+        if notional_per_vol > 0:
+            raw = min(raw, (available_f * leverage_f) / notional_per_vol)
 
-    if float(vol_unit) > 0 and not math.isfinite(raw / float(vol_unit)):
+    if max_vol_f is not None:
+        raw = min(raw, max_vol_f)
+    if vol_unit_f > 0 and not math.isfinite(raw / vol_unit_f):
         return 0.0
-    rounded = round_down_to_unit(raw, vol_unit)
+    rounded = round_down_to_unit(raw, vol_unit_f)
     if rounded <= 0:
         return 0.0
-    if min_vol and rounded < float(min_vol):
+    if min_vol_f > 0 and rounded < min_vol_f:
         return 0.0
     return rounded
 
@@ -193,7 +240,7 @@ def round_down_to_unit(value: float, unit: float) -> float:
     steps = math.floor(step_count + 1e-12)
     if steps < 0:
         steps = 0
-    return _clean_float(steps * u)
+    return _directed_unit_product(v, u, steps, direction="down")
 
 
 def round_to_unit(value: float, unit: float, direction: str = "nearest") -> float:
@@ -221,8 +268,10 @@ def round_to_unit(value: float, unit: float, direction: str = "nearest") -> floa
     d = (direction or "nearest").strip().lower()
     if d in ("down", "floor"):
         steps = math.floor(step_count + 1e-12)
+        return _directed_unit_product(v, u, steps, direction="down")
     elif d in ("up", "ceil"):
         steps = math.ceil(step_count - 1e-12)
+        return _directed_unit_product(v, u, steps, direction="up")
     else:
         steps = round(step_count)
     return _clean_float(steps * u)
@@ -263,3 +312,33 @@ def _clean_float(x: float) -> float:
     if not math.isfinite(x):
         return 0.0
     return float(f"{x:.12g}")
+
+
+def _directed_unit_product(
+    value: float, unit: float, steps: int, *, direction: str
+) -> float:
+    """Clean a unit product without reversing floor/ceil direction.
+
+    Twelve-significant-digit cleanup is useful for ordinary exchange values,
+    but at large step counts it can cross the original value. The small epsilon
+    used before floor/ceil can do the same around an exact boundary. Recheck the
+    direction after cleanup and move one whole step when necessary.
+    """
+    delta = -1 if direction == "down" else 1
+    for _ in range(2):
+        product = steps * unit
+        if not math.isfinite(product):
+            return 0.0
+        cleaned = _clean_float(product)
+        if direction == "down":
+            if cleaned <= value:
+                return cleaned
+            if product <= value:
+                return product
+        else:
+            if cleaned >= value:
+                return cleaned
+            if product >= value:
+                return product
+        steps += delta
+    return 0.0

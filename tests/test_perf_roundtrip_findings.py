@@ -212,7 +212,7 @@ async def test_mexc_pre_hold_reuses_injected_positions_no_fetch():
             "symbol": "BTC_USDT",
             "side": "long",
             "hold_vol": 3.0,
-            "open_type": 1,
+            "open_type": "isolated",
             "position_id": 42,
         }
     ]
@@ -256,15 +256,23 @@ class CountingMonitorClient:
         }
 
     async def ticker(self, symbol):
-        return SimpleNamespace(last_price=102.0)
+        return SimpleNamespace(symbol="BTC", last_price=102.0)
 
     async def open_stop_orders(self, symbol):
         self.open_stop_orders_calls += 1
-        return [{"triggerPrice": 98.0, "orderType": "Stop"}]
+        return [{"symbol": "BTC", "triggerPrice": 98.0, "orderType": "Stop"}]
 
-    async def user_fills(self, symbol=None, limit=100):
+    async def user_fills(self, symbol=None, limit=100, *, fresh=False):
+        assert fresh is True
         self.user_fills_calls += 1
-        return [{"dir": "Open Long", "time": 5000, "start_position": 0.0}]
+        return [
+            {
+                "symbol": "BTC",
+                "dir": "Open Long",
+                "time": 5000,
+                "start_position": 0.0,
+            }
+        ]
 
 
 @pytest.mark.asyncio

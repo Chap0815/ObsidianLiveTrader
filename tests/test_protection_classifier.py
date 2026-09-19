@@ -63,6 +63,54 @@ def test_classify_rejects_conflicting_position_side_aliases():
     assert tp is None
 
 
+def test_classify_rejects_conflicting_order_label_aliases():
+    sl, tp = classify_protection(
+        [
+            {
+                "orderType": "Stop",
+                "tpsl": "tp",
+                "triggerPrice": 95_000.0,
+            }
+        ],
+        side="long",
+        entry=100_000.0,
+    )
+
+    assert sl is None
+    assert tp is None
+
+
+def test_classify_ignores_numeric_execution_type_when_label_is_explicit():
+    sl, tp = classify_protection(
+        [{"orderType": "Stop", "type": 1, "triggerPrice": 95_000.0}],
+        side="long",
+        entry=100_000.0,
+    )
+
+    assert sl == 95_000.0
+    assert tp is None
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"orderType": "Stop", "triggerPrice": 95_000.0, "reduceOnly": False},
+        {"orderType": "Stop", "triggerPrice": 95_000.0, "reduceOnly": 1},
+        {
+            "orderType": "Stop",
+            "triggerPrice": 95_000.0,
+            "reduceOnly": True,
+            "reduce_only": False,
+        },
+    ],
+)
+def test_classify_rejects_invalid_reduce_only_stop_geometry(row):
+    sl, tp = classify_protection([row], side="long", entry=100_000.0)
+
+    assert sl is None
+    assert tp is None
+
+
 def test_classify_label_then_price():
     """An explicit orderType label beats the side+entry heuristic.
 
@@ -94,7 +142,14 @@ async def test_reevaluate_and_verify_agree():
     the auto-flatten verifier confirms an SL near 95_000 is attached. They can
     no longer diverge into "protected" vs "SL missing → flatten".
     """
-    stops = [{"symbol": "BTC_USDT", "orderType": "Stop", "triggerPrice": 95_000.0}]
+    stops = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "orderType": "Stop",
+            "triggerPrice": 95_000.0,
+        }
+    ]
 
     # (a) Reevaluate extractor
     sl, tp = classify_protection(stops, side="long", entry=100_000.0)
@@ -122,6 +177,7 @@ async def test_reevaluate_and_verify_agree():
     [
         (
             {
+                "orderId": 7,
                 "symbol": "BTC_USDT",
                 "orderType": "Stop",
                 "stopLossPrice": 90_000.0,
@@ -131,6 +187,7 @@ async def test_reevaluate_and_verify_agree():
         ),
         (
             {
+                "orderId": 7,
                 "symbol": "BTC_USDT",
                 "orderType": "Take Profit",
                 "stopLossPrice": 95_000.0,
@@ -161,9 +218,105 @@ async def test_entry_sl_verify_honors_explicit_sl_field_priority(
 
 
 @pytest.mark.asyncio
+async def test_entry_sl_verify_rejects_conflicting_order_label_aliases():
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "tpsl": "tp",
+                "triggerPrice": 95_000.0,
+            }
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
+async def test_entry_sl_verify_rejects_explicit_non_reduce_only_stop():
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+                "reduceOnly": False,
+            }
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side_fields", "expected_verified", "expected_checked"),
+    [
+        ({"positionType": 1}, True, True),
+        ({"positionType": 2}, False, True),
+        ({"positionType": 1, "position_type": 2}, False, False),
+    ],
+    ids=["matching-long", "opposite-short", "conflicting-aliases"],
+)
+async def test_entry_sl_verify_respects_stop_position_side(
+    side_fields, expected_verified, expected_checked
+):
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+                "reduceOnly": True,
+                **side_fields,
+            }
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is expected_verified
+    assert checked is expected_checked
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reported_symbol", [None, "ETH_USDT", "BTC_USDC"])
 async def test_entry_sl_verify_requires_matching_stop_symbol(reported_symbol):
-    stop = {"orderType": "Stop", "triggerPrice": 95_000.0}
+    stop = {"orderId": 7, "orderType": "Stop", "triggerPrice": 95_000.0}
     if reported_symbol is not None:
         stop["symbol"] = reported_symbol
     client = MagicMock()
@@ -179,7 +332,61 @@ async def test_entry_sl_verify_requires_matching_stop_symbol(reported_symbol):
     )
 
     assert verified is False
-    assert checked is True
+    assert checked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stops",
+    [
+        [
+            {
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+            }
+        ],
+        [
+            {
+                "orderId": 7,
+                "oid": 8,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+            }
+        ],
+        [
+            {
+                "orderId": 7,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+            },
+            {
+                "oid": "7",
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+            },
+        ],
+    ],
+    ids=["missing-id", "conflicting-aliases", "duplicate-id"],
+)
+async def test_entry_sl_verify_requires_unique_consistent_stop_ids(stops):
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(return_value=stops)
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
 
 
 @pytest.mark.asyncio
@@ -230,7 +437,9 @@ async def test_mexc_verify_does_not_count_invalid_stop_price_as_checked(bad_pric
     client = MagicMock()
     client.exchange_id = "mexc"
     client.open_stop_orders = AsyncMock(
-        return_value=[{"symbol": "BTC_USDT", "stopLossPrice": bad_price}]
+        return_value=[
+            {"orderId": 7, "symbol": "BTC_USDT", "stopLossPrice": bad_price}
+        ]
     )
     client.positions = AsyncMock(return_value=[])
     svc = OrderService(
@@ -302,6 +511,96 @@ async def test_mexc_verify_rejects_conflicting_position_sl_aliases():
 
 
 @pytest.mark.asyncio
+async def test_entry_sl_verify_bypasses_cached_position_evidence():
+    class CachedPositionClient:
+        exchange_id = "mexc"
+
+        def __init__(self):
+            self.fresh_reads = []
+
+        async def open_stop_orders(self, _symbol):
+            return []
+
+        async def positions(self, _symbol, *, fresh=False):
+            self.fresh_reads.append(fresh)
+            row = {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+            }
+            if not fresh:
+                row["stopLossPrice"] = 95_000.0
+            return [row]
+
+    client = CachedPositionClient()
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+    assert client.fresh_reads == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "positions",
+    [
+        [{"side": "long", "hold_vol": 1.0, "stop_loss": 95_000.0}],
+        [
+            {
+                "symbol": "ETH_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+                "stop_loss": 95_000.0,
+            }
+        ],
+        [
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 0.0,
+                "stop_loss": 95_000.0,
+            }
+        ],
+        [
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+                "stop_loss": 95_000.0,
+            },
+            {
+                "symbol": "BTC_USDT",
+                "side": "long",
+                "hold_vol": 1.0,
+            },
+        ],
+    ],
+    ids=["missing-symbol", "foreign-symbol", "zero-volume", "duplicate-side"],
+)
+async def test_entry_sl_verify_rejects_invalid_position_identity(positions):
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.open_stop_orders = AsyncMock(return_value=[])
+    client.positions = AsyncMock(return_value=positions)
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_attached(
+        symbol="BTC_USDT", expected_sl=95_000.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("malformed_stops", [None, {}, "", [None]])
 async def test_modify_sl_oid_verify_treats_malformed_stop_collection_as_unknown(
     malformed_stops,
@@ -309,6 +608,76 @@ async def test_modify_sl_oid_verify_treats_malformed_stop_collection_as_unknown(
     client = MagicMock()
     client.exchange_id = "hyperliquid"
     client.open_stop_orders = AsyncMock(return_value=malformed_stops)
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_oid(
+        "BTC_USDT", 555, 95_000.0, 1.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
+async def test_modify_sl_oid_verify_rejects_explicit_non_reduce_only_stop():
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 555,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+                "vol": 1.0,
+                "reduceOnly": False,
+            }
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
+    svc = OrderService(
+        client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
+    )
+
+    verified, _detail, checked = await svc._verify_sl_oid(
+        "BTC_USDT", 555, 95_000.0, 1.0, side="long"
+    )
+
+    assert verified is False
+    assert checked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"positionType": 1, "position_type": 2},
+        {"orderType": "Stop", "tpsl": "tp"},
+        {"stopLossPrice": 95_000.0, "stop_loss_price": 94_000.0},
+    ],
+    ids=["conflicting-side", "conflicting-label", "conflicting-explicit-sl"],
+)
+async def test_modify_sl_oid_verify_marks_ambiguous_stop_identity_unknown(
+    invalid_fields,
+):
+    client = MagicMock()
+    client.exchange_id = "hyperliquid"
+    client.open_stop_orders = AsyncMock(
+        return_value=[
+            {
+                "orderId": 555,
+                "symbol": "BTC_USDT",
+                "orderType": "Stop",
+                "triggerPrice": 95_000.0,
+                "vol": 1.0,
+                "reduceOnly": True,
+                **invalid_fields,
+            }
+        ]
+    )
+    client.positions = AsyncMock(return_value=[])
     svc = OrderService(
         client, _settings(sl_verify_attempts=1, sl_verify_delay_s=0.0), PreviewStore()
     )
@@ -482,7 +851,14 @@ async def test_mexc_tpsl_combined_order_is_sl_not_tp():
     Auto-Flatten einer geschuetzten Position. Wer classify_order_label je
     wieder auf ein startswith("tp")-Muster "vereinfacht", macht diesen Test rot.
     """
-    stops = [{"symbol": "BTC_USDT", "orderType": "tpsl", "triggerPrice": 95_000.0}]
+    stops = [
+        {
+            "orderId": 7,
+            "symbol": "BTC_USDT",
+            "orderType": "tpsl",
+            "triggerPrice": 95_000.0,
+        }
+    ]
 
     # (a) Klassifizierer direkt
     sl, tp = classify_protection(stops, side="long", entry=100_000.0)

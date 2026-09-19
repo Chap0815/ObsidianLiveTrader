@@ -52,7 +52,14 @@ jobs:
       - name: Install isolated dependencies
         run: |
           python -m venv .venv
-          .\.venv\Scripts\python.exe -m pip install --require-virtualenv -r requirements.lock -r requirements-dev.txt
+          .\.venv\Scripts\python.exe -m pip install --require-virtualenv pip==26.2.1
+          .\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps -r requirements.lock -r requirements-dev.lock
+      - name: Verify installed dependency consistency
+        run: .\.venv\Scripts\python.exe -m pip check
+      - name: Audit pinned runtime dependencies
+        run: .\.venv\Scripts\python.exe -m pip_audit --strict --no-deps --disable-pip --progress-spinner off --vulnerability-service osv -r requirements.lock
+      - name: Audit installed runtime and development dependencies
+        run: .\.venv\Scripts\python.exe -m pip_audit --strict --local --progress-spinner off --vulnerability-service osv
       - name: Lint Python
         run: .\.venv\Scripts\ruff.exe check .
       - name: Check JavaScript
