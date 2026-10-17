@@ -211,8 +211,32 @@ function isValidPreviewResponse(data) {
   return (
     typeof data.token === "string" &&
     data.token.trim().length > 0 &&
-    previewTtlSeconds(data.expires_in_seconds) !== null
+    previewTtlSeconds(data.expires_in_seconds) !== null &&
+    validExecutionContext(data.summary)
   );
+}
+
+function validExecutionContext(summary) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return false;
+  const exchange = summary.execution_exchange;
+  const testnet = summary.execution_hl_testnet;
+  const armed = summary.execution_trading_enabled;
+  const live = summary.execution_live_trading;
+  if (exchange !== "mexc" && exchange !== "hyperliquid") return false;
+  if (typeof armed !== "boolean" || typeof live !== "boolean") return false;
+  if (exchange === "mexc" && testnet !== null) return false;
+  if (exchange === "hyperliquid" && typeof testnet !== "boolean") return false;
+  return live === (armed && !(exchange === "hyperliquid" && testnet));
+}
+
+function sameExecutionContext(summary, health) {
+  if (!validExecutionContext(summary) || !health || typeof health !== "object") {
+    return false;
+  }
+  return summary.execution_exchange === health.exchange &&
+    summary.execution_hl_testnet === health.hl_testnet &&
+    summary.execution_trading_enabled === health.trading_enabled &&
+    summary.execution_live_trading === health.live_trading;
 }
 
 function isValidFillsResponse(data) {

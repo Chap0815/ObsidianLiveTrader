@@ -46,6 +46,7 @@ async def _purge_expired_previews(conn: aiosqlite.Connection) -> None:
 # baseline must reset (never silently inherit a stale 1R from a prior trade).
 _ENTRY_TOLERANCE_REL = 0.001  # 0.1% relative
 _ENTRY_TOLERANCE_ABS_FLOOR = 1e-6
+_MAX_ORDER_CLOCK_SKEW_MS = 5 * 60 * 1000
 
 
 def _entry_deviated(old_entry: float, new_entry: float) -> bool:
@@ -104,6 +105,11 @@ class Database:
     def __init__(self, db_path: str):
         self.path = _resolve_path(db_path)
         self._shared: aiosqlite.Connection | None = None
+        # A transaction is larger than one aiosqlite call.  Without a
+        # connection-wide lock, cancellation after execute() but before
+        # commit() can leave a dirty transaction that an unrelated coroutine
+        # later commits.  Serialize complete shared-connection units of work.
+        self._connection_lock = asyncio.Lock()
         # Dedupe is a SELECT followed by UPDATE-or-INSERT. aiosqlite serializes
         # individual statements, but two coroutines can still interleave that
         # sequence on the shared connection and create duplicate samples.
@@ -145,10 +151,35 @@ class Database:
         """
         shared = self._shared
         if shared is not None:
-            yield shared
+            async with self._connection_lock:
+                try:
+                    yield shared
+                except BaseException:
+                    # Roll back even while the caller is being cancelled.  The
+                    # shield keeps the shared connection clean before another
+                    # authority-changing writer can acquire it.
+                    try:
+                        await asyncio.shield(shared.rollback())
+                    except BaseException:
+                        # A connection whose transaction state cannot be
+                        # recovered must not be handed to another request.
+                        if self._shared is shared:
+                            self._shared = None
+                        try:
+                            await asyncio.shield(shared.close())
+                        except BaseException:
+                            pass
+                    raise
         else:
             async with self._connect() as conn:
-                yield conn
+                try:
+                    yield conn
+                except BaseException:
+                    try:
+                        await asyncio.shield(conn.rollback())
+                    except BaseException:
+                        pass
+                    raise
 
     @asynccontextmanager
     async def _acquire_journal_insert(self):
@@ -330,6 +361,87 @@ class Database:
             await conn.commit()
             return int(cur.lastrowid or 0)
 
+    async def active_entry_reservation(
+        self, *, exchange_id: str, symbol: str, side: str
+    ) -> dict[str, Any] | None:
+        """Return an unexpired entry convergence guard, if one exists."""
+        now = _now_ms()
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(
+                "DELETE FROM entry_reservations WHERE expires_at <= ?", (now,)
+            )
+            cur = await conn.execute(
+                """
+                SELECT exchange_id, symbol, side, external_oid, pre_hold, expires_at
+                FROM entry_reservations
+                WHERE exchange_id = ? AND symbol = ? AND side = ?
+                  AND expires_at > ?
+                """,
+                (exchange_id, symbol, side, now),
+            )
+            row = await cur.fetchone()
+            await conn.commit()
+            return dict(row) if row is not None else None
+
+    async def claim_entry_reservation(
+        self,
+        *,
+        exchange_id: str,
+        symbol: str,
+        side: str,
+        external_oid: str,
+        pre_hold: float,
+        ttl_seconds: int,
+    ) -> bool:
+        """Atomically reserve one side while exchange state converges."""
+        now = _now_ms()
+        expires_at = now + max(1, int(ttl_seconds)) * 1000
+        async with self._acquire() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO entry_reservations
+                  (exchange_id, symbol, side, external_oid, pre_hold, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exchange_id, symbol, side) DO UPDATE SET
+                  external_oid = excluded.external_oid,
+                  pre_hold = excluded.pre_hold,
+                  expires_at = excluded.expires_at
+                WHERE entry_reservations.expires_at <= ?
+                """,
+                (
+                    exchange_id,
+                    symbol,
+                    side,
+                    external_oid,
+                    float(pre_hold),
+                    expires_at,
+                    now,
+                ),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def release_entry_reservation(
+        self,
+        *,
+        exchange_id: str,
+        symbol: str,
+        side: str,
+        external_oid: str,
+    ) -> None:
+        """Release only the caller's guard after a proved non-placement."""
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM entry_reservations
+                WHERE exchange_id = ? AND symbol = ? AND side = ?
+                  AND external_oid = ?
+                """,
+                (exchange_id, symbol, side, external_oid),
+            )
+            await conn.commit()
+
     async def recent_proposals(self, limit: int = 20) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
@@ -408,8 +520,9 @@ class Database:
 
         The position-management row supplies the active trade epoch. Confirmed
         order audit rows carry ``_proposal_id`` separately from the exchange
-        payload. The closest placed order within the bounded placement window
-        is used; unrelated newer analyses can never become the original thesis.
+        payload. The closest order placed before that epoch is used.  A resting
+        limit may fill hours later, so elapsed time alone must not sever the
+        explicit provenance link; unrelated later analyses are never eligible.
 
         The optional observed values let the monitor resolve a newly detected
         epoch before its baseline upsert. This prevents a same-entry reopen from
@@ -474,11 +587,16 @@ class Database:
                     )
                 except (TypeError, ValueError, OverflowError):
                     continue
-                distance = abs(order_ms - opened_at)
-                if proposal_id <= 0 or distance > 15 * 60 * 1000:
+                # Allow a small clock-skew window because the exchange's fill
+                # timestamp and the local audit timestamp have different
+                # clocks.  Never bind a genuinely later order to an older
+                # position epoch.
+                distance = opened_at - order_ms
+                if proposal_id <= 0 or distance < -_MAX_ORDER_CLOCK_SKEW_MS:
                     continue
-                if best is None or distance < best[0]:
-                    best = (distance, proposal_id)
+                proximity = abs(distance)
+                if best is None or proximity < best[0]:
+                    best = (proximity, proposal_id)
             if best is None:
                 return None
             cur = await conn.execute(

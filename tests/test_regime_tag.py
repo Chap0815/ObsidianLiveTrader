@@ -47,3 +47,8 @@ def test_regime_tag_deterministic_buckets(daily_stack, atr_pct, expected):
 def test_regime_tag_unknown_on_missing_or_invalid_signals(btc_regime, atr_pct):
     # Fail-safe: any missing/invalid signal collapses to "unknown", never a crash.
     assert regime_tag(btc_regime, atr_pct) == "unknown"
+
+
+@pytest.mark.parametrize("atr_pct", [float("inf"), float("-inf")])
+def test_regime_tag_rejects_infinite_volatility(atr_pct):
+    assert regime_tag({"btc_daily_stack": "bullish"}, atr_pct) == "unknown"

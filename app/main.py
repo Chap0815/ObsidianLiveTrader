@@ -1123,6 +1123,7 @@ async def health(request: Request):
     live_trading = bool(s.trading_enabled) and not on_testnet
     return {
         "ok": True,
+        "app_id": "obsidian-live-trader",
         "live_trading": live_trading,
         "exchange": s.exchange,
         "hl_testnet": s.hl_testnet if s.exchange == "hyperliquid" else None,
@@ -2337,6 +2338,30 @@ def _valid_account_snapshot(snapshot: object, *, exchange: str) -> bool:
     return snapshot["error"] is None
 
 
+def _valid_reevaluation_position(row: object, *, exchange: str) -> bool:
+    """Validate every financial field consumed by the reevaluation boundary."""
+    if not isinstance(row, dict):
+        return False
+    if not valid_normalized_position_symbol(row.get("symbol"), exchange=exchange):
+        return False
+    if row.get("side") not in ("long", "short"):
+        return False
+    for field in ("hold_vol", "entry_price"):
+        value = row.get(field)
+        if not _finite_real_number(value) or value <= 0:
+            return False
+    for field in ("leverage", "liquidate_price", "im"):
+        value = row.get(field)
+        if value is not None and (not _finite_real_number(value) or value <= 0):
+            return False
+    for field in ("unrealized_pnl", "margin_ratio"):
+        value = row.get(field)
+        if value is not None and not _finite_real_number(value):
+            return False
+    open_type = row.get("open_type")
+    return open_type is None or open_type in ("isolated", "cross")
+
+
 _FILL_REQUIRED_FIELDS = {
     "symbol",
     "px",
@@ -3043,37 +3068,22 @@ async def reevaluate(
     positions = acct.get("positions") if isinstance(acct, dict) else None
     if not isinstance(positions, list):
         raise HTTPException(status_code=502, detail="Invalid account position data")
+    client_exchange = getattr(client, "exchange_id", None)
+    active_exchange = (
+        client_exchange
+        if client_exchange in ("mexc", "hyperliquid")
+        else s.exchange
+    )
     candidates = []
     for candidate in positions:
-        symbol_raw = candidate.get("symbol") if isinstance(candidate, dict) else None
-        candidate_side = candidate.get("side") if isinstance(candidate, dict) else None
-        if (
-            not isinstance(symbol_raw, str)
-            or not symbol_raw.strip()
-            or candidate_side not in ("long", "short")
-        ):
+        if not _valid_reevaluation_position(candidate, exchange=active_exchange):
             raise HTTPException(status_code=502, detail="Invalid account position data")
+        symbol_raw = candidate["symbol"]
+        candidate_side = candidate["side"]
         if symbol_raw.upper() != symbol.upper():
             continue
         if body.side is not None and candidate_side != body.side:
             continue
-        try:
-            hold_raw = candidate.get("hold_vol")
-            entry_raw = candidate.get("entry_price")
-            hold_vol = float(hold_raw) if not isinstance(hold_raw, bool) else None
-            entry_price = float(entry_raw) if not isinstance(entry_raw, bool) else None
-        except (TypeError, ValueError, OverflowError):
-            hold_vol = None
-            entry_price = None
-        if (
-            hold_vol is None
-            or entry_price is None
-            or not math.isfinite(hold_vol)
-            or not math.isfinite(entry_price)
-            or hold_vol <= 0
-            or entry_price <= 0
-        ):
-            raise HTTPException(status_code=502, detail="Invalid account position data")
         candidates.append(candidate)
     if not candidates:
         side_label = f" {body.side}" if body.side else ""

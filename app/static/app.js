@@ -10100,8 +10100,10 @@
     const armed = health.trading_enabled === true;
     const exchangeReady = health.exchange_configured === true;
     const executionReady = armed && exchangeReady;
-    const testnet = health.exchange === "hyperliquid" && health.hl_testnet === true;
-    const canConfirm = okGates && ttl !== null && executionReady;
+    const networkMatches = sameExecutionContext(s, health);
+    const testnet = s.execution_exchange === "hyperliquid" &&
+      s.execution_hl_testnet === true;
+    const canConfirm = okGates && ttl !== null && executionReady && networkMatches;
     const title = $("confirm-title");
     if (title) title.textContent = !executionReady ? "Order Preview"
       : testnet ? "Confirm Order · Testnet"
@@ -10136,6 +10138,11 @@
         '<div class="blocker-title">⛔ EXCHANGE NOT READY — submission is locked</div>' +
         "<p>Exchange credentials are incomplete or invalid. Review the local configuration " +
         "before creating another preview.</p></div>";
+    } else if (okGates && !networkMatches) {
+      html +=
+        '<div class="blocker-box">' +
+        '<div class="blocker-title">EXECUTION NETWORK CHANGED - submission is locked</div>' +
+        "<p>The server network no longer matches this preview. Review the order again.</p></div>";
     }
 
     // 2) Order summary as a compact, readable card
@@ -10446,7 +10453,11 @@
 
     try {
       // Refresh arming flag
-      await loadHealth();
+      const freshHealth = await loadHealth();
+      if (!freshHealth) {
+        setTicketError("Unable to verify the current execution network. Try again.");
+        return;
+      }
       if (rejectChangedPreviewInputs(inputFingerprint)) return;
 
       const res = await apiFetch("/api/orders/preview", {
@@ -10476,6 +10487,14 @@
         state.previewToken = null;
         state.previewSummary = null;
         const message = "Invalid preview response. Review the order again.";
+        setTicketError(message);
+        showToast(message, "err");
+        return;
+      }
+      if (data.ok === true && !sameExecutionContext(data.summary, freshHealth)) {
+        state.previewToken = null;
+        state.previewSummary = null;
+        const message = "Execution network changed during preview. Review the order again.";
         setTicketError(message);
         showToast(message, "err");
         return;
@@ -10623,6 +10642,15 @@
           errEl.classList.remove("hidden");
           errEl.textContent =
             "EXCHANGE NOT READY: credentials are incomplete — submission is locked.";
+        }
+        return;
+      }
+      if (!sameExecutionContext(summary, freshHealth)) {
+        const errEl = $("confirm-error");
+        if (errEl) {
+          errEl.classList.remove("hidden");
+          errEl.textContent =
+            "EXECUTION NETWORK CHANGED: this preview is no longer valid. Review the order again.";
         }
         return;
       }

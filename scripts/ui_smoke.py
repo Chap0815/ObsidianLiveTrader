@@ -3,7 +3,8 @@
 Run with .venv/Scripts/python.exe scripts/ui_smoke.py [--capture-only].
 Requires the optional dev dependency playwright and `playwright install chromium`.
 Never imports app.main, reads .env, starts a server, or contacts an exchange.
-Screenshots are written to the ignored .superpowers/ui-review directory.
+Screenshots default to the ignored .superpowers/ui-review directory; set
+UI_SMOKE_OUTPUT_DIR to keep artifacts in an external workspace.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import asyncio
 import math
 import mimetypes
+import os
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +23,9 @@ from playwright.async_api import async_playwright, expect
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGIN = "http://127.0.0.1:18787"
+OUTPUT_DIR = Path(
+    os.environ.get("UI_SMOKE_OUTPUT_DIR", ROOT / ".superpowers/ui-review")
+)
 
 
 def market(symbol="BTC"):
@@ -91,7 +96,7 @@ async def run(capture_only=False):
             {"value": "free", "title": "Unrestricted", "desc": "no equity cap"},
         ],
     )
-    out = ROOT / ".superpowers/ui-review"
+    out = OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
     calls, errors = [], []
     preview_contract = {
@@ -265,6 +270,10 @@ async def run(capture_only=False):
                     "risk_pct": 0.016,
                     "rrr": 2,
                     "trigger_mode": ticket.get("trigger_mode", "auto"),
+                    "execution_exchange": health["exchange"],
+                    "execution_hl_testnet": health["hl_testnet"],
+                    "execution_trading_enabled": health["trading_enabled"],
+                    "execution_live_trading": health["live_trading"],
                 },
             }
         elif path == "/api/orders/confirm":
@@ -1010,6 +1019,12 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
               toastText: toast.textContent.trim()
             };
             Trader.state.previewToken = 'synthetic-server-error-token';
+            Trader.state.previewSummary = {
+              execution_exchange: 'hyperliquid',
+              execution_hl_testnet: true,
+              execution_trading_enabled: true,
+              execution_live_trading: false
+            };
             await Trader.runConfirm();
             for (let i = 0; i < 100 &&
                  (accountCalls < 3 || orderCalls < 3); i += 1) {
@@ -3487,7 +3502,7 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     await page.set_viewport_size({"width": 390, "height": 600})
     footer = await page.locator("#btn-confirm-cancel").bounding_box()
     assert footer and footer["y"] >= 0 and footer["y"] + footer["height"] <= 600
-    await page.screenshot(path=ROOT / ".superpowers/ui-review/preview-mobile.png")
+    await page.screenshot(path=OUTPUT_DIR / "preview-mobile.png")
     await page.keyboard.press("Escape")
     await expect(page.locator("#btn-send-order")).to_be_focused()
     assert not any(path == "/api/orders/confirm" for _, path in calls)
@@ -3790,7 +3805,7 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     for width in (1440, 390, 320):
         await page.set_viewport_size({"width": width, "height": 900})
         await page.screenshot(
-            path=ROOT / f".superpowers/ui-review/position-{width}.png", full_page=True
+            path=OUTPUT_DIR / f"position-{width}.png", full_page=True
         )
         assert await page.evaluate(
             "document.documentElement.scrollWidth <= innerWidth"

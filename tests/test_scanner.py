@@ -1066,7 +1066,7 @@ async def test_scanner_claude_retries_one_transient_response(monkeypatch):
         async def post(self, *args, **kwargs):
             Client.calls += 1
             if Client.calls == 1:
-                return Response(503, {"error": "synthetic transient"})
+                return Response(429, {"error": "synthetic rate limit"})
             return Response(
                 200,
                 {"content": [{"type": "text", "text": '{"results": []}'}]},
@@ -1093,12 +1093,12 @@ async def test_scanner_claude_persistent_transient_stops_after_one_retry(monkeyp
     from app.llm.client import LlmError
 
     class Response:
-        status_code = 503
-        text = '{"error":"synthetic down"}'
+        status_code = 429
+        text = '{"error":"synthetic rate limit"}'
 
         @staticmethod
         def json():
-            return {"error": "synthetic down"}
+            return {"error": "synthetic rate limit"}
 
     class Client:
         calls = 0

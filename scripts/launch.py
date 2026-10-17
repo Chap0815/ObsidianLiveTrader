@@ -52,18 +52,21 @@ _check_python_version()
 
 import argparse  # noqa: E402
 import hashlib  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
 import webbrowser  # noqa: E402
+from urllib.request import urlopen  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_DIR = ROOT / ".venv"
 PINNED_PIP_REQUIREMENT = "pip==26.2.1"
 _DEPS_MARKER_SCHEMA = 3
+_APP_ID = "obsidian-live-trader"
 
 
 def _system_python() -> str:
@@ -398,6 +401,22 @@ def _port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def _app_is_running(host: str, port: int) -> bool:
+    """Identify our server without sending cookies, tokens, or credentials."""
+    try:
+        with urlopen(_local_url(host, port, "/api/health"), timeout=0.75) as response:
+            if getattr(response, "status", None) != 200:
+                return False
+            payload = json.loads(response.read(64_000).decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and payload.get("app_id") == _APP_ID
+    )
+
+
 def _local_url(host: str, port: int, path: str = "") -> str:
     authority = f"[{host}]" if ":" in host else host
     return f"http://{authority}:{port}{path}"
@@ -487,6 +506,12 @@ def main() -> None:
     # start.bat) und würde sonst einen englischen uvicorn-Bind-Traceback
     # sehen. Rein advisory: bei Unklarheit wird normal weitergestartet.
     if _port_in_use(host, port):
+        if not _app_is_running(host, port):
+            print(
+                f"ERROR: Port {port} is occupied by another application. "
+                "Choose a different port and restart."
+            )
+            raise SystemExit(1)
         print(f"Already running on port {port} — opening the browser; no second server needed.")
         print(f"  URL: {url}")
         if not args.no_browser:

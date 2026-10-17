@@ -567,6 +567,40 @@ def test_port_in_use_uses_address_family_aware_connection(launch, monkeypatch):
     assert calls == [(('::1', 8787), 0.5)]
 
 
+def test_app_identity_rejects_unrelated_listener(launch, monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _limit):
+            return b'{"ok":true,"app_id":"different-app"}'
+
+    monkeypatch.setattr(launch, "urlopen", lambda *_a, **_kw: FakeResponse())
+    assert launch._app_is_running("127.0.0.1", 8787) is False
+
+
+def test_app_identity_accepts_our_health_contract(launch, monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _limit):
+            return b'{"ok":true,"app_id":"obsidian-live-trader"}'
+
+    monkeypatch.setattr(launch, "urlopen", lambda *_a, **_kw: FakeResponse())
+    assert launch._app_is_running("127.0.0.1", 8787) is True
+
+
 @pytest.mark.parametrize(
     ("host", "path", "expected"),
     [

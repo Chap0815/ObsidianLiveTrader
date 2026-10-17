@@ -842,9 +842,7 @@ async def _anthropic_text(
 
     t0 = time.monotonic()
     try:
-        # Scanner calls are advisory and idempotent. Use the same single
-        # bounded retry as every other provider transport so one transient
-        # 429/502/503/504 or timeout does not discard the whole scan.
+        # Shared safe retry: explicit 429 rejections and pre-send timeouts only.
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"Scanner ({provider_label}) request failed") from e
@@ -920,9 +918,7 @@ async def _openai_compat_text(
     t0 = time.monotonic()
     try:
         # O2-14/L2X-12: this call carries production xai/grok scanner traffic
-        # — route it through the same transient-retry helper the analyze/
-        # reevaluate calls use so a single 502/503/504/429 or client timeout
-        # gets one retry instead of failing the whole scan.
+        # — route it through the same safe helper as analyze/reevaluate.
         r = await _post_with_retry(_post)
     except httpx.HTTPError as e:
         raise LlmError(f"Scanner ({provider_label}) request failed") from e

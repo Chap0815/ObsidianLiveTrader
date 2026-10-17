@@ -35,6 +35,22 @@ CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_proposals_created ON proposals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_previews_expires ON order_previews(expires_at);
 
+-- Short, durable convergence guard for accepted entry orders.  Exchange
+-- positions/open-orders can lag a successful create response; during that
+-- window a second preview must not reuse the same apparent risk budget.
+CREATE TABLE IF NOT EXISTS entry_reservations (
+  exchange_id TEXT NOT NULL,
+  symbol      TEXT NOT NULL,
+  side        TEXT NOT NULL,
+  external_oid TEXT NOT NULL,
+  pre_hold    REAL NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  PRIMARY KEY (exchange_id, symbol, side)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entry_reservations_expires
+  ON entry_reservations(expires_at);
+
 -- Journal + feedback-loop: the KI's SHADOW book. Advisory/measurement only —
 -- it never touches the order/gate/confirm path. A dedicated table (NOT an
 -- extension of proposals) because proposals is wiped by /api/history/clear

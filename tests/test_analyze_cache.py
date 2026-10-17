@@ -431,6 +431,9 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
     import asyncio as _asyncio
 
     import httpx
+    from contextlib import asynccontextmanager
+
+    import app.main as main
 
     _env(monkeypatch)
     from app.main import app
@@ -438,6 +441,18 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
     llm_calls = 0
     started = _asyncio.Event()
     release = _asyncio.Event()
+    second_waiting = _asyncio.Event()
+    lock_calls = 0
+    original_singleflight = main._keyed_singleflight_lock
+
+    @asynccontextmanager
+    async def observed_singleflight(state, attr, key):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            second_waiting.set()
+        async with original_singleflight(state, attr, key):
+            yield
 
     async def fake_analyze_with_llm(context, settings):
         nonlocal llm_calls
@@ -459,15 +474,16 @@ async def test_concurrent_identical_cache_miss_calls_llm_once(monkeypatch):
     p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
     p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
     p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+    p5 = patch("app.main._keyed_singleflight_lock", new=observed_singleflight)
 
     transport = httpx.ASGITransport(app=app)
     body = {"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
-    with p1, p2, p3, p4:
+    with p1, p2, p3, p4, p5:
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
             t1 = _asyncio.create_task(ac.post("/api/analyze", json=body))
             await _asyncio.wait_for(started.wait(), timeout=2.0)
             t2 = _asyncio.create_task(ac.post("/api/analyze", json=body))
-            await _asyncio.sleep(0.1)  # let t2 reach (and block on) the per-key lock
+            await _asyncio.wait_for(second_waiting.wait(), timeout=2.0)
             release.set()
             r1 = await t1
             r2 = await t2
@@ -559,6 +575,9 @@ async def test_same_key_still_singleflight(monkeypatch):
     import asyncio as _asyncio
 
     import httpx
+    from contextlib import asynccontextmanager
+
+    import app.main as main
 
     _env(monkeypatch)
     from app.main import app
@@ -566,6 +585,18 @@ async def test_same_key_still_singleflight(monkeypatch):
     llm_calls = 0
     started = _asyncio.Event()
     release = _asyncio.Event()
+    second_waiting = _asyncio.Event()
+    lock_calls = 0
+    original_singleflight = main._keyed_singleflight_lock
+
+    @asynccontextmanager
+    async def observed_singleflight(state, attr, key):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            second_waiting.set()
+        async with original_singleflight(state, attr, key):
+            yield
 
     async def fake_analyze_with_llm(context, settings):
         nonlocal llm_calls
@@ -587,15 +618,16 @@ async def test_same_key_still_singleflight(monkeypatch):
     p2 = patch("app.main.snapshot_to_api_dict", return_value=_mock_snap())
     p3 = patch("app.main.analyze_with_llm", new=fake_analyze_with_llm)
     p4 = patch("app.main.build_llm_context", return_value={"symbol": "BTC_USDT"})
+    p5 = patch("app.main._keyed_singleflight_lock", new=observed_singleflight)
 
     transport = httpx.ASGITransport(app=app)
     body = {"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"}
-    with p1, p2, p3, p4:
+    with p1, p2, p3, p4, p5:
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
             t1 = _asyncio.create_task(ac.post("/api/analyze", json=body))
             await _asyncio.wait_for(started.wait(), timeout=2.0)
             t2 = _asyncio.create_task(ac.post("/api/analyze", json=body))
-            await _asyncio.sleep(0.1)  # let t2 reach (and block on) the per-key lock
+            await _asyncio.wait_for(second_waiting.wait(), timeout=2.0)
             release.set()
             r1 = await t1
             r2 = await t2

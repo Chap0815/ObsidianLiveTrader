@@ -43,7 +43,12 @@ def _mock_client(positions, *, sl_price=98.0):
     client.account_snapshot = AsyncMock(return_value={"positions": positions})
     client.open_stop_orders = AsyncMock(
         return_value=[
-            {"symbol": "BTC", "triggerPrice": sl_price, "orderType": "Stop"}
+            {
+                "symbol": "BTC",
+                "triggerPrice": sl_price,
+                "orderType": "Stop",
+                "vol": 1.0,
+            }
         ]
     )
     return client

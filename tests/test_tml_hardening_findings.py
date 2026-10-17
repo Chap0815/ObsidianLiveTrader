@@ -155,7 +155,9 @@ async def test_f1_frozen_zero_r1_is_healed_and_unblocks_auto_be(monkeypatch, db_
     app = _make_app(
         db,
         FakeClient(
-            [_pos()], mark=102.5, stops=[{"symbol": "BTC", "triggerPrice": 98.0}]
+            [_pos()],
+            mark=102.5,
+            stops=[{"symbol": "BTC", "triggerPrice": 98.0, "vol": 1.0}],
         ),
     )
 
@@ -454,7 +456,7 @@ async def test_f4_manual_modify_records_user_override_hw(db_path):
 
 # ── FINDING 5: opened_at journal fallback picks the OLDEST matching row ───────
 @pytest.mark.asyncio
-async def test_f5_opened_at_journal_fallback_uses_oldest_match():
+async def test_f5_mexc_opened_at_does_not_borrow_old_journal_trade():
     # No user_fills (MEXC-like) → journal fallback. recent_journal is newest-first.
     class _DB:
         async def recent_journal(self, limit=50):
@@ -469,12 +471,11 @@ async def test_f5_opened_at_journal_fallback_uses_oldest_match():
 
     client = SimpleNamespace()  # no user_fills attr → HL branch skipped
     got = await monitor._best_effort_opened_at(client, _DB(), "BTC_USDT", "long", NOW_MS)
-    expected = monitor._iso_to_ms("2026-07-20T09:00:00+00:00")
-    assert got == expected
+    assert got == NOW_MS
 
 
 @pytest.mark.asyncio
-async def test_opened_at_skips_platform_invalid_journal_date_and_keeps_searching():
+async def test_mexc_opened_at_ignores_even_parseable_journal_dates():
     class _DB:
         async def recent_journal(self, limit=50):
             return [
@@ -496,4 +497,4 @@ async def test_opened_at_skips_platform_invalid_journal_date_and_keeps_searching
         SimpleNamespace(), _DB(), "BTC_USDT", "long", NOW_MS
     )
 
-    assert got == monitor._iso_to_ms("2026-07-20T09:00:00+00:00")
+    assert got == NOW_MS

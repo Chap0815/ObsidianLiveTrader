@@ -48,6 +48,7 @@ _AUDIT_MAX_ITEMS = 100
 _AUDIT_MAX_STRING = 2_000
 _POSITION_IDENTITY_UNSET: Any = object()
 _MAX_FILL_FUTURE_SKEW_MS = 5 * 60 * 1000
+_ENTRY_CONVERGENCE_GUARD_SECONDS = 120
 _AUDIT_SECRET_LABEL_RE = re.compile(
     r"(?i)\b([a-z0-9_-]*(?:token|secret|credential|cookie)[a-z0-9_-]*|"
     r"api[ _-]?key|signature|authorization|private[ _-]?key|password|"
@@ -1562,6 +1563,100 @@ class OrderService:
         # unit tests.
         self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
 
+    def _entry_reservation_key(self, symbol: str, side: str) -> tuple[str, str, str]:
+        return (str(getattr(self.client, "exchange_id", "") or ""), symbol, side)
+
+    async def _has_entry_reservation(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if exchange_id != "mexc":
+            return False
+        method = getattr(type(self.db), "active_entry_reservation", None)
+        if self.db is not None and callable(method):
+            try:
+                reservation = await self.db.active_entry_reservation(
+                    exchange_id=exchange_id, symbol=symbol, side=side
+                )
+                if reservation is None:
+                    return False
+                pre_hold = _normalized_float(reservation.get("pre_hold"))
+                if positions is not None and pre_hold is not None and pre_hold >= 0:
+                    current, _open_type, checked = (
+                        await self._mexc_pre_hold_and_position_id(
+                            symbol, side, positions=positions
+                        )
+                    )[0]
+                    tolerance = max(1e-12, pre_hold * 1e-9)
+                    if checked and current > pre_hold + tolerance:
+                        await self._release_entry_reservation(
+                            symbol,
+                            side,
+                            str(reservation.get("external_oid") or ""),
+                        )
+                        return False
+                return True
+            except Exception as exc:
+                raise OrderError(
+                    "entry reservation unavailable — exposure convergence unknown"
+                ) from exc
+        return self.store.active_entry_reservation(exchange_id, symbol, side)
+
+    async def _claim_entry_reservation(
+        self, symbol: str, side: str, external_oid: str, pre_hold: float
+    ) -> bool:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if exchange_id != "mexc":
+            return True
+        method = getattr(type(self.db), "claim_entry_reservation", None)
+        if self.db is not None and callable(method):
+            try:
+                return bool(
+                    await self.db.claim_entry_reservation(
+                        exchange_id=exchange_id,
+                        symbol=symbol,
+                        side=side,
+                        external_oid=external_oid,
+                        pre_hold=pre_hold,
+                        ttl_seconds=_ENTRY_CONVERGENCE_GUARD_SECONDS,
+                    )
+                )
+            except Exception as exc:
+                raise OrderError(
+                    "entry reservation failed — order blocked"
+                ) from exc
+        return self.store.claim_entry_reservation(
+            exchange_id,
+            symbol,
+            side,
+            external_oid,
+            pre_hold,
+            _ENTRY_CONVERGENCE_GUARD_SECONDS,
+        )
+
+    async def _release_entry_reservation(
+        self, symbol: str, side: str, external_oid: str
+    ) -> None:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if exchange_id != "mexc":
+            return
+        method = getattr(type(self.db), "release_entry_reservation", None)
+        if self.db is not None and callable(method):
+            await self.db.release_entry_reservation(
+                exchange_id=exchange_id,
+                symbol=symbol,
+                side=side,
+                external_oid=external_oid,
+            )
+            return
+        self.store.release_entry_reservation(
+            exchange_id, symbol, side, external_oid
+        )
+
     def _require_active_client(self) -> None:
         """Fail closed if the caller reports a replaced runtime context."""
         if self._client_is_active is None:
@@ -1866,6 +1961,13 @@ class OrderService:
             )
             if isinstance(pending_r, BaseException):
                 raise pending_r
+            if await self._has_entry_reservation(
+                symbol, ticket.side, positions=positions
+            ):
+                raise OrderError(
+                    f"a recent {ticket.side} entry on {symbol} is still "
+                    "converging — wait for exchange state before another entry"
+                )
         except OrderError as e:
             # Preview: still return gate errors instead of 500
             return {
@@ -1891,6 +1993,16 @@ class OrderService:
         summary = _confirm_summary(ticket, gate, contract, equity, last_price)
         summary["available_usdt"] = available
         summary["existing_same_side_risk_usdt"] = existing
+        summary["execution_exchange"] = self.settings.exchange
+        summary["execution_hl_testnet"] = (
+            self.settings.hl_testnet
+            if self.settings.exchange == "hyperliquid"
+            else None
+        )
+        summary["execution_trading_enabled"] = self.settings.trading_enabled
+        summary["execution_live_trading"] = bool(self.settings.trading_enabled) and not (
+            self.settings.exchange == "hyperliquid" and self.settings.hl_testnet
+        )
 
         if not gate.ok:
             return {
@@ -2663,6 +2775,13 @@ class OrderService:
         )
         if isinstance(pending_r, BaseException):
             raise pending_r
+        if await self._has_entry_reservation(
+            symbol, ticket.side, positions=account_positions
+        ):
+            raise OrderError(
+                f"a recent {ticket.side} entry on {symbol} is still "
+                "converging — order blocked"
+            )
 
         gate = validate_order(
             ticket,
@@ -2802,6 +2921,13 @@ class OrderService:
                 "pre-trade position snapshot is unavailable or ambiguous — "
                 "order blocked"
             )
+        if not await self._claim_entry_reservation(
+            symbol, ticket.side, external_oid, pre_hold
+        ):
+            raise OrderError(
+                f"a recent {ticket.side} entry on {symbol} is still "
+                "converging — order blocked"
+            )
         try:
             await self._await_pre_submit_mutation(
                 self.client.set_leverage(
@@ -2813,7 +2939,15 @@ class OrderService:
                 )
             )
         except ExchangeError as e:
+            await self._release_entry_reservation(
+                symbol, ticket.side, external_oid
+            )
             raise OrderError(f"set_leverage failed — order blocked: {e}") from e
+        except BaseException:
+            await self._release_entry_reservation(
+                symbol, ticket.side, external_oid
+            )
+            raise
 
         # Hold before place — used so auto-flatten never closes pre-existing size.
         # pre_hold_ok records whether the query was RELIABLE; a failed lookup
@@ -2912,6 +3046,9 @@ class OrderService:
                         f"externalOid={external_oid}. The order may be live; reconcile "
                         "positions and open orders before another preview."
                     ) from e
+                await self._release_entry_reservation(
+                    symbol, ticket.side, external_oid
+                )
                 audit_suffix = f" ({audit_error})" if audit_error else ""
                 raise OrderError(f"place_order failed: {e}{audit_suffix}") from e
             # Order is (likely) live — fall through to SL verify/flatten (not early-return)

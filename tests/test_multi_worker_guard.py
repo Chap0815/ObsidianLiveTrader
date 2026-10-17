@@ -158,7 +158,17 @@ def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
     stale_dir.mkdir()
     dead_pid = _dead_pid()
     (stale_dir / "instance.lock").write_text(str(dead_pid))
-    assert _pid_is_alive(dead_pid) is False
+    # Windows may reuse the just-exited child's PID before a long full-suite
+    # run reaches this assertion. Pin only this synthetic PID as dead.
+    import app.main as main
+
+    real_pid_is_alive = main._pid_is_alive
+    monkeypatch.setattr(
+        main,
+        "_pid_is_alive",
+        lambda pid: False if pid == dead_pid else real_pid_is_alive(pid),
+    )
+    assert main._pid_is_alive(dead_pid) is False
     reclaimed = _acquire_instance_lock(stale_dir)
     assert reclaimed is not None
     reclaimed_pid, _reclaimed_start = _parse_lock_content(reclaimed.read_text())
