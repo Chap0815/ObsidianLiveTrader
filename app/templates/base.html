@@ -8,7 +8,7 @@
   {# T49: IBM Plex is vendored locally (@font-face in app.css → /static/fonts),
      so there is NO external font request on first-start/setup and the CSP needs
      no Google Fonts host. #}
-  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r29-en') }}" />
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version|default('r30-en') }}" />
   {# S3-14: wrapped in a block so a page that doesn't need the chart lib
      (e.g. setup.html) can override it to empty instead of paying for an
      unused vendor bundle. Dashboard doesn't override — same tag as before. #}
@@ -53,7 +53,7 @@
      tag pattern as utils.js / trade-math.js). Loading BEFORE app.js is why it
      must not reference app.js's `state` — the state object is not yet defined. #}
   <script src="/static/api.js?v={{ asset_version|default('r26') }}"></script>
-  <script src="/static/app.js?v={{ asset_version|default('r52') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r53') }}"></script>
   {% endblock %}
   {% block scripts %}{% endblock %}
 </body>

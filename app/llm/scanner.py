@@ -30,6 +30,7 @@ from app.config import Settings
 from app.llm.client import (
     LlmError,
     _categorize_provider_http_error,
+    _chat_token_parameters,
     _log_llm_metrics,
     _oi_read_label,
     _post_with_retry,
@@ -896,14 +897,13 @@ async def _openai_compat_text(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    # max_tokens + temperature MUST be set: without an explicit output budget a
+    # An explicit output budget is required: without it a
     # reasoning model (e.g. Grok-4) can spend the default budget on reasoning
     # tokens and return an EMPTY content string, which then fails JSON parsing
     # ("Modell … lieferte: ''"). Mirrors the working analyze call in client.py.
     body = {
         "model": model,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
+        **_chat_token_parameters(model, provider_label, max_tokens),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

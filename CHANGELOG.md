@@ -5,6 +5,9 @@ certification or a record of private account performance.
 
 ## 2026-10-17 - Execution safety and reproducible verification
 
+- Manage AI Keys now offers provider-specific model names with exact API IDs,
+  preserving saved/custom models and editable local Ollama tags. Modern OpenAI
+  chat requests use the supported token parameter without changing token caps.
 - Durable MEXC entry reservations now require terminal, order-bound
   reconciliation with visible position exposure; partial fills, stale snapshots
   and time alone cannot release the risk budget.

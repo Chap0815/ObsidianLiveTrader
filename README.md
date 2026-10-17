@@ -126,6 +126,12 @@ For terminal-only setup, run `setup.bat`. Manual `.env` changes require a restar
 Copying `.env.example` marks setup complete and disables the first-run setup
 write path; it is not equivalent to the normal guided bootstrap.
 
+In **AI keys → Model selection**, choose a named preset for the selected
+provider to fill its exact API model ID, or keep an editable custom ID. Existing
+models are preserved; apply changes explicitly with **Save**. The offline list
+does not verify account access or download Ollama models. **Test key** is a
+read-only connectivity check, not a completion or quality test.
+
 Use the [operating guide](docs/OPERATIONS.md) for account/network changes,
 updates, privacy, protection and unknown order outcomes. The
 [diagnostics guide](docs/DIAGNOSTICS.md) distinguishes offline checks, public

@@ -144,6 +144,54 @@ class _CapturingClient:
         return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["analyze", "reevaluate", "scanner"])
+@pytest.mark.parametrize(
+    ("provider", "model", "modern"),
+    [
+        ("Codex", "gpt-6.1-sol", True),
+        ("Codex", "gpt-6-astra", True),
+        ("Codex", "gpt-6-sol", True),
+        ("Codex", "gpt-6-luna", True),
+        ("OpenAI", "gpt-5.1", True),
+        ("OpenAI", "gpt-4.1", False),
+        ("Ollama", "gpt-6-sol", False),
+        ("xAI", "grok-4.7", False),
+    ],
+)
+async def test_model_picker_transport_parameters_preserve_budgets_and_provider_scope(
+    monkeypatch, route, provider, model, modern
+):
+    import app.llm.scanner as scanner_mod
+
+    fake = _CapturingClient(200, {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]})
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
+    monkeypatch.setattr(client_mod, "_parse_content_to_proposal", lambda *a, **kw: "parsed")
+    monkeypatch.setattr(client_mod, "_parse_content_to_reevaluation", lambda *a, **kw: "parsed")
+    if route == "scanner":
+        await scanner_mod._openai_compat_text(
+            "synthetic system", "synthetic user", model,
+            "https://synthetic.invalid/v1", "synthetic-key", provider_label=provider,
+        )
+        budget = 8000
+    else:
+        call = client_mod._call_openai_compat if route == "analyze" else client_mod._call_openai_compat_reevaluate
+        await call(
+            {"symbol": "BTC"}, base_url="https://synthetic.invalid/v1",
+            api_key="synthetic-key", model=model, provider_label=provider,
+        )
+        budget = 1800 if route == "analyze" else 1200
+    assert len(fake.posted_bodies) == 1
+    body = fake.posted_bodies[0]
+    assert body["model"] == model
+    if modern:
+        assert body["max_completion_tokens"] == budget
+        assert "max_tokens" not in body and "temperature" not in body
+    else:
+        assert body["max_tokens"] == budget and body["temperature"] == 0
+        assert "max_completion_tokens" not in body
+
+
 class _SeqClient:
     """httpx.AsyncClient stand-in returning a queued sequence of responses,
     one per post() call — for exercising retry/fallback code paths."""

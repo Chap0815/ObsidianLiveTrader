@@ -1612,6 +1612,7 @@ _PROVIDER_LABELS = {
 
 def _settings_llm_status(request: Request) -> dict:
     from app.env_builder import DEFAULT_MODELS, LLM_KEY_VARS
+    from app.llm.model_catalog import model_options
 
     s = get_settings()
     eff = _llm_settings(request)
@@ -1634,6 +1635,7 @@ def _settings_llm_status(request: Request) -> dict:
             "configured": bool(configured[pid]),
             "model": models[pid],
             "default_model": DEFAULT_MODELS[pid],
+            "models": model_options(pid),
         }
         for pid in LLM_KEY_VARS
     ]

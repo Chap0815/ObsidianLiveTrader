@@ -8717,6 +8717,10 @@
 
   // ── KI-Keys panel (authenticated post-setup key management) ──────────
   var AI_DEFAULT_MODELS = Object.create(null);
+  var AI_SAVED_MODELS = Object.create(null);
+  var AI_MODEL_OPTIONS = Object.create(null);
+  var aiModelDrafts = Object.create(null);
+  var kiEditingProvider = "";
 
   function kiPill(ok, text) {
     var pill = $("ki-test-pill");
@@ -8742,13 +8746,19 @@
     var ul = $("ki-keys-status");
     if (!ul) return;
     ul.innerHTML = "";
-    (data.providers || []).forEach(function (p) {
+    (Array.isArray(data.providers) ? data.providers : []).forEach(function (p) {
+      if (!p || !["claude", "xai", "openai", "ollama"].includes(p.id)) return;
       if (
         p && typeof p.id === "string" &&
         typeof p.default_model === "string" && p.default_model.trim()
       ) {
         AI_DEFAULT_MODELS[p.id] = p.default_model.trim();
       }
+      AI_SAVED_MODELS[p.id] = typeof p.model === "string" ? p.model.trim() : "";
+      AI_MODEL_OPTIONS[p.id] = (Array.isArray(p.models) ? p.models : []).filter(function (m) {
+        return m && typeof m.id === "string" && m.id.trim() &&
+          typeof m.label === "string" && m.label.trim();
+      });
       var li = document.createElement("li");
       var dot = document.createElement("span");
       dot.className = "status-dot " + (p.configured ? "ok" : "unknown");
@@ -8766,15 +8776,45 @@
     kiSyncProvider();
   }
 
+  function kiRenderModelOptions() {
+    var select = $("ki-model-preset");
+    var input = $("ki-model");
+    if (!select || !input) return;
+    var models = AI_MODEL_OPTIONS[$("ki-provider").value] || [];
+    select.replaceChildren();
+    var custom = document.createElement("option");
+    custom.value = "";
+    custom.textContent = "Custom / current model ID";
+    select.appendChild(custom);
+    models.forEach(function (m) {
+      var option = document.createElement("option");
+      option.value = m.id.trim();
+      option.textContent = m.label.trim() + " — " + option.value;
+      select.appendChild(option);
+    });
+    var model = input.value.trim();
+    select.value = models.some(function (m) { return m.id.trim() === model; }) ? model : "";
+  }
+
   function kiSyncProvider() {
     var p = $("ki-provider").value;
     var isOllama = p === "ollama";
     var kf = $("ki-key-field");
     if (kf) kf.classList.toggle("hidden", isOllama);
     var modelInput = $("ki-model");
-    if (modelInput && !modelInput.value.trim()) {
-      modelInput.value = AI_DEFAULT_MODELS[p] || "";
+    if (modelInput) {
+      if (kiEditingProvider && kiEditingProvider !== p) {
+        aiModelDrafts[kiEditingProvider] = modelInput.value;
+      }
+      modelInput.value = Object.prototype.hasOwnProperty.call(aiModelDrafts, p)
+        ? aiModelDrafts[p] : (AI_SAVED_MODELS[p] || AI_DEFAULT_MODELS[p] || "");
     }
+    kiEditingProvider = p;
+    kiRenderModelOptions();
+    var help = $("ki-model-help");
+    if (help) help.textContent = isOllama
+      ? "Choose an example or enter the exact tag of an already installed local model. Selection does not download or call a model."
+      : "Choose a named model to fill its exact API ID, or enter your own. Availability depends on your provider account. Selecting a model makes no API call.";
     var pill = $("ki-test-pill");
     if (pill) pill.classList.add("hidden");
   }
@@ -8798,7 +8838,10 @@
     var pill = $("ki-test-pill");
     if (pill) pill.classList.add("hidden");
     var modelInput = $("ki-model");
+    aiModelDrafts = Object.create(null);
+    kiEditingProvider = "";
     if (modelInput) modelInput.value = "";
+    if ($("ki-api-key")) $("ki-api-key").value = "";
     kiSyncProvider();
     showDialog(modal, $("ki-provider"));
     loadKiStatus();
@@ -8806,6 +8849,7 @@
 
   function closeKiModal() {
     const modal = $("ki-keys-modal");
+    if ($("ki-api-key")) $("ki-api-key").value = "";
     hideDialog(modal);
   }
 
@@ -9899,11 +9943,24 @@
     const kiProvider = $("ki-provider");
     if (kiProvider) {
       kiProvider.addEventListener("change", () => {
-        const m = $("ki-model");
-        if (m) m.value = "";
+        if ($("ki-api-key")) $("ki-api-key").value = "";
         kiSyncProvider();
       });
     }
+    const kiModel = $("ki-model");
+    if (kiModel) kiModel.addEventListener("input", () => {
+      aiModelDrafts[$("ki-provider").value] = kiModel.value;
+      kiRenderModelOptions();
+      if ($("ki-test-pill")) $("ki-test-pill").classList.add("hidden");
+    });
+    const kiPreset = $("ki-model-preset");
+    if (kiPreset) kiPreset.addEventListener("change", () => {
+      if (kiPreset.value && kiModel) {
+        kiModel.value = kiPreset.value;
+        aiModelDrafts[$("ki-provider").value] = kiModel.value;
+      }
+      if ($("ki-test-pill")) $("ki-test-pill").classList.add("hidden");
+    });
     const kiTestBtn = $("btn-ki-test");
     if (kiTestBtn) {
       kiTestBtn.addEventListener("click", () => kiTestProvider());
