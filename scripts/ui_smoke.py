@@ -105,6 +105,7 @@ async def run(capture_only=False):
         "expires_in_seconds": 60,
         "errors": [],
         "warnings": [],
+        "execution_context": None,
     }
     health = {
         "ok": True,
@@ -246,6 +247,7 @@ async def run(capture_only=False):
             data = {"entries": [], "total": 0, "by_confidence": {}, "by_regime": {}}
         elif path == "/api/orders/preview":
             ticket = route.request.post_data_json
+            execution = preview_contract["execution_context"] or health
             data = {
                 "ok": preview_contract["ok"],
                 "token": preview_contract["token"],
@@ -270,10 +272,10 @@ async def run(capture_only=False):
                     "risk_pct": 0.016,
                     "rrr": 2,
                     "trigger_mode": ticket.get("trigger_mode", "auto"),
-                    "execution_exchange": health["exchange"],
-                    "execution_hl_testnet": health["hl_testnet"],
-                    "execution_trading_enabled": health["trading_enabled"],
-                    "execution_live_trading": health["live_trading"],
+                    "execution_exchange": execution["exchange"],
+                    "execution_hl_testnet": execution["hl_testnet"],
+                    "execution_trading_enabled": execution["trading_enabled"],
+                    "execution_live_trading": execution["live_trading"],
                 },
             }
         elif path == "/api/orders/confirm":
@@ -795,6 +797,21 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     )
     preview_contract["expires_in_seconds"] = 60
 
+    preview_contract["execution_context"] = {
+        "exchange": "hyperliquid",
+        "hl_testnet": False,
+        "trading_enabled": True,
+        "live_trading": True,
+    }
+    await page.locator("#btn-send-order").click()
+    await expect(page.locator("#confirm-modal")).to_be_hidden()
+    assert await page.evaluate("Trader.state.previewToken === null")
+    await expect(page.locator("#ticket-error")).to_contain_text(
+        "Execution network changed during preview"
+    )
+    preview_contract["execution_context"] = None
+    print("PASS execution-network change during preview invalidates the token")
+
     preview_contract.update(
         ok=False,
         token=None,
@@ -893,6 +910,27 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     await expect(page.locator("#confirm-modal")).to_be_visible()
     await expect(page.locator("#btn-confirm-live")).to_be_enabled()
     print("PASS failed health refresh cannot reuse stale armed state for confirmation")
+
+    confirm_calls_before = sum(
+        path == "/api/orders/confirm" for _, path in calls
+    )
+    health["hl_testnet"] = False
+    health["live_trading"] = True
+    await page.locator("#btn-confirm-live").click()
+    await page.wait_for_function("!Trader.state.orderBusy")
+    assert sum(path == "/api/orders/confirm" for _, path in calls) == confirm_calls_before
+    assert await page.evaluate("Trader.state.previewToken === null")
+    await expect(page.locator("#confirm-error")).to_contain_text(
+        "EXECUTION NETWORK CHANGED"
+    )
+    health["hl_testnet"] = True
+    health["live_trading"] = False
+    await page.locator("#btn-confirm-cancel").click()
+    await page.evaluate("() => Trader.loadHealth()")
+    await page.locator("#btn-send-order").click()
+    await expect(page.locator("#confirm-modal")).to_be_visible()
+    await expect(page.locator("#btn-confirm-live")).to_be_enabled()
+    print("PASS execution-network change before confirm blocks submission")
 
     invalid_confirm = await page.evaluate(
         """async () => {

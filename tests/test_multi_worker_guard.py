@@ -74,6 +74,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -87,14 +88,55 @@ from app.main import (
 )
 
 
-def _dead_pid() -> int:
-    """A PID guaranteed to be dead: spawn a trivial child and wait for exit."""
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait(timeout=10)
-    return proc.pid
+_LOCK_WORKER = r"""
+import sys
+from pathlib import Path
+from app.main import _acquire_instance_lock, _release_instance_lock
+
+data_dir = Path(sys.argv[1])
+print("READY", flush=True)
+if sys.stdin.readline().strip() != "GO":
+    raise SystemExit(2)
+lock_path = _acquire_instance_lock(data_dir)
+print("ACQUIRED" if lock_path is not None else "BUSY", flush=True)
+if lock_path is not None:
+    sys.stdin.readline()
+    _release_instance_lock(lock_path)
+"""
 
 
-def test_oversized_lock_pid_is_inconclusive_instead_of_crashing(tmp_path):
+def _lock_worker(data_dir: Path) -> subprocess.Popen[str]:
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", _LOCK_WORKER, str(data_dir)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "READY"
+    return proc
+
+
+def _worker_command(proc: subprocess.Popen[str], command: str) -> str:
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    proc.stdin.write(command + "\n")
+    proc.stdin.flush()
+    return proc.stdout.readline().strip()
+
+
+def _finish_worker(proc: subprocess.Popen[str], *, release: bool) -> None:
+    if release:
+        assert proc.stdin is not None
+        proc.stdin.write("RELEASE\n")
+        proc.stdin.flush()
+    stdout, stderr = proc.communicate(timeout=10)
+    assert proc.returncode == 0, f"stdout={stdout!r} stderr={stderr!r}"
+
+
+def test_oversized_legacy_metadata_fails_closed(tmp_path):
     oversized_pid = 10**100
     assert _pid_is_alive(oversized_pid) is True
     assert _process_start_time(oversized_pid) is None
@@ -107,6 +149,38 @@ def test_oversized_lock_pid_is_inconclusive_instead_of_crashing(tmp_path):
 
     assert _acquire_instance_lock(data_dir) is None
     assert lock_path.read_text() == original
+
+
+def test_live_legacy_owner_without_kernel_lock_remains_busy(tmp_path):
+    """An app started before the upgrade owns only its unversioned PID file."""
+    data_dir = tmp_path / "live_legacy"
+    data_dir.mkdir()
+    lock_path = data_dir / "instance.lock"
+    current_start = _process_start_time(os.getpid())
+    legacy_marker = (
+        str(os.getpid())
+        if current_start is None
+        else f"{os.getpid()}:{current_start}"
+    )
+    lock_path.write_text(legacy_marker)
+
+    assert _acquire_instance_lock(data_dir) is None
+    assert lock_path.read_text() == legacy_marker
+
+
+@pytest.mark.parametrize(
+    "legacy_marker", ["", "not-a-pid", "0", "999999999:not-a-time"]
+)
+def test_ambiguous_legacy_marker_fails_closed_without_rewrite(
+    tmp_path, legacy_marker
+):
+    data_dir = tmp_path / "ambiguous_legacy"
+    data_dir.mkdir()
+    lock_path = data_dir / "instance.lock"
+    lock_path.write_text(legacy_marker)
+
+    assert _acquire_instance_lock(data_dir) is None
+    assert lock_path.read_text() == legacy_marker
 
 
 @pytest.mark.parametrize(
@@ -124,119 +198,41 @@ def test_windows_open_failure_only_proves_dead_for_invalid_pid(
 
 
 def test_file_lock_detects_second_instance(tmp_path, monkeypatch, caplog):
-    """Unit-level: the lockfile primitives at the heart of Q-02.
-
-    - A fresh acquire creates a PID lockfile and succeeds.
-    - A second acquire while a LIVE foreign PID holds it is busy (None) and
-      must not disturb the other side's lock content.
-    - A lock left behind by a crashed process (dead PID) is stale and must
-      be silently reclaimed instead of blocking startup forever.
-    - Release only ever removes a lock THIS process actually owns.
-    """
-    # Fresh acquire. B3-01: the lockfile now stores "pid:start_time" (or bare
-    # "pid" if the start time could not be determined) — parse instead of a
-    # literal string match against the new format.
-    own_dir = tmp_path / "own"
-    own_dir.mkdir()
-    lock_path = _acquire_instance_lock(own_dir)
-    assert lock_path is not None
-    written_pid, _written_start = _parse_lock_content(lock_path.read_text())
-    assert written_pid == os.getpid()
-    assert _pid_is_alive(os.getpid()) is True
-
-    # Busy: a live foreign PID (the test-runner's parent process) holds it.
-    busy_dir = tmp_path / "busy"
-    busy_dir.mkdir()
-    busy_lock = busy_dir / "instance.lock"
-    other_live_pid = os.getppid()
-    busy_lock.write_text(str(other_live_pid))
-    assert _acquire_instance_lock(busy_dir) is None
-    assert busy_lock.read_text().strip() == str(other_live_pid)  # untouched
-
-    # Stale: a dead PID must be reclaimed, not block startup.
-    stale_dir = tmp_path / "stale"
-    stale_dir.mkdir()
-    dead_pid = _dead_pid()
-    (stale_dir / "instance.lock").write_text(str(dead_pid))
-    # Windows may reuse the just-exited child's PID before a long full-suite
-    # run reaches this assertion. Pin only this synthetic PID as dead.
-    import app.main as main
-
-    real_pid_is_alive = main._pid_is_alive
-    monkeypatch.setattr(
-        main,
-        "_pid_is_alive",
-        lambda pid: False if pid == dead_pid else real_pid_is_alive(pid),
-    )
-    assert main._pid_is_alive(dead_pid) is False
-    reclaimed = _acquire_instance_lock(stale_dir)
-    assert reclaimed is not None
-    reclaimed_pid, _reclaimed_start = _parse_lock_content(reclaimed.read_text())
-    assert reclaimed_pid == os.getpid()
-
-    # Release: only our own lock is removed; a foreign one is left alone.
-    _release_instance_lock(lock_path)
-    assert not lock_path.exists()
-    foreign_lock = tmp_path / "foreign" / "instance.lock"
-    foreign_lock.parent.mkdir()
-    foreign_lock.write_text(str(other_live_pid))
-    _release_instance_lock(foreign_lock)
-    assert foreign_lock.exists()
-
-    # Integration (lifespan): a second instance whose startup lock is busy
-    # (a live foreign PID already holds it) logs a loud WARNING and aborts
-    # startup even while entry trading is disarmed: close/cancel/SL remain real
-    # safety actions and still require the one process-global trade lock.
+    """A kernel lock, not stale PID text, is the startup authority."""
     from app.config import get_settings
-    from fastapi.testclient import TestClient
     from app.main import app
+    from fastapi.testclient import TestClient
 
-    data_dir = tmp_path / "db"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "instance.lock").write_text(str(other_live_pid))
-    monkeypatch.setenv("DATABASE_PATH", str(data_dir / "trader.db"))
-
-    # Unarmed still fails closed.
-    monkeypatch.setenv("TRADING_ENABLED", "false")
-    get_settings.cache_clear()
-    with caplog.at_level(logging.WARNING, logger="app.main"):
-        with pytest.raises(RuntimeError, match="Refusing to start"):
-            with TestClient(app):
-                pass
-    assert any("MULTI-INSTANCE DETECTED" in r.message for r in caplog.records)
-
-    # Armed: fail-closed abort.
-    monkeypatch.setenv("TRADING_ENABLED", "true")
-    monkeypatch.setenv("LOCAL_API_TOKEN", "test-token-1234567890")
-    get_settings.cache_clear()
-    with pytest.raises(RuntimeError, match="Refusing to start"):
-        with TestClient(app):
-            pass
-
-    get_settings.cache_clear()
-
-
-# ── B3-01: PID + process start time in the lockfile ─────────────────────────
-# An alive PID alone is not proof the ORIGINAL lock-owning process is still
-# running — the OS can reassign a dead process's PID to an unrelated new
-# process (PID reuse/wraparound), which would otherwise make a stale lock
-# look permanently busy and block every future ARMED start (a false-positive
-# DoS). Storing + comparing the process START TIME lets a reclaim tell a
-# genuinely-busy PID apart from a reused one.
-
-
-def test_instance_lock_does_not_reclaim_empty_publication_window(tmp_path):
-    """An existing empty path may belong to an O_EXCL winner that has not yet
-    written its PID. It must remain busy instead of being unlinked underneath
-    that live owner."""
-    data_dir = tmp_path / "publishing"
+    data_dir = tmp_path / "db_kernel_lock"
     data_dir.mkdir()
     lock_path = data_dir / "instance.lock"
-    lock_path.write_text("")
 
-    assert _acquire_instance_lock(data_dir) is None
+    holder = _lock_worker(data_dir)
+    try:
+        assert _worker_command(holder, "GO") == "ACQUIRED"
+        monkeypatch.setenv("DATABASE_PATH", str(data_dir / "trader.db"))
+        monkeypatch.setenv("TRADING_ENABLED", "false")
+        get_settings.cache_clear()
+        with caplog.at_level(logging.WARNING, logger="app.main"):
+            with pytest.raises(RuntimeError, match="Refusing to start"):
+                with TestClient(app):
+                    pass
+        assert any("MULTI-INSTANCE DETECTED" in r.message for r in caplog.records)
+    finally:
+        get_settings.cache_clear()
+        _finish_worker(holder, release=True)
+
+    # Release retains one stable path; the next owner locks that same inode.
     assert lock_path.exists()
-    assert lock_path.read_text() == ""
+    reacquired = _acquire_instance_lock(data_dir)
+    assert reacquired == lock_path.resolve()
+    _release_instance_lock(reacquired)
+
+
+# ── Q-02: retained kernel lock + diagnostic metadata ────────────────────────
+# Versioned PID/start-time text is diagnostic; the open descriptor's OS lock is
+# the cross-process authority. Live or ambiguous unversioned legacy markers stay
+# fail-closed because an app started before this protocol owns no kernel lock.
 
 
 def test_instance_lock_second_acquire_in_same_process_is_busy(tmp_path):
@@ -245,53 +241,48 @@ def test_instance_lock_second_acquire_in_same_process_is_busy(tmp_path):
     data_dir.mkdir()
     lock_path = _acquire_instance_lock(data_dir)
     assert lock_path is not None
-    original = lock_path.read_text()
 
     try:
         assert _acquire_instance_lock(data_dir) is None
-        assert lock_path.read_text() == original
     finally:
         _release_instance_lock(lock_path)
+    assert lock_path.exists()
+    written = lock_path.read_text()
+    assert written.startswith("oslock-v1:")
+    written_pid, _written_start = _parse_lock_content(written)
+    assert written_pid == os.getpid()
+
+    # The prior versioned marker still names this live PID, but its released
+    # kernel lock (not PID text) permits a new owner.
+    reacquired = _acquire_instance_lock(data_dir)
+    assert reacquired == lock_path
+    _release_instance_lock(reacquired)
 
 
-def test_stale_pid_reuse_reclaimed_via_start_time_mismatch(tmp_path):
-    """Same (alive) PID, but the recorded start time does NOT match the
-    current process running under that PID -> the original owner is gone
-    and the PID was reissued -> stale, must be reclaimed (not treated as
-    busy). Contrast: the SAME alive PID with the CORRECT start time must
-    still be treated as genuinely busy (Q-02 fail-closed must not be
-    weakened by this change)."""
-    other_live_pid = os.getppid()  # guaranteed alive for the whole test
+def test_stale_metadata_concurrent_reclaim_has_exactly_one_owner(tmp_path):
+    """Two reclaimers contend on one persistent inode; neither may unlink it."""
+    data_dir = tmp_path / "stale_contention"
+    data_dir.mkdir()
+    lock_path = data_dir / "instance.lock"
+    lock_path.write_text("999999999:1.0")
+    workers = [_lock_worker(data_dir), _lock_worker(data_dir)]
+    statuses: list[str] = []
+    try:
+        # Release both subprocesses from their barrier before reading either
+        # result. The winner retains its kernel lock until explicit cleanup.
+        for proc in workers:
+            assert proc.stdin is not None
+            proc.stdin.write("GO\n")
+            proc.stdin.flush()
+        for proc in workers:
+            assert proc.stdout is not None
+            statuses.append(proc.stdout.readline().strip())
+    finally:
+        for index, proc in enumerate(workers):
+            _finish_worker(
+                proc,
+                release=index < len(statuses) and statuses[index] == "ACQUIRED",
+            )
 
-    # Reused-PID case: deliberately WRONG start time for this alive PID.
-    reuse_dir = tmp_path / "reuse"
-    reuse_dir.mkdir()
-    (reuse_dir / "instance.lock").write_text(f"{other_live_pid}:1.0")
-    reclaimed = _acquire_instance_lock(reuse_dir)
-    assert reclaimed is not None
-    reclaimed_pid, _ts = _parse_lock_content(reclaimed.read_text())
-    assert reclaimed_pid == os.getpid()
-
-    # Contrast: genuinely busy — same alive PID AND matching start time must
-    # still block (fail-closed preserved). Skips if this platform/permission
-    # cannot resolve a start time at all (inconclusive, not a regression).
-    real_start = _process_start_time(other_live_pid)
-    if real_start is not None:
-        busy_dir = tmp_path / "busy_matching_start"
-        busy_dir.mkdir()
-        (busy_dir / "instance.lock").write_text(f"{other_live_pid}:{real_start}")
-        assert _acquire_instance_lock(busy_dir) is None
-
-    # Backward tolerance: an OLD-format lockfile (bare PID, no start time) on
-    # an alive foreign PID is still treated as busy (today's PID-only path),
-    # not a crash and not a reclaim.
-    old_format_dir = tmp_path / "old_format_busy"
-    old_format_dir.mkdir()
-    (old_format_dir / "instance.lock").write_text(str(other_live_pid))
-    assert _acquire_instance_lock(old_format_dir) is None
-
-    # Non-finite metadata is likewise inconclusive, never proof of PID reuse.
-    nonfinite_dir = tmp_path / "nonfinite_start_busy"
-    nonfinite_dir.mkdir()
-    (nonfinite_dir / "instance.lock").write_text(f"{other_live_pid}:nan")
-    assert _acquire_instance_lock(nonfinite_dir) is None
+    assert sorted(statuses) == ["ACQUIRED", "BUSY"]
+    assert lock_path.exists()

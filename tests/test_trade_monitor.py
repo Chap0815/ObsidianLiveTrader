@@ -368,6 +368,15 @@ async def test_current_sl_requires_full_position_coverage():
 
 
 @pytest.mark.asyncio
+async def test_current_sl_treats_missing_stop_as_unverified_coverage():
+    client = FakeClient([], stops=[])
+
+    assert await monitor._current_sl(
+        client, "BTC_USDT", "long", 100.0, hold_vol=1.0
+    ) == (None, False)
+
+
+@pytest.mark.asyncio
 async def test_partial_stop_coverage_pauses_automation_and_alerts(
     monkeypatch, db_path
 ):
@@ -393,6 +402,42 @@ async def test_partial_stop_coverage_pauses_automation_and_alerts(
     service.modify_stop_loss.assert_not_awaited()
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row["last_alert_state"]["protection_coverage"]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_restored_stop_coverage_clears_stale_coverage_alert(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=False)
+    _install_spy(monkeypatch)
+    client = FakeClient(
+        [_pos(hold=1.0)],
+        stops=[
+            {
+                "symbol": "BTC",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+                "vol": 0.25,
+            }
+        ],
+    )
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert "protection_coverage" in row["last_alert_state"]
+
+    client._stops = [
+        {
+            "symbol": "BTC",
+            "triggerPrice": 99.0,
+            "orderType": "Stop",
+            "vol": 1.0,
+        }
+    ]
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS + 1)
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert "protection_coverage" not in row["last_alert_state"]
 
 
 @pytest.mark.asyncio
@@ -473,6 +518,7 @@ async def test_invalidation_uses_entry_proposal_not_latest_symbol_proposal():
         observed_open_sig=222,
         observed_opened_at=2_000,
         reopen_opened_at=2_000,
+        execution_context="",
     )
     db.latest_proposal_for_symbol.assert_not_awaited()
 
@@ -856,6 +902,13 @@ async def test_unarmed_only_alerts_no_modify(monkeypatch, db_path):
         error=None,
     )
     await _seed_open(db, armed=False, opened_at=opened_at)
+    await db.bind_entry_proposal(
+        "BTC_USDT",
+        "long",
+        open_sig=NOW_MS,
+        proposal_id=original_id,
+        external_oid="mlt-source",
+    )
     # A newer unrelated analysis must not replace the entry's thesis. At mark
     # 98.5 the original invalidation (99) crosses, while the newer one (80) does not.
     await db.insert_proposal(

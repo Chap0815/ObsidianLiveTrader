@@ -1563,7 +1563,9 @@ class MexcClient:
             raise MexcError("history recovery pagination cap reached after a match")
         return None
 
-    async def order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
+    async def order_by_external_oid(
+        self, symbol: str, external_oid: str, *, include_terminal: bool = False
+    ) -> Any:
         """Lookup order by client externalOid (idempotency / timeout recovery).
 
         Tries, in order:
@@ -1616,7 +1618,7 @@ class MexcClient:
                 "recovery response contains an inconsistent matching identity"
             )
         if direct_matches:
-            if _mexc_state_is_dead(direct):
+            if not include_terminal and _mexc_state_is_dead(direct):
                 return {}  # X2-04: cancelled/invalid — not live
             return {"match": "direct", "externalOid": external_oid, "order": direct}
 
@@ -1625,7 +1627,7 @@ class MexcClient:
         for attempt in range(attempts):
             hist_row = await self._history_row_by_external_oid(symbol, external_oid)
             if hist_row is not None:
-                if _mexc_state_is_dead(hist_row):
+                if not include_terminal and _mexc_state_is_dead(hist_row):
                     return {}  # X2-04: terminal-dead state is definitive → no retry
                 return {
                     "match": "history",
@@ -1641,7 +1643,7 @@ class MexcClient:
                 open_rows, symbol, external_oid
             )
             if open_row is not None:
-                if _mexc_state_is_dead(open_row):
+                if not include_terminal and _mexc_state_is_dead(open_row):
                     return {}  # X2-04
                 return {
                     "match": "open",
@@ -1786,6 +1788,51 @@ def _mexc_recovery_identity_matches(
     return row_symbol is None or str(row_symbol).upper() == str(symbol).upper()
 
 
+def _mexc_recovery_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize documented aliases when comparing duplicate order rows."""
+    canonical = dict(row)
+    groups = (
+        ("orderId", "order_id", "oid", "id"),
+        ("positionId", "position_id"),
+        ("dealVol", "deal_vol", "dealVolume"),
+        ("vol", "volume", "quantity"),
+        ("price",), ("leverage",), ("side",), ("type",), ("openType",),
+        ("stopLossPrice",), ("takeProfitPrice",),
+    )
+    for aliases in groups:
+        values = []
+        for key in aliases:
+            if key in canonical:
+                raw = canonical.pop(key)
+                if aliases[0] in ("orderId", "positionId"):
+                    number = int(str(raw)) if _mexc_positive_order_id(raw) else None
+                else:
+                    number = _opt_float(raw)
+                values.append(number if number is not None else (type(raw).__name__, repr(raw)))
+        if values:
+            if any(value != values[0] for value in values[1:]):
+                raise MexcError("recovery response contains conflicting order snapshots")
+            canonical[aliases[0]] = values[0]
+    # Stringified integral order IDs are intentionally supported by the adapter.
+    # Preserve their full precision rather than comparing them through floats.
+    canonical["orderId"] = _mexc_consistent_order_id(row)
+    states = []
+    terminal_states = {"3": "filled", "completed": "filled", "filled": "filled",
+                       "4": "cancelled", "canceled": "cancelled", "cancelled": "cancelled",
+                       "5": "invalid", "invalid": "invalid"}
+    for key in ("state", "orderState", "order_state"):
+        if key in canonical:
+            raw = str(canonical.pop(key)).strip().lower()
+            states.append(terminal_states.get(raw, raw))
+    if states:
+        if len(set(states)) != 1:
+            raise MexcError("recovery response contains conflicting order snapshots")
+        canonical["state"] = states[0]
+    if "external_oid" in canonical:
+        canonical["externalOid"] = canonical.pop("external_oid")
+    return canonical
+
+
 def _mexc_unique_recovery_match(
     rows: list[dict[str, Any]], symbol: str, external_oid: str
 ) -> dict[str, Any] | None:
@@ -1804,6 +1851,8 @@ def _mexc_unique_recovery_match(
         order_id = _mexc_consistent_order_id(row)
         if order_id is None:
             continue
+        if order_id in matches and _mexc_recovery_snapshot(matches[order_id]) != _mexc_recovery_snapshot(row):
+            raise MexcError("recovery response contains conflicting order snapshots")
         matches.setdefault(order_id, row)
         if len(matches) > 1:
             raise MexcError(

@@ -45,7 +45,7 @@ class PreviewStore:
         # Fallback for unit tests/minimal embeddings without a Database.  The
         # production path persists the same guard in SQLite.
         self._entry_reservations: dict[
-            tuple[str, str, str], tuple[str, float, float]
+            tuple[str, str, str], dict[str, Any]
         ] = {}
 
     @staticmethod
@@ -123,16 +123,11 @@ class PreviewStore:
 
     def active_entry_reservation(
         self, exchange_id: str, symbol: str, side: str
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         key = (exchange_id, symbol, side)
         with self._lock:
             item = self._entry_reservations.get(key)
-            if item is None:
-                return False
-            if time.monotonic() >= item[1]:
-                self._entry_reservations.pop(key, None)
-                return False
-            return True
+            return copy.deepcopy(item)
 
     def claim_entry_reservation(
         self,
@@ -142,18 +137,20 @@ class PreviewStore:
         external_oid: str,
         pre_hold: float,
         ttl_seconds: int,
+        requested_vol: float | None = None,
+        request_json: Any = None,
+        proposal_id: int | None = None,
     ) -> bool:
         key = (exchange_id, symbol, side)
-        now = time.monotonic()
         with self._lock:
             current = self._entry_reservations.get(key)
-            if current is not None and now < current[1]:
+            if current is not None:
                 return False
-            self._entry_reservations[key] = (
-                external_oid,
-                now + max(1, int(ttl_seconds)),
-                float(pre_hold),
-            )
+            self._entry_reservations[key] = {
+                "external_oid": external_oid, "pre_hold": float(pre_hold),
+                "requested_vol": requested_vol, "request": copy.deepcopy(request_json),
+                "proposal_id": proposal_id,
+            }
             return True
 
     def release_entry_reservation(
@@ -162,7 +159,7 @@ class PreviewStore:
         key = (exchange_id, symbol, side)
         with self._lock:
             current = self._entry_reservations.get(key)
-            if current is not None and current[0] == external_oid:
+            if current is not None and current["external_oid"] == external_oid:
                 self._entry_reservations.pop(key, None)
 
     def _purge_unlocked(self) -> None:

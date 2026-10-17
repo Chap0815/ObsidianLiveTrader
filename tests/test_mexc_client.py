@@ -1684,6 +1684,76 @@ async def test_mexc_recovery_retries_before_giving_up():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["direct", "history", "open"])
+async def test_reconciliation_can_read_terminal_zero_fill_without_claiming_live(source):
+    target_oid = "cli-terminal-evidence"
+    row = {
+        "externalOid": target_oid, "orderId": 9, "symbol": "BTC_USDT",
+        "state": 4, "dealVol": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/external/" + target_oid):
+            if source == "direct":
+                return httpx.Response(200, json=row)
+            return httpx.Response(404, json={"code": 404, "msg": "not found"})
+        if path.endswith("/history_orders"):
+            return httpx.Response(200, json={"resultList": [row] if source == "history" else []})
+        if path.endswith("/open_orders/BTC_USDT") or "/open_orders" in path:
+            return httpx.Response(200, json={"resultList": [row]})
+        return httpx.Response(404, json={"code": 404, "msg": "not found"})
+
+    client = _client_with_handler(handler)
+    client._RECOVERY_RETRY_DELAY_S = 0
+    try:
+        found = await client.order_by_external_oid(
+            "BTC_USDT", target_oid, include_terminal=True
+        )
+        assert found["match"] == source
+        assert found["order"] == row
+        assert await client.order_by_external_oid("BTC_USDT", target_oid) == {}
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [{"state": 2}, {"dealVol": 0.5}, {"positionId": 999}])
+async def test_recovery_rejects_conflicting_duplicate_snapshots(changes):
+    target_oid = "cli-conflicting-snapshots"
+    row = {
+        "externalOid": target_oid, "orderId": 9, "symbol": "BTC_USDT",
+        "state": 3, "dealVol": 1.0, "positionId": 77,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/external/" in request.url.path:
+            return httpx.Response(404, json={"code": 404, "msg": "not found"})
+        return httpx.Response(200, json={"resultList": [row, {**row, **changes}]})
+
+    client = _client_with_handler(handler)
+    try:
+        with pytest.raises(MexcError, match="conflicting order snapshots"):
+            await client.order_by_external_oid("BTC_USDT", target_oid, include_terminal=True)
+    finally:
+        await client.aclose()
+
+
+def test_recovery_compares_normalized_aliases_without_losing_id_precision():
+    from app.mexc.client import _mexc_unique_recovery_match
+
+    row = {"externalOid": "exact", "orderId": 7, "positionId": 9007199254740992,
+           "dealVol": 1, "state": 3}
+    equivalent = {"external_oid": "exact", "order_id": "7",
+                  "position_id": "9007199254740992", "deal_vol": "1.0", "orderState": "completed"}
+    assert _mexc_unique_recovery_match([row, equivalent], "BTC_USDT", "exact") == row
+    with pytest.raises(MexcError, match="conflicting order snapshots"):
+        _mexc_unique_recovery_match(
+            [row, {**row, "positionId": 9007199254740993}], "BTC_USDT", "exact"
+        )
+
+
+@pytest.mark.asyncio
 async def test_mexc_recovery_rejects_cancelled_state():
     """X2-04: a match whose MEXC state is cancelled(4)/invalid(5) is NOT live and
     must NOT be reported as recovered → order_by_external_oid returns {} (so the

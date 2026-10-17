@@ -434,7 +434,11 @@ async def test_open_position_resolves_explicit_order_proposal_not_latest(db_path
         status="placed",
         error=None,
     )
-    await db.upsert_position_mgmt(**_base_kwargs(opened_at=order_ms))
+    await db.bind_entry_proposal(
+        "BTC_USDT", "long", open_sig=77, proposal_id=original_id,
+        external_oid="mlt-source",
+    )
+    await db.upsert_position_mgmt(**_base_kwargs(opened_at=order_ms, open_sig=77))
     await db.insert_proposal(
         symbol="BTC_USDT",
         proposal_json={"action": "SELL", "thesis": "unrelated newer analysis"},
@@ -486,6 +490,14 @@ async def test_reopen_resolves_proposal_from_observed_trade_epoch(db_path):
         await conn.commit()
     await db.upsert_position_mgmt(
         **_base_kwargs(opened_at=old_ms, open_sig=111)
+    )
+    await db.bind_entry_proposal(
+        "BTC_USDT", "long", open_sig=111, proposal_id=old_id,
+        external_oid="mlt-old",
+    )
+    await db.bind_entry_proposal(
+        "BTC_USDT", "long", open_sig=222, proposal_id=new_id,
+        external_oid="mlt-new",
     )
 
     resolved = await db.proposal_for_open_position(

@@ -53,7 +53,7 @@ jobs:
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --require-virtualenv pip==26.2.1
-          .\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps -r requirements.lock -r requirements-dev.lock
+          .\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps --require-hashes -r requirements.lock -r requirements-dev.lock
       - name: Verify installed dependency consistency
         run: .\.venv\Scripts\python.exe -m pip check
       - name: Audit pinned runtime dependencies
@@ -63,12 +63,28 @@ jobs:
       - name: Lint Python
         run: .\.venv\Scripts\ruff.exe check .
       - name: Check JavaScript
+        shell: pwsh
         run: |
           node --check app/static/app.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check app/static/api.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check app/static/utils.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --check
+      - name: Check committed whitespace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $base = '${{ github.event.pull_request.base.sha }}'
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'push' -and '${{ github.event.before }}' -notmatch '^0+$') {
+            $base = '${{ github.event.before }}'
+          } else {
+            $base = git rev-parse HEAD^1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          git diff --check "$base..HEAD"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Offline regression suite
         run: .\.venv\Scripts\python.exe -m pytest tests/ -q
       - name: Install browser

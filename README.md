@@ -89,6 +89,11 @@ Auto break-even and trailing rules require a separate per-position opt-in.
 - Stop replacement places and verifies the new stop before removing the old.
 - Hyperliquid limit entries remain disabled without a persistent fill watcher.
 - MEXC pending same-side entries block additional unaggregated exposure.
+  Submitted entries remain reserved across restarts until an exact terminal
+  order lookup and visible position exposure agree; elapsed time or a partial
+  fill alone never releases the reservation.
+- Entry-thesis attribution requires a verified order/position link. If that
+  identity is unavailable, the app leaves the thesis unassigned.
 - Account and position data is sent to an external AI only with
   `INCLUDE_ACCOUNT_IN_LLM=true`; external position reevaluation is blocked
   until that opt-in is enabled. Local Ollama can use the reduced position
@@ -140,7 +145,7 @@ real AI provider.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install --require-virtualenv pip==26.2.1
-.\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps -r requirements.lock -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps --require-hashes -r requirements.lock -r requirements-dev.lock
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe -m pip_audit --strict --no-deps --disable-pip --progress-spinner off --vulnerability-service osv -r requirements.lock
 .\.venv\Scripts\python.exe -m pip_audit --strict --local --progress-spinner off --vulnerability-service osv

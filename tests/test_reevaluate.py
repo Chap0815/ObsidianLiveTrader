@@ -339,6 +339,7 @@ async def test_reevaluate_resolves_thesis_against_current_position_epoch(monkeyp
         observed_open_sig=222,
         observed_opened_at=None,
         reopen_opened_at=2_000_000,
+        execution_context="",
     )
     assert captured_context["original_thesis"]["rationale"] == "fresh trade epoch"
     assert captured_context["original_thesis"]["proposed_at"] == (

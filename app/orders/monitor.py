@@ -36,6 +36,7 @@ from app.config import get_settings
 from app.orders.service import (
     OrderOutcomeUnknown,
     client_uses_hyperliquid_semantics,
+    execution_context_id,
     hl_epoch_signature,
     hl_flat_open_epoch as _hl_flat_open_epoch,
     open_position_signature,
@@ -195,6 +196,7 @@ async def _best_effort_invalidation(
     observed_open_sig: int | None = None,
     observed_opened_at: int | None = None,
     reopen_opened_at: int | None = None,
+    execution_context: str = "",
 ) -> float | None:
     """Thesis-invalidation price from this position's explicit proposal.
 
@@ -211,6 +213,7 @@ async def _best_effort_invalidation(
             observed_open_sig=observed_open_sig,
             observed_opened_at=observed_opened_at,
             reopen_opened_at=reopen_opened_at,
+            execution_context=execution_context,
         )
         if not prop:
             return None
@@ -272,9 +275,15 @@ async def _current_sl(
                 continue
             matching_stops.append(row)
         sl, _tp = classify_protection(matching_stops, side=side, entry=entry)
-        if sl is None or hold_vol is None:
+        if hold_vol is None:
             return sl, True
         if not _finite_real_number(hold_vol) or hold_vol <= 0:
+            return None, False
+        # A successful lookup that found no SL is authoritative evidence that
+        # the live position has no verified stop coverage.  It is not a read
+        # failure, but callers must take the same fail-closed path: pause
+        # autonomous moves and surface the protection warning.
+        if sl is None:
             return None, False
 
         # A tighter partial stop is not the stop for the whole position. Walk
@@ -374,6 +383,7 @@ async def ensure_baseline(
         observed_open_sig=open_sig,
         observed_opened_at=opened_at,
         reopen_opened_at=reopen_opened_at,
+        execution_context=execution_context_id(client),
     )
 
     # Durable baseline. First sighting inserts; a later sighting refreshes in
@@ -443,6 +453,11 @@ async def _process_position(
         mark = None
     if mark is None or mark <= 0:
         return
+
+    # A resting MEXC entry may fill long after Confirm. Reconcile its exact
+    # order/position evidence before resolving the durable entry thesis.
+    if callable(getattr(type(service), "_has_entry_reservation", None)):
+        await service._has_entry_reservation(symbol, side, positions=[pos])
 
     # Durable baseline via the SHARED helper (identical freeze/reset semantics
     # to the arm endpoint). evaluate_rules below still uses the LIVE current_sl
@@ -564,6 +579,11 @@ async def _process_position(
             ),
             "ts": now_ms,
         }
+        state_dirty = True
+    elif sl_ok and "protection_coverage" in alert_state:
+        # This alert describes current coverage, not a historical action.  Once
+        # the full live hold is verifiably protected, remove the stale warning.
+        alert_state.pop("protection_coverage", None)
         state_dirty = True
 
     # Advisory alarms always all fire (they never touch an order).
