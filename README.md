@@ -78,6 +78,12 @@ aliases for `python.exe` and `python3.exe`. For an offline retry after a
 successful first install, use `start.bat --skip-install`. After an update, run
 the normal launcher first so it can apply the updated lockfile.
 
+Keep the original start window open while running. On Windows, closing it
+stops its server process tree; closing the browser does not. Prefer **Ctrl+C**
+and wait for shutdown. Stopping the app does not close exchange positions or
+cancel their orders. A second launcher only opens an already running instance
+and cannot stop it by closing its own window.
+
 ## Safe operating flow
 
 1. Verify the venue, Testnet/Mainnet label and trading state; load a symbol.

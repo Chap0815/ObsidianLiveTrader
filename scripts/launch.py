@@ -117,6 +117,47 @@ def _run(
     return r.returncode
 
 
+def _run_server(cmd: list[str], env: dict[str, str]) -> int:
+    if os.name != "nt":
+        return subprocess.call(cmd, cwd=str(ROOT), env=env)
+
+    # Import only the stdlib-only process boundary, never app.main or settings.
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from app.server_process import WindowsServerJob
+
+    try:
+        job = WindowsServerJob()
+    except OSError:
+        print("ERROR: Cannot establish server ownership. No server was started.")
+        return 1
+    process = None
+    try:
+        guarded = [cmd[0], "-m", "app.server_process", job.name, *cmd[3:]]
+        process = subprocess.Popen(guarded, cwd=str(ROOT), env=env, close_fds=True)
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            print("Stopping server — waiting up to 10 seconds for shutdown...")
+            try:
+                return process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print("Server did not stop in time; ending this launcher's server tree.")
+                return 130
+    finally:
+        # Explicit cleanup on normal/exceptional return; the kernel closes the
+        # same non-inherited handle even if this launcher is forcibly killed.
+        job.close()
+        if process is not None and process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # The Venv redirector is outside the server job; reap our own
+                # direct child if it failed to exit after its server was killed.
+                process.kill()
+                process.wait(timeout=5)
+
+
 def _venv_env() -> dict[str, str]:
     """Env for child processes: force virtualenv for pip, no user installs."""
     e = os.environ.copy()
@@ -574,7 +615,7 @@ def main() -> None:
     print(f"Trading:  {read_trading_banner()}")
     if setup_open:
         print("Next:     complete the guided setup in your browser")
-    print("Ctrl+C to stop.")
+    print("Closing the browser does not stop the server or close exchange positions.")
     print()
 
     # W3-11: Port-Pre-Check — der häufigste "Fehler" ist gar keiner: der
@@ -589,6 +630,7 @@ def main() -> None:
             )
             raise SystemExit(1)
         print(f"Already running on port {port} — opening the browser; no second server needed.")
+        print("The existing server is NOT owned by this window. Stop it in its original session.")
         print(f"  URL: {url}")
         if not args.no_browser:
             try:
@@ -596,6 +638,10 @@ def main() -> None:
             except Exception:
                 pass
         raise SystemExit(0)
+
+    print("Ctrl+C to stop.")
+    if os.name == "nt":
+        print("Closing THIS server's start window also stops its server process tree.")
 
     if not args.no_browser:
 
@@ -623,7 +669,7 @@ def main() -> None:
     ]
     if args.reload:
         cmd.append("--reload")
-    raise SystemExit(subprocess.call(cmd, cwd=str(ROOT), env=_venv_env()))
+    raise SystemExit(_run_server(cmd, _venv_env()))
 
 
 if __name__ == "__main__":

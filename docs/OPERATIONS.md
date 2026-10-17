@@ -26,6 +26,17 @@ do not expose it through a public reverse proxy, tunnel or multi-worker service.
 The launcher checks the health identity of an existing listener and refuses to
 treat a foreign listener or HTTP redirect as this application.
 
+On Windows, `start.bat` and `start.ps1` bind a newly started server to their
+launcher and calling start window. Keep that original window open. **Ctrl+C**
+allows up to ten seconds for graceful server shutdown; closing/killing the
+start window ends its guarded server process tree, including reload children.
+Abrupt closure can interrupt cleanup, so prefer Ctrl+C and wait for completion.
+Closing the browser does not stop the server. A second launcher that finds an
+existing instance only opens its browser and does not acquire shutdown authority
+over that server. This binding does not apply to manually launched Uvicorn or
+service installations. No process exit automatically closes exchange positions
+or cancels their orders.
+
 Use [`.env.example`](../.env.example) as a field reference and
 [`app/config.py`](../app/config.py) for authoritative defaults and validation.
 Guided setup creates a safe bootstrap configuration. Copying `.env.example`
