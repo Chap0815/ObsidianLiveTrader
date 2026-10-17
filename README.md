@@ -16,6 +16,7 @@ server-side risk checks, order execution, position management, and a journal in
 one FastAPI web interface.
 
 [Get started](#quick-start-on-windows) · [Support](SUPPORT.md) ·
+[Operating guide](docs/OPERATIONS.md) · [Diagnostics](docs/DIAGNOSTICS.md) ·
 [Security](SECURITY.md) · [Changelog](CHANGELOG.md) · [License](LICENSE)
 
 ![Trading dashboard with synthetic demonstration data](docs/media/dashboard.png)
@@ -29,16 +30,24 @@ one FastAPI web interface.
   Ollama. AI use is optional; provider API access is configured separately.
 - Build an order ticket, review server-side risk checks, then explicitly confirm.
 - Monitor exchange-side protection and opt into position-specific break-even
-  and trailing rules.
+  and trailing rules on Hyperliquid.
 - Review fills, trade history, journal outcomes and analysis calibration.
+  Journal outcomes are shadow measurements, not verified account PnL.
 
 > There is no paper-trading mode. Hyperliquid Testnet uses test funds;
 > Hyperliquid Mainnet and MEXC use real funds. Trading is disabled by default.
 
+| Venue | Funds and network | Entry orders | Automatic break-even / trailing |
+| --- | --- | --- | --- |
+| Hyperliquid Testnet | Test funds; `HL_TESTNET=true` | Market only | Per-position opt-in |
+| Hyperliquid Mainnet | Real funds; `HL_TESTNET=false` | Market only; armed startup also requires `MAINNET_ACK=true` | Per-position opt-in |
+| MEXC | Live funds; no Testnet mode in this app | Market and limit, subject to risk gates | Not supported |
+
 ## Quick start on Windows
 
-Requirements: Python 3.11 or newer and an internet connection for the first
-dependency install.
+Requirements: Python 3.11 or newer, a current browser and an internet connection
+for the first dependency install. Node.js and Playwright are development tools;
+they are not needed for normal startup.
 
 1. [Download the source ZIP](https://github.com/Chap0815/ObsidianLiveTrader/archive/refs/heads/main.zip)
    and extract it into its own folder, or clone this repository. Double-click
@@ -49,14 +58,15 @@ dependency install.
    ```
 
 2. On the first launch, the browser opens the guided setup automatically.
-3. Choose Hyperliquid Testnet for the safest first run and enter a trade-only
+3. Keep trading disabled, choose Hyperliquid Testnet and enter a trade-only
    agent/API-wallet key. Never grant withdrawal or transfer permissions.
 4. Save the setup. The dashboard opens immediately.
 
 Later launches use the same `start.bat`. The launcher creates an isolated
 `.venv`, installs packages only there, creates a safe bootstrap `.env`, and
-opens the correct local page. Do not copy `.env.example` for the normal first
-run; it is a reference for manual configuration.
+opens the correct local page. Exact dependency versions and SHA-256 artifact
+hashes are checked during installation. Do not copy `.env.example` for the
+normal first run; it is a reference for manual configuration.
 
 Default URL: <http://127.0.0.1:8787>
 
@@ -65,19 +75,23 @@ Health check: <http://127.0.0.1:8787/api/health>
 If Python opens the Microsoft Store instead, install Python 3.11+ from
 <https://www.python.org/downloads/> and disable the Windows app-execution
 aliases for `python.exe` and `python3.exe`. For an offline retry after a
-successful first install, use `start.bat --skip-install`.
+successful first install, use `start.bat --skip-install`. After an update, run
+the normal launcher first so it can apply the updated lockfile.
 
 ## Safe operating flow
 
-1. Load a symbol or choose one from the market scan.
-2. Run AI analysis and review the proposal.
-3. Explicitly copy the proposal into the order ticket.
-4. Review the order preview and every risk gate.
-5. Confirm only when trading has deliberately been armed.
-6. Monitor the position and its exchange-side SL/TP protection.
+1. Verify the venue, Testnet/Mainnet label and trading state; load a symbol.
+2. Build a ticket manually, or optionally request AI analysis and explicitly
+   copy the reviewed proposal into the ticket.
+3. Review the preview, size, stop, risk gates and execution-network warning.
+4. Confirm only after deliberately arming trading for the intended account.
+5. Monitor the position and verify its exchange-side SL/TP protection.
 
 AI is advisory only. It cannot bypass risk gates or submit an entry by itself.
 Auto break-even and trailing rules require a separate per-position opt-in.
+The position-management kill switch disarms those rules; it does not close
+positions, cancel orders or turn off entry trading. See the
+[operating guide](docs/OPERATIONS.md#trading-and-position-controls).
 
 ## Safety model
 
@@ -108,42 +122,27 @@ All available settings are documented in [`.env.example`](.env.example), while
 [`app/config.py`](app/config.py) is the authoritative source for defaults and
 validation.
 
-For terminal-only setup, run `setup.bat`. To switch to real funds, first stop
-the server and back up `.env` and `data/`, keep `TRADING_ENABLED=false`, verify
-a trade-only key and the target account, and complete the applicable read-only
-connectivity checks. Hyperliquid Mainnet additionally requires
-`HL_TESTNET=false` and `MAINNET_ACK=true`. Restart after changing `.env`.
+For terminal-only setup, run `setup.bat`. Manual `.env` changes require a restart.
+Copying `.env.example` marks setup complete and disables the first-run setup
+write path; it is not equivalent to the normal guided bootstrap.
 
-For a read-only Hyperliquid Testnet check, run
-`python scripts/hl_spike.py`; the tool refuses Mainnet before creating a client.
-The default client receives no account credentials. Add `--with-account` only
-when the configured Testnet account should also be read; a missing private key
-or malformed account identity is rejected before client creation or network
-access. The constructed client must still prove its Testnet flag and canonical
-HTTPS endpoint before the first public or private request. MEXC has no futures
-Testnet, so `python scripts/mexc_spike.py` is strictly
-read-only. Add `--with-account` only when authenticated MEXC asset and position
-reads are explicitly intended. Before any request, the constructed client must
-still target the canonical HTTPS MEXC endpoint without embedded credentials.
-All trading mutations remain behind the app's authoritative Preview and Confirm
-flow.
-
-For the Hyperliquid order-lifecycle diagnostic, run
-`python scripts/hl_smoke_trade.py`. Its default is a credential-free public
-Testnet preflight. Add `--with-account` for private, non-mutating Preview checks;
-only the exact `--confirm TESTNET` acknowledgement may place and clean up the
-bounded Testnet probe order. Both
-account-backed modes require a valid private key and optional account address
-before client creation. The constructed client is then checked against the
-canonical HTTPS Testnet endpoint before any exchange read, in addition to the
-instance lock, clean-account baseline, audit DB and trading gates.
+Use the [operating guide](docs/OPERATIONS.md) for account/network changes,
+updates, privacy, protection and unknown order outcomes. The
+[diagnostics guide](docs/DIAGNOSTICS.md) distinguishes offline checks, public
+connectivity, private account reads and the explicitly acknowledged Testnet
+order probe. Connectivity diagnostics contact real exchange endpoints; they
+are not part of the offline suite.
 
 ## Development checks
 
-All tests are offline or mock-based and must never submit real orders or call a
-real AI provider.
+Run checks in a clean source checkout without a real `.env` or private runtime
+data. The regression suite and UI smoke use synthetic data and mocked transports;
+the two OSV audits and first dependency/browser installations require network
+access. Node.js is required for JavaScript checks; dev dependencies come from
+`requirements-dev.lock`.
 
 ```powershell
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --require-virtualenv pip==26.2.1
 .\.venv\Scripts\python.exe -m pip install --require-virtualenv --no-deps --require-hashes -r requirements.lock -r requirements-dev.lock
 .\.venv\Scripts\python.exe -m pip check
@@ -152,8 +151,9 @@ real AI provider.
 .\.venv\Scripts\python.exe -m pytest tests/ -q
 .\.venv\Scripts\ruff.exe check .
 node --check app/static/app.js
+node --check app/static/api.js
 node --check app/static/utils.js
-python scripts/check_publication.py
+.\.venv\Scripts\python.exe scripts/check_publication.py
 git diff --check
 ```
 
@@ -163,6 +163,11 @@ Install Chromium once and run the isolated responsive UI smoke test with:
 .\.venv\Scripts\python.exe -m playwright install chromium
 .\.venv\Scripts\python.exe scripts/ui_smoke.py
 ```
+
+The smoke covers 320–2048 px, keyboard/modal interactions, blocked states and
+execution-network changes. Set `UI_SMOKE_OUTPUT_DIR` to an external artifact
+directory if needed. Maintainer publishing rules are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Project map
 
@@ -176,16 +181,19 @@ app/llm/          Providers, prompts, scanner, and recalibration
 app/db/           SQLite schema and repository
 app/static/       Browser application and styles
 app/templates/    Dashboard and first-run setup
+docs/             Operating guide and diagnostic modes
 scripts/          Launchers, terminal setup, and UI smoke tests
 tests/            Offline regression suite
 ```
 
 ## Verification and limits
 
-Automated checks cover offline regression tests, responsive browser behavior,
-Python linting, JavaScript syntax and the publication boundary. They run without
-real exchange orders or provider LLM calls. The status badge links to the actual
-GitHub check results.
+Automated checks cover fresh hash-verified installs, both OSV audits, secret
+scanning, offline regressions, responsive browser behavior, Python linting,
+JavaScript syntax, committed whitespace and the publication boundary. Tests run
+without real exchange orders or provider LLM calls. The status badge links to
+the actual GitHub check results; a green check does not certify live trading or
+profitability.
 
 This application targets a local, single-user Windows installation. It is not
 a multi-user hosted service. Exchange API access, account permissions and live
@@ -198,8 +206,7 @@ are welcome; official code and releases are maintained by the project owner.
 See [maintenance rules](CONTRIBUTING.md) and [community conduct](CODE_OF_CONDUCT.md).
 
 Source is available under **PolyForm Noncommercial 1.0.0 with an additional
-permission for personal trading**, matching the licensing rules of
-[Obsidian Trading Terminal](https://github.com/Chap0815/ObsidianTerminal).
+permission for personal trading**.
 Natural persons may trade solely for their own personal account using their own
 funds under that permission. This is not an OSI open-source license. Read
 [LICENSE](LICENSE) for the complete terms and [third-party notices](THIRD_PARTY_NOTICES.md)

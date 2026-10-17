@@ -4,24 +4,26 @@ title: "[Bug]: "
 body:
   - type: markdown
     attributes:
-      value: "For vulnerabilities, use the private Security reporting channel. Never attach secrets, raw logs or real account data."
+      value: "Read the [support guide](https://github.com/Chap0815/ObsidianLiveTrader/blob/main/SUPPORT.md) first. For vulnerabilities, follow the [private Security reporting policy](https://github.com/Chap0815/ObsidianLiveTrader/blob/main/SECURITY.md). Never attach secrets, raw logs, databases or real account data. MEXC is live-only in this app."
   - type: input
     id: version
     attributes:
       label: Version or commit
+      description: Include the exact commit or source ZIP date, not only 'latest'.
     validations:
       required: true
   - type: input
     id: environment
     attributes:
       label: OS, Python version, browser, exchange and Testnet/Mainnet mode
+      placeholder: "Windows; Python version; browser/version; Hyperliquid Testnet or Mainnet, or MEXC live"
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
       label: Steps to reproduce
-      description: Use synthetic examples; do not reproduce against live funds.
+      description: Use synthetic examples; do not reproduce against live funds. State whether this came from offline tests, public connectivity or an explicitly authorized Testnet probe.
     validations:
       required: true
   - type: textarea
@@ -34,6 +36,7 @@ body:
     id: evidence
     attributes:
       label: Sanitized error excerpt
+      description: Include the action and HTTP/status result if relevant. Redact tokens, keys, account identities, balances and order identifiers tied to a real account.
   - type: checkboxes
     id: privacy
     attributes:
