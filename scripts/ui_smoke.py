@@ -14,6 +14,7 @@ import asyncio
 import math
 import mimetypes
 import os
+import sys
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,9 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from playwright.async_api import async_playwright, expect
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from app.llm.model_catalog import model_options  # noqa: E402
+
 ORIGIN = "http://127.0.0.1:18787"
 OUTPUT_DIR = Path(
     os.environ.get("UI_SMOKE_OUTPUT_DIR", ROOT / ".superpowers/ui-review")
@@ -148,6 +152,16 @@ async def run(capture_only=False):
         "release_get": asyncio.Event(),
     }
     symbols_degraded = {"active": False}
+    key_providers = [
+        {"id": pid, "label": label, "configured": True, "model": model,
+         "default_model": model, "models": model_options(pid)}
+        for pid, label, model in (
+            ("claude", "Claude", "claude-sonnet-5"),
+            ("xai", "Grok", "grok-4"),
+            ("openai", "OpenAI", "saved-custom-openai"),
+            ("ollama", "Ollama (local)", "llama3.1"),
+        )
+    ]
 
     async def route_request(route):
         url = urlparse(route.request.url)
@@ -214,7 +228,13 @@ async def run(capture_only=False):
                         llm["provider"] == "ollama"
                     )
         elif path == "/api/settings/llm":
-            data = {"provider": llm["provider"], "providers": providers}
+            data = {"active": llm["provider"], "providers": key_providers}
+        elif path == "/api/settings/llm-key":
+            body = route.request.post_data_json
+            assert body["api_key"] == "", "Model-only save must not send a key"
+            provider = next(p for p in key_providers if p["id"] == body["provider"])
+            provider["model"] = body["model"]
+            data = {"active": llm["provider"], "providers": key_providers}
         elif path.startswith("/api/market/"):
             data = market(path.rsplit("/", 1)[-1])
         elif path == "/api/mini":
@@ -3525,6 +3545,46 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     await page.locator("#btn-ki-keys").click()
     await expect(page.locator("#ki-provider")).to_be_focused()
     await expect(page.locator("#ki-model")).to_have_value("claude-sonnet-5")
+    await expect(page.locator('#ki-model-preset option[value="claude-sonnet-5-5"]')).to_have_text(
+        "Claude Sonnet 5.5 — claude-sonnet-5-5"
+    )
+    mutations_before = sum(method == "POST" and path.startswith("/api/settings/") for method, path in calls)
+    await page.locator("#ki-model-preset").select_option("claude-sonnet-5-5")
+    await expect(page.locator("#ki-model")).to_have_value("claude-sonnet-5-5")
+    await page.locator("#ki-api-key").fill("synthetic-key-do-not-carry")
+    for provider, model in (("xai", "grok-4.7"), ("openai", "gpt-6.1-sol"), ("ollama", "qwen3:8b")):
+        await page.locator("#ki-provider").select_option(provider)
+        await expect(page.locator("#ki-api-key")).to_have_value("")
+        if provider == "openai":
+            await expect(page.locator("#ki-model")).to_have_value("saved-custom-openai")
+        expected_options = ["", *[m["id"] for m in model_options(provider)]]
+        assert await page.locator("#ki-model-preset option").evaluate_all("els => els.map(el => el.value)") == expected_options
+        await page.locator("#ki-model-preset").select_option(model)
+        await expect(page.locator("#ki-model")).to_have_value(model)
+    await expect(page.locator("#ki-key-field")).to_be_hidden()
+    await expect(page.locator("#ki-model-help")).to_contain_text("already installed")
+    await page.locator("#ki-model").fill("my-local:model-tag")
+    await expect(page.locator("#ki-model-preset")).to_have_value("")
+    await page.locator("#ki-provider").select_option("claude")
+    await expect(page.locator("#ki-model")).to_have_value("claude-sonnet-5-5")
+    await page.locator("#ki-provider").select_option("ollama")
+    await expect(page.locator("#ki-model")).to_have_value("my-local:model-tag")
+    assert sum(method == "POST" and path.startswith("/api/settings/") for method, path in calls) == mutations_before
+    async with page.expect_response(lambda response: response.url.endswith("/api/settings/llm-key")) as saved:
+        await page.locator("#btn-ki-save").click()
+    assert (await saved.value).request.post_data_json == {
+        "provider": "ollama", "api_key": "", "model": "my-local:model-tag"
+    }
+    await expect(page.locator("#ki-keys-status")).to_contain_text("my-local:model-tag")
+    await page.locator("#ki-provider").select_option("claude")
+    for width in (320, 390, 768, 1024, 1280, 1440, 1920):
+        await page.set_viewport_size({"width": width, "height": 900})
+        assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth"), width
+        assert await page.locator("#ki-model-preset").evaluate("el => el.getBoundingClientRect().right <= innerWidth"), width
+        if width in (390, 1440):
+            await page.screenshot(path=OUTPUT_DIR / f"model-picker-{width}.png", full_page=True)
+    await page.set_viewport_size({"width": 1440, "height": 1000})
+    print("PASS provider-scoped model choices preserve custom IDs and send only explicit saves")
     for _ in range(12):
         await page.keyboard.press("Tab")
         assert await page.evaluate(
@@ -3534,6 +3594,46 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
     await expect(page.locator("#btn-ki-keys")).to_be_focused()
     assert await page.locator("main").evaluate("el => !el.inert")
     print("PASS tab navigation and modal focus containment/restore")
+
+    # A status read may finish after the user starts editing. It can populate
+    # suggestions but must not replace that draft. Malformed metadata is ignored
+    # and even HTML-looking labels must remain text, never executable markup.
+    await page.evaluate("""() => {
+      window.__kiOriginalFetch = window.fetch;
+      window.__kiReadStarted = false;
+      window.fetch = async function(input, options) {
+        const response = await window.__kiOriginalFetch(input, options);
+        if (String(input).split('?')[0] !== '/api/settings/llm') return response;
+        const data = await response.json();
+        data.providers.push(null);
+        data.providers.find(p => p && p.id === 'openai').models.push(
+          null, {id: 42, label: 'Invalid'},
+          {id: 'synthetic-safe', label: '<img src=x onerror=window.__catalogXss=true>'}
+        );
+        window.__kiReadStarted = true;
+        await new Promise(resolve => { window.__kiReleaseRead = resolve; });
+        return new Response(JSON.stringify(data), {
+          status: 200, headers: {'Content-Type': 'application/json'}
+        });
+      };
+    }""")
+    try:
+        await page.locator("#btn-ki-keys").click()
+        await page.wait_for_function("window.__kiReadStarted")
+        await page.locator("#ki-provider").select_option("openai")
+        await page.locator("#ki-model").fill("unsaved-custom-model")
+        await page.evaluate("window.__kiReleaseRead()")
+        await expect(page.locator('#ki-model-preset option[value="synthetic-safe"]')).to_have_text(
+            "<img src=x onerror=window.__catalogXss=true> — synthetic-safe"
+        )
+        await expect(page.locator("#ki-model")).to_have_value("unsaved-custom-model")
+        await expect(page.locator("#ki-model-preset")).to_have_value("")
+        assert not await page.evaluate("Boolean(window.__catalogXss)")
+        assert await page.locator("#ki-model-preset img").count() == 0
+    finally:
+        await page.evaluate("() => { window.fetch = window.__kiOriginalFetch; }")
+        await page.keyboard.press("Escape")
+    print("PASS late model status preserves drafts and malformed/HTML metadata stays inert")
 
     await page.locator("#symbol-input").fill("BTC")
     await page.locator("#symbol-input").press("Enter")

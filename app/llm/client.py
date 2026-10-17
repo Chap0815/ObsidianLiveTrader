@@ -1753,6 +1753,19 @@ async def _call_xai(context: dict[str, Any], settings: Settings) -> TradeProposa
     return _parse_content_to_proposal(str(content), provider="xAI", context=context)
 
 
+def _chat_token_parameters(model: str, provider_label: str, max_tokens: int) -> dict[str, Any]:
+    """Modern OpenAI reasoning models reject legacy token/sampling fields.
+
+    Preserve the existing budgets and non-OpenAI transports, including local
+    models with OpenAI-like names. No API migration or automatic retry is needed.
+    https://developers.openai.com/api/docs/guides/latest-model
+    """
+    reasoning = re.match(r"^(?:gpt-[56](?:[.-]|$)|o[134](?:-|$))", model.strip().lower())
+    if provider_label in {"Codex", "OpenAI"} and reasoning:
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens, "temperature": 0.0}
+
+
 async def _call_openai_compat(
     context: dict[str, Any],
     *,
@@ -1770,12 +1783,11 @@ async def _call_openai_compat(
         headers["Authorization"] = f"Bearer {api_key}"
     body: dict[str, Any] = {
         "model": model,
-        "max_tokens": 1800,
+        **_chat_token_parameters(model, provider_label, 1800),
         "messages": [
             {"role": "system", "content": build_system_prompt(context)},
             {"role": "user", "content": build_user_prompt(context)},
         ],
-        "temperature": 0.0,
     }
     if json_response_format:
         body["response_format"] = {"type": "json_object"}
@@ -2202,12 +2214,11 @@ async def _call_openai_compat_reevaluate(
         headers["Authorization"] = f"Bearer {api_key}"
     body: dict[str, Any] = {
         "model": model,
-        "max_tokens": 1200,
+        **_chat_token_parameters(model, provider_label, 1200),
         "messages": [
             {"role": "system", "content": build_reevaluate_system_prompt(context)},
             {"role": "user", "content": build_reevaluate_user_prompt(context)},
         ],
-        "temperature": 0.0,
     }
     if json_response_format:
         body["response_format"] = {"type": "json_object"}

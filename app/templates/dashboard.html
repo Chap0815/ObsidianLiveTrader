@@ -467,11 +467,21 @@
           <span>API Key</span>
           <input type="password" id="ki-api-key" placeholder="sk-…" spellcheck="false" autocomplete="off" />
         </label>
-        <label>
-          <span>Model</span>
-          <input type="text" id="ki-model" spellcheck="false" />
+        <label class="ki-model-choice">
+          <span>Model selection</span>
+          <select id="ki-model-preset" aria-describedby="ki-model-help">
+            <option value="">Custom / current model ID</option>
+          </select>
+        </label>
+        <label class="ki-model-choice">
+          <span>API model ID (editable)</span>
+          <input type="text" id="ki-model" spellcheck="false" autocomplete="off" aria-describedby="ki-model-help" />
         </label>
       </div>
+      <p id="ki-model-help" class="hint muted">
+        Choose a named model to fill its exact API ID, or enter your own.
+        Availability depends on your provider account. Selecting a model makes no API call.
+      </p>
       <div class="setup-row mt-10">
         <button type="button" id="btn-ki-test" class="btn btn-ghost">Test key</button>
         <span id="ki-test-pill" class="pill hidden"></span>

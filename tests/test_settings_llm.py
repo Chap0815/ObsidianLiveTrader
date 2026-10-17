@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock
 
+import pytest
+
 import app.main as main_mod
 
 
@@ -22,11 +24,61 @@ def test_get_status_returns_no_secrets():
     ids = {p["id"] for p in data["providers"]}
     assert ids == {"claude", "xai", "openai", "ollama"}
     for p in data["providers"]:
-        assert set(p) == {"id", "label", "configured", "model", "default_model"}
+        assert set(p) == {"id", "label", "configured", "model", "default_model", "models"}
         assert p["default_model"] == DEFAULT_MODELS[p["id"]]
+        from app.llm.model_catalog import model_options
+
+        assert p["models"] == model_options(p["id"])
         # non-secret fields only — never an api key
         assert "api_key" not in p
         assert "key" not in p
+
+
+def test_model_catalog_is_provider_scoped_and_returns_independent_metadata():
+    from app.llm.model_catalog import MODEL_CATALOG, model_options
+
+    assert set(MODEL_CATALOG) == {"claude", "xai", "openai", "ollama"}
+    seen = set()
+    for provider in MODEL_CATALOG:
+        options = model_options(provider)
+        assert options
+        for option in options:
+            assert set(option) == {"id", "label"}
+            assert option["id"] == option["id"].strip()
+            assert option["label"] and option["id"] not in seen
+            assert not any(c.isspace() for c in option["id"])
+            seen.add(option["id"])
+        options[0]["id"] = "synthetic-mutated"
+        assert model_options(provider)[0]["id"] != "synthetic-mutated"
+    assert model_options("unknown") == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("claude", "claude-sonnet-5-5"),
+        ("xai", "grok-4.7"),
+        ("openai", "gpt-6.1-sol"),
+        ("ollama", "qwen3:8b"),
+        ("ollama", "custom-local:my-tag"),
+        ("openai", "custom-future-model"),
+    ],
+)
+def test_model_picker_ids_and_custom_values_use_existing_write_boundary(monkeypatch, provider, model):
+    import app.env_builder as builder
+
+    writes = []
+
+    def capture(path, updates, *, allowed):
+        writes.append((updates, allowed))
+
+    monkeypatch.setattr(builder, "patch_env_vars", capture)
+    with _client() as tc:
+        response = tc.post("/api/settings/llm-key", json={"provider": provider, "model": model})
+    assert response.status_code == 200, response.text
+    assert len(writes) == 1
+    assert writes[0][0] == {builder.LLM_KEY_VARS[provider][1]: model}
+    assert writes[0][1] == set(builder.SETTINGS_LLM_WRITABLE)
 
 
 def test_llm_key_rejects_unknown_provider():

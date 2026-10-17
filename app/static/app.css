@@ -3946,6 +3946,10 @@ label.setup-check > span {
   font-size: var(--fs-base);
 }
 
+.ki-keys-status li > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+#ki-keys-modal .ki-model-choice { grid-column: 1 / -1; min-width: 0; }
+#ki-model-preset, #ki-model { width: 100%; max-width: 100%; min-width: 0; }
+
 #setup-form .btn-submit {
   border-color: var(--accent);
   background: var(--accent-dim);

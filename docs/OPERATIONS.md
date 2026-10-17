@@ -89,6 +89,12 @@ cannot substitute for it. Missing provenance is displayed as unavailable.
 
 AI analysis is optional and advisory. Provider API access is configured
 separately; a model response cannot authorize an order or override a risk gate.
+The **AI keys** panel provides named, provider-specific model presets and shows
+the exact API ID before saving. Custom IDs and local Ollama tags remain editable.
+Opening the list or selecting a preset makes no provider request and does not
+change the saved model until **Save**. Cloud access depends on the account;
+Ollama examples must already be installed locally. A listed model is not a
+trading-quality recommendation or a guarantee of availability.
 Ambiguous provider POST outcomes are not automatically repeated, so an outage
 can require a deliberate later request.
 
