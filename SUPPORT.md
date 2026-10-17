@@ -13,13 +13,55 @@ Security reports follow [SECURITY.md](SECURITY.md).
 
 - **Python opens the Microsoft Store:** install Python 3.11+ and disable its
   Windows app-execution aliases. Then run `start.bat` again.
-- **Port already in use:** check whether another instance is running. Do not
-  run two instances against the same account/database. The default port is 8787.
+- **Venv identity/ABI is invalid:** the launcher checks the actual Venv Python,
+  not just its path. Stop the app and prepare a compatible project environment;
+  do not point pip at the system interpreter or remove `.env`/`data/`.
+- **Port already in use or foreign listener:** the default port is 8787. The
+  launcher reopens only a listener with the expected app health identity and
+  refuses redirects. Stop a known old instance normally, or choose a free port
+  as described in the [operating guide](docs/OPERATIONS.md#startup-and-configuration).
+  Do not start a second process to work around a lock warning.
 - **Browser shows old UI:** restart the server, then refresh with Ctrl+F5.
 - **Dependency installation fails:** verify network access and Python version.
-  After a successful install, `start.bat --skip-install` can reuse the environment.
+  A hash mismatch must be investigated, not bypassed by removing hash checks.
+  `start.bat --skip-install` can reuse a successful install, but does not apply
+  changed locks after an update.
+- **Setup is locked:** completed setup or stored sensitive configuration closes
+  the unauthenticated setup path. Update the private `.env` and restart; do not
+  clear setup markers or delete credentials to reopen it.
 - **AI unavailable:** check the configured provider and its API access. Manual
-  chart viewing and the order ticket do not require AI analysis.
+  chart viewing and the order ticket do not require AI analysis. A timeout or
+  gateway error may represent an accepted provider request; immediate automatic
+  retries are intentionally limited. External position review also requires
+  `INCLUDE_ACCOUNT_IN_LLM=true`.
+
+## Orders, protection and automation
+
+- **Execution network changed:** the reviewed token no longer matches the
+  current venue, account or network. Review the intended context and create a
+  fresh preview; do not try to reuse the token.
+- **Entry is still converging:** a MEXC submission is waiting for exact terminal
+  order and position evidence. Partial fills and delayed open-order snapshots
+  can keep it blocked across restarts. Verify order status, executed quantity
+  and position identity at the exchange. Preserve local state instead of
+  deleting the reservation or database.
+- **Confirm/Close/SL request timed out:** an action may already have reached the
+  exchange. Inspect its actual result before issuing another mutation. A cancel
+  acknowledgement can race with a fill and is not by itself a flat position.
+- **Stop coverage is incomplete or unknown:** verify the full position size is
+  protected. The app pauses automatic stop movement until it can verify that
+  coverage; a tighter partial stop is not complete protection.
+- **Automatic break-even/trailing is unavailable:** these rules are
+  Hyperliquid-only and require per-position opt-in. Reconcile unknown stop moves
+  before re-arming. The position-management kill switch only disarms those
+  rules; it does not flatten or cancel.
+- **Entry thesis is missing:** no verified order/position provenance is
+  available. The app deliberately does not borrow an old or newer proposal.
+
+For the full control boundaries, see the [operating guide](docs/OPERATIONS.md).
+For public connectivity, private reads and explicit Testnet integration probes,
+see [Diagnostics](docs/DIAGNOSTICS.md). Never share the raw private output of
+those tools in a public report.
 
 This project offers no guaranteed response time or managed trading service.
 If positions are affected, inspect orders and exposure directly at the exchange.

@@ -216,8 +216,6 @@ async def run(capture_only=False):
         elif path == "/api/settings/llm":
             data = {"provider": llm["provider"], "providers": providers}
         elif path.startswith("/api/market/"):
-            if path.endswith("/ETH"):
-                await asyncio.sleep(0.4)
             data = market(path.rsplit("/", 1)[-1])
         elif path == "/api/mini":
             symbols = parse_qs(url.query).get("symbols", ["BTC,ETH,SOL"])[0].split(",")
@@ -3420,19 +3418,31 @@ async def interaction_checks(page, calls, health, account, preview_contract, llm
 
     await page.set_viewport_size({"width": 1440, "height": 1000})
     await page.locator("#ticket-sl").fill("61000")
-    before = sum(path == "/api/market/ETH" for _, path in calls)
     await page.locator("#symbol-input").fill("ETH")
-    await page.locator("#symbol-input").press("Enter")
-    assert await page.evaluate(
-        "Trader.state.symbol === 'ETH' && Trader.state.market === null && Trader.state.lastPx === null"
+    # Inspect the keyboard handler and blur in one browser task. Counting HTTP
+    # requests across awaits also counts legitimate five-second background
+    # polls, and a delayed fixture cannot make that assertion deterministic.
+    switched = await page.evaluate(
+        """() => {
+          const before = Trader.state._marketSeq || 0;
+          document.getElementById('symbol-input').dispatchEvent(new KeyboardEvent(
+            'keydown', {key: 'Enter', bubbles: true, cancelable: true}
+          ));
+          const sl = document.getElementById('ticket-sl');
+          sl.focus(); // blur must not issue a second load
+          return {
+            loads: Trader.state._marketSeq - before,
+            cleared: Trader.state.symbol === 'ETH' &&
+              Trader.state.market === null && Trader.state.lastPx === null,
+            stop: sl.value,
+            blocked: document.getElementById('btn-send-order').disabled
+          };
+        }"""
     )
-    await expect(page.locator("#ticket-sl")).to_have_value("")
-    await expect(page.locator("#btn-send-order")).to_be_disabled()
+    assert switched == {"loads": 1, "cleared": True, "stop": "", "blocked": True}, switched
     await page.wait_for_function(
         "Trader.state.market && Trader.state.market.symbol === 'ETH'"
     )
-    await page.locator("#ticket-sl").focus()  # blur must not issue a second load
-    assert sum(path == "/api/market/ETH" for _, path in calls) - before == 1
     print("PASS symbol switch clears old prices and loads once")
 
     await page.locator("#ticket-sl").fill("3000")

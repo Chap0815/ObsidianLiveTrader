@@ -2,6 +2,9 @@ name: Feature suggestion
 description: Describe a user need and the expected benefit.
 title: "[Suggestion]: "
 body:
+  - type: markdown
+    attributes:
+      value: "Suggestions are welcome; official code is maintained by the owner. Describe the workflow with synthetic examples, without keys, account data or return guarantees."
   - type: textarea
     id: problem
     attributes:
@@ -12,5 +15,6 @@ body:
     id: proposal
     attributes:
       label: Suggested behavior and alternatives
+      description: Explain the user benefit and any effect on Preview/Confirm, protection, privacy or Testnet/Mainnet clarity.
     validations:
       required: true

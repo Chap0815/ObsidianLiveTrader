@@ -12,6 +12,14 @@ Charts use [TradingView Lightweight Charts](https://www.tradingview.com/lightwei
 The existing chart attribution and upstream source headers are retained.
 Obsidian Live Trader is an independent project.
 
-Python packages listed in `requirements.lock` and development tools in
-`requirements-dev.txt` retain their respective licenses. They are downloaded
+Python packages listed in [`requirements.lock`](requirements.lock) and development
+tools in [`requirements-dev.lock`](requirements-dev.lock) retain their respective
+licenses. They are downloaded
 during installation rather than included as vendored Python packages here.
+The `.txt` requirement files describe direct version ranges; the `.lock` files
+identify the tested installation with exact versions and artifact hashes.
+Hashes and project licensing do not replace an upstream component's terms.
+
+The project terms and personal-trading permission are in [LICENSE](LICENSE).
+The unmodified base license and bundled component license/notice files are
+retained under [`LICENSES/`](LICENSES/).

@@ -11,3 +11,6 @@ Keep issues, discussions and reviews respectful, constructive and relevant.
 The maintainer may remove harmful content, lock discussions or restrict
 participation. Use GitHub's reporting tools for abuse; keep sensitive details
 private. Security vulnerabilities follow [SECURITY.md](SECURITY.md).
+Usage questions belong in [Discussions](https://github.com/Chap0815/ObsidianLiveTrader/discussions);
+reproducible defects follow the [support reporting guidance](SUPPORT.md).
+Reports must use sanitized or synthetic evidence rather than real account data.
