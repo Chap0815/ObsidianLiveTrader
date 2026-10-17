@@ -21,6 +21,13 @@ Security reports follow [SECURITY.md](SECURITY.md).
   refuses redirects. Stop a known old instance normally, or choose a free port
   as described in the [operating guide](docs/OPERATIONS.md#startup-and-configuration).
   Do not start a second process to work around a lock warning.
+- **Python keeps running after closing a window:** closing the browser is not
+  shutdown. The Windows launchers bind a new server to the original start
+  window; use Ctrl+C there and wait for completion. A second launcher only
+  opens an existing server and explicitly does not own it. Manual Uvicorn or
+  service starts have their own lifecycle. Do not terminate unrelated Python
+  processes or delete the instance lock; restarting/stopping is not a position
+  close or order cancellation.
 - **Browser shows old UI:** restart the server, then refresh with Ctrl+F5.
 - **Dependency installation fails:** verify network access and Python version.
   A hash mismatch must be investigated, not bypassed by removing hash checks.

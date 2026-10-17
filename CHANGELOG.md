@@ -5,6 +5,10 @@ certification or a record of private account performance.
 
 ## 2026-10-17 - Execution safety and reproducible verification
 
+- Windows launcher shutdown now owns the server process tree, including Python
+  redirectors and reload descendants. Closing the original start window cannot
+  leave its server silently running; reopening an existing instance does not
+  transfer shutdown ownership. Browser closure remains separate from shutdown.
 - Manage AI Keys now offers provider-specific model names with exact API IDs,
   preserving saved/custom models and editable local Ollama tags. Modern OpenAI
   chat requests use the supported token parameter without changing token caps.
