@@ -6,6 +6,7 @@ No place without unused, unexpired preview token AND TRADING_ENABLED=true.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import math
@@ -48,6 +49,7 @@ _AUDIT_MAX_ITEMS = 100
 _AUDIT_MAX_STRING = 2_000
 _POSITION_IDENTITY_UNSET: Any = object()
 _MAX_FILL_FUTURE_SKEW_MS = 5 * 60 * 1000
+_ENTRY_CONVERGENCE_GUARD_SECONDS = 120
 _AUDIT_SECRET_LABEL_RE = re.compile(
     r"(?i)\b([a-z0-9_-]*(?:token|secret|credential|cookie)[a-z0-9_-]*|"
     r"api[ _-]?key|signature|authorization|private[ _-]?key|password|"
@@ -158,6 +160,25 @@ def client_uses_hyperliquid_semantics(client: Any) -> bool:
     if isinstance(exchange_id, str):
         return exchange_id == "hyperliquid"
     return hasattr(client, "place_stop_order")
+
+
+def execution_context_id(client: Any) -> str:
+    """Local opaque namespace; never store account credentials in provenance."""
+    exchange = getattr(client, "exchange_id", None)
+    if exchange == "mexc":
+        identity = getattr(client, "api_key", None)
+        network = "live"
+    elif exchange == "hyperliquid":
+        identity = getattr(client, "account_address", None)
+        network = "testnet" if getattr(client, "testnet", False) is True else "mainnet"
+    else:
+        return ""
+    if not isinstance(identity, str) or not identity.strip():
+        return ""  # Unconfigured clients and synthetic minimal embeddings.
+    identity = identity.strip().lower() if exchange == "hyperliquid" else identity.strip()
+    return hashlib.sha256(
+        f"{exchange}\0{network}\0{identity}".encode()
+    ).hexdigest()
 
 
 async def hl_epoch_signature(
@@ -1562,6 +1583,195 @@ class OrderService:
         # unit tests.
         self._trade_lock = trade_lock if trade_lock is not None else asyncio.Lock()
 
+    def _entry_reservation_key(self, symbol: str, side: str) -> tuple[str, str, str]:
+        exchange = str(getattr(self.client, "exchange_id", "") or "")
+        context = execution_context_id(self.client)
+        return (f"{exchange}:{context}" if context else exchange, symbol, side)
+
+    async def _has_entry_reservation(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if getattr(self.client, "exchange_id", "") != "mexc":
+            return False
+        method = getattr(type(self.db), "active_entry_reservation", None)
+        if self.db is not None and callable(method):
+            try:
+                reservation = await self.db.active_entry_reservation(
+                    exchange_id=exchange_id, symbol=symbol, side=side
+                )
+                if reservation is None:
+                    if exchange_id != "mexc":
+                        legacy = await self.db.active_entry_reservation(
+                            exchange_id="mexc", symbol=symbol, side=side
+                        )
+                        if legacy is not None:
+                            # Old guards have no trustworthy account namespace.
+                            # Switching credentials cannot silently bypass them.
+                            return True
+                    return False
+                return not await self._reconcile_entry_reservation(
+                    symbol, side, reservation, positions
+                )
+            except Exception as exc:
+                raise OrderError(
+                    "entry reservation unavailable — exposure convergence unknown"
+                ) from exc
+        reservation = self.store.active_entry_reservation(exchange_id, symbol, side)
+        if reservation is None:
+            return False
+        return not await self._reconcile_entry_reservation(
+            symbol, side, reservation, positions
+        )
+
+    async def _reconcile_entry_reservation(
+        self, symbol: str, side: str, reservation: dict[str, Any],
+        positions: list[dict[str, Any]] | None,
+    ) -> bool:
+        """Only terminal order evidence plus visible exposure releases authority."""
+        pre_hold = _normalized_float(reservation.get("pre_hold"))
+        requested = _normalized_float(reservation.get("requested_vol"))
+        request = reservation.get("request")
+        external_oid = reservation.get("external_oid")
+        if (
+            positions is None or pre_hold is None or pre_hold < 0
+            or requested is None or requested <= 0 or not isinstance(request, dict)
+            or not isinstance(external_oid, str) or not external_oid
+        ):
+            return False
+        try:
+            found = await self.client.order_by_external_oid(
+                symbol, external_oid, include_terminal=True
+            )
+            if not _recovery_is_match(found, external_oid, expected_symbol=symbol):
+                return False
+            if not _mexc_recovery_matches_request(
+                found, expected_side=int(request["side"]), expected_vol=requested,
+                expected_type=int(request["type"]),
+                expected_open_type=int(request["openType"]),
+                expected_price=request.get("price") if request["type"] == MEXC_TYPE_LIMIT else None,
+                expected_leverage=request.get("leverage"),
+                expected_stop_loss=request.get("stopLossPrice"),
+                expected_take_profit=request.get("takeProfitPrice"),
+            ):
+                return False
+            order = found.get("order")
+            if not isinstance(order, dict):
+                return False
+            reported_oid = _consistent_positive_order_id(order)
+            saved_oid = reservation.get("order_id")
+            if saved_oid is not None and reported_oid != saved_oid:
+                return False
+            deal, present = _consistent_nonnegative_aliases(
+                order, ("dealVol", "deal_vol", "dealVolume")
+            )
+            tolerance = max(1e-12, requested * 1e-9)
+            if not present or deal is None or deal > requested + tolerance:
+                return False
+            state_groups = {
+                "3": "filled", "completed": "filled", "filled": "filled",
+                "4": "cancelled", "cancelled": "cancelled", "canceled": "cancelled",
+                "5": "invalid", "invalid": "invalid",
+            }
+            states = [state_groups.get(str(order[key]).strip().lower())
+                      for key in ("state", "orderState", "order_state") if key in order]
+            if not states or None in states or len(set(states)) != 1:
+                return False
+            # A completed order with a smaller execution is terminal too. Never
+            # infer terminality from a partial position or elapsed wall time.
+            (current, _open_type, checked), position_id = (
+                await self._mexc_pre_hold_and_position_id(symbol, side, positions=positions)
+            )
+            if not checked or current + tolerance < pre_hold + deal:
+                return False
+            proposal_id = reservation.get("proposal_id")
+            order_position = position_id_signature(
+                {"position_id": order.get("positionId")}
+            )
+            if deal > 0:
+                aliases = [position_id_signature({"position_id": order[key]})
+                           for key in ("positionId", "position_id") if key in order]
+                if not aliases or None in aliases or len(set(aliases)) != 1:
+                    return False
+                order_position = aliases[0]
+                if order_position != position_id:
+                    return False
+            if (
+                pre_hold == 0 and deal > 0 and position_id is not None
+                and position_id == order_position and type(proposal_id) is int
+                and callable(getattr(type(self.db), "bind_entry_proposal", None))
+            ):
+                await self.db.bind_entry_proposal(
+                    symbol, side, open_sig=position_id, proposal_id=proposal_id,
+                    external_oid=external_oid,
+                    execution_context=execution_context_id(self.client),
+                )
+            await self._release_entry_reservation(symbol, side, external_oid)
+            return True
+        except Exception:
+            # Unavailable, malformed or legacy evidence cannot clear exposure.
+            return False
+
+    async def _claim_entry_reservation(
+        self, symbol: str, side: str, external_oid: str, pre_hold: float,
+        request: dict[str, Any], proposal_id: int | None,
+    ) -> bool:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if getattr(self.client, "exchange_id", "") != "mexc":
+            return True
+        method = getattr(type(self.db), "claim_entry_reservation", None)
+        if self.db is not None and callable(method):
+            try:
+                return bool(
+                    await self.db.claim_entry_reservation(
+                        exchange_id=exchange_id,
+                        symbol=symbol,
+                        side=side,
+                        external_oid=external_oid,
+                        pre_hold=pre_hold,
+                        ttl_seconds=_ENTRY_CONVERGENCE_GUARD_SECONDS,
+                        requested_vol=float(request["vol"]), request_json=request,
+                        proposal_id=proposal_id,
+                    )
+                )
+            except Exception as exc:
+                raise OrderError(
+                    "entry reservation failed — order blocked"
+                ) from exc
+        return self.store.claim_entry_reservation(
+            exchange_id,
+            symbol,
+            side,
+            external_oid,
+            pre_hold,
+            _ENTRY_CONVERGENCE_GUARD_SECONDS,
+            requested_vol=float(request["vol"]), request_json=request,
+            proposal_id=proposal_id,
+        )
+
+    async def _release_entry_reservation(
+        self, symbol: str, side: str, external_oid: str
+    ) -> None:
+        exchange_id, symbol, side = self._entry_reservation_key(symbol, side)
+        if getattr(self.client, "exchange_id", "") != "mexc":
+            return
+        method = getattr(type(self.db), "release_entry_reservation", None)
+        if self.db is not None and callable(method):
+            await self.db.release_entry_reservation(
+                exchange_id=exchange_id,
+                symbol=symbol,
+                side=side,
+                external_oid=external_oid,
+            )
+            return
+        self.store.release_entry_reservation(
+            exchange_id, symbol, side, external_oid
+        )
+
     def _require_active_client(self) -> None:
         """Fail closed if the caller reports a replaced runtime context."""
         if self._client_is_active is None:
@@ -1866,6 +2076,13 @@ class OrderService:
             )
             if isinstance(pending_r, BaseException):
                 raise pending_r
+            if await self._has_entry_reservation(
+                symbol, ticket.side, positions=positions
+            ):
+                raise OrderError(
+                    f"a recent {ticket.side} entry on {symbol} is still "
+                    "converging — wait for exchange state before another entry"
+                )
         except OrderError as e:
             # Preview: still return gate errors instead of 500
             return {
@@ -1891,6 +2108,16 @@ class OrderService:
         summary = _confirm_summary(ticket, gate, contract, equity, last_price)
         summary["available_usdt"] = available
         summary["existing_same_side_risk_usdt"] = existing
+        summary["execution_exchange"] = self.settings.exchange
+        summary["execution_hl_testnet"] = (
+            self.settings.hl_testnet
+            if self.settings.exchange == "hyperliquid"
+            else None
+        )
+        summary["execution_trading_enabled"] = self.settings.trading_enabled
+        summary["execution_live_trading"] = bool(self.settings.trading_enabled) and not (
+            self.settings.exchange == "hyperliquid" and self.settings.hl_testnet
+        )
 
         if not gate.ok:
             return {
@@ -1931,6 +2158,14 @@ class OrderService:
             "equity_usdt": equity,
             "available_usdt": available,
             "last_price": last_price,
+            "execution_context": {
+                "exchange": self.settings.exchange,
+                "account": execution_context_id(self.client),
+                "hl_testnet": (
+                    self.settings.hl_testnet
+                    if self.settings.exchange == "hyperliquid" else None
+                ),
+            },
             "external_oid": external_oid,
             "created_at": _utc_now_iso(),
         }
@@ -2618,6 +2853,15 @@ class OrderService:
         except (KeyError, TypeError, ValueError) as exc:
             raise OrderError("preview payload has invalid ticket") from exc
         symbol = ticket.symbol.upper().strip()
+        if payload.get("execution_context") != {
+            "exchange": self.settings.exchange,
+            "account": execution_context_id(self.client),
+            "hl_testnet": (
+                self.settings.hl_testnet
+                if self.settings.exchange == "hyperliquid" else None
+            ),
+        }:
+            raise OrderError("Execution network changed. Review the order again.")
         external_oid = payload.get("external_oid")
         if not isinstance(external_oid, str) or not _PREVIEW_EXTERNAL_OID_RE.fullmatch(
             external_oid
@@ -2663,6 +2907,13 @@ class OrderService:
         )
         if isinstance(pending_r, BaseException):
             raise pending_r
+        if await self._has_entry_reservation(
+            symbol, ticket.side, positions=account_positions
+        ):
+            raise OrderError(
+                f"a recent {ticket.side} entry on {symbol} is still "
+                "converging — order blocked"
+            )
 
         gate = validate_order(
             ticket,
@@ -2802,6 +3053,13 @@ class OrderService:
                 "pre-trade position snapshot is unavailable or ambiguous — "
                 "order blocked"
             )
+        if not await self._claim_entry_reservation(
+            symbol, ticket.side, external_oid, pre_hold, body, ticket.proposal_id
+        ):
+            raise OrderError(
+                f"a recent {ticket.side} entry on {symbol} is still "
+                "converging — order blocked"
+            )
         try:
             await self._await_pre_submit_mutation(
                 self.client.set_leverage(
@@ -2813,7 +3071,15 @@ class OrderService:
                 )
             )
         except ExchangeError as e:
+            await self._release_entry_reservation(
+                symbol, ticket.side, external_oid
+            )
             raise OrderError(f"set_leverage failed — order blocked: {e}") from e
+        except BaseException:
+            await self._release_entry_reservation(
+                symbol, ticket.side, external_oid
+            )
+            raise
 
         # Hold before place — used so auto-flatten never closes pre-existing size.
         # pre_hold_ok records whether the query was RELIABLE; a failed lookup
@@ -2821,6 +3087,17 @@ class OrderService:
         # On MEXC this reuses the read taken above (no duplicate positions call).
 
         recovered_from_timeout = False
+        if getattr(self.client, "exchange_id", "") == "mexc" and callable(
+            getattr(type(self.db), "mark_entry_submission_started", None)
+        ):
+            try:
+                await self.db.mark_entry_submission_started(
+                    exchange_id=self._entry_reservation_key(symbol, ticket.side)[0],
+                    symbol=symbol, side=ticket.side, external_oid=external_oid,
+                )
+            except BaseException:
+                await self._release_entry_reservation(symbol, ticket.side, external_oid)
+                raise
         if mutation_started is not None:
             mutation_started.set()
         try:
@@ -2912,6 +3189,9 @@ class OrderService:
                         f"externalOid={external_oid}. The order may be live; reconcile "
                         "positions and open orders before another preview."
                     ) from e
+                await self._release_entry_reservation(
+                    symbol, ticket.side, external_oid
+                )
                 audit_suffix = f" ({audit_error})" if audit_error else ""
                 raise OrderError(f"place_order failed: {e}{audit_suffix}") from e
             # Order is (likely) live — fall through to SL verify/flatten (not early-return)
@@ -3629,6 +3909,43 @@ class OrderService:
         if audit_error:
             post_errors.append(audit_error)
 
+        # Persist the acknowledged identity before later cancel/reconciliation.
+        # Metadata failure cannot turn an already submitted order into a retry.
+        try:
+            entry_oid, _present = _reported_entry_order_id(resp)
+            if not is_hl and entry_oid is not None and callable(
+                getattr(type(self.db), "set_entry_reservation_order_id", None)
+            ):
+                await self.db.set_entry_reservation_order_id(
+                    exchange_id=self._entry_reservation_key(symbol, ticket.side)[0],
+                    symbol=symbol, side=ticket.side,
+                    external_oid=external_oid, order_id=entry_oid,
+                )
+            if pre_hold == 0 and ticket.proposal_id is not None and callable(
+                getattr(type(self.db), "bind_entry_proposal", None)
+            ):
+                if is_hl and entry_oid is not None:
+                    fills = await safe_user_fills(self.client, symbol)
+                    own_epochs = {
+                        epoch for fill in fills or []
+                        if str(fill.get("oid")) == str(entry_oid)
+                        and (epoch := hl_flat_open_epoch(fill, symbol, ticket.side))
+                        is not None
+                    }
+                    if len(own_epochs) == 1:
+                        await self.db.bind_entry_proposal(
+                            symbol, ticket.side, open_sig=own_epochs.pop(),
+                            proposal_id=ticket.proposal_id, external_oid=external_oid,
+                            execution_context=execution_context_id(self.client),
+                        )
+                elif not is_hl:
+                    positions = await self.client.positions(symbol, fresh=True)
+                    await self._has_entry_reservation(
+                        symbol, ticket.side, positions=positions
+                    )
+        except Exception:
+            post_errors.append("Entry identity could not be persisted; verify order state.")
+
         return {
             "ok": True,
             "external_oid": external_oid,
@@ -4189,6 +4506,7 @@ class OrderService:
             validated_rows.append((r, rid))
 
         matched = False
+        matched_symbol: str | None = None
         for r, rid in validated_rows:
             if rid != oid:
                 continue
@@ -4197,6 +4515,7 @@ class OrderService:
             ):
                 continue
             matched = True
+            matched_symbol = r.get("symbol")
             break
         if not matched:
             raise OrderError(
@@ -4256,6 +4575,17 @@ class OrderService:
             raise OrderRejectedByExchange(
                 f"cancel rejected by exchange: {response_error}{audit_suffix}"
             )
+        if not is_hl and isinstance(matched_symbol, str):
+            # A cancel acknowledgement can race with a fill. Clear only after
+            # an exact terminal lookup accounts for any executed quantity.
+            try:
+                positions = await self.client.positions(matched_symbol, fresh=True)
+                for side in ("long", "short"):
+                    await self._has_entry_reservation(
+                        matched_symbol, side, positions=positions
+                    )
+            except Exception:
+                pass  # Keep the durable guard; the next preview retries evidence.
         result = {"ok": True, "response": detail}
         if audit_error:
             result["warnings"] = [audit_error]

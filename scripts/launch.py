@@ -52,6 +52,7 @@ _check_python_version()
 
 import argparse  # noqa: E402
 import hashlib  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import socket  # noqa: E402
@@ -59,11 +60,24 @@ import subprocess  # noqa: E402
 import time  # noqa: E402
 import webbrowser  # noqa: E402
 from pathlib import Path  # noqa: E402
+from urllib.request import HTTPRedirectHandler, build_opener  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_DIR = ROOT / ".venv"
 PINNED_PIP_REQUIREMENT = "pip==26.2.1"
-_DEPS_MARKER_SCHEMA = 3
+_DEPS_MARKER_SCHEMA = 4
+_APP_ID = "obsidian-live-trader"
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Never let a local health probe escape to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Kept as one injectable seam for focused launcher tests.
+urlopen = build_opener(_NoRedirectHandler()).open
 
 
 def _system_python() -> str:
@@ -123,7 +137,8 @@ def _venv_env() -> dict[str, str]:
 
 def ensure_venv(vpy: Path) -> Path:
     if vpy.is_file() and _is_project_venv(vpy):
-        print(f"venv OK (project-local only): {vpy}")
+        marker = _interpreter_marker(vpy)
+        print(f"venv OK (project-local, {marker}): {vpy}")
         return vpy
 
     if vpy.is_file() and not _is_project_venv(vpy):
@@ -145,7 +160,8 @@ def ensure_venv(vpy: Path) -> Path:
         raise SystemExit(f"venv python missing after create: {vpy}")
     if not _is_project_venv(vpy):
         raise SystemExit(f"venv path check failed: {vpy}")
-    print(f"venv created: {vpy}")
+    marker = _interpreter_marker(vpy)
+    print(f"venv created ({marker}): {vpy}")
     return vpy
 
 
@@ -161,20 +177,83 @@ def _select_requirements_file() -> Path | None:
     return None
 
 
-def _interpreter_marker() -> str:
-    """Stable ABI identity for the interpreter that owns the project venv."""
+def _current_interpreter_marker() -> str:
+    """Stable ABI identity for the interpreter running this launcher."""
     cache_tag = getattr(sys.implementation, "cache_tag", None) or "unknown"
     bitness = 64 if sys.maxsize > 2**32 else 32
     return f"{cache_tag}-{bitness}bit"
 
 
-def _deps_marker_state(req: Path) -> str:
+def _interpreter_marker(python_exe: Path | None = None) -> str:
+    """Inspect the actual venv interpreter instead of trusting its pathname."""
+    if python_exe is None:
+        return _current_interpreter_marker()
+
+    probe = (
+        "import json,struct,sys;"
+        "print(json.dumps({"
+        "'executable':sys.executable,'prefix':sys.prefix,"
+        "'base_prefix':getattr(sys,'base_prefix',sys.prefix),"
+        "'version':[sys.version_info[0],sys.version_info[1]],"
+        "'cache_tag':getattr(sys.implementation,'cache_tag',None),"
+        "'bits':struct.calcsize('P')*8}))"
+    )
+    try:
+        result = subprocess.run(
+            [str(python_exe), "-I", "-c", probe],
+            cwd=str(ROOT),
+            env=_venv_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        payload = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        payload = None
+
+    if not isinstance(payload, dict):
+        raise SystemExit("Project .venv Python could not be verified")
+    try:
+        prefix = Path(payload["prefix"]).resolve()
+        base_prefix = Path(payload["base_prefix"]).resolve()
+        executable = Path(payload["executable"]).absolute()
+        expected_root = VENV_DIR.resolve()
+        version = payload["version"]
+        cache_tag = payload["cache_tag"]
+        bits = payload["bits"]
+    except (KeyError, OSError, TypeError, ValueError):
+        raise SystemExit("Project .venv Python returned an invalid identity") from None
+
+    executable_inside = expected_root in executable.parents
+    if (
+        prefix != expected_root
+        or base_prefix == prefix
+        or not executable_inside
+        or not isinstance(version, list)
+        or len(version) != 2
+        or any(type(part) is not int for part in version)
+        or tuple(version) < (3, 11)
+        or not isinstance(cache_tag, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", cache_tag) is None
+        or type(bits) is not int
+        or bits not in (32, 64)
+    ):
+        raise SystemExit(
+            "Project .venv Python identity/ABI is invalid; recreate the .venv"
+        )
+    return f"{cache_tag}-{bits}bit"
+
+
+def _deps_marker_state(req: Path, *, interpreter_marker: str | None = None) -> str:
     """Identify all inputs that define the installed dependency environment."""
     digest = hashlib.sha256(req.read_bytes()).hexdigest()
-    mode = "no-deps" if req.name == "requirements.lock" else "resolve"
+    mode = "no-deps+require-hashes" if req.name == "requirements.lock" else "resolve"
+    marker = interpreter_marker or _current_interpreter_marker()
     return (
         f"{req.name}:sha256:{digest}:schema:{_DEPS_MARKER_SCHEMA}:"
-        f"python:{_interpreter_marker()}:pip:{PINNED_PIP_REQUIREMENT}:mode:{mode}"
+        f"python:{marker}:pip:{PINNED_PIP_REQUIREMENT}:mode:{mode}"
     )
 
 
@@ -193,7 +272,7 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         print("No requirements.lock/requirements.txt — skip install")
         return
 
-    state = _deps_marker_state(req)
+    state = _deps_marker_state(req, interpreter_marker=_interpreter_marker(vpy))
     if marker.is_file() and marker.read_text(encoding="utf-8").strip() == state:
         print(f"Dependencies already installed in .venv (marker up to date: {req.name})")
         return
@@ -226,7 +305,7 @@ def ensure_deps(vpy: Path, *, skip: bool) -> None:
         "--require-virtualenv",
     ]
     if req.name == "requirements.lock":
-        install_cmd.append("--no-deps")
+        install_cmd.extend(["--no-deps", "--require-hashes"])
     install_cmd.extend(["-r", str(req)])
     _run(
         install_cmd,
@@ -398,6 +477,22 @@ def _port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def _app_is_running(host: str, port: int) -> bool:
+    """Identify our server without sending cookies, tokens, or credentials."""
+    try:
+        with urlopen(_local_url(host, port, "/api/health"), timeout=0.75) as response:
+            if getattr(response, "status", None) != 200:
+                return False
+            payload = json.loads(response.read(64_000).decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and payload.get("app_id") == _APP_ID
+    )
+
+
 def _local_url(host: str, port: int, path: str = "") -> str:
     authority = f"[{host}]" if ":" in host else host
     return f"http://{authority}:{port}{path}"
@@ -487,6 +582,12 @@ def main() -> None:
     # start.bat) und würde sonst einen englischen uvicorn-Bind-Traceback
     # sehen. Rein advisory: bei Unklarheit wird normal weitergestartet.
     if _port_in_use(host, port):
+        if not _app_is_running(host, port):
+            print(
+                f"ERROR: Port {port} is occupied by another application. "
+                "Choose a different port and restart."
+            )
+            raise SystemExit(1)
         print(f"Already running on port {port} — opening the browser; no second server needed.")
         print(f"  URL: {url}")
         if not args.no_browser:

@@ -21,12 +21,31 @@ def _canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _requirement_names(filename: str) -> set[str]:
-    names: set[str] = set()
+def _locked_requirement_lines(filename: str) -> list[str]:
+    requirements: list[str] = []
+    pending = ""
     for raw in (ROOT / filename).read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        continued = line.endswith("\\")
+        fragment = line[:-1].rstrip() if continued else line
+        pending = f"{pending} {fragment}".strip()
+        if not continued:
+            requirements.append(pending)
+            pending = ""
+    assert not pending, f"unterminated continuation in {filename}"
+    return requirements
+
+
+def _requirement_without_hashes(line: str) -> str:
+    return line.split(" --hash=", 1)[0].strip()
+
+
+def _requirement_names(filename: str) -> set[str]:
+    names: set[str] = set()
+    for line in _locked_requirement_lines(filename):
+        line = _requirement_without_hashes(line)
         names.add(
             _canonical_name(re.split(r"[<>=!~;\[]", line, maxsplit=1)[0])
         )
@@ -35,9 +54,8 @@ def _requirement_names(filename: str) -> set[str]:
 
 def _locked_versions(filename: str) -> dict[str, Version]:
     active_lines = [
-        line.strip()
-        for line in (ROOT / filename).read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+        _requirement_without_hashes(line)
+        for line in _locked_requirement_lines(filename)
     ]
     exact_pin = re.compile(
         r"^(?P<name>[A-Za-z0-9_.-]+)(?:\[[^\]]+\])?=="
@@ -106,10 +124,8 @@ def test_dev_lock_is_exact_disjoint_and_covers_direct_dependencies():
 def test_installed_runtime_matches_every_exact_lock_pin():
     """The offline suite must execute against the runtime it claims to validate."""
     mismatches: list[str] = []
-    for raw in (ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
+    for line in _locked_requirement_lines("requirements.lock"):
+        line = _requirement_without_hashes(line)
         requirement = Requirement(line)
         locked = line.split("==", 1)[1].split(";", 1)[0].strip()
         try:
@@ -199,9 +215,43 @@ def test_ci_installs_exact_lockfiles_without_dependency_resolution():
     )
 
     assert "--no-deps" in install
+    assert "--require-hashes" in install
     assert "-r requirements.lock" in install
     assert "-r requirements-dev.lock" in install
     assert "requirements-dev.txt" not in install
+
+
+def test_every_lock_pin_has_only_sha256_artifact_hashes():
+    hash_pattern = re.compile(r"--hash=sha256:[0-9a-f]{64}")
+    for filename in ("requirements.lock", "requirements-dev.lock"):
+        for line in _locked_requirement_lines(filename):
+            hashes = hash_pattern.findall(line)
+            assert hashes, f"missing artifact hash in {filename}: {line}"
+            residue = hash_pattern.sub("", line)
+            assert "--hash=" not in residue, f"unsupported hash in {filename}: {line}"
+
+
+def test_documented_and_ci_lock_installs_enforce_hashes():
+    for source in (
+        ROOT / ".github" / "workflows" / "checks.yml",
+        ROOT / "README.md",
+    ):
+        install = next(
+            line.strip()
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if " pip install " in line and "requirements.lock" in line
+        )
+        assert "--require-hashes" in install
+    launch = (ROOT / "scripts" / "launch.py").read_text(encoding="utf-8")
+    assert 'install_cmd.extend(["--no-deps", "--require-hashes"])' in launch
+
+
+def test_ci_checks_api_syntax_and_committed_diff_whitespace():
+    workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "node --check app/static/api.js" in workflow
+    assert 'git diff --check "$base..HEAD"' in workflow
 
 
 def test_pip_bootstrap_pin_is_consistent_across_install_paths():

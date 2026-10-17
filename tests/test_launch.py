@@ -7,6 +7,7 @@ per importlib aus dem Dateipfad statt `import scripts.launch`.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -75,6 +76,7 @@ def test_ensure_deps_prefers_requirements_lock_when_present(
     monkeypatch.setattr(launch, "ROOT", root)
     monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
     monkeypatch.setattr(launch, "_is_project_venv", lambda p: True)
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda p=None: "test-abi")
     monkeypatch.setattr(launch, "_venv_env", lambda: {})
 
     calls: list[list[str]] = []
@@ -96,6 +98,7 @@ def test_ensure_deps_prefers_requirements_lock_when_present(
     assert req_arg.endswith("requirements.lock")
     assert "requirements.txt" not in req_arg
     assert "--no-deps" in install_calls[0]
+    assert "--require-hashes" in install_calls[0]
 
 
 def test_ensure_deps_falls_back_to_requirements_txt_without_lock(
@@ -109,6 +112,7 @@ def test_ensure_deps_falls_back_to_requirements_txt_without_lock(
     monkeypatch.setattr(launch, "ROOT", root)
     monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
     monkeypatch.setattr(launch, "_is_project_venv", lambda p: True)
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda p=None: "test-abi")
     monkeypatch.setattr(launch, "_venv_env", lambda: {})
 
     calls: list[list[str]] = []
@@ -133,25 +137,27 @@ def test_dependency_marker_tracks_interpreter_bootstrap_and_resolution_contract(
 ):
     req = tmp_path / "requirements.lock"
     req.write_text("fastapi==0.139.0\n", encoding="utf-8")
-    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-312-64bit")
-
-    state = launch._deps_marker_state(req)
+    state = launch._deps_marker_state(
+        req, interpreter_marker="cpython-312-64bit"
+    )
 
     assert "python:cpython-312-64bit" in state
     assert "pip==26.2.1" in state
-    assert "mode:no-deps" in state
+    assert "mode:no-deps+require-hashes" in state
     assert "schema:" in state
 
 
 def test_dependency_marker_changes_with_interpreter_abi(launch, tmp_path, monkeypatch):
     req = tmp_path / "requirements.lock"
     req.write_text("fastapi==0.139.0\n", encoding="utf-8")
-    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-311-64bit")
-    old_state = launch._deps_marker_state(req)
+    old_state = launch._deps_marker_state(
+        req, interpreter_marker="cpython-311-64bit"
+    )
 
-    monkeypatch.setattr(launch, "_interpreter_marker", lambda: "cpython-312-64bit")
-
-    assert launch._deps_marker_state(req) != old_state
+    assert (
+        launch._deps_marker_state(req, interpreter_marker="cpython-312-64bit")
+        != old_state
+    )
 
 
 def test_ensure_deps_marker_tracks_actual_file_used_switch_reinstalls(
@@ -168,6 +174,7 @@ def test_ensure_deps_marker_tracks_actual_file_used_switch_reinstalls(
     monkeypatch.setattr(launch, "ROOT", root)
     monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
     monkeypatch.setattr(launch, "_is_project_venv", lambda p: True)
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda p=None: "test-abi")
     monkeypatch.setattr(launch, "_venv_env", lambda: {})
 
     calls: list[list[str]] = []
@@ -214,8 +221,12 @@ def test_ensure_deps_marker_detects_content_change_with_same_mtime(
     monkeypatch.setattr(launch, "ROOT", root)
     monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
     monkeypatch.setattr(launch, "_is_project_venv", lambda p: True)
+    monkeypatch.setattr(launch, "_interpreter_marker", lambda p=None: "test-abi")
     monkeypatch.setattr(launch, "_venv_env", lambda: {})
-    marker.write_text(launch._deps_marker_state(req), encoding="utf-8")
+    marker.write_text(
+        launch._deps_marker_state(req, interpreter_marker="test-abi"),
+        encoding="utf-8",
+    )
 
     req.write_text("fastapi==0.138.0\n", encoding="utf-8")
     os.utime(req, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
@@ -230,7 +241,66 @@ def test_ensure_deps_marker_detects_content_change_with_same_mtime(
     launch.ensure_deps(venv_dir / "Scripts" / "python.exe", skip=False)
 
     assert len(calls) == 2
-    assert marker.read_text(encoding="utf-8") == launch._deps_marker_state(req)
+    assert marker.read_text(encoding="utf-8") == launch._deps_marker_state(
+        req, interpreter_marker="test-abi"
+    )
+
+
+def test_ensure_venv_checks_the_executed_interpreter_identity(
+    launch, tmp_path, monkeypatch
+):
+    venv_dir = tmp_path / ".venv"
+    vpy = venv_dir / "Scripts" / "python.exe"
+    vpy.parent.mkdir(parents=True)
+    vpy.write_bytes(b"synthetic")
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
+    payload = {
+        "executable": str(vpy),
+        "prefix": str(venv_dir),
+        "base_prefix": str(tmp_path / "base-python"),
+        "version": [3, 12],
+        "cache_tag": "cpython-312",
+        "bits": 64,
+    }
+    monkeypatch.setattr(
+        launch.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    assert launch.ensure_venv(vpy) == vpy
+
+
+def test_ensure_venv_rejects_interpreter_with_foreign_prefix(
+    launch, tmp_path, monkeypatch
+):
+    venv_dir = tmp_path / ".venv"
+    vpy = venv_dir / "Scripts" / "python.exe"
+    vpy.parent.mkdir(parents=True)
+    vpy.write_bytes(b"synthetic")
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    monkeypatch.setattr(launch, "VENV_DIR", venv_dir)
+    payload = {
+        "executable": str(vpy),
+        "prefix": str(tmp_path / "other-venv"),
+        "base_prefix": str(tmp_path / "base-python"),
+        "version": [3, 12],
+        "cache_tag": "cpython-312",
+        "bits": 64,
+    }
+    monkeypatch.setattr(
+        launch.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="identity/ABI is invalid"):
+        launch.ensure_venv(vpy)
 
 
 def test_setup_flag_explicit_alias_not_prefix_abbreviation(launch):
@@ -565,6 +635,77 @@ def test_port_in_use_uses_address_family_aware_connection(launch, monkeypatch):
 
     assert launch._port_in_use("::1", 8787) is True
     assert calls == [(('::1', 8787), 0.5)]
+
+
+def test_app_identity_rejects_unrelated_listener(launch, monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _limit):
+            return b'{"ok":true,"app_id":"different-app"}'
+
+    monkeypatch.setattr(launch, "urlopen", lambda *_a, **_kw: FakeResponse())
+    assert launch._app_is_running("127.0.0.1", 8787) is False
+
+
+def test_app_identity_accepts_our_health_contract(launch, monkeypatch):
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _limit):
+            return b'{"ok":true,"app_id":"obsidian-live-trader"}'
+
+    monkeypatch.setattr(launch, "urlopen", lambda *_a, **_kw: FakeResponse())
+    assert launch._app_is_running("127.0.0.1", 8787) is True
+
+
+def test_app_identity_does_not_follow_health_redirects(launch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    redirected_requests = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal redirected_requests
+            if self.path == "/api/health":
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{self.server.server_port}/target"
+                )
+                self.end_headers()
+                return
+            redirected_requests += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"app_id":"obsidian-live-trader"}')
+
+        def log_message(self, _format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert launch._app_is_running("127.0.0.1", server.server_port) is False
+        assert redirected_requests == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.mark.parametrize(

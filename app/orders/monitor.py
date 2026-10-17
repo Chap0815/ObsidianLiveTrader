@@ -36,6 +36,7 @@ from app.config import get_settings
 from app.orders.service import (
     OrderOutcomeUnknown,
     client_uses_hyperliquid_semantics,
+    execution_context_id,
     hl_epoch_signature,
     hl_flat_open_epoch as _hl_flat_open_epoch,
     open_position_signature,
@@ -155,8 +156,13 @@ async def _best_effort_opened_at(
             return max(times)
     except Exception:
         pass
-    # 2) Journal approximation (MEXC fills lack current-position identity; also
-    # the Hyperliquid fallback when no usable epoch fill is available).
+    # 2) Journal approximation is HL-only. MEXC journal rows have no durable
+    # position identity, so an old same-side trade could make a fresh position
+    # immediately eligible for the advisory time-stop.
+    if not client_uses_hyperliquid_semantics(client):
+        return now_ms
+
+    # Hyperliquid fallback when no usable epoch fill is available.
     # F5: recent_journal is newest-first, so returning the FIRST match picked the
     # YOUNGEST row — every fresh proposal then "rejuvenated" opened_at and the
     # time-stop could never reach its threshold. Take the OLDEST matching row in
@@ -190,6 +196,7 @@ async def _best_effort_invalidation(
     observed_open_sig: int | None = None,
     observed_opened_at: int | None = None,
     reopen_opened_at: int | None = None,
+    execution_context: str = "",
 ) -> float | None:
     """Thesis-invalidation price from this position's explicit proposal.
 
@@ -206,6 +213,7 @@ async def _best_effort_invalidation(
             observed_open_sig=observed_open_sig,
             observed_opened_at=observed_opened_at,
             reopen_opened_at=reopen_opened_at,
+            execution_context=execution_context,
         )
         if not prop:
             return None
@@ -231,7 +239,11 @@ async def _best_effort_invalidation(
 
 
 async def _current_sl(
-    client: Any, symbol: str, side: str, entry: float
+    client: Any,
+    symbol: str,
+    side: str,
+    entry: float,
+    hold_vol: float | None = None,
 ) -> tuple[float | None, bool]:
     """Current protective stop + a read-OK flag.
 
@@ -263,7 +275,37 @@ async def _current_sl(
                 continue
             matching_stops.append(row)
         sl, _tp = classify_protection(matching_stops, side=side, entry=entry)
-        return sl, True
+        if hold_vol is None:
+            return sl, True
+        if not _finite_real_number(hold_vol) or hold_vol <= 0:
+            return None, False
+        # A successful lookup that found no SL is authoritative evidence that
+        # the live position has no verified stop coverage.  It is not a read
+        # failure, but callers must take the same fail-closed path: pause
+        # autonomous moves and surface the protection warning.
+        if sl is None:
+            return None, False
+
+        # A tighter partial stop is not the stop for the whole position. Walk
+        # from most to least protective and return the price at which validated
+        # reduce-only size cumulatively covers the live hold.
+        coverage: list[tuple[float, float]] = []
+        for row in matching_stops:
+            row_sl, _row_tp = classify_protection([row], side=side, entry=entry)
+            if row_sl is None:
+                continue
+            raw_vol = row.get("vol")
+            if not _finite_real_number(raw_vol) or raw_vol <= 0:
+                return None, False
+            coverage.append((row_sl, float(raw_vol)))
+        coverage.sort(key=lambda item: item[0], reverse=side == "long")
+        covered = 0.0
+        tolerance = max(1e-12, float(hold_vol) * 1e-9)
+        for stop_price, stop_vol in coverage:
+            covered += stop_vol
+            if covered + tolerance >= float(hold_vol):
+                return stop_price, True
+        return None, False
     except Exception:
         return None, False
 
@@ -299,7 +341,14 @@ async def ensure_baseline(
     ``current_sl`` of None is honoured as "no stop" (not re-read).
     """
     if current_sl is _UNSET:
-        current_sl, _sl_ok = await _current_sl(client, symbol, side, entry)
+        hold_vol = pos.get("hold_vol") if isinstance(pos, dict) else None
+        current_sl, _sl_ok = await _current_sl(
+            client,
+            symbol,
+            side,
+            entry,
+            float(hold_vol) if _finite_real_number(hold_vol) else None,
+        )
     is_hl = client_uses_hyperliquid_semantics(client)
     # Only HL fills carry start_position, which links Flat→Open evidence to a
     # trade epoch. MEXC's account-wide deals cannot identify the current position;
@@ -334,6 +383,7 @@ async def ensure_baseline(
         observed_open_sig=open_sig,
         observed_opened_at=opened_at,
         reopen_opened_at=reopen_opened_at,
+        execution_context=execution_context_id(client),
     )
 
     # Durable baseline. First sighting inserts; a later sighting refreshes in
@@ -379,7 +429,12 @@ async def _process_position(
         return
     entry = float(entry)
 
-    current_sl, sl_ok = await _current_sl(client, symbol, side, entry)
+    hold_vol = pos.get("hold_vol")
+    if not _finite_real_number(hold_vol) or hold_vol <= 0:
+        return
+    current_sl, sl_ok = await _current_sl(
+        client, symbol, side, entry, float(hold_vol)
+    )
 
     # Mark price — required to evaluate any rule geometry. No mark → skip (the
     # next cycle retries); never guess.  Adapters normally return a float, but
@@ -398,6 +453,11 @@ async def _process_position(
         mark = None
     if mark is None or mark <= 0:
         return
+
+    # A resting MEXC entry may fill long after Confirm. Reconcile its exact
+    # order/position evidence before resolving the durable entry thesis.
+    if callable(getattr(type(service), "_has_entry_reservation", None)):
+        await service._has_entry_reservation(symbol, side, positions=[pos])
 
     # Durable baseline via the SHARED helper (identical freeze/reset semantics
     # to the arm endpoint). evaluate_rules below still uses the LIVE current_sl
@@ -508,6 +568,23 @@ async def _process_position(
     # Working copy of the debounce/feed state; persisted once at the end.
     alert_state = dict(baseline.last_alert_state)
     state_dirty = False
+
+    if not sl_ok and not alert_state.get("protection_coverage"):
+        alert_state["protection_coverage"] = {
+            "active": True,
+            "message": (
+                "Stop-loss coverage is incomplete or could not be verified. "
+                "Automatic stop movement is paused; verify the full position "
+                "coverage on the exchange."
+            ),
+            "ts": now_ms,
+        }
+        state_dirty = True
+    elif sl_ok and "protection_coverage" in alert_state:
+        # This alert describes current coverage, not a historical action.  Once
+        # the full live hold is verifiably protected, remove the stale warning.
+        alert_state.pop("protection_coverage", None)
+        state_dirty = True
 
     # Advisory alarms always all fire (they never touch an order).
     for action in actions:
@@ -927,14 +1004,9 @@ async def _run_one_cycle(app: Any, now_ms: int) -> None:
             # baseline BEFORE processing so the fresh position re-arms cleanly. A
             # normal continuous cycle (NO prior absence) never resets → the
             # transient-glitch tolerance and the monotonic high-water are preserved.
-            if absence.pop(key, 0) > 0:
-                try:
-                    await db.reset_position_mgmt_baseline(symbol, side)
-                except Exception as exc:
-                    log.warning(
-                        "trade monitor: reopen baseline reset failed type=%s",
-                        type(exc).__name__,
-                    )
+            # A sub-grace absence is not proof of a reopen. The upsert below
+            # resets only on a changed exchange identity or entry geometry.
+            absence.pop(key, None)
         try:
             await _process_position(app, db, client, settings, service, pos, now_ms)
         except Exception as exc:

@@ -328,7 +328,7 @@ def regime_tag(btc_regime: dict[str, Any] | None, atr_pct: float | None) -> str:
         pct = float(atr_pct)
     except (TypeError, ValueError, OverflowError):
         return "unknown"
-    if pct != pct or pct < 0:  # NaN / negative guard
+    if not math.isfinite(pct) or pct < 0:
         return "unknown"
     if pct < _VOL_BUCKET_LOW_PCT:
         vol = "low"

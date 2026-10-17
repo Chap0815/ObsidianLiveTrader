@@ -42,6 +42,11 @@ class PreviewStore:
         self._lock = threading.Lock()
         # token -> {payload, expires_at, used}
         self._items: dict[str, dict[str, Any]] = {}
+        # Fallback for unit tests/minimal embeddings without a Database.  The
+        # production path persists the same guard in SQLite.
+        self._entry_reservations: dict[
+            tuple[str, str, str], dict[str, Any]
+        ] = {}
 
     @staticmethod
     def hash_token(token: str) -> str:
@@ -115,6 +120,47 @@ class PreviewStore:
         """Remove only this token; a newer single-slot token must survive."""
         with self._lock:
             self._items.pop(token, None)
+
+    def active_entry_reservation(
+        self, exchange_id: str, symbol: str, side: str
+    ) -> dict[str, Any] | None:
+        key = (exchange_id, symbol, side)
+        with self._lock:
+            item = self._entry_reservations.get(key)
+            return copy.deepcopy(item)
+
+    def claim_entry_reservation(
+        self,
+        exchange_id: str,
+        symbol: str,
+        side: str,
+        external_oid: str,
+        pre_hold: float,
+        ttl_seconds: int,
+        requested_vol: float | None = None,
+        request_json: Any = None,
+        proposal_id: int | None = None,
+    ) -> bool:
+        key = (exchange_id, symbol, side)
+        with self._lock:
+            current = self._entry_reservations.get(key)
+            if current is not None:
+                return False
+            self._entry_reservations[key] = {
+                "external_oid": external_oid, "pre_hold": float(pre_hold),
+                "requested_vol": requested_vol, "request": copy.deepcopy(request_json),
+                "proposal_id": proposal_id,
+            }
+            return True
+
+    def release_entry_reservation(
+        self, exchange_id: str, symbol: str, side: str, external_oid: str
+    ) -> None:
+        key = (exchange_id, symbol, side)
+        with self._lock:
+            current = self._entry_reservations.get(key)
+            if current is not None and current["external_oid"] == external_oid:
+                self._entry_reservations.pop(key, None)
 
     def _purge_unlocked(self) -> None:
         now = time.monotonic()

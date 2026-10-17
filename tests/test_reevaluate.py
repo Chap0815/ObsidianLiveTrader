@@ -218,6 +218,52 @@ def test_reevaluate_account_error_does_not_reflect_diagnostics(monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unrealized_pnl", float("inf")),
+        ("leverage", True),
+        ("liquidate_price", {"raw": 90_000}),
+        ("im", float("nan")),
+        ("margin_ratio", "0.1"),
+    ],
+)
+def test_reevaluate_rejects_invalid_optional_financial_fields(
+    monkeypatch, field, value
+):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    _env(monkeypatch)
+    position = _mock_position()
+    position[field] = value
+    client = MagicMock()
+    client.exchange_id = "mexc"
+    client.account_snapshot = AsyncMock(return_value={"positions": [position]})
+    client.open_stop_orders = AsyncMock(return_value=[])
+    market = AsyncMock()
+    llm = AsyncMock()
+
+    with TestClient(main.app) as tc:
+        tc.app.state.mexc = client
+        tc.app.state.exchange = client
+        with (
+            patch("app.main.build_market_snapshot", new=market),
+            patch("app.main.reevaluate_with_llm", new=llm),
+        ):
+            response = tc.post(
+                "/api/reevaluate",
+                json={"symbol": "BTC_USDT", "tf": "15m", "htf": "1H"},
+            )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Invalid account position data"
+    market.assert_not_awaited()
+    llm.assert_not_awaited()
+    get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_reevaluate_resolves_thesis_against_current_position_epoch(monkeypatch):
     """A same-entry reopen must resolve against the live position identity."""
@@ -293,6 +339,7 @@ async def test_reevaluate_resolves_thesis_against_current_position_epoch(monkeyp
         observed_open_sig=222,
         observed_opened_at=None,
         reopen_opened_at=2_000_000,
+        execution_context="",
     )
     assert captured_context["original_thesis"]["rationale"] == "fresh trade epoch"
     assert captured_context["original_thesis"]["proposed_at"] == (

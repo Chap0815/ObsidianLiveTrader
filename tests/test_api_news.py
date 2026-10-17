@@ -322,6 +322,23 @@ async def test_concurrent_cache_miss_only_refreshes_once(monkeypatch):
     fetch_batches = 0
     started = _asyncio.Event()
     release = _asyncio.Event()
+    second_waiting = _asyncio.Event()
+
+    class ObservedLock:
+        def __init__(self):
+            self._lock = _asyncio.Lock()
+            self._attempts = 0
+
+        async def __aenter__(self):
+            self._attempts += 1
+            if self._attempts == 2:
+                second_waiting.set()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_args):
+            self._lock.release()
+            return False
 
     async def fake_refresh(request):
         nonlocal fetch_batches
@@ -334,14 +351,14 @@ async def test_concurrent_cache_miss_only_refreshes_once(monkeypatch):
 
     monkeypatch.setattr(main, "_refresh_news", fake_refresh)
     app.state.news_cache = None
-    app.state.news_lock = _asyncio.Lock()
+    app.state.news_lock = ObservedLock()
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         t1 = _asyncio.create_task(client.get("/api/news"))
         await _asyncio.wait_for(started.wait(), timeout=2.0)
         t2 = _asyncio.create_task(client.get("/api/news"))
-        await _asyncio.sleep(0.1)  # let t2 reach (and block on) the lock
+        await _asyncio.wait_for(second_waiting.wait(), timeout=2.0)
         release.set()
         r1 = await t1
         r2 = await t2

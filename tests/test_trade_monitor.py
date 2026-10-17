@@ -35,6 +35,7 @@ class FakeClient:
                 "symbol": "BTC" if is_hl else "BTC_USDT",
                 "triggerPrice": 98.0,
                 "orderType": "Stop",
+                "vol": 1.0,
             }
         ]
         if is_hl:
@@ -348,6 +349,147 @@ async def test_current_sl_rejects_malformed_stop_collections(malformed_stops):
 
 
 @pytest.mark.asyncio
+async def test_current_sl_requires_full_position_coverage():
+    client = FakeClient(
+        [],
+        stops=[
+            {
+                "symbol": "BTC",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+                "vol": 0.25,
+            }
+        ],
+    )
+
+    assert await monitor._current_sl(
+        client, "BTC_USDT", "long", 100.0, hold_vol=1.0
+    ) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_current_sl_treats_missing_stop_as_unverified_coverage():
+    client = FakeClient([], stops=[])
+
+    assert await monitor._current_sl(
+        client, "BTC_USDT", "long", 100.0, hold_vol=1.0
+    ) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_partial_stop_coverage_pauses_automation_and_alerts(
+    monkeypatch, db_path
+):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=True)
+    service = _install_spy(monkeypatch)
+    client = FakeClient(
+        [_pos(hold=1.0)],
+        mark=103.0,
+        stops=[
+            {
+                "symbol": "BTC",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+                "vol": 0.25,
+            }
+        ],
+    )
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+
+    service.modify_stop_loss.assert_not_awaited()
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert row["last_alert_state"]["protection_coverage"]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_restored_stop_coverage_clears_stale_coverage_alert(monkeypatch, db_path):
+    db = Database(db_path)
+    await db.init()
+    await _seed_open(db, armed=False)
+    _install_spy(monkeypatch)
+    client = FakeClient(
+        [_pos(hold=1.0)],
+        stops=[
+            {
+                "symbol": "BTC",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+                "vol": 0.25,
+            }
+        ],
+    )
+
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS)
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert "protection_coverage" in row["last_alert_state"]
+
+    client._stops = [
+        {
+            "symbol": "BTC",
+            "triggerPrice": 99.0,
+            "orderType": "Stop",
+            "vol": 1.0,
+        }
+    ]
+    await monitor._run_one_cycle(_make_app(db, client), NOW_MS + 1)
+
+    row = await db.get_open_position_mgmt("BTC_USDT", "long")
+    assert "protection_coverage" not in row["last_alert_state"]
+
+
+@pytest.mark.asyncio
+async def test_current_sl_uses_price_that_covers_the_whole_position():
+    client = FakeClient(
+        [],
+        stops=[
+            {
+                "symbol": "BTC",
+                "triggerPrice": 99.0,
+                "orderType": "Stop",
+                "vol": 0.25,
+            },
+            {
+                "symbol": "BTC",
+                "triggerPrice": 98.0,
+                "orderType": "Stop",
+                "vol": 0.75,
+            },
+        ],
+    )
+
+    assert await monitor._current_sl(
+        client, "BTC_USDT", "long", 100.0, hold_vol=1.0
+    ) == (98.0, True)
+
+
+@pytest.mark.asyncio
+async def test_mexc_open_time_does_not_borrow_old_journal_trade():
+    client = SimpleNamespace(exchange_id="mexc")
+    db = SimpleNamespace(
+        recent_journal=AsyncMock(
+            return_value=[
+                {
+                    "symbol": "BTC_USDT",
+                    "direction": "long",
+                    "created_at": "2020-01-01T00:00:00+00:00",
+                }
+            ]
+        )
+    )
+
+    assert (
+        await monitor._best_effort_opened_at(
+            client, db, "BTC_USDT", "long", NOW_MS, fills=[]
+        )
+        == NOW_MS
+    )
+    db.recent_journal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_invalidation_uses_entry_proposal_not_latest_symbol_proposal():
     db = SimpleNamespace(
         proposal_for_open_position=AsyncMock(
@@ -376,6 +518,7 @@ async def test_invalidation_uses_entry_proposal_not_latest_symbol_proposal():
         observed_open_sig=222,
         observed_opened_at=2_000,
         reopen_opened_at=2_000,
+        execution_context="",
     )
     db.latest_proposal_for_symbol.assert_not_awaited()
 
@@ -759,6 +902,13 @@ async def test_unarmed_only_alerts_no_modify(monkeypatch, db_path):
         error=None,
     )
     await _seed_open(db, armed=False, opened_at=opened_at)
+    await db.bind_entry_proposal(
+        "BTC_USDT",
+        "long",
+        open_sig=NOW_MS,
+        proposal_id=original_id,
+        external_oid="mlt-source",
+    )
     # A newer unrelated analysis must not replace the entry's thesis. At mark
     # 98.5 the original invalidation (99) crosses, while the newer one (80) does not.
     await db.insert_proposal(
@@ -1457,10 +1607,12 @@ async def test_unverified_trail_move_writes_no_done_feed(monkeypatch, db_path):
 
 
 @pytest.mark.asyncio
-async def test_reopen_after_absence_resets_be_and_high_water(monkeypatch, db_path):
-    """C3: when a position vanishes for < grace cycles (record NOT closed) and
-    then REAPPEARS at ~the same entry, the fresh position must NOT inherit the old
-    be_done latch or a stale high_water. Reappearance-after-absence resets both."""
+async def test_transient_absence_preserves_be_and_high_water(monkeypatch, db_path):
+    """A sub-grace snapshot gap does not prove a reopen.
+
+    When the same position reappears at the same entry, preserve the BE latch and
+    monotonic high-water instead of re-arming automation from transient data loss.
+    """
     db = Database(db_path)
     await db.init()
     await _seed_open(db, armed=True, rules={"auto_be": True})
@@ -1483,8 +1635,7 @@ async def test_reopen_after_absence_resets_be_and_high_water(monkeypatch, db_pat
     await monitor._run_one_cycle(app, NOW_MS + 20_000)
     row = await db.get_open_position_mgmt("BTC_USDT", "long")
     assert row is not None
-    assert row["be_done"] == 0  # stale BE latch cleared → auto-BE eligible again
-    # high_water re-seeded to entry (100) then advanced to the live mark (101),
-    # NOT the stale 130 from the prior trade.
-    assert row["high_water"] == pytest.approx(101.0)
+    assert row["be_done"] == 1
+    # The prior high-water remains authoritative for the same trade epoch.
+    assert row["high_water"] == pytest.approx(130.0)
     svc.modify_stop_loss.assert_not_awaited()  # +0.5R < +1R → no move yet

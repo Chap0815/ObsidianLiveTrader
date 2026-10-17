@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 import json
 import math
 from contextlib import asynccontextmanager
@@ -46,6 +47,7 @@ async def _purge_expired_previews(conn: aiosqlite.Connection) -> None:
 # baseline must reset (never silently inherit a stale 1R from a prior trade).
 _ENTRY_TOLERANCE_REL = 0.001  # 0.1% relative
 _ENTRY_TOLERANCE_ABS_FLOOR = 1e-6
+_RESERVATION_OWNER = uuid.uuid4().hex
 
 
 def _entry_deviated(old_entry: float, new_entry: float) -> bool:
@@ -104,6 +106,11 @@ class Database:
     def __init__(self, db_path: str):
         self.path = _resolve_path(db_path)
         self._shared: aiosqlite.Connection | None = None
+        # A transaction is larger than one aiosqlite call.  Without a
+        # connection-wide lock, cancellation after execute() but before
+        # commit() can leave a dirty transaction that an unrelated coroutine
+        # later commits.  Serialize complete shared-connection units of work.
+        self._connection_lock = asyncio.Lock()
         # Dedupe is a SELECT followed by UPDATE-or-INSERT. aiosqlite serializes
         # individual statements, but two coroutines can still interleave that
         # sequence on the shared connection and create duplicate samples.
@@ -145,10 +152,35 @@ class Database:
         """
         shared = self._shared
         if shared is not None:
-            yield shared
+            async with self._connection_lock:
+                try:
+                    yield shared
+                except BaseException:
+                    # Roll back even while the caller is being cancelled.  The
+                    # shield keeps the shared connection clean before another
+                    # authority-changing writer can acquire it.
+                    try:
+                        await asyncio.shield(shared.rollback())
+                    except BaseException:
+                        # A connection whose transaction state cannot be
+                        # recovered must not be handed to another request.
+                        if self._shared is shared:
+                            self._shared = None
+                        try:
+                            await asyncio.shield(shared.close())
+                        except BaseException:
+                            pass
+                    raise
         else:
             async with self._connect() as conn:
-                yield conn
+                try:
+                    yield conn
+                except BaseException:
+                    try:
+                        await asyncio.shield(conn.rollback())
+                    except BaseException:
+                        pass
+                    raise
 
     @asynccontextmanager
     async def _acquire_journal_insert(self):
@@ -164,6 +196,23 @@ class Database:
             await conn.execute("PRAGMA synchronous=NORMAL;")
             await conn.execute("PRAGMA busy_timeout=30000;")
             await conn.executescript(SCHEMA_SQL)
+            cur = await conn.execute("PRAGMA table_info(entry_reservations)")
+            reservation_cols = {row[1] for row in await cur.fetchall()}
+            for column, sql_type in (
+                ("requested_vol", "REAL"), ("request_json", "TEXT"),
+                ("proposal_id", "INTEGER"), ("order_id", "INTEGER"),
+                ("phase", "TEXT"), ("owner_id", "TEXT"),
+            ):
+                if column not in reservation_cols:
+                    await conn.execute(
+                        f"ALTER TABLE entry_reservations ADD COLUMN {column} {sql_type}"
+                    )
+            # Only claims known never to have reached submission may be retired
+            # after process restart. Submitted/legacy unknowns remain blocked.
+            await conn.execute(
+                "DELETE FROM entry_reservations WHERE phase = 'claimed' AND owner_id != ?",
+                (_RESERVATION_OWNER,),
+            )
             # F2-07: additive migration for pre-existing DBs. CREATE TABLE IF
             # NOT EXISTS won't add a column to an already-created table, so add
             # realized_r_net explicitly when missing. Idempotent + safe: an
@@ -330,6 +379,138 @@ class Database:
             await conn.commit()
             return int(cur.lastrowid or 0)
 
+    async def active_entry_reservation(
+        self, *, exchange_id: str, symbol: str, side: str
+    ) -> dict[str, Any] | None:
+        """Return unresolved exposure, regardless of its age."""
+        async with self._acquire() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """
+                SELECT *
+                FROM entry_reservations
+                WHERE exchange_id = ? AND symbol = ? AND side = ?
+                """,
+                (exchange_id, symbol, side),
+            )
+            row = await cur.fetchone()
+            await conn.commit()
+            if row is None:
+                return None
+            result = dict(row)
+            result["request"] = _loads(result.pop("request_json"))
+            return result
+
+    async def claim_entry_reservation(
+        self,
+        *,
+        exchange_id: str,
+        symbol: str,
+        side: str,
+        external_oid: str,
+        pre_hold: float,
+        ttl_seconds: int,
+        requested_vol: float | None = None,
+        request_json: Any = None,
+        proposal_id: int | None = None,
+    ) -> bool:
+        """Atomically reserve one side while exchange state converges."""
+        now = _now_ms()
+        expires_at = now + max(1, int(ttl_seconds)) * 1000
+        async with self._acquire() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO entry_reservations
+                  (exchange_id, symbol, side, external_oid, pre_hold, expires_at,
+                   requested_vol, request_json, proposal_id, phase, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)
+                ON CONFLICT(exchange_id, symbol, side) DO NOTHING
+                """,
+                (
+                    exchange_id,
+                    symbol,
+                    side,
+                    external_oid,
+                    float(pre_hold),
+                    expires_at,
+                    requested_vol, _dumps(request_json), proposal_id,
+                    _RESERVATION_OWNER,
+                ),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def mark_entry_submission_started(
+        self, *, exchange_id: str, symbol: str, side: str, external_oid: str,
+    ) -> None:
+        async with self._acquire() as conn:
+            cur = await conn.execute(
+                "UPDATE entry_reservations SET phase = 'submission_started' "
+                "WHERE exchange_id = ? AND symbol = ? AND side = ? AND external_oid = ? "
+                "AND phase = 'claimed' AND owner_id = ?",
+                (exchange_id, symbol, side, external_oid, _RESERVATION_OWNER),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("entry reservation submission authority unavailable")
+            await conn.commit()
+
+    async def set_entry_reservation_order_id(
+        self, *, exchange_id: str, symbol: str, side: str,
+        external_oid: str, order_id: int,
+    ) -> None:
+        if type(order_id) is not int or order_id <= 0:
+            raise ValueError("invalid order identity")
+        async with self._acquire() as conn:
+            cur = await conn.execute(
+                "UPDATE entry_reservations SET order_id = ? "
+                "WHERE exchange_id = ? AND symbol = ? AND side = ? AND external_oid = ? "
+                "AND (order_id IS NULL OR order_id = ?)",
+                (order_id, exchange_id, symbol, side, external_oid, order_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("entry reservation order identity conflict")
+            await conn.commit()
+
+    async def bind_entry_proposal(
+        self, symbol: str, side: str, *, open_sig: int,
+        proposal_id: int, external_oid: str,
+        execution_context: str = "",
+    ) -> None:
+        """Persist the original entry only; a later add-on cannot replace it."""
+        if type(open_sig) is not int or open_sig <= 0:
+            raise ValueError("invalid position identity")
+        if type(proposal_id) is not int or proposal_id <= 0 or not external_oid:
+            raise ValueError("invalid entry provenance")
+        async with self._acquire() as conn:
+            await conn.execute(
+                "INSERT INTO position_entry_links_v2 "
+                "(execution_context, symbol, side, open_sig, proposal_id, external_oid) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(execution_context, symbol, side, open_sig) DO NOTHING",
+                (execution_context, symbol, side, open_sig, proposal_id, external_oid),
+            )
+            await conn.commit()
+
+    async def release_entry_reservation(
+        self,
+        *,
+        exchange_id: str,
+        symbol: str,
+        side: str,
+        external_oid: str,
+    ) -> None:
+        """Release only the caller's guard after a proved non-placement."""
+        async with self._acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM entry_reservations
+                WHERE exchange_id = ? AND symbol = ? AND side = ?
+                  AND external_oid = ?
+                """,
+                (exchange_id, symbol, side, external_oid),
+            )
+            await conn.commit()
+
     async def recent_proposals(self, limit: int = 20) -> list[dict[str, Any]]:
         async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
@@ -403,17 +584,12 @@ class Database:
         observed_open_sig: int | None = None,
         observed_opened_at: int | None = None,
         reopen_opened_at: int | None = None,
+        execution_context: str = "",
     ) -> dict[str, Any] | None:
-        """Resolve only a proposal explicitly carried by this position's order.
+        """Resolve only an evidence-backed link to the active position identity.
 
-        The position-management row supplies the active trade epoch. Confirmed
-        order audit rows carry ``_proposal_id`` separately from the exchange
-        payload. The closest placed order within the bounded placement window
-        is used; unrelated newer analyses can never become the original thesis.
-
-        The optional observed values let the monitor resolve a newly detected
-        epoch before its baseline upsert. This prevents a same-entry reopen from
-        borrowing the previous trade's proposal for one evaluation cycle.
+        Legacy audit timestamps, including recent ones, cannot prove which order
+        opened a position. Missing identity/link therefore means no entry thesis.
         """
         mgmt = await self.get_open_position_mgmt(symbol, side)
 
@@ -426,67 +602,31 @@ class Database:
                 return None
             return parsed if parsed > 0 else None
 
-        opened_at = _epoch((mgmt or {}).get("opened_at"))
-        if mgmt is None:
-            opened_at = _epoch(observed_opened_at)
-        else:
+        signature = _epoch(observed_open_sig)
+        if signature is None and mgmt is not None:
             try:
                 entry_changed = observed_entry is not None and _entry_deviated(
                     float(mgmt.get("entry_snap")), float(observed_entry)
                 )
-                sig_changed = (
-                    observed_open_sig is not None
-                    and mgmt.get("open_sig") is not None
-                    and int(mgmt.get("open_sig")) != int(observed_open_sig)
-                )
             except (TypeError, ValueError, OverflowError):
                 return None
             if entry_changed:
-                opened_at = _epoch(observed_opened_at)
-            elif sig_changed:
-                opened_at = _epoch(reopen_opened_at)
-        if opened_at is None:
+                return None
+            signature = _epoch(mgmt.get("open_sig"))
+        if signature is None:
             return None
 
         async with self._acquire() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 """
-                SELECT id, created_at, request_json
-                FROM orders
-                WHERE symbol = ? AND side = ?
-                  AND (status LIKE 'placed%' OR status LIKE 'recovered_placed%')
-                ORDER BY id DESC
-                LIMIT 200
+                SELECT p.id, p.created_at, p.symbol, p.proposal_json
+                FROM position_entry_links_v2 AS link
+                JOIN proposals AS p ON p.id = link.proposal_id AND p.symbol = link.symbol
+                WHERE link.symbol = ? AND link.side = ? AND link.open_sig = ?
+                  AND link.execution_context = ?
                 """,
-                (symbol, side),
-            )
-            best: tuple[int, int] | None = None
-            for row in await cur.fetchall():
-                request_data = _loads(row["request_json"])
-                if not isinstance(request_data, dict):
-                    continue
-                try:
-                    proposal_id = int(request_data.get("_proposal_id") or 0)
-                    order_ms = int(
-                        datetime.fromisoformat(str(row["created_at"])).timestamp()
-                        * 1000
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                distance = abs(order_ms - opened_at)
-                if proposal_id <= 0 or distance > 15 * 60 * 1000:
-                    continue
-                if best is None or distance < best[0]:
-                    best = (distance, proposal_id)
-            if best is None:
-                return None
-            cur = await conn.execute(
-                """
-                SELECT id, created_at, symbol, proposal_json
-                FROM proposals WHERE id = ? AND symbol = ?
-                """,
-                (best[1], symbol),
+                (symbol, side, signature, execution_context),
             )
             proposal = await cur.fetchone()
             if proposal is None:

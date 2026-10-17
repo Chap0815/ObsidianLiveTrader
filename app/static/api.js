@@ -48,10 +48,16 @@ function authHeaders(extra) {
   const canonKey =
     (typeof PERSIST !== "undefined" && PERSIST && PERSIST.TOKEN) ||
     "mexc_local_token";
-  const tok =
-    _localToken ||
-    (typeof localStorage !== "undefined" && localStorage.getItem(canonKey)) ||
-    "";
+  let storedToken = "";
+  try {
+    storedToken =
+      (typeof localStorage !== "undefined" && localStorage.getItem(canonKey)) || "";
+  } catch (_) {
+    // Storage can be disabled by browser privacy/security policy. Cookie auth
+    // still works, so treat the optional fallback token as unavailable.
+    storedToken = "";
+  }
+  const tok = _localToken || storedToken;
   if (tok) h["X-Local-Token"] = tok;
   return h;
 }

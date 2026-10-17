@@ -160,9 +160,10 @@ def test_visible_ai_status_and_chart_copy_is_english():
     assert 'llmLabel: "AI"' in store_src
     assert "app.css?v={{ asset_version|default('r29-en') }}" in base_src
     assert "store.js?v={{ asset_version|default('r29') }}" in base_src
-    assert "utils.js?v={{ asset_version|default('r30-en') }}" in base_src
+    assert "utils.js?v={{ asset_version|default('r31-en') }}" in base_src
     assert "trade-math.js?v={{ asset_version|default('r38') }}" in base_src
-    assert "app.js?v={{ asset_version|default('r51') }}" in base_src
+    assert "api.js?v={{ asset_version|default('r26') }}" in base_src
+    assert "app.js?v={{ asset_version|default('r52') }}" in base_src
 
 
 def test_ai_key_modal_uses_server_default_models():

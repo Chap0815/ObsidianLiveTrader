@@ -309,8 +309,8 @@ class _FlakyClient:
 
 
 @pytest.mark.asyncio
-async def test_llm_retries_once_on_transient(monkeypatch):
-    """L-09: a transient 503 on the first attempt is retried exactly once
+async def test_llm_retries_once_on_explicit_rate_limit(monkeypatch):
+    """An explicit 429 rejection can be retried exactly once
     (after a short backoff) and a 200 on the retry succeeds -- the advisory
     call is not lost to a one-off provider hiccup."""
     from unittest.mock import AsyncMock
@@ -325,7 +325,7 @@ async def test_llm_retries_once_on_transient(monkeypatch):
             }
         ]
     }
-    fake = _FlakyClient(503, {"error": "service unavailable"}, claude_payload)
+    fake = _FlakyClient(429, {"error": "rate limited"}, claude_payload)
     monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
     monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
 
@@ -336,17 +336,17 @@ async def test_llm_retries_once_on_transient(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_llm_does_not_retry_twice_on_persistent_transient_failure(monkeypatch):
-    """L-09: a provider that stays down (503 on every call) must fail after
+async def test_llm_does_not_retry_twice_on_persistent_rate_limit(monkeypatch):
+    """A provider that keeps rejecting with 429 fails after
     exactly one retry (two total attempts), not loop indefinitely."""
     from unittest.mock import AsyncMock
 
     class _AlwaysDownClient(_FlakyClient):
         async def post(self, url, headers=None, json=None):
             self.calls += 1
-            return _FakeResp(503, {"error": "service unavailable"})
+            return _FakeResp(429, {"error": "rate limited"})
 
-    fake = _AlwaysDownClient(503, {"error": "down"}, {})
+    fake = _AlwaysDownClient(429, {"error": "rate limited"}, {})
     monkeypatch.setattr(client_mod.httpx, "AsyncClient", fake)
     monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
 
@@ -354,6 +354,58 @@ async def test_llm_does_not_retry_twice_on_persistent_transient_failure(monkeypa
         await _call_claude({"symbol": "BTC"}, _settings())
 
     assert fake.calls == 2  # first attempt + exactly one retry
+
+
+@pytest.mark.asyncio
+async def test_billable_post_does_not_retry_ambiguous_503(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    calls = 0
+
+    async def post():
+        nonlocal calls
+        calls += 1
+        return _FakeResp(503, {"error": "gateway unavailable"})
+
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+    response = await client_mod._post_with_retry(post)
+
+    assert response.status_code == 503
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_billable_post_does_not_retry_read_timeout():
+    calls = 0
+
+    async def post():
+        nonlocal calls
+        calls += 1
+        raise client_mod.httpx.ReadTimeout("synthetic read timeout")
+
+    with pytest.raises(client_mod.httpx.ReadTimeout):
+        await client_mod._post_with_retry(post)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_billable_post_retries_pre_send_connect_timeout(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    calls = 0
+
+    async def post():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise client_mod.httpx.ConnectTimeout("synthetic connect timeout")
+        return _FakeResp(200, {})
+
+    monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+    response = await client_mod._post_with_retry(post)
+
+    assert response.status_code == 200
+    assert calls == 2
 
 
 # --- Full /api/analyze wiring (fake provider transport, no network) ----

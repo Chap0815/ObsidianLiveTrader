@@ -8,13 +8,14 @@ import math
 import os
 import re as _re
 import tempfile
+import threading
 import time as _time
 import defusedxml.ElementTree as _ET  # hardened parser: news feeds are untrusted
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 from urllib.parse import urlsplit
 
 import httpx
@@ -79,6 +80,7 @@ from app.orders.service import (
     OrderService,
     client_uses_hyperliquid_semantics,
     estimate_same_side_risk_usdt,
+    execution_context_id,
 )
 from app.orders.tokens import PreviewStore
 from app.risk.sizing import adverse_market_entry, suggest_vol
@@ -312,13 +314,16 @@ def _detect_multi_worker_env(env: dict[str, str] | None = None) -> str | None:
 # Q-02: exclusive startup lock on the data directory. This is a runtime
 # check (rather than the env-var heuristic above) so it also catches a bare
 # `--workers N` / `gunicorn -w N` launch, which sets none of those vars.
-# Implemented as a PID lockfile created with O_CREAT|O_EXCL (atomic
-# create-if-absent on both POSIX and Windows via Python's os.open) instead
-# of an OS advisory lock, specifically so a lock left behind by a process
-# that was killed (SIGKILL/taskkill, no chance to run the `finally` below)
-# can be told apart from one held by a still-running instance and reclaimed
-# instead of blocking every future start — see _pid_is_alive() below.
+# A non-blocking kernel file lock is held for the whole lifespan. Its stable
+# path is never unlinked during reclaim/release, so simultaneous starts cannot
+# race through a stale delete-and-recreate window. A versioned marker identifies
+# this OS-lock protocol. Unversioned metadata from an already-running older app
+# remains authoritative during migration; after conversion, the kernel lock is
+# authoritative and the OS automatically releases it after a crash.
 _INSTANCE_LOCK_FILENAME = "instance.lock"
+_INSTANCE_LOCK_PROTOCOL_PREFIX = "oslock-v1:"
+_INSTANCE_LOCK_HANDLES: dict[Path, BinaryIO] = {}
+_INSTANCE_LOCK_GUARD = threading.Lock()
 
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -373,16 +378,10 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _process_start_time(pid: int) -> float | None:
-    """Best-effort process START TIME for `pid`, used by B3-01 to tell a PID
-    that is genuinely still held by the ORIGINAL lock-owning process apart
-    from an unrelated process that happens to have been assigned the same
-    PID after the original one exited (PID reuse/wraparound — an alive-PID
-    check alone cannot see this, and a stale lock that "looks busy" would
-    otherwise permanently block a legitimate ARMED start: a false-positive
-    DoS). Returns None if the start time cannot be determined at all (e.g.
-    no permission, or an unsupported platform) — callers must then treat the
-    comparison as INCONCLUSIVE, not as proof of anything, so this never turns
-    a genuinely-busy lock into a false reclaim.
+    """Best-effort process start time for diagnostic lockfile metadata.
+
+    The value is never lock authority; the retained kernel lock provides that.
+    Returns None when the platform cannot determine it.
 
     No new dependency (no psutil): Windows uses stdlib `ctypes` to call
     GetProcessTimes(); the value returned is the raw creation FILETIME
@@ -454,6 +453,8 @@ def _parse_lock_content(raw: str) -> tuple[int, float | None]:
     returned None) is never mistaken for corrupt content.
     """
     raw = raw.strip()
+    if raw.startswith(_INSTANCE_LOCK_PROTOCOL_PREFIX):
+        raw = raw[len(_INSTANCE_LOCK_PROTOCOL_PREFIX) :]
     if not raw:
         return -1, None
     pid_part, sep, ts_part = raw.partition(":")
@@ -470,98 +471,166 @@ def _parse_lock_content(raw: str) -> tuple[int, float | None]:
     return (pid, start_time) if math.isfinite(start_time) else (pid, None)
 
 
+def _legacy_instance_lock_is_busy(raw: str) -> bool:
+    """Fail closed for a possibly live owner from the pre-OS-lock protocol."""
+    stripped = raw.strip()
+    pid_text, separator, start_text = stripped.partition(":")
+    try:
+        parsed_pid = int(pid_text)
+    except ValueError:
+        return True
+    if parsed_pid <= 0:
+        return True
+    if separator:
+        try:
+            parsed_start = float(start_text)
+        except (ValueError, OverflowError):
+            return True
+        if not math.isfinite(parsed_start):
+            return True
+
+    pid, recorded_start = _parse_lock_content(raw)
+    if not _pid_is_alive(pid):
+        return False
+    if recorded_start is None:
+        return True
+    current_start = _process_start_time(pid)
+    return current_start is None or current_start == recorded_start
+
+
+def _try_instance_file_lock(handle: BinaryIO) -> bool:
+    """Acquire one non-blocking kernel lock on ``handle``."""
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_instance_file(handle: BinaryIO) -> None:
+    """Best-effort counterpart to ``_try_instance_file_lock``."""
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        # Closing the descriptor below still releases a kernel-held lock.
+        pass
+
+
 def _acquire_instance_lock(data_dir: Path) -> Path | None:
-    """Try to take the exclusive startup lock in data_dir.
+    """Take and retain the data directory's cross-process OS lock.
 
-    Returns the lockfile Path if THIS process now holds it, or None if a
-    still-live process already holds it. A lock left behind by a dead PID
-    (crashed process) is treated as orphaned/stale and silently reclaimed —
-    it must never permanently block a normal single-instance start.
-
-    B3-01: an alive PID alone is NOT sufficient proof that the ORIGINAL
-    process still holds the lock — the OS can reassign a dead process's PID
-    to an unrelated new process (PID reuse/wraparound), which would
-    otherwise make a stale lock look permanently busy (false-positive DoS
-    against an ARMED start). The lockfile therefore also stores the lock
-    owner's process START TIME; on a live PID, the reclaim additionally
-    compares the CURRENT start time of that PID against the stored one.
-    Only a definite MISMATCH is treated as a reused PID (stale, reclaim) —
-    if either side's start time is unavailable (old-format lockfile, or
-    _process_start_time() returned None) the comparison is inconclusive and
-    the pre-B3-01 PID-only behavior applies (alive -> busy), preserving the
-    Q-02 fail-closed guarantee: this never turns a genuinely-busy lock into
-    a false reclaim.
+    New-protocol ownership is the kernel lock held by the open descriptor in
+    ``_INSTANCE_LOCK_HANDLES``. During rollout, an unversioned marker can still
+    belong to an already-running legacy process which has no kernel lock, so a
+    live legacy owner (or malformed legacy metadata) remains fail-closed. The
+    stable path is never unlinked.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = data_dir / _INSTANCE_LOCK_FILENAME
-    my_pid = os.getpid()
+    lock_path = (data_dir / _INSTANCE_LOCK_FILENAME).resolve()
 
-    if lock_path.exists():
-        other_pid = -1
-        other_start: float | None = None
+    # Also serialize same-process lifespan attempts and registry changes.
+    with _INSTANCE_LOCK_GUARD:
+        if lock_path in _INSTANCE_LOCK_HANDLES:
+            return None
+
+        created = False
         try:
-            raw = lock_path.read_text(encoding="utf-8")
-            if not raw.strip():
-                # os.open(O_EXCL) publishes the path before the owner writes
-                # its PID. An empty file can therefore be a live acquisition
-                # in progress, never proof that the lock is stale.
+            fd = os.open(
+                str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+            )
+            created = True
+        except FileExistsError:
+            try:
+                fd = os.open(str(lock_path), os.O_RDWR)
+            except OSError:
                 return None
-            other_pid, other_start = _parse_lock_content(raw)
-            if other_pid <= 0:
-                # Unknown ownership must fail closed. Reclaiming malformed or
-                # partially written content could admit a second live process.
-                return None
-        except FileNotFoundError:
-            # The path disappeared between exists() and read_text(); continue
-            # to the atomic O_EXCL acquire below.
-            pass
         except OSError:
             return None
-        if other_pid > 0 and _pid_is_alive(other_pid):
-            current_start = _process_start_time(other_pid)
-            reused_pid = (
-                other_start is not None
-                and current_start is not None
-                and other_start != current_start
-            )
-            if not reused_pid:
-                return None  # held by another live process (genuinely busy)
-            # else: same PID, but the running process's start time doesn't
-            # match what was recorded -> the original owner is gone and the
-            # PID was reissued. Falls through to the reclaim below.
-        if other_pid > 0:
-            # Only a proven dead PID or a proven PID/start-time mismatch is
-            # stale. Empty, malformed and unreadable files returned busy above.
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
 
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-    except FileExistsError:
-        # Lost a race right after the staleness check above.
-        return None
-    try:
-        my_start = _process_start_time(my_pid)
-        content = str(my_pid) if my_start is None else f"{my_pid}:{my_start}"
-        os.write(fd, content.encode("ascii"))
-    finally:
-        os.close(fd)
-    return lock_path
+        try:
+            handle = os.fdopen(fd, "r+b", buffering=0)
+        except OSError:
+            os.close(fd)
+            return None
+
+        locked = False
+        try:
+            # An existing empty file is an ambiguous legacy marker. Do not
+            # mutate it merely to make Windows byte-range locking possible.
+            # A newly O_EXCL-created file, however, is ours to seed before the
+            # first kernel lock. A concurrent opener treats that transient
+            # empty/seed-only state as busy until this creator installs the
+            # versioned marker.
+            if not created and os.fstat(handle.fileno()).st_size == 0:
+                return None
+            if created:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            locked = _try_instance_file_lock(handle)
+            if not locked:
+                return None
+
+            handle.seek(0)
+            raw = handle.read().decode("ascii", errors="replace")
+            if not created and not raw.strip().startswith(
+                _INSTANCE_LOCK_PROTOCOL_PREFIX
+            ):
+                if _legacy_instance_lock_is_busy(raw):
+                    return None
+
+            my_pid = os.getpid()
+            my_start = _process_start_time(my_pid)
+            diagnostic = (
+                str(my_pid) if my_start is None else f"{my_pid}:{my_start}"
+            )
+            content = f"{_INSTANCE_LOCK_PROTOCOL_PREFIX}{diagnostic}"
+            handle.seek(0)
+            handle.write(content.encode("ascii"))
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+            _INSTANCE_LOCK_HANDLES[lock_path] = handle
+            return lock_path
+        except OSError:
+            if locked:
+                _unlock_instance_file(handle)
+            return None
+        finally:
+            if lock_path not in _INSTANCE_LOCK_HANDLES:
+                handle.close()
 
 
 def _release_instance_lock(lock_path: Path) -> None:
-    """Release a lock THIS process holds. Verifies the PID recorded inside
-    still matches ours before deleting, so a lock some other process may
-    have reclaimed is never deleted out from under it."""
+    """Release only a descriptor owned here; retain the stable lock path."""
     try:
-        raw = lock_path.read_text(encoding="utf-8")
-        pid, _start = _parse_lock_content(raw)
-        if pid == os.getpid():
-            lock_path.unlink()
+        key = Path(lock_path).resolve()
     except OSError:
-        pass
+        return
+    with _INSTANCE_LOCK_GUARD:
+        handle = _INSTANCE_LOCK_HANDLES.pop(key, None)
+        if handle is None:
+            return
+        try:
+            _unlock_instance_file(handle)
+        finally:
+            handle.close()
 
 
 @asynccontextmanager
@@ -1123,6 +1192,7 @@ async def health(request: Request):
     live_trading = bool(s.trading_enabled) and not on_testnet
     return {
         "ok": True,
+        "app_id": "obsidian-live-trader",
         "live_trading": live_trading,
         "exchange": s.exchange,
         "hl_testnet": s.hl_testnet if s.exchange == "hyperliquid" else None,
@@ -2337,6 +2407,30 @@ def _valid_account_snapshot(snapshot: object, *, exchange: str) -> bool:
     return snapshot["error"] is None
 
 
+def _valid_reevaluation_position(row: object, *, exchange: str) -> bool:
+    """Validate every financial field consumed by the reevaluation boundary."""
+    if not isinstance(row, dict):
+        return False
+    if not valid_normalized_position_symbol(row.get("symbol"), exchange=exchange):
+        return False
+    if row.get("side") not in ("long", "short"):
+        return False
+    for field in ("hold_vol", "entry_price"):
+        value = row.get(field)
+        if not _finite_real_number(value) or value <= 0:
+            return False
+    for field in ("leverage", "liquidate_price", "im"):
+        value = row.get(field)
+        if value is not None and (not _finite_real_number(value) or value <= 0):
+            return False
+    for field in ("unrealized_pnl", "margin_ratio"):
+        value = row.get(field)
+        if value is not None and not _finite_real_number(value):
+            return False
+    open_type = row.get("open_type")
+    return open_type is None or open_type in ("isolated", "cross")
+
+
 _FILL_REQUIRED_FIELDS = {
     "symbol",
     "px",
@@ -3043,37 +3137,22 @@ async def reevaluate(
     positions = acct.get("positions") if isinstance(acct, dict) else None
     if not isinstance(positions, list):
         raise HTTPException(status_code=502, detail="Invalid account position data")
+    client_exchange = getattr(client, "exchange_id", None)
+    active_exchange = (
+        client_exchange
+        if client_exchange in ("mexc", "hyperliquid")
+        else s.exchange
+    )
     candidates = []
     for candidate in positions:
-        symbol_raw = candidate.get("symbol") if isinstance(candidate, dict) else None
-        candidate_side = candidate.get("side") if isinstance(candidate, dict) else None
-        if (
-            not isinstance(symbol_raw, str)
-            or not symbol_raw.strip()
-            or candidate_side not in ("long", "short")
-        ):
+        if not _valid_reevaluation_position(candidate, exchange=active_exchange):
             raise HTTPException(status_code=502, detail="Invalid account position data")
+        symbol_raw = candidate["symbol"]
+        candidate_side = candidate["side"]
         if symbol_raw.upper() != symbol.upper():
             continue
         if body.side is not None and candidate_side != body.side:
             continue
-        try:
-            hold_raw = candidate.get("hold_vol")
-            entry_raw = candidate.get("entry_price")
-            hold_vol = float(hold_raw) if not isinstance(hold_raw, bool) else None
-            entry_price = float(entry_raw) if not isinstance(entry_raw, bool) else None
-        except (TypeError, ValueError, OverflowError):
-            hold_vol = None
-            entry_price = None
-        if (
-            hold_vol is None
-            or entry_price is None
-            or not math.isfinite(hold_vol)
-            or not math.isfinite(entry_price)
-            or hold_vol <= 0
-            or entry_price <= 0
-        ):
-            raise HTTPException(status_code=502, detail="Invalid account position data")
         candidates.append(candidate)
     if not candidates:
         side_label = f" {body.side}" if body.side else ""
@@ -3189,6 +3268,7 @@ async def reevaluate(
                 observed_open_sig=open_sig,
                 observed_opened_at=observed_opened_at,
                 reopen_opened_at=reopen_opened_at,
+                execution_context=execution_context_id(client),
             )
             thesis = build_original_thesis((row or {}).get("proposal"))
             if thesis is not None:

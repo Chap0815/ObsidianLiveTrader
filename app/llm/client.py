@@ -1343,14 +1343,10 @@ def _parse_content_to_reevaluation(
     return annotate_reevaluation(proposal, context)
 
 
-# L-09: transient-failure retry for the advisory provider POST. These calls
-# are read-only/advisory (never place, move or close anything), so a single
-# retry is safe and can't double-act. Only truly transient conditions retry —
-# a substantive failure (4xx auth/schema, non-timeout connection errors)
-# raises straight through on the first attempt, and even a transient one
-# retries at most ONCE, so a persistently-down provider still fails in
-# bounded time instead of silently doubling the caller's timeout budget.
-_RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+# L-09: retry provider POSTs only after an explicit 429 rejection or a known
+# pre-send connect/pool timeout. Ambiguous read/write/5xx outcomes are never
+# duplicated because a provider may already have accepted and billed them.
+_RETRYABLE_STATUS_CODES = frozenset({429})
 _RETRY_BACKOFF_SECONDS = 0.5
 _KNOWN_FINISH_REASONS = frozenset(
     {"stop", "length", "content_filter", "tool_calls", "function_call"}
@@ -1463,14 +1459,15 @@ def _log_llm_metrics(
 async def _post_with_retry(
     post: Callable[[], Awaitable[httpx.Response]],
 ) -> httpx.Response:
-    """Call `post()`; on a transient failure (429/502/503/504 response, or a
-    client-side httpx.TimeoutException) wait a short backoff and retry
-    exactly once. Any other outcome (a non-transient status code, or a
-    non-timeout httpx error) is returned/raised immediately from the first
-    attempt without retrying."""
+    """Retry once only when the request is known not to have been sent.
+
+    Connect/pool timeouts happen before provider processing. A 429 is an
+    explicit rejection. Read/write timeouts and gateway 5xx responses are
+    outcome-ambiguous for billable POSTs and must not be duplicated.
+    """
     try:
         response = await post()
-    except httpx.TimeoutException:
+    except (httpx.ConnectTimeout, httpx.PoolTimeout):
         await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
         return await post()
     if response.status_code in _RETRYABLE_STATUS_CODES:

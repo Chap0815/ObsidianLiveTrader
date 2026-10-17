@@ -132,13 +132,20 @@ def test_confirm_modal_uses_validated_ttl_for_token_and_countdown():
 
     assert "const ttl = previewTtlSeconds(preview.expires_in_seconds);" in app_source
     assert "preview.ok === true && previewToken !== null && ttl !== null" in app_source
-    assert "const canConfirm = okGates && ttl !== null && executionReady;" in app_source
+    assert "executionReady && networkMatches" in app_source
     assert "let left = ttl;" in app_source
     assert "preview.expires_in_seconds || 60" not in app_source
 
 
 def test_preview_response_contract_accepts_valid_pass_and_gate_rejection():
-    summary = {"symbol": "BTC", "side": "long"}
+    summary = {
+        "symbol": "BTC",
+        "side": "long",
+        "execution_exchange": "hyperliquid",
+        "execution_hl_testnet": True,
+        "execution_trading_enabled": True,
+        "execution_live_trading": False,
+    }
     gate = {"errors": [], "warnings": []}
     assert _call_utils(
         "isValidPreviewResponse",
@@ -170,7 +177,13 @@ def test_preview_response_contract_rejects_malformed_success_payloads():
         "ok": True,
         "token": "synthetic-token",
         "expires_in_seconds": 60,
-        "summary": {"symbol": "BTC"},
+        "summary": {
+            "symbol": "BTC",
+            "execution_exchange": "mexc",
+            "execution_hl_testnet": None,
+            "execution_trading_enabled": True,
+            "execution_live_trading": True,
+        },
         "gate": {"errors": [], "warnings": []},
         "errors": [],
         "warnings": [],
@@ -186,6 +199,49 @@ def test_preview_response_contract_rejects_malformed_success_payloads():
     ]
     for mutation in mutations:
         assert _call_utils("isValidPreviewResponse", {**base, **mutation}) is False
+
+
+def test_preview_execution_context_is_bound_to_health_identity():
+    summary = {
+        "execution_exchange": "hyperliquid",
+        "execution_hl_testnet": True,
+        "execution_trading_enabled": True,
+        "execution_live_trading": False,
+    }
+    health = {
+        "exchange": "hyperliquid",
+        "hl_testnet": True,
+        "trading_enabled": True,
+        "live_trading": False,
+    }
+    assert _call_utils("sameExecutionContext", summary, health) is True
+    assert _call_utils(
+        "sameExecutionContext", summary, {**health, "hl_testnet": False, "live_trading": True}
+    ) is False
+
+
+def test_auth_headers_survives_blocked_local_storage():
+    api_js = ROOT / "app" / "static" / "api.js"
+    script = """
+const fs = require("fs");
+const vm = require("vm");
+const sandbox = {
+  localStorage: { getItem: () => { throw new Error("blocked"); } },
+  PERSIST: { TOKEN: "mexc_local_token" },
+  fetch: () => { throw new Error("not called"); },
+};
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+process.stdout.write(JSON.stringify(sandbox.authHeaders({})));
+"""
+    result = subprocess.run(
+        ["node", "-e", script, str(api_js)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {}
 
 
 def test_run_preview_opens_modal_for_valid_gate_rejection_only():

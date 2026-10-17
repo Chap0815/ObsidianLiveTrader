@@ -38,7 +38,7 @@
      module) loaded IMMEDIATELY BEFORE app.js so its top-level functions are
      globals app.js can call by bare name — same-origin /static under CSP
      'self', matching the app.js tag pattern (no nonce needed for src). #}
-  <script src="/static/utils.js?v={{ asset_version|default('r30-en') }}"></script>
+  <script src="/static/utils.js?v={{ asset_version|default('r31-en') }}"></script>
   {# A3-06 (T41b): pure money-math (PnL, ROE, break-even, R-multiple,
      contract-size fallback, SL/TP trigger-classification) extracted to
      trade-math.js — the ONE frontend source per formula, mirroring the
@@ -52,8 +52,8 @@
      BEFORE app.js so its functions are globals app.js calls by bare name (same
      tag pattern as utils.js / trade-math.js). Loading BEFORE app.js is why it
      must not reference app.js's `state` — the state object is not yet defined. #}
-  <script src="/static/api.js?v={{ asset_version|default('r25') }}"></script>
-  <script src="/static/app.js?v={{ asset_version|default('r51') }}"></script>
+  <script src="/static/api.js?v={{ asset_version|default('r26') }}"></script>
+  <script src="/static/app.js?v={{ asset_version|default('r52') }}"></script>
   {% endblock %}
   {% block scripts %}{% endblock %}
 </body>
